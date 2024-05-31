@@ -1,0 +1,8 @@
+jsonschema
+rich
+requests
+pandas
+argparse
+configparser
+openpyxl
+ipaddress

@@ -1,0 +1,22 @@
+[api]
+#endpoint = API_URL
+
+[logging]
+#logfile = ~/cn.log
+#Levels supported DEBUG,INFO,WARNING,ERROR
+#Defaults to INFO
+#level = DEBUG
+
+[output]
+#filename = ~/report.xlsx
+#auto_save = True
+
+[config_repository]
+#storage_directory = /opt/data/configs
+#vendors = cisco,aruba,f5,bluecoat,paloalto
+#vendors = cisco
+#regions = ap, eu, am
+#regions = ap
+
+[gpg]
+#credentials = ~/device-apply.gpg
