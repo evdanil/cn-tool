@@ -46,7 +46,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 6
-version = '0.1.81 hash 6beab68'
+version = '0.1.85 hash 9d55486'
 
 # Disable SSL self-signed cert warnings, comment out line below if Infoblox
 # deployment uses proper certificate
