@@ -46,7 +46,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 6
-version = '0.1.85 hash 9d55486'
+version = '0.1.86 hash 1cd1fd5'
 
 # Disable SSL self-signed cert warnings, comment out line below if Infoblox
 # deployment uses proper certificate
@@ -333,21 +333,24 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
             continue
 
         # Try to compile the input as a regular expression
-        try:
-            keyword_regexp = re.compile(search_input)
-        except re.error as e:
-            logger.info(f'User input - Invalid regexp: {e}')
-            console.print(f'[red]Invalid regular expression - {e.msg}')
-            # Skipping wrong line
-            continue
-        else:
-            # Last added regexp or string line is considered as search term.
-            # However, if subnets were supplied, we ignore it
-            if networks:
+        # Only first regexp like expression will be used, the rest lines will be discarded
+        # If first line contained valid subnet address, regexp like input will be ignored
+        if keyword_regexp is None:
+            try:
+                keyword_regexp = re.compile(search_input)
+            except re.error as e:
+                logger.info(f'User input - Invalid regexp: {e}')
+                console.print(f'[red]Invalid regular expression - {e.msg}')
+                # Skipping wrong line
                 continue
             else:
-                search_term = keyword_regexp
-                break
+                # Last added regexp or string line is considered as search term.
+                # However, if subnets were supplied, we ignore it
+                if networks:
+                    continue
+                else:
+                    search_term = keyword_regexp
+                    continue
 
     if networks and len(networks) > 0:
         # just as a precaution we set search_term to None if we have networks populated
@@ -1585,11 +1588,11 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
     network = net_addr[0]
 
     # Catching exception if non-numerical mask
-    if len(net_addr) == 2:
+    if len(net_addr) == 2 and net_addr[1] != '':
         try:
             subnet_prefix = int(net_addr[1])
         except ValueError:
-            logger.info(f'Wrong network mask - Use only digits - {subnet_prefix}')
+            logger.info(f'Wrong network mask - Use only digits - {net_addr[1]}')
             console.print('[red]Wrong network mask - Use only digits[/red]')
             return
         else:
@@ -1598,10 +1601,8 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                 logger.info(f'Wrong network mask - Out of bounds - {subnet_prefix}')
                 console.print('[red]Wrong network mask - Out of bounds[/red]')
                 return
-
-    # If valid mask is given update network address with the mask
-    if len(net_addr) == 2:
-        network = f'{network}/{net_addr[1]}'
+            # If valid mask is given update network address with the mask
+            network = f'{network}/{subnet_prefix}'
 
     # Compile API request URIs to obtain general network information
     req_urls = {
