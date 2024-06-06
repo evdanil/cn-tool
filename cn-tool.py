@@ -46,7 +46,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 6
-version = '0.1.86 hash 1cd1fd5'
+version = '0.1.87 hash 8177a86'
 
 # Disable SSL self-signed cert warnings, comment out line below if Infoblox
 # deployment uses proper certificate
@@ -216,7 +216,7 @@ def make_dir_list(logger: logging.Logger, cfg: dict) -> list:
     return dir_list
 
 
-def search_config(logger: logging.Logger, cfg: dict, dir: str, nets: list[ipaddress.IPv4Network], search_term: list[re.Pattern], search_input: str) -> tuple[list,list]:
+def search_config(logger: logging.Logger, cfg: dict, dir: str, nets: list[ipaddress.IPv4Network], search_term: list[re.Pattern], search_input: str) -> tuple[list, list]:
     """
     Searches files in a given directory for keywords(regex) or subnet addresses, or a single IP
     @param logger: logger instance
@@ -1250,7 +1250,7 @@ def process_data(logger: logging.Logger, type: str, content: str) -> dict:
 
 def ip_request(logger: logging.Logger, cfg: dict) -> None:
     """
-    Requests user to provide IP address
+    Requests user to provide IP address(es)
     Validates user input
     Calls do_fancy_request
     Calls process_ip_data
@@ -1263,66 +1263,115 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
     """
 
     logger.info('Request Type - IP Information')
-
     console.print(
             "\n"
-            "[yellow]Please provide IP address, tool will request API and return detailed information,\n"
-            "such as its hostname, location, and network configuration[/yellow]\n"
+            "[yellow]Please provide IP address or a list of IP addresses one per line, tool will request API and return detailed information,\n"
+            "such as its hostname, location, and network configuration[/]\n"
+            "[yellow]Empty input line starts the process[/]\n"
+            "[magenta]Example:[/]\n"
+            "[green bold]134.162.104.110[/]\n"
+            "[green bold]134.143.104.145[/]\n"
         )
+    search_input = 'none'
+    ip_addresses = None
+    while True:
+        search_input = read_user_input(logger, '').strip()
+        if search_input == '':
+            break
 
-    ip = read_user_input(logger, 'Enter the IP Address: ')
+        # Check if input looks like an IP address or subnet
+        if '/' not in search_input and re.match(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', search_input):
+            # IP address provided
+            try:
+                ip = ipaddress.ip_address(search_input)
+            except ValueError:
+                logger.info(f'User input - Input not matching IP address: {search_input}')
+                console.print('[red]Invalid IP format. Enter a valid IP (e.g. 192.168.1.10)[/]')
+                continue
+            else:
+                if ip.is_multicast or ip.is_unspecified or ip.is_reserved or ip.is_link_local:
+                    logger.info(f'User input - Invalid IP address type: {search_input}')
+                    console.print(
+                        '[red]Invalid IP - multicast, broadcast, and reserved IPs are excluded.\n'
+                        'Enter a valid non-reserved IP (e.g. 192.168.1.10)[/]')
+                    continue
+                if ip_addresses is None:
+                    ip_addresses = set()
+                ip_addresses.add((ip, None))
+                continue
 
-    logger.info(f'User input - {ip}')
-
-    if not validate_ip(ip):
-        logger.info(f'User input - Not valid IP address: {ip}')
-        console.print('[red]Not valid IP address[/red]')
+    if ip_addresses and len(ip_addresses) > 0:
+        log_value = ', '.join([str(ip) for ip, _ in ip_addresses])
+        # log_value = search_input.replace(",", " ")
+        logger.info(f'User input - {log_value}')
+    else:
         return
 
+    start = perf_counter()
+
+    # Keep all provided input in a set, allows to get rid of duplicates
     processed_data = {}
 
-    data = do_fancy_request(
-        logger,
-        message=f'Fetching data for [magenta]{ip}[/magenta]...',
-        endpoint=cfg["api_endpoint"],
-        uri=f'ipv4address?ip_address={ip}&_return_fields=network,names,status,types,lease_state,mac_address',
-    )
+    # prepare dict for threaded execution
+    req_urls = {}
+    for ip, _ in ip_addresses:
+        req_urls[ip] = f'ipv4address?ip_address={ip}&_return_fields=network,names,status,types,lease_state,mac_address'
 
-    if data and len(data) > 0:
-        # process_data if not empty has 'general' and 'extra' keys with IP data
-        processed_data = process_data(logger, type="ip", content=data)
+    # Request general network information
+    with ThreadPoolExecutor() as executor:
+        with console.status(status=f'[yellow]Fetching IP information...[/]'):
+            futures = {
+                ip: executor.submit(
+                    do_fancy_request,
+                    logger=logger,
+                    message='',
+                    endpoint=cfg["api_endpoint"],
+                    uri=uri,
+                    spinner=None
+                ) for ip, uri in req_urls.items()
+            }
+            results = {ip: future.result() for ip, future in futures.items()}
 
-    if len(processed_data) == 0:
-        logger.info('Request Type - IP Information - No information received')
-        console.print('[red]No information received[/red]')
-        logger.debug(f'Request Type - IP Information - raw data {data}')
+    for ip, response in results.items():
+        if response and len(response) > 0:
+            # process_data if not empty has 'general' and 'extra' keys with IP data
+            processed_data[ip] = process_data(logger, type="ip", content=response)
+            if processed_data[ip] and len(processed_data[ip].get('general')) > 0:
+                try:
+                    ip_addresses.remove((ip, None))
+                except KeyError:
+                    pass
+                ip_addresses.add((ip, True))
+
+    end = perf_counter()
+    logger.info(f'Search took {round(end-start, 2)} seconds!')
+    console.print(f'Request Type - IP Information - Search took {round(end-start, 2)} seconds!')
+
+    returned_ips = None
+    for ip, status in ip_addresses:
+        if status:
+            returned_ips = True
+
+    if not returned_ips:
+        logger.info('Request Type - IP Information - No data received!')
+        console.print('[red]No data received![/]')
         return
+    else:
+        for ip, status in ip_addresses:
+            if not status:
+                console.print(f'[yellow][green bold]{ip}[/green bold] - [red]No data received[/]')
 
-    print_table_data(
-        logger,
-        processed_data,
-        suffix={"general": "IP Information", "extra": "IP Information"},
-    )
-    logger.debug(f'Request Type - IP Information - processed data {processed_data}')
+    save_data_all = []
 
-    # Saving data automatically unless user requested to not to(relies on global auto_save flag)
-    if cfg["auto_save"]:
-        columns = [
-            "Subnet",
-            "IP",
-            "Name",
-            "Status",
-            "Lease State",
-            "Record Type",
-            "MAC",
-        ]
+    for ip in processed_data:
+
+        logger.debug(f'Request Type - IP Information - processed data {processed_data[ip]}')
+
         save_data, save_data_general, save_data_extra = [], [], []
-
-        for ip in processed_data["general"]:
-            save_data_general.append([value for value in ip.values()])
-        for ip_data in processed_data["extra"]:
+        for ip_data in processed_data[ip]["general"]:
+            save_data_general.append([value for value in ip_data.values()])
+        for ip_data in processed_data[ip]["extra"]:
             save_data_extra.append([value for value in ip_data.values()])
-
         # Combine two arrays
         # Iterate over the rows of save_data_general and save_data_extra simultaneously using zip()
         # If save_data_extra has fewer rows than save_data_general, we add empty lists ([]) to save_data_extra to make their lengths equal
@@ -1343,14 +1392,54 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
                 + [[] for _ in range(len(save_data_general) - len(save_data_extra))],
             )
         ]
+        save_data_all.extend(save_data)
 
+    columns = [
+        "Subnet",
+        "IP",
+        "Name",
+        "Status",
+        "Lease State",
+        "Record Type",
+        "MAC",
+    ]
+
+    print_data = [dict(zip(columns, row)) for row in save_data_all]
+    print_table_data(
+        logger,
+        {'IP': print_data},
+        suffix={"IP": "Information"},
+    )
+
+    # Saving data automatically unless user requested not to (relies on global auto_save flag)
+    if cfg["auto_save"]:
+        missing_ip_addresses = set()
+        for ip, status in ip_addresses:
+            if not status:
+                missing_ip_addresses.add(ip)
+
+        if len(missing_ip_addresses) > 0:
+            missed_ip_data = [[str(ip), "No Information"] for ip in missing_ip_addresses]
+            # Saving IP Data with missed IPs first
+            append_df_to_excel(
+                logger,
+                cfg["report_filename"],
+                ["IP", "Status"],
+                missed_ip_data,
+                sheet_name="IP Data",
+                index=False,
+                force_header=True
+            )
+
+        # Saving IP Data with found IP information
         append_df_to_excel(
             logger,
             cfg["report_filename"],
             columns,
-            save_data,
+            save_data_all,
             sheet_name="IP Data",
             index=False,
+            force_header=True
         )
 
     return
