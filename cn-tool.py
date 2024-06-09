@@ -17,8 +17,12 @@ import os
 import ipaddress
 import signal
 import json
+import sys
+import termios
+import tty
+
 from operator import itemgetter
-from time import perf_counter
+from time import perf_counter, sleep
 from socket import gaierror, herror, timeout
 import socket
 from concurrent.futures import ThreadPoolExecutor
@@ -46,7 +50,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 6
-version = '0.1.87 hash 8177a86'
+version = '0.1.88 hash 581a104'
 
 # Disable SSL self-signed cert warnings, comment out line below if Infoblox
 # deployment uses proper certificate
@@ -68,6 +72,24 @@ session = requests.Session()
 session.mount("https://", adapter)
 session.headers.update({"Content-Type": "application/json"})
 
+# Precise match to IP, however search takes over 60 seconds
+# ip_regexp = re.compile(r'(?:(?:25[0-5]|(?:2[0-4]|1\d|[1-9]|)\d)\.?\b){4}')
+# Generic 4 1-3 numbers, lots of false positives but search takes 32 seconds
+ip_regexp = re.compile(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}')
+
+subnet_regexp = re.compile(r'(?:(?:25[0-5]|(?:2[0-4]|1\d|[1-9]|)\d)\.?\b){4}\/((?:[1-2][0-9])|(?:3[0-2])|(?:[0-9]\b))')
+
+
+def measure_execution_time(func):
+    def wrapper(*args, **kwargs):
+        start_time = perf_counter()
+        result = func(*args, **kwargs)
+        end_time = perf_counter()
+        execution_time = end_time - start_time
+        print(f"Function {func.__name__} took {execution_time:.4f} seconds to execute")
+        return result
+    return wrapper
+
 
 def interrupt_handler(logger: logging.Logger, signum: int, frame: any) -> None:
     """
@@ -81,6 +103,24 @@ def interrupt_handler(logger: logging.Logger, signum: int, frame: any) -> None:
 
     console.print("[red bold]Interrupted... Exiting...[/red bold]")
     exit_now(logger, exit_code=1)
+
+
+def read_single_keypress():
+    # Save the current terminal settings
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    try:
+        # Switch terminal to raw mode to capture single key press without enter
+        tty.setraw(sys.stdin.fileno())
+
+        # Read a single character
+        ch = sys.stdin.read(1)
+    finally:
+        # Restore the terminal settings
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    return ch
 
 
 def read_config(cfg: dict, config_file: str = ".cn") -> dict:
@@ -188,6 +228,7 @@ def print_search_config_data(data: list) -> None:
     return
 
 
+# @measure_execution_time
 def make_dir_list(logger: logging.Logger, cfg: dict) -> list:
     """
     Reads cfg and makes up a list of directories to read devices from
@@ -216,12 +257,12 @@ def make_dir_list(logger: logging.Logger, cfg: dict) -> list:
     return dir_list
 
 
-def search_config(logger: logging.Logger, cfg: dict, dir: str, nets: list[ipaddress.IPv4Network], search_term: list[re.Pattern], search_input: str) -> tuple[list, list]:
+def search_config(logger: logging.Logger, cfg: dict, folder: str, nets: list[ipaddress.IPv4Network], search_terms: list[re.Pattern], search_input: str) -> tuple[list, list]:
     """
     Searches files in a given directory for keywords(regex) or subnet addresses, or a single IP
     @param logger: logger instance
     @param cfg: configuration parameters
-    @param dir: directory path
+    @param folder: directory path
     @param nets: list of ipaddress.IPv4Network objects
     @param search_terms: list of regular expressions to match
     @param search_input: only used in interacive mode when user explicitly looks for a single subnet/keyword
@@ -231,8 +272,8 @@ def search_config(logger: logging.Logger, cfg: dict, dir: str, nets: list[ipaddr
 
     data_to_save = []
     matched_nets = set()
-    dir_list = os.listdir(dir)
-    parts = dir.split('/')
+    dir_list = os.listdir(folder)
+    parts = folder.split('/')
     with console.status(
         f'[yellow]Searching through [green bold]{parts[4].upper()}/{parts[5].upper()}[/green bold] configurations in [green bold]{parts[6].upper()}[/green bold] region...[/yellow]',
         spinner="dots12"
@@ -243,9 +284,9 @@ def search_config(logger: logging.Logger, cfg: dict, dir: str, nets: list[ipaddr
                 device: executor.submit(
                     matched_lines,
                     logger,
-                    os.path.join(dir, device),
+                    os.path.join(folder, device),
                     nets,
-                    search_term,
+                    search_terms,
                     search_input
                 ) for device in dir_list
             }
@@ -280,8 +321,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
     logger.info('Configuration Repository - Search Request')
     console.print(
         "\n"
-        "[yellow]Enter subnets in the format [green]IP_ADDRESS/\\[MASK][/green], one subnet per line[/yellow]\n"
-        "[yellow]Alternatively a [red bold]single line[/red bold] with [green]KEYWORDS(regex supported)[/green] can be used(longer than 6 chars)[/yellow]\n"
+        "[yellow]Enter subnet([green]IP_ADDRESS/\\[MASK][/]) or keyword(regular expression), one item per line[/]\n"
         "[yellow]Empty input line starts the process[/yellow]\n"
         "\n"
         "[magenta]Subnet Examples:[/magenta]\n"
@@ -293,8 +333,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
         )
 
     search_input = 'none'
-    search_term = None
-    keyword_regexp = None
+    keyword_regexps = []
     networks = None
     while True:
         search_input = read_user_input(logger, '').strip()
@@ -302,11 +341,11 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
             break
 
         # Check if input looks like an IP address or subnet
-        if '/' not in search_input and re.match(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', search_input):
+        if '/' not in search_input and re.match(ip_regexp, search_input):
             # IP address without mask, append default mask of /32
             search_input += '/32'
 
-        if '/' in search_input and re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2}$', search_input):
+        if '/' in search_input and re.match(subnet_regexp, search_input):
             # IP address with mask
             try:
                 network = ipaddress.ip_network(search_input, strict=False)
@@ -318,7 +357,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
                 if network.is_multicast or network.is_unspecified or network.is_reserved or network.is_link_local:
                     logger.info(f'User input - Invalid subnet: {search_input}')
                     console.print(
-                        '[red]Invalid IP - multicast, broadcast, and reserved subnets excluded.\n'
+                        '[red]Invalid IP - multicast, broadcast and reserved subnets excluded.\n'
                         'Enter a valid non-reserved subnet or IP (e.g., 10.10.1.0/24 or 192.168.1.10)[/red]')
                     continue
                 if networks is None:
@@ -326,42 +365,36 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
                 networks.append(network)
                 continue
 
-        if len(search_input) < MIN_INPUT_LEN:
+        if len(search_input) < MIN_INPUT_LEN and not is_valid_site(search_input):
             logger.info(f'User input - Input keyword is too short: {search_input}')
             console.print(f'[red]Input keyword is too short: {search_input}')
             # Skipping wrong line
             continue
 
         # Try to compile the input as a regular expression
-        # Only first regexp like expression will be used, the rest lines will be discarded
-        # If first line contained valid subnet address, regexp like input will be ignored
-        if keyword_regexp is None:
-            try:
-                keyword_regexp = re.compile(search_input)
-            except re.error as e:
-                logger.info(f'User input - Invalid regexp: {e}')
-                console.print(f'[red]Invalid regular expression - {e.msg}')
-                # Skipping wrong line
-                continue
-            else:
-                # Last added regexp or string line is considered as search term.
-                # However, if subnets were supplied, we ignore it
-                if networks:
-                    continue
-                else:
-                    search_term = keyword_regexp
-                    continue
+        try:
+            keyword_regexp = re.compile(search_input, re.IGNORECASE)
+        except re.error as e:
+            logger.info(f'User input - Invalid regexp: {e}')
+            console.print(f'[red]Invalid regular expression - {e.msg}')
+            # Skipping wrong line
+            continue
+        else:
+            # Last added regexp or string line is considered as search term.
+            # However, if subnets were supplied, we ignore it
+            keyword_regexps.append(keyword_regexp)
+            continue
 
     if networks and len(networks) > 0:
         # just as a precaution we set search_term to None if we have networks populated
-        search_term = None
         search_input = ',\n'.join([str(network) for network in networks])
-        log_value = search_input.replace(",\n", " ")
-        logger.info(f'User input - {log_value}')
-    else:
-        logger.info(f'User input - {search_input}')
+    if keyword_regexps and len(keyword_regexps) > 0:
+        search_input = search_input + ',\n' + ',\n'.join([str(keyword) for keyword in keyword_regexps])
 
-    if not networks and not search_term:
+    log_value = search_input.replace(",\n", " ")
+    logger.info(f'User input - {log_value}')
+
+    if not networks and len(keyword_regexps) == 0:
         return
 
     data_to_save = []
@@ -369,10 +402,10 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
 
     start = perf_counter()
     for dir in make_dir_list(logger, cfg):
-        lines, nets = search_config(logger, cfg, dir, networks, search_term, search_input)
-
+        lines, nets = search_config(logger, cfg, dir, networks, keyword_regexps, search_input)
         data_to_save.extend(lines)
         matched_nets.update(nets)
+
     end = perf_counter()
     logger.info(f'Configuration Repository - Search took {round(end-start, 2)} seconds!')
     console.print(f'Configuration Repository - Search took {round(end-start, 2)} seconds!')
@@ -399,7 +432,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
 
     # Saving data automatically unless user requested not to (relies on global auto_save flag)
     if cfg["auto_save"]:
-        save_found_data(logger, cfg, data_to_save, missing_nets, 'Config Check')
+        save_found_data(logger, cfg, data_to_save, missing_nets, matched_nets, 'Config Check')
 
 
 def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
@@ -427,30 +460,30 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
         "[green bold]AMS-DC, WND-RYD[/green bold]\n"
     )
 
-    raw_input = read_user_input(logger, "Enter location site code: ").lower().strip()
+    raw_input = read_user_input(logger, "Enter location site code: ").strip()
 
     logger.info(f'User input - {raw_input}')
     if is_valid_site(raw_input):
-        search_term = raw_input
-        logger.info(f'User input - Sitecode search for {search_term}')
+        sitecode = raw_input.upper()
+        logger.info(f'User input - Sitecode search for {sitecode}')
     else:
         logger.info(f'User input - Incorrect site code {raw_input}')
         console.print("[red]Incorrect site code[/red]")
         return
 
-    uri = f'network?comment:~={search_term}&_max_results=50'
+    uri = f'network?comment:~={sitecode}&_max_results=50'
     processed_data = {}
 
     data = do_fancy_request(
         logger,
-        message=f'Fetching data for [magenta]{search_term.upper()}[/magenta]...',
+        message=f'Fetching data for [magenta]{sitecode}[/magenta]...',
         endpoint=cfg["api_endpoint"],
         uri=uri,
     )
 
     if data and len(data) > 0:
         # process_data if not empty has 'location' key with subnet data
-        processed_data = process_data(logger, type=f"location_{search_term}", content=data)
+        processed_data = process_data(logger, type=f"location_{sitecode}", content=data)
 
     if len(processed_data.get("location", '')) == 0:
         logger.info('Request Type - Location Information - No information received')
@@ -462,7 +495,7 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
         processed_data
     )
 
-    message = f'Received {len(processed_data["location"])} subnet records registered for {search_term.upper()}'
+    message = f'Received {len(processed_data["location"])} subnet records registered for {sitecode}'
     console.print(message)
     logger.info(f'Request Type - Location Information - {message}')
     logger.debug(f'Request Type - Location Information - Processed data {processed_data}')
@@ -473,22 +506,41 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
     # Now for each location subnet we have to perform configuration lookup, it might take longer than we expect
     locations = processed_data["location"]
     networks = []
+    skipped_networks = []
     for location in locations:
-        networks.append(ipaddress.ip_network(location["network"]))
+        net = ipaddress.ip_network(location["network"])
+        if net.is_multicast or net.is_unspecified:
+            skipped_networks.append(location["network"])
+        else:
+            networks.append(net)
 
     start = perf_counter()
     data_to_save = []
+    search_terms = []
     matched_nets = set()
-    for dir in make_dir_list(logger, cfg):
-        lines, nets = search_config(logger, cfg, dir, networks, None, search_term.upper())
+
+    if len(skipped_networks) > 0:
+        console.print(f'[yellow bold]Site {sitecode} has reserved/mulicast networks registered in Infoblox[/]\n')
+        for skipped_net in skipped_networks:
+            console.print(f'[cyan]Skipping reserved/mulicast network: [magenta bold]{skipped_net}[/]')
+        console.print('\n')
+    # Creating single search term to match WLC configs (Shell specific)
+    pattern = rf'\b(?:[A-Z-]{{2,3}}{re.escape(sitecode.replace("-", ""))}|{re.escape(sitecode)}[_0-9]+[-\w\d]*)\b'
+
+    compiled_pattern = re.compile(pattern)
+    search_terms.append(compiled_pattern)
+    for folder in make_dir_list(logger, cfg):
+        # Searching for IP addresses
+        lines, nets = search_config(logger, cfg, folder, networks, search_terms, search_input=sitecode)
         data_to_save.extend(lines)
         matched_nets.update(nets)
 
     end = perf_counter()
+    console.print(f'Configuration Repository - Search took {round(end-start, 2)} seconds!')
     logger.info(f'Configuration Repository - Search took {round(end-start, 2)} seconds!')
 
     if len(data_to_save) == 0:
-        logger.info(f'Configuration Repository - No matches for {search_term.upper()} found!')
+        logger.info(f'Configuration Repository - No matches for {sitecode} found!')
         console.print('No matches found!')
         return
 
@@ -509,10 +561,10 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
 
     # Saving data automatically unless user requested not to (relies on global auto_save flag)
     if cfg["auto_save"]:
-        save_found_data(logger, cfg, data_to_save, missing_nets, 'Demob Site Check')
+        save_found_data(logger, cfg, data_to_save, missing_nets, matched_nets, 'Demob Site Check')
 
 
-def save_found_data(logger: logging.Logger, cfg: dict, data: list, missed_nets: set, sheet: str = 'Config Check') -> None:
+def save_found_data(logger: logging.Logger, cfg: dict, data: list, missed_nets: set, matched_nets: set, sheet: str = 'Config Check') -> None:
     """
     Saves provided data in report file, used by search_config_request and demob_site_request functions
 
@@ -530,27 +582,36 @@ def save_found_data(logger: logging.Logger, cfg: dict, data: list, missed_nets: 
                 f'Saving data to {cfg["report_filename"]}...',
                 spinner="dots12"
             ):
-        # Adding information about subnets which did not have any matches
+        # Adding search results information about subnets
         search_input = data[0][0]
 
-        if missed_nets:
+        if missed_nets or matched_nets:
             missed_nets_data = [
-                [search_input, net] for net in missed_nets
+                [search_input, net, "No match"] for net in missed_nets if net
             ]
+            matched_nets_data = [
+                [search_input, net, "Used"] for net in matched_nets if net
+            ]
+
+            save_nets_data = []
+            save_nets_data.extend(missed_nets_data)
+            save_nets_data.extend(matched_nets_data)
+
             if is_valid_site(search_input):
-                columns = ["Site Code", "Unused Subnets"]
+                columns = ["Site Code", "Subnet", "Status"]
             else:
-                columns = ["Search Terms", "Unused Subnets"]
-            # Saving Subnet Data first
-            append_df_to_excel(
-                logger,
-                cfg["report_filename"],
-                columns,
-                missed_nets_data,
-                sheet_name=sheet,
-                index=False,
-                force_header=True
-            )
+                columns = ["Search Terms", "Subnet", "Status"]
+            # Saving Missed Subnet Data first
+            if save_nets_data:
+                append_df_to_excel(
+                    logger,
+                    cfg["report_filename"],
+                    columns,
+                    save_nets_data,
+                    sheet_name=sheet,
+                    index=False,
+                    force_header=True
+                )
 
         # Adding hyperlinks to Line number
         columns = ["Search Terms", "Device", "Line number", "Line"]
@@ -594,28 +655,26 @@ def save_found_data(logger: logging.Logger, cfg: dict, data: list, missed_nets: 
                 )
 
 
-def matched_lines(logger: logging.Logger, filename: str, ip_nets: list[ipaddress.IPv4Network], search_term: re.Pattern, search_input: str) -> tuple[list, set]:
+# @measure_execution_time
+def matched_lines(logger: logging.Logger, filename: str, ip_nets: list[ipaddress.IPv4Network], search_terms: list[re.Pattern], search_input: str) -> tuple[list, set]:
     """
-    Looks up for matches in a file for a given list of IP networks or search pattern
+    Looks up for matches in a file for a given list of IP networks or search patterns
     Returns data list
 
     @param logger(Logger): logger instance
     @param filename(str): filename to match data on
     @param ip_nets(IPv4Network): subnets to lookup
-    @param search_term(re.Pattern): keyword regexp to match
+    @param search_terms(list re.Pattern): list of keyword regexps to match
     @search_input(str): to save in file as info if provided
 
     @return: tuple[list, list] first list in tuple is the matched lines data, second list in tuple is the list of matched subnets
     """
     data_to_save = []
+    search_term = None
     matched_nets = set()
 
-    if ip_nets:
-        search_term = re.compile(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}')
-    else:
-        # return if no search_term given and no ip_nets defined (should'nt happen)
-        if search_term is None:
-            return (data_to_save, matched_nets)
+    if ip_nets is None and search_terms is None:
+        return (data_to_save, matched_nets)
 
     if os.path.isfile(filename):
         with open(filename, 'r', encoding='utf-8') as f:
@@ -632,24 +691,27 @@ def matched_lines(logger: logging.Logger, filename: str, ip_nets: list[ipaddress
             for index, current_line in enumerate(current_config):
                 # if there is a match in line check if we have ip_data and verify found IP within the subnet range
                 if ip_nets:
-                    found_matches = re.findall(search_term, current_line)
+                    found_matches = re.findall(ip_regexp, current_line)
+                    # import ipdb; ipdb.set_trace()                    
                     for match in found_matches:
                         try:
                             found_ip = ipaddress.ip_address(match)
                         except (re.error, ValueError):
                             logger.debug(f'Config Check - Found {match} bad IP(skipped) in {device.upper()} line {index}')
-                            continue
+                            pass
                         else:
                             matched_subnet = next((net for net in ip_nets if found_ip in net), None)
                             if matched_subnet:
                                 matched_nets.add(matched_subnet)
                                 logger.debug(f'Config Check - Found {found_ip} matching subnet {matched_subnet} in {device.upper()} line {index}')
                                 rows_to_save[index] = f'{current_config[index]}'
-                else:
-                    matched = re.search(search_term, current_line)
-                    if matched:
-                        logger.debug(f'Config Check - Found expresison "{matched.group()}" in {device.upper()} line {index}')
-                        rows_to_save[index] = f'{current_config[index]}'
+                if search_terms:
+                    for search_term in search_terms:
+                        # console.print(f'DEBUG - Searching for {str(search_term)}')
+                        matched = re.search(search_term, current_line)
+                        if matched:
+                            logger.debug(f'Config Check - Found expressison "{matched.group()}" in {device.upper()} line {index}')
+                            rows_to_save[index] = f'{current_config[index]}'
 
         # Saving all gathered data to data_to_save array
         if len(rows_to_save) > 0:
@@ -846,11 +908,11 @@ def validate_ip(ip: str) -> bool:
     """
 
     # Valid IP regex
-    ip_regex = r"^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$"
+    # ip_regex = r"^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$"
 
     # pass the regular expression
     # and the string in search() method
-    if re.search(ip_regex, ip):
+    if re.search(ip_regexp, ip):
         return True
 
     return False
@@ -970,6 +1032,7 @@ def print_table_data(
             continue
 
         # Since we get list of dict objects - each has same keys() which we can use as column names
+        # import ipdb; ipdb.set_trace()
         for name in value_list[0].keys():
             columns.append(name.upper())
 
@@ -1280,7 +1343,7 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
             break
 
         # Check if input looks like an IP address or subnet
-        if '/' not in search_input and re.match(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', search_input):
+        if '/' not in search_input and re.match(ip_regexp, search_input):
             # IP address provided
             try:
                 ip = ipaddress.ip_address(search_input)
@@ -1319,7 +1382,7 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
 
     # Request general network information
     with ThreadPoolExecutor() as executor:
-        with console.status(status=f'[yellow]Fetching IP information...[/]'):
+        with console.status(status='[yellow]Fetching IP information...[/]'):
             futures = {
                 ip: executor.submit(
                     do_fancy_request,
@@ -1345,7 +1408,7 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
 
     end = perf_counter()
     logger.info(f'Search took {round(end-start, 2)} seconds!')
-    console.print(f'Request Type - IP Information - Search took {round(end-start, 2)} seconds!')
+    console.print(f'[yellow]Request Type - IP Information - Search took {round(end-start, 2)} seconds![/]')
 
     returned_ips = None
     for ip, status in ip_addresses:
@@ -1659,115 +1722,123 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
 
     console.print(
         "\n"
-        "[yellow]Enter a network address in the format 'x.x.x.x\\[/x]', where:\n"
-        "- 'x.x.x.x' represents the IP address.\n"
-        "- '/x' (optional) represents the subnet mask prefix in CIDR notation\n"
+        "[yellow]Enter a network addresses in the format 'x.x.x.x\\[/x]' one subnet per line\n"
     )
-    raw_input = read_user_input(logger, "(x.x.x.x\\[/x]): ")
 
-    logger.info(f"User input - {raw_input}")
+    net_addresses = set()
+    while True:
+        search_input = read_user_input(logger, '').strip()
+        if search_input == '':
+            break
 
-    net_addr = raw_input.split("/")
+        # Check if input looks like an IP address or subnet
+        if '/' not in search_input and re.match(ip_regexp, search_input):
+            # IP address provided
+            try:
+                ip = ipaddress.ip_address(search_input)
+            except ValueError:
+                logger.info(f'User input - Input not matching IP address: {search_input}')
+                console.print('[red]Invalid IP format. Enter a valid IP (e.g. 192.168.1.10)[/]')
+                continue
+            else:
+                if ip.is_unspecified or ip.is_reserved or ip.is_multicast or ip.is_loopback:
+                    logger.info(f'User input - Invalid IP address type: {search_input}')
+                    console.print(
+                        '[red]Invalid IP - multicast, broadcast, and reserved IPs are excluded.\n'
+                        'Enter a valid non-reserved IP[/]')
+                    continue
+                net_addresses.add((ip, None))
+                continue
+        else:
+            try:
+                net = ipaddress.ip_network(search_input)
+            except ValueError:
+                logger.info(f'User input - Input not matching valid IP/MASK: {search_input}')
+                console.print('[red]Invalid IP format. Enter a valid IP/MASK (e.g. 192.168.1.10/24)[/]')
+                continue
+            else:
+                if net.is_unspecified or net.is_reserved or net.is_multicast or net.is_loopback:
 
-    if not validate_ip(net_addr[0]):
-        logger.info(f'User input - Not valid IP address: {net_addr[0]}')
-        console.print('[red]Not valid IP address[/red]')
+                    logger.info(f'User input - Invalid IP address type: {search_input}')
+                    console.print(
+                        '[red]Invalid IP - multicast, broadcast, and reserved IPs are excluded.\n'
+                        'Enter a valid non-reserved IP[/]')
+                    continue
+                net_addresses.add((net, None))
+                continue
+
+    if net_addresses and len(net_addresses) > 0:
+        log_value = ', '.join([str(ip) for ip, _ in net_addresses])
+        # log_value = search_input.replace(",", " ")
+        logger.info(f'User input - {log_value}')
+    else:
         return
 
-    network = net_addr[0]
+    start = perf_counter()
 
-    # Catching exception if non-numerical mask
-    if len(net_addr) == 2 and net_addr[1] != '':
-        try:
-            subnet_prefix = int(net_addr[1])
-        except ValueError:
-            logger.info(f'Wrong network mask - Use only digits - {net_addr[1]}')
-            console.print('[red]Wrong network mask - Use only digits[/red]')
-            return
-        else:
-            # Checking if mask is outside 32 bits
-            if subnet_prefix < 0 or subnet_prefix > 32:
-                logger.info(f'Wrong network mask - Out of bounds - {subnet_prefix}')
-                console.print('[red]Wrong network mask - Out of bounds[/red]')
-                return
-            # If valid mask is given update network address with the mask
-            network = f'{network}/{subnet_prefix}'
+    req_urls = {}
+    processed_data = {}
+    data_to_save = {}
+    # Compile API request URIs to obtain general network information for each address
+    for network, _ in net_addresses:
+        req_urls[network] = {
+            "general": f'network?network={network}',
+            "DNS records": f'ipv4address?network={network}&usage=DNS&_return_fields=ip_address,names',
+            "network options": f'network?network={network}&_return_fields=options,members',
+            "DHCP range": f'range?network={network}',
+            "DHCP failover": f'range?network={network}&_return_fields=member,failover_association',
+            "fixed addresses": f'fixedaddress?network={network}&_return_fields=ipv4addr,mac,name',
+        }
+        # process_data function will return 'DHCP members' and 'DHCP options' when type = 'network options'
+        processed_data[network] = {
+            "general": [],
+            "DNS records": [],
+            "DHCP options": [],
+            "DHCP members": [],
+            "DHCP range": [],
+            "DHCP failover": [],
+            "fixed addresses": [],
+        }
 
-    # Compile API request URIs to obtain general network information
-    req_urls = {
-        "general": f'network?network={network}',
-        "DNS records": f'ipv4address?network={network}&usage=DNS&_return_fields=ip_address,names',
-        "network options": f'network?network={network}&_return_fields=options,members',
-        "DHCP range": f'range?network={network}',
-        "DHCP failover": f'range?network={network}&_return_fields=member,failover_association',
-        "fixed addresses": f'fixedaddress?network={network}&_return_fields=ipv4addr,mac,name',
-    }
-    # process_data function will return 'DHCP members' and 'DHCP options' when type = 'network options'
-    processed_data = {
-        "general": [],
-        "DNS records": [],
-        "DHCP options": [],
-        "DHCP members": [],
-        "DHCP range": [],
-        "DHCP failover": [],
-        "fixed addresses": [],
-    }
+    # Request general network information for each subnet
+    for network, _ in net_addresses:
+        with ThreadPoolExecutor() as executor:
+            with console.status(status=f'Fetching [magenta]{network}[/magenta] information...'):
+                futures = {
+                    label: executor.submit(
+                        do_fancy_request,
+                        logger=logger,
+                        message='',
+                        endpoint=cfg["api_endpoint"],
+                        uri=uri,
+                        spinner=None
+                    ) for label, uri in req_urls[network].items()
+                }
+                results = {label: future.result() for label, future in futures.items()}
 
-    # Request general network information
-    with ThreadPoolExecutor() as executor:
-        with console.status(status=f'Fetching [magenta]{network}[/magenta] information...'):
-            futures = {
-                label: executor.submit(
-                    do_fancy_request,
-                    logger=logger,
-                    message='',
-                    endpoint=cfg["api_endpoint"],
-                    uri=uri,
-                    spinner=None
-                ) for label, uri in req_urls.items()
-            }
+        for key, response in results.items():
+            if response and len(response) > 0:
+                processed_data[network].update(process_data(logger, type=key, content=response))
 
-            results = {label: future.result() for label, future in futures.items()}
-
-    for key, response in results.items():
-        if response and len(response) > 0:
-            processed_data.update(process_data(logger, type=key, content=response))
-
-    # display data only if it is available
-    if len(processed_data["general"]) > 0:
-        print_table_data(logger, processed_data, suffix={"general": "Information"})
-
-        # save data
-        if cfg["auto_save"]:
+        # display data only if it is available
+        data = []
+        if len(processed_data[network]["general"]) > 0:
+            # print_table_data(logger, processed_data[network], suffix={"general": "Information"})
             # Need to compile single 2d array with all the data to save it in xlsx
-            dhcp_members_data = processed_data.get("DHCP members", "")
-            dhcp_options_data = processed_data.get("DHCP options", "")
-            dhcp_ranges_data = processed_data.get("DHCP range", "")
-            dhcp_failover_data = processed_data.get("DHCP failover", "")
-            dns_data = processed_data.get("DNS records", "")
-            fixed_address_data = processed_data.get("fixed addresses", "")
-            columns = [
-                "IP",
-                "Mask",
-                "Name",
-                "MAC",
-                "DHCP",
-                "DHCP Scope Start",
-                "DHCP Scope End",
-                "DHCP Servers",
-                "DHCP Options\nOption - Value",
-                "DHCP Failover Association",
-                "Notes",
-            ]
-            data = []
+            dhcp_members_data = processed_data[network].get("DHCP members", "")
+            dhcp_options_data = processed_data[network].get("DHCP options", "")
+            dhcp_ranges_data = processed_data[network].get("DHCP range", "")
+            dhcp_failover_data = processed_data[network].get("DHCP failover", "")
+            dns_data = processed_data[network].get("DNS records", "")
+            fixed_address_data = processed_data[network].get("fixed addresses", "")
             DHCP = "N"
             DHCP_Start = ""
             DHCP_End = ""
             DHCP_Servers = ""
             DHCP_Options = ""
             DHCP_Failover = ""
-            Notes = processed_data.get("general", [])[0].get("description", "")
-            subnet = processed_data["general"][0].get("subnet").split("/")
+            notes = processed_data[network].get("general", [])[0].get("description", "")
+            subnet = processed_data[network].get("general", [])[0].get("subnet").split("/")
 
             if len(dhcp_members_data) > 0 and len(dhcp_members_data[0]) > 0:
                 DHCP = "Y"
@@ -1804,7 +1875,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                 DHCP_Servers,
                 DHCP_Options,
                 DHCP_Failover,
-                Notes,
+                notes,
             ]
 
             data.append(first_row)
@@ -1851,20 +1922,88 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                 ]
                 data.extend(fixed_ip_rows)
 
-            # Save data
-            append_df_to_excel(
-                logger,
-                cfg["report_filename"],
-                columns,
-                data,
-                sheet_name="Subnet Data",
-                index=False,
-            )
-    else:
-        # No network data available
-        logger.info(f'Subnet Information - No information received for {network}')
-        console.print('[red]No information received[red]')
+        data_to_save[network] = data
 
+    end = perf_counter()
+
+    logger.info(f'Request Type - Subnet Information - Search took {round(end-start, 2)} seconds!')
+
+    console.print('\n\n')
+    console.print(f'[yellow]Request Type - Subnet Information - Search took {round(end-start, 2)} seconds![/]\n')
+
+    for network, _ in net_addresses:
+        if len(processed_data[network].get("general")) == 0:
+            console.print(f'[yellow]No data received for network: [magenta bold]{network}[/]')
+
+    console.print('\n\n')
+    for network, _ in net_addresses:
+        if len(processed_data[network].get("general")) > 0:
+            print_table_data(logger, processed_data[network], suffix={"general": "Information"})
+            console.print('([green bold]Press space to see [/])[green] next page[/] [yellow]/ Any other key - return to the menu(data will be saved in report file)[/]\n')
+            key = read_single_keypress()
+            if key == ' ':
+                sleep(1)
+                continue
+            else:
+                break
+
+    columns = [
+        "IP",
+        "Mask",
+        "Name",
+        "MAC",
+        "DHCP",
+        "DHCP Scope Start",
+        "DHCP Scope End",
+        "DHCP Servers",
+        "DHCP Options\nOption - Value",
+        "DHCP Failover Association",
+        "Notes",
+    ]   
+    columns_common = [
+        "Search Network",
+        "Status",
+    ]       
+    data_combined = []
+    common_search_results = []
+    for network, _ in net_addresses:
+        if len(data_to_save[network]) > 0:
+            common_search_results.append([network, "Used"])
+            data_combined.extend(data_to_save[network])
+        else:
+            common_search_results.append([network, "No match"])
+
+    # Print all data
+    # print_data = [dict(zip(columns, row)) for row in data_combined]
+    # import ipdb; ipdb.set_trace()
+    # print_table_data(
+        # logger,
+        # {'Subnet': print_data},
+        # suffix={"Subnet": "Information"},
+    # )
+
+    # save data
+    if cfg["auto_save"]:
+        # Save general data
+        append_df_to_excel(
+            logger,
+            cfg["report_filename"],
+            columns_common,
+            common_search_results,
+            sheet_name="Subnet Data",
+            force_header=True,
+            index=False,
+        )
+        # Save main data
+        append_df_to_excel(
+            logger,
+            cfg["report_filename"],
+            columns,
+            data_combined,
+            sheet_name="Subnet Data",
+            force_header=True,
+            index=False,
+        )
     return
 
 
