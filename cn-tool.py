@@ -50,7 +50,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 6
-version = '0.1.88 hash 581a104'
+version = '0.1.89 hash 0596afe'
 
 # Disable SSL self-signed cert warnings, comment out line below if Infoblox
 # deployment uses proper certificate
@@ -1359,14 +1359,17 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
                         'Enter a valid non-reserved IP (e.g. 192.168.1.10)[/]')
                     continue
                 if ip_addresses is None:
-                    ip_addresses = set()
-                ip_addresses.add((ip, None))
+                    ip_addresses = []
+                ip_addresses.append((ip, None))
                 continue
 
     if ip_addresses and len(ip_addresses) > 0:
         log_value = ', '.join([str(ip) for ip, _ in ip_addresses])
         # log_value = search_input.replace(",", " ")
         logger.info(f'User input - {log_value}')
+
+        # One liner remove duplicates from net_addresses
+        ip_addresses = list(dict.fromkeys(ip_addresses))
     else:
         return
 
@@ -1404,25 +1407,15 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
                     ip_addresses.remove((ip, None))
                 except KeyError:
                     pass
-                ip_addresses.add((ip, True))
+                ip_addresses.append((ip, True))
 
     end = perf_counter()
     logger.info(f'Search took {round(end-start, 2)} seconds!')
     console.print(f'[yellow]Request Type - IP Information - Search took {round(end-start, 2)} seconds![/]')
 
-    returned_ips = None
     for ip, status in ip_addresses:
-        if status:
-            returned_ips = True
-
-    if not returned_ips:
-        logger.info('Request Type - IP Information - No data received!')
-        console.print('[red]No data received![/]')
-        return
-    else:
-        for ip, status in ip_addresses:
-            if not status:
-                console.print(f'[yellow][green bold]{ip}[/green bold] - [red]No data received[/]')
+        if not status:
+            console.print(f'[yellow][green bold]{ip}[/green bold] - [red]No data received[/]')
 
     save_data_all = []
 
@@ -1467,6 +1460,7 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
         "MAC",
     ]
 
+    # Print IP information in a single table
     print_data = [dict(zip(columns, row)) for row in save_data_all]
     print_table_data(
         logger,
@@ -1476,34 +1470,36 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
 
     # Saving data automatically unless user requested not to (relies on global auto_save flag)
     if cfg["auto_save"]:
-        missing_ip_addresses = set()
-        for ip, status in ip_addresses:
-            if not status:
-                missing_ip_addresses.add(ip)
+        with console.status(f'Saving data to {cfg["report_filename"]}...', spinner="dots12"):
+            missing_ip_addresses = []
+            for ip, status in ip_addresses:
+                if not status:
+                    missing_ip_addresses.append(ip)
 
-        if len(missing_ip_addresses) > 0:
-            missed_ip_data = [[str(ip), "No Information"] for ip in missing_ip_addresses]
-            # Saving IP Data with missed IPs first
-            append_df_to_excel(
-                logger,
-                cfg["report_filename"],
-                ["IP", "Status"],
-                missed_ip_data,
-                sheet_name="IP Data",
-                index=False,
-                force_header=True
-            )
+            if len(missing_ip_addresses) > 0:
+                missed_ip_data = [[str(ip), "No Information"] for ip in missing_ip_addresses]
+                # Saving IP Data with missed IPs first
+                append_df_to_excel(
+                    logger,
+                    cfg["report_filename"],
+                    ["IP", "Status"],
+                    missed_ip_data,
+                    sheet_name="IP Data",
+                    index=False,
+                    force_header=True
+                )
 
-        # Saving IP Data with found IP information
-        append_df_to_excel(
-            logger,
-            cfg["report_filename"],
-            columns,
-            save_data_all,
-            sheet_name="IP Data",
-            index=False,
-            force_header=True
-        )
+            # Saving IP Data with found IP information
+            if len(save_data_all) > 0:
+                append_df_to_excel(
+                    logger,
+                    cfg["report_filename"],
+                    columns,
+                    save_data_all,
+                    sheet_name="IP Data",
+                    index=False,
+                    force_header=True
+                )
 
     return
 
@@ -1574,20 +1570,21 @@ def fqdn_request(logger: logging.Logger, cfg: dict) -> None:
 
     # Saving data automatically unless user requested to not to(relies on global auto_save flag)
     if cfg["auto_save"]:
-        columns = ["IP Address", "Device Name"]
-        save_data = []
-        for fqdn in processed_data["fqdn"]:
-            save_data.append([value for value in fqdn.values()])
+        with console.status(f'Saving data to {cfg["report_filename"]}...', spinner="dots12"):
+            columns = ["IP Address", "Device Name"]
+            save_data = []
+            for fqdn in processed_data["fqdn"]:
+                save_data.append([value for value in fqdn.values()])
 
-        append_df_to_excel(
-            logger,
-            cfg["report_filename"],
-            columns,
-            save_data,
-            sheet_name="FQDN Data",
-            index=False,
-        )
-
+            append_df_to_excel(
+                logger,
+                cfg["report_filename"],
+                columns,
+                save_data,
+                sheet_name="FQDN Data",
+                index=False,
+                force_header=True
+            )
     return
 
 
@@ -1698,6 +1695,7 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
             save_data,
             sheet_name="Subnet Lookup",
             index=False,
+            force_header=True
         )
 
     return
@@ -1725,7 +1723,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
         "[yellow]Enter a network addresses in the format 'x.x.x.x\\[/x]' one subnet per line\n"
     )
 
-    net_addresses = set()
+    net_addresses = []
     while True:
         search_input = read_user_input(logger, '').strip()
         if search_input == '':
@@ -1747,7 +1745,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                         '[red]Invalid IP - multicast, broadcast, and reserved IPs are excluded.\n'
                         'Enter a valid non-reserved IP[/]')
                     continue
-                net_addresses.add((ip, None))
+                net_addresses.append(ip)
                 continue
         else:
             try:
@@ -1764,12 +1762,14 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                         '[red]Invalid IP - multicast, broadcast, and reserved IPs are excluded.\n'
                         'Enter a valid non-reserved IP[/]')
                     continue
-                net_addresses.add((net, None))
+                net_addresses.append(net)
                 continue
 
+    # One liner remove duplicates from net_addresses
+    net_addresses = list(dict.fromkeys(net_addresses))
+
     if net_addresses and len(net_addresses) > 0:
-        log_value = ', '.join([str(ip) for ip, _ in net_addresses])
-        # log_value = search_input.replace(",", " ")
+        log_value = ', '.join([str(ip) for ip in net_addresses])
         logger.info(f'User input - {log_value}')
     else:
         return
@@ -1780,7 +1780,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
     processed_data = {}
     data_to_save = {}
     # Compile API request URIs to obtain general network information for each address
-    for network, _ in net_addresses:
+    for network in net_addresses:
         req_urls[network] = {
             "general": f'network?network={network}',
             "DNS records": f'ipv4address?network={network}&usage=DNS&_return_fields=ip_address,names',
@@ -1801,7 +1801,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
         }
 
     # Request general network information for each subnet
-    for network, _ in net_addresses:
+    for network in net_addresses:
         with ThreadPoolExecutor() as executor:
             with console.status(status=f'Fetching [magenta]{network}[/magenta] information...'):
                 futures = {
@@ -1929,20 +1929,25 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
     logger.info(f'Request Type - Subnet Information - Search took {round(end-start, 2)} seconds!')
 
     console.print('\n\n')
-    console.print(f'[yellow]Request Type - Subnet Information - Search took {round(end-start, 2)} seconds![/]\n')
+    console.print(f'[yellow]Request Type - Subnet Information - Search took [green]{round(end-start, 2)}[/green] seconds![/]\n')
 
-    for network, _ in net_addresses:
+    num_results = 0
+    for network in net_addresses:
         if len(processed_data[network].get("general")) == 0:
             console.print(f'[yellow]No data received for network: [magenta bold]{network}[/]')
+        else:
+            num_results += 1
+    sleep(1)
 
-    console.print('\n\n')
-    for network, _ in net_addresses:
+    for network in net_addresses:
         if len(processed_data[network].get("general")) > 0:
+            console.clear()
             print_table_data(logger, processed_data[network], suffix={"general": "Information"})
-            console.print('([green bold]Press space to see [/])[green] next page[/] [yellow]/ Any other key - return to the menu(data will be saved in report file)[/]\n')
+            if len(net_addresses) == 1 or num_results == 1:
+                continue
+            console.print('([green]Press [bold]space[/bold] to see next result / Any key - return to the menu(request data will be saved in report file)[/]\n')
             key = read_single_keypress()
             if key == ' ':
-                sleep(1)
                 continue
             else:
                 break
@@ -1959,14 +1964,14 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
         "DHCP Options\nOption - Value",
         "DHCP Failover Association",
         "Notes",
-    ]   
+    ]
     columns_common = [
         "Search Network",
         "Status",
-    ]       
+    ]
     data_combined = []
     common_search_results = []
-    for network, _ in net_addresses:
+    for network in net_addresses:
         if len(data_to_save[network]) > 0:
             common_search_results.append([network, "Used"])
             data_combined.extend(data_to_save[network])
@@ -1983,27 +1988,29 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
     # )
 
     # save data
-    if cfg["auto_save"]:
-        # Save general data
-        append_df_to_excel(
-            logger,
-            cfg["report_filename"],
-            columns_common,
-            common_search_results,
-            sheet_name="Subnet Data",
-            force_header=True,
-            index=False,
-        )
-        # Save main data
-        append_df_to_excel(
-            logger,
-            cfg["report_filename"],
-            columns,
-            data_combined,
-            sheet_name="Subnet Data",
-            force_header=True,
-            index=False,
-        )
+    with console.status(f'Saving data to {cfg["report_filename"]}...', spinner="dots12"):
+        if cfg["auto_save"]:
+            # Save general data
+            append_df_to_excel(
+                logger,
+                cfg["report_filename"],
+                columns_common,
+                common_search_results,
+                sheet_name="Subnet Data",
+                force_header=True,
+                index=False,
+            )
+            # Save main data
+            if len(data_combined) > 0:
+                append_df_to_excel(
+                    logger,
+                    cfg["report_filename"],
+                    columns,
+                    data_combined,
+                    sheet_name="Subnet Data",
+                    force_header=True,
+                    index=False,
+                )
     return
 
 
@@ -2074,6 +2081,9 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
 
     logger.info(f'User input - {", ".join(hosts)}')
 
+    # One liner remove duplicates from hosts
+    hosts = list(dict.fromkeys(hosts))
+
     # Stackoverflow good example on how to run multiple pings at once
     # ip -> process
     p = {}
@@ -2103,27 +2113,35 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
                         results['Bulk PING'].append({'Host': f'{host}', 'Result': 'ERROR'})
                     break
 
-    print_table_data(logger, results)
+    # Sort data per key
+    sorted_results = {'Bulk PING': []}
+    for host in hosts:
+        for result in results['Bulk PING']:
+            if result['Host'] == host:
+                sorted_results['Bulk PING'].append(result)
+
+    print_table_data(logger, sorted_results)
 
     logger.debug(
-        f'Request Type - Bulk PING - processed data {results}'
+        f'Request Type - Bulk PING - processed data {sorted_results}'
     )
 
-    if cfg["auto_save"] and len(results["Bulk PING"]) > 0:
-        columns = ["Host", "Result"]
-        save_data = []
-        for ping_result in results["Bulk PING"]:
-            save_data.append([ping_result['Host'], ping_result['Result']])
+    if cfg["auto_save"] and len(sorted_results["Bulk PING"]) > 0:
+        with console.status(f'Saving data to {cfg["report_filename"]}...', spinner="dots12"):
+            columns = ["Host", "Result"]
+            save_data = []
+            for ping_result in sorted_results["Bulk PING"]:
+                save_data.append([ping_result['Host'], ping_result['Result']])
 
-        append_df_to_excel(
-            logger,
-            cfg["report_filename"],
-            columns,
-            save_data,
-            sheet_name="Bulk PING",
-            index=False,
-        )
-
+            append_df_to_excel(
+                logger,
+                cfg["report_filename"],
+                columns,
+                save_data,
+                sheet_name="Bulk PING",
+                index=False,
+                force_header=True
+            )
     return
 
 
@@ -2172,6 +2190,10 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
 
     logger.info(f"User input - {data_lines}")
 
+    # Remove duplicates from data_lines
+    data_lines['ip'] = list(dict.fromkeys(data_lines['ip']))
+    data_lines['name'] = list(dict.fromkeys(data_lines['name']))
+
     results = {'Bulk Name Lookup': [], 'Bulk IP Lookup': []}
 
     with console.status('Resolving...', spinner="dots12"):
@@ -2192,7 +2214,7 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
         else:
             bulk_ip_results.append({'IP': req, 'Name': 'Not Resolved'})
 
-    results['Bulk IP Lookup'].extend(remove_duplicates(bulk_ip_results))
+    results['Bulk IP Lookup'].extend(bulk_ip_results)
 
     # bulk_name_results = [{'Name': req, 'IP': f'{",".join(data[2])}'} if data else {'Name': req, 'IP': 'Not Resolved'} for req, data in name_data]
     bulk_name_results = []
@@ -2210,57 +2232,52 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
         else:
             bulk_name_results.append({'Name': req, 'IP': 'Not Resolved'})
 
-    results['Bulk Name Lookup'].extend(remove_duplicates(bulk_name_results))
+    results['Bulk Name Lookup'].extend(bulk_name_results)
 
-    # import ipdb; ipdb.set_trace()
+    # Sort data per original order (without duplicates)
+    sorted_results = {'Bulk IP Lookup': [], 'Bulk Name Lookup': []}
+    for ip in data_lines['ip']:
+        for result in results['Bulk IP Lookup']:
+            if result['IP'] == ip:
+                sorted_results['Bulk IP Lookup'].append(result)
+
+    for name in data_lines['name']:
+        for result in results['Bulk IP Lookup']:
+            if result['Name'] == name:
+                sorted_results['Bulk IP Lookup'].append(result)
+
     if len(results['Bulk IP Lookup']) == 0 and len(results['Bulk Name Lookup']) == 0:
         results['Bulk IP Lookup'].extend(list({'IP': ip, 'Name': 'Not Resolved'} for ip in data_lines['ip']))
         results['Bulk Name Lookup'].extend(list({'Name': name, 'IP': 'Not Resolved'} for name in data_lines['name']))
         print_table_data(logger, results)
         logger.debug('Request Type - Bulk DNS Lookup - unable to resolve any')
-        return
-
-    print_table_data(logger, results)
+    else:
+        print_table_data(logger, results)
 
     logger.debug(
         f'Request Type - Bulk DNS Lookup - processed data {results}'
     )
 
-    if cfg["auto_save"] and (len(results['Bulk Name Lookup']) > 0 or len(results["Bulk IP Lookup"]) > 0):
-        columns = ["Query", "Result"]
-        save_data = []
-        for name_result in results['Bulk Name Lookup']:
-            save_data.append([name_result['Name'], name_result['IP']])
+    if cfg["auto_save"]:
+        with console.status(f'Saving data to {cfg["report_filename"]}...', spinner="dots12"):
+            columns = ["Query", "Result"]
+            save_data = []
+            for name_result in results['Bulk Name Lookup']:
+                save_data.append([name_result['Name'], name_result['IP']])
 
-        for ip_result in results['Bulk IP Lookup']:
-            save_data.append([ip_result['IP'], ip_result['Name']])
+            for ip_result in results['Bulk IP Lookup']:
+                save_data.append([ip_result['IP'], ip_result['Name']])
 
-        append_df_to_excel(
-            logger,
-            cfg["report_filename"],
-            columns,
-            save_data,
-            sheet_name="Bulk DNS Lookup",
-            index=False,
-        )
-
+            append_df_to_excel(
+                logger,
+                cfg["report_filename"],
+                columns,
+                save_data,
+                sheet_name="Bulk DNS Lookup",
+                index=False,
+                force_header=True
+            )
     return
-
-
-def remove_duplicates(data):
-    """Remove duplicate elements from a list of IP/Name objects"""
-    seen = set()  # A set to keep track of seen (data) pairs
-    unique_data = []  # A list to store unique objects
-
-    for item in data:
-        # Use (item['Name'], item['IP']) tuple as a unique identifier
-        identifier = (item['Name'], item['IP'])
-
-        if identifier not in seen:
-            seen.add(identifier)
-            unique_data.append(item)  # Append only if it's not in the seen set
-
-    return unique_data
 
 
 def check_file_accessibility(file_path: str, logger: logging.Logger) -> bool:
