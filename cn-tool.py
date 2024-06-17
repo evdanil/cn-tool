@@ -53,10 +53,10 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 6
-version = '0.1.92 hash dc6bc6d'
+version = '0.1.93 hash 6bc633a'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
-cache_version = 5
+cache_version = 6
 
 # Disable SSL self-signed cert warnings, comment out line below if Infoblox
 # deployment uses proper certificate
@@ -370,7 +370,6 @@ stop_words = {
             'snmp-server trap',
             'conductor-l3redundancy',
             'l3-sync',
-            'controller',
             'ip nat',
             'permit any',
             'netservice svc-',
@@ -783,7 +782,6 @@ standard_keywords = {
         'chi',
         'minh',
         'ho',
-        ''
     ),
     'cisco':
     (
@@ -3959,7 +3957,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
 
     parser.add_argument("-c", "--config", default=os.path.join(home_dir, '.cn'), help='specify configuration file(default $HOME/.cn)')
     parser.add_argument("-l", "--log-file", help='specify logfile(default $HOME/cn.log)')
-    parser.add_argument("-nc", "--no-cache", action="store_true", help='run without cache use', )
+    parser.add_argument("-nc", "--no-cache", action="store_true", help='run without cache use')
     parser.add_argument("-r", "--report-file", help='report filename(default $HOME/report.xlsx)')
     parser.add_argument("-g", "--gpg-file", help='GPG credentials file')
     parser.add_argument("-v", "--version", action="version", version=version_message, help='show version number and exit')
