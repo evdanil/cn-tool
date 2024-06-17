@@ -53,7 +53,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 6
-version = '0.1.91 hash b25224f'
+version = '0.1.92 hash dc6bc6d'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 5
@@ -3963,7 +3963,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
     parser.add_argument("-r", "--report-file", help='report filename(default $HOME/report.xlsx)')
     parser.add_argument("-g", "--gpg-file", help='GPG credentials file')
     parser.add_argument("-v", "--version", action="version", version=version_message, help='show version number and exit')
-    
+
     args = parser.parse_args()
 
     # Read configuration
