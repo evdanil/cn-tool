@@ -6,3 +6,5 @@ argparse
 configparser
 openpyxl
 ipaddress
+diskcache
+
