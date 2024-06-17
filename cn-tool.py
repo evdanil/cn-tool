@@ -32,7 +32,6 @@ from argparse import RawTextHelpFormatter
 import argparse
 import logging
 import pandas as pd
-# from xlsxwriter.workbook import Workbook
 import requests
 from requests.exceptions import HTTPError, Timeout, RequestException, MissingSchema
 from requests.adapters import HTTPAdapter
@@ -54,7 +53,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 6
-version = '0.1.90 hash dcef970'
+version = '0.1.91 hash b25224f'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 5
@@ -1337,7 +1336,7 @@ def search_config(logger: logging.Logger, cfg: dict, folder: str, nets: list[ipa
     parts = folder.split('/')
     vendor = str(parts[4]).capitalize()
     device_type = str(parts[5]).upper()
-    region = str(parts[6]).upper()    
+    region = str(parts[6]).upper()
     with console.status(
         f'[yellow]Searching through [green bold]{vendor}/{device_type}[/green bold] configurations in [green bold]{region}[/green bold] region...[/yellow]',
         spinner="dots12"
@@ -1884,14 +1883,6 @@ def append_df_to_excel(
         # Log report creation
         logger.info(f"Export - Report {filename} doesn't exist - creating...")
 
-        # export_excel(
-        #     logger,
-        #     df,
-        #     startrow,
-        #     sheet_name,
-        #     filename,
-        #     force_header
-        #     )
         df.to_excel(
             filename,
             sheet_name=sheet_name,
@@ -1959,41 +1950,10 @@ def append_df_to_excel(
             **to_excel_kwargs,
         )
 
-        # if columns and force_header:
-        #     header = True
-        # elif columns:
-        #     header = not bool(filled_rows)
-        # else:
-        #     header = False
-
-        # export_excel(logger, df, startrow, sheet_name, filename, header)
         # log success
         logger.info(f'Export - Updated {filename} successfully')
 
     return
-
-
-def export_excel(logger: logging.Logger, df: pd.DataFrame, start_row: int, sheet: str, filename: str, header: bool = False):
-    with Workbook(filename, ) as workbook:
-
-        if start_row > 0:
-            worksheet = workbook.get_worksheet_by_name(sheet)
-        else:
-            worksheet = workbook.add_worksheet(name=sheet)
-
-        if not worksheet:
-            logger.info(f'Unable to save data in the report {filename}')
-            return
-
-        if header:
-            worksheet.write_row(start_row+1, 0, [col for col in df.columns])
-            start_row += 1
-
-        # worksheet.write_row(start_row+1, 0, [col for col in df.columns])
-
-        for index, row in df.iterrows():
-            worksheet.write_row(start_row+index+1, 0, [col for col in row])
-        # workbook.close()
 
 
 def configure_logging(logfile_location: str, log_level=logging.INFO) -> logging.Logger:
@@ -3671,7 +3631,7 @@ def search_cache_keywords(logger: logging.Logger, cfg: dict, search_terms: list)
                 #         vendor = cfg['dev_idx'][hostname].get('vendor', '')
                 #         if fname:
                 #             data, _ = matched_lines(logger, fname, vendor, None, [term], str(term))
-                #             data_to_save.extend(data)               
+                #             data_to_save.extend(data)
 
                 with ThreadPoolExecutor() as executor:
                     futures = {
@@ -3999,10 +3959,11 @@ Please send any feedback/feature requests to evdanil@gmail.com
 
     parser.add_argument("-c", "--config", default=os.path.join(home_dir, '.cn'), help='specify configuration file(default $HOME/.cn)')
     parser.add_argument("-l", "--log-file", help='specify logfile(default $HOME/cn.log)')
+    parser.add_argument("-nc", "--no-cache", action="store_true", help='run without cache use', )
     parser.add_argument("-r", "--report-file", help='report filename(default $HOME/report.xlsx)')
     parser.add_argument("-g", "--gpg-file", help='GPG credentials file')
     parser.add_argument("-v", "--version", action="version", version=version_message, help='show version number and exit')
-    parser.add_argument("-nc", "--no-cache", action="store_true", help='run without cache use', )
+    
     args = parser.parse_args()
 
     # Read configuration
