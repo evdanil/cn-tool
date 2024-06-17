@@ -53,7 +53,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 6
-version = '0.1.93 hash 6bc633a'
+version = '0.1.94 hash a00bef9'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 6
@@ -1465,13 +1465,13 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
 
     start = perf_counter()
 
-    if not cfg['cache'] or (cfg['cache'] and not cfg['dc'].get('updated', False)):
+    if cfg['cache'] and cfg['dc'].get('updated', False):
+        data_to_save, matched_nets = search_cache_config(logger, cfg, '', networks, keyword_regexps, search_input)
+    else:
         for folder in make_dir_list(logger, cfg):
             lines, nets = search_config(logger, cfg, folder, networks, keyword_regexps, search_input)
             data_to_save.extend(lines)
             matched_nets.update(nets)
-    else:
-        data_to_save, matched_nets = search_cache_config(logger, cfg, '', networks, keyword_regexps, search_input)
 
     end = perf_counter()
     logger.info(f'Configuration Repository - Search took {round(end-start, 3)} seconds!')
@@ -1605,7 +1605,7 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
     # compiled_pattern = re.compile(pattern)
     search_terms.append(pattern)
 
-    if not cfg['cache'] or (cfg['cache'] and cfg['dc'].get('updated', False)):
+    if cfg['cache'] and cfg['dc'].get('updated', False):
         data_to_save, matched_nets = search_cache_config(logger, cfg, '', networks, search_terms, search_input=sitecode)
     else:
         for folder in make_dir_list(logger, cfg):
