@@ -20,3 +20,7 @@
 
 [gpg]
 #credentials = ~/device-apply.gpg
+
+[cache]
+#directory = ~/.cn-cache
+#enabled = True
