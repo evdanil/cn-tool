@@ -21,7 +21,7 @@ import sys
 import termios
 import tty
 
-from operator import itemgetter
+# from operator import itemgetter
 from time import perf_counter, sleep
 from socket import gaierror, herror, timeout
 import socket
@@ -32,6 +32,7 @@ from argparse import RawTextHelpFormatter
 import argparse
 import logging
 import pandas as pd
+# from xlsxwriter.workbook import Workbook
 import requests
 from requests.exceptions import HTTPError, Timeout, RequestException, MissingSchema
 from requests.adapters import HTTPAdapter
@@ -43,6 +44,9 @@ from rich import box
 import subprocess
 from subprocess import Popen, DEVNULL, STDOUT
 from datetime import datetime, timedelta
+from diskcache import FanoutCache, JSONDisk
+import threading
+from time import time
 
 # Fix MAC address emoji issue
 from rich._emoji_codes import EMOJI
@@ -50,11 +54,1057 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 6
-version = '0.1.89 hash 0596afe'
+version = '0.1.90 hash dcef970'
+
+# increment cache_version during release if indexes or structures changed and rebuild of the cache is required
+cache_version = 5
 
 # Disable SSL self-signed cert warnings, comment out line below if Infoblox
 # deployment uses proper certificate
 urllib3.disable_warnings()
+
+stop_words = {
+        'bluecoat':
+        (
+            '"',
+            '!',
+            'max-bandwidth',
+            'exit',
+            'priority',
+            'disable',
+            'interface',
+            'reject',
+            'failover',
+            'clear',
+            'ssl',
+            'inline',
+            '-',
+            '*',
+            'ssh',
+            'security hashed-',
+            'security windows',
+            'group-cache',
+            'security radius',
+            'alternate-server encrypted-secret',
+            'archive-configuration encrypted-',
+            'security sequence',
+            'security management',
+            'access-log',
+            'overflow-policy',
+            'type',
+            'no ',
+            'format-name',
+            'ftp-client',
+            'scp-client',
+            'edit log',
+            'create log',
+            'continuous-upload',
+            'upload-settings',
+            'service-info',
+            'diagnostics',
+            'caching',
+            'max-cache-size',
+            'tunnel',
+            'adn',
+            'cifs',
+            'remote-storage-',
+            'mapi',
+            'keep-alive',
+            'forwarding',
+            'load-balance',
+            'host-affinity',
+            'failure-mode',
+            'content-filter',
+            'bluecoat',
+            'data-source',
+            'download',
+            'cpu-monitor',
+            'event-log',
+            'level',
+            'syslog en',
+            'syslog fa',
+            'smtp',
+            'http',
+            'remove',
+            'management-services',
+            'force-bypass',
+            'proxy-services',
+            'delete',
+            'attribute',
+            'alert',
+            'im http',
+            'ntp clear',
+            'restart',
+            'snmp',
+            'authentication',
+            'privacy',
+            'tcp-ip',
+            'policy hmac',
+            'upgrade-path',
+            'default',
+            'license-key',
+            'statistics-export',
+            'ssl-device-profile',
+            'inline',
+            '(',
+            '<',
+            '$',
+            ')',
+            'Click',
+            'if',
+            '{',
+            '}',
+            'document.',
+            '//',
+            'function',
+            'var',
+            'pin.',
+            'return',
+            'cookie',
+            'else',
+            'challenge',
+            'realm',
+            'rsacompare',
+            'isrsarealm',
+            'beginlocation',
+            'define',
+            'end',
+            'name=',
+            'single=',
+            'type=',
+            'n=',
+            'd=',
+            'h=',
+            'f-o=',
+            'port=',
+            'n-',
+            'cmt=',
+            't=',
+            'typ=',
+            'delimiters=',
+            'group-',
+            'restrict=',
+            'suffix=',
+            'layertype=',
+            'id=',
+            'col=',
+            'negate=',
+            'disabled=',
+            'num=',
+            '&lt',
+            'hashed-',
+            'group add "readonly"',
+            'line-vty',
+        ),
+        'f5':
+        (
+            '#',
+            'cli',
+            'update',
+            'apm',
+            'report',
+            'user',
+            'auth',
+            'role-',
+            '/',
+            'console',
+            'line',
+            'role',
+            'default-',
+            'fallback',
+            'type',
+            'account',
+            'protocol',
+            'secret',
+            'service',
+            'encrypted-p',
+            'partition',
+            'all-',
+            'session-',
+            'shell',
+            'alias-',
+            'prompt',
+            'suppress-',
+            'cm',
+            'cache-',
+            'cert',
+            '--',
+            'checksum',
+            'revision',
+            'active-mo',
+            'build',
+            'edition',
+            'key',
+            'marketing-name',
+            'multicast-interface',
+            'multicast-port',
+            'optional-',
+            'product',
+            'platform-id',
+            'self-device',
+            'time-',
+            'unicast-address',
+            'effective-ip management-ip',
+            'effective-port',
+            'ip management-ip',
+            'multicast-ip',
+            'hidden',
+            'type',
+            'network-failover',
+            'unit-id',
+            'ca-',
+            'status',
+            'trust-group',
+            'gtm',
+            'ilx global-settings',
+            'addresses none',
+            'debug-port-blacklist',
+            'rule none',
+            'members',
+            'load-balancing-mode',
+            'ip-protocol tcp',
+            'profiles',
+            'mask',
+            'rules',
+            'source 0.0.0.0/0',
+            'source-address-',
+            'translate-port',
+            'translate-address enabled',
+            'creation-time',
+            'last-modified-time',
+            'persist',
+            'default yes',
+            'arp',
+            'icmp-echo',
+            'adaptive',
+            'defaults-from',
+            'destination *.',
+            'interval',
+            'ip-dscp',
+            'recv',
+            'send',
+            'time-until-up',
+            'timeout',
+            'app-service',
+            'net port-list',
+            'id',
+            'vlan',
+            'net self-allow',
+            'defaults',
+            'igmp',
+            'ospf',
+            'pim',
+            'tcp',
+            'udp',
+            'interfaces',
+            'trunks',
+            'net stp',
+            'net trunk HA',
+            'lacp ',
+            'tag',
+            'net fdb',
+            'net ipsec',
+            'pem ',
+            'security device',
+            'id ',
+            'action',
+            'ip-protocol',
+            'sys',
+            'inherited-',
+            'gui-',
+            'request-options',
+            'bfd-',
+            'flooding-type',
+            'log-level',
+            'logical-',
+            'tunnel-maintenance-mode',
+            'network default',
+            'level nominal',
+            'agent-addresses',
+            'communities',
+            'disk-monitors',
+            'minspace',
+            'max-processes',
+            'process',
+            'snmpv',
+            'privacy-',
+            'version',
+            'expiration',
+            'options',
+            'password',
+            'development-mode',
+            'property-',
+            'availability-',
+            'valid-values',
+            'instance-type',
+            'region',
+            'dhcp-',
+            'node-',
+            'cloud-',
+            'auto-',
+            'end-',
+            'frequency',
+            'wom',
+        ),
+        'aruba':
+        (
+            'interface',
+            'switchport',
+            'spanning',
+            'key',
+            'netservice',
+            'priority-map',
+            'queue-weights',
+            'ap-console-password',
+            'bkup-passwords',
+            'g-',
+            'a-',
+            'wmm',
+            'qbss-',
+            '"',
+            'band-',
+            'regulatory-domain',
+            'id "',
+            'airgroupprofile',
+            'logging level',
+            'logging security',
+            'snmp-server trap',
+            'conductor-l3redundancy',
+            'l3-sync',
+            'controller',
+            'ip nat',
+            'permit any',
+            'netservice svc-',
+            'netdestination6 ipv6-reserved-range',
+            'invert',
+            'netexthdr',
+            'time-range',
+            'weekday',
+            'user',
+            'any any svc-',
+            'ipv6 any any',
+            'network 127.',
+            'network 169.254.',
+            'network 224.0.0',
+            'host 255.255.255.255',
+            'network 240.0.0.0',
+            'any any any permit',
+            'ipv6 host fe80',
+            'ipv6 network fc00',
+            'ipv6 network fe80',
+            'ipv6 alias ipv6-reserved-range',
+            'ipv6 any any any',
+            'any any app alg-',
+            'any any svc-',
+            'ipv6 any any svc-',
+            'ipv6 any any svc-v6-dhcp permit',
+            'ip access-list session captiveportal',
+            'any any tcp',
+            'any any udp',
+            'any any ip',
+            'no ',
+            'vpn-dialer',
+            'ike authentication',
+            'aaa tacacs',
+            'command ',
+            'controller-ip vlan',
+            'datapath',
+            'kernel coredump',
+            'interface mgmt',
+            'shutdown',
+            'vlan ',
+            'trusted',
+            'ip nexthop',
+            'crypto ',
+            'version',
+            'encryption',
+            'hash',
+            'authentication',
+            'group',
+            'prf',
+            'set transform-set',
+            'localip 0.0.0.0 ipsec',
+            'vpdn',
+            'ip dynamic-dns',
+            'snmp-server',
+            'tunneled-node-address',
+            'adp',
+            'ap',
+            'amon',
+            'ssh mgmt-',
+            'mgmt-user ',
+            'ip mobile',
+            'ip igmp',
+            'ipv6 mld',
+            'firewall',
+            'prohibit-ip-spoofing',
+            'attack-rate',
+            'session-idle-timeout',
+            'cp-',
+            'amsdu',
+            'wireless-',
+            'session-tunnel-fib',
+            'optimize-dad-frames',
+            'deny-needfrag-df-ipsec',
+            'ipv6 firewall',
+            'ext-hdr-parse-len',
+            'dpi-classif-cache',
+            'ipv4 permit any proto 6',
+            'ipv6 permit any proto 6',
+            'ipv6 deny any proto',
+            'ip domain',
+            'country',
+            'change-config-node',
+            'key ',
+            'session-authorization',
+            'aaa authentication via',
+            'scheduler-profile',
+            'queue-weights',
+            'priority-map',
+            'authentication-mac',
+            'mac-default-role',
+            'initial-role',
+            'enable',
+            'web-',
+            'guest-',
+            'ids',
+            'control-plane-security',
+            'aaa policy',
+            'valid-network',
+            'traceoptions',
+            'activate',
+            'file ',
+            'ucc',
+            'license-',
+            'pefng-',
+            'rfp-',
+            'papi-security',
+            'est profile',
+            'aruba-central',
+            'ifmap cppm',
+            'pan',
+            'banner',
+            'virtual-ap',
+            'websocket',
+            'openflow',
+            'sdwan-profile',
+            'valid-',
+            'gps',
+            'channel-',
+            'node-',
+            'frame-type',
+            'dst-mac',
+            'src-mac',
+            'bssid valid-ap',
+            'payload',
+            'rf',
+            'arm-',
+            'wlan hotspot',
+            'wpa-passphrase',
+            'opmode',
+            'mcast-rate-opt',
+            'band-steering',
+            'dynamic-mcast-optimization',
+            'broadcast-filter',
+            'stats-enable',
+            'tag-enable',
+            'sessions-enable',
+            'monitored-',
+            'wids-',
+            'misc-',
+            'location-e',
+            'uccmonitoring-',
+            'airgroupinfo-',
+            'wan-state',
+            'sessions-enable',
+            'airmatch',
+            'condition',
+            'enet',
+            'id "',
+            'service "',
+            'logging security',
+            'process',
+            'ale-configuration',
+        ),
+        'cisco':
+        (
+            '!',
+            '*',
+            '^C',
+            'end',
+            'Building',
+            'Current',
+            'boot',
+            'vrf definition mgmtVrf',
+            'address-family ',
+            'exit-address-family',
+            'mac-address ',
+            'rd ',
+            'route-target ',
+            'ip multicast',
+            'service-policy',
+            'power redundancy',
+            'mac access-list',
+            'redundancy',
+            'mode',
+            'lldp',
+            'priority',
+            'police',
+            'dbl',
+            'speed ',
+            'duplex ',
+            'dual-active',
+            'ip vrf forwarding',
+            'ip ospf authentication',
+            'ip ospf message-digest-key',
+            'passive-interface',
+            'logging buffered',
+            'logging monitor',
+            'logging trap',
+            'logging origin',
+            'logging source',
+            'username',
+            'redistribute',
+            'bgp log',
+            'permit tcp any any',
+            'permit udp any any',
+            'deny ipv6 any any',
+            'permit ipv6 any any',
+            'permit ip any any',
+            'permit udp any eq boot',
+            'ipv6 access-list IPv6-Deny-All',
+            'ip access-list extended AutoQos',
+            'ip access-list extended VSL-',
+            'ipv6 access-list VSL-',
+            'stopbits',
+            'track ',
+            'permit ip any 224',
+            'vrf',
+            'threshold',
+            'timeout',
+            'frequency',
+            # Shell specific
+            'access-list 1 ',
+            'access-list 16 ',
+            'access-list 22 ',
+            'route-map STATIC-TO-OSPF',
+            'permit ipv6 any FF02::/124',
+            'module provision',
+            'chassis-type',
+            'mac address-table',
+            'ntp source',
+            'clock',
+            'switch ',
+            'vtp m',
+            'mls qos',
+            'subject-',
+            'priority-queue',
+            'version',
+            'service',
+            'platform',
+            'interface',
+            'switchport',
+            'spanning',
+            'aaa',
+            'option',
+            'flow',
+            'crypto pki',
+            'certificate',
+            'negoti',
+            'cdp',
+            'encapsu',
+            'bandwi',
+            'ip pim',
+            'no ',
+            'auto-cost',
+            'snmp-server enable traps',
+            'banner',
+            'line',
+            'transport',
+            'access-cl',
+            'ipv6 access-class',
+            'exec-timeout',
+            'session-timeout',
+            'call-home',
+            'contact-email-addr',
+            'profile "Cisco',
+            'escape-',
+            'mab',
+            'dot1x',
+            'authentication',
+            'shutdown',
+            'ip http',
+            'ip ssh',
+            'ip ftp',
+            'ip tf',
+            'iox',
+            'ip tacacs',
+            'snmp',
+            'ip radi',
+            'server-private',
+            'client ',
+            'udld',
+            'table',
+            'ip dhcp',
+            'login',
+            'enrollment',
+            'revocation',
+            'rsakeypair',
+            'license',
+            'errdisable',
+            'memory',
+            'class-map',
+            'match',
+            'policy-map',
+            'class',
+            'queue-',
+            'set ',
+            'auto',
+            'vlan',
+            'ip ospf network',
+            'ip mtu',
+            'tunnel source',
+            'channel-group',
+            'ip helper-address ',
+            'router ospf',
+            'capability',
+            'ip forward',
+            'remark',
+            'ip sla',
+            'slot',
+            'load-interval',
+            'stackwise-virtual',
+            'domain ',
+            'ip vrf ',
+            'default copy',
+            'quit',
+            'cabundle ',
+            'diagnostic ',
+            'transceiver',
+            'monitoring',
+            'ip access-list standard network_management',
+            'control-plane',
+            'active',
+            'restconf',
+            'destination transport-method',
+            'area ',
+            'radius server',
+            'key 7 ',
+            'standby 1 preempt',
+            'ip flow',
+            'downshift',
+            'alarm ',
+            'syslog ',
+            'notifies ',
+            'map ',
+            'ptp ',
+            'auth-type',
+            'system mtu',
+            'ip routing',
+            'deadtime',
+            'port',
+            'random-detect ',
+            'shape ',
+            'exceed-',
+            'conform-',
+            'multilink',
+            'subscriber',
+
+        )
+    }
+
+standard_keywords = {
+    'paloalto':
+    (
+        'set',
+        'protocol',
+        'shared',
+        'botnet',
+        'configuration',
+        'qos',
+        'profile',
+        'default',
+        'ike',
+        'gateway',
+        'application',
+        'service',
+        'application-group',
+        'service-group',
+        'rulebase',
+        'zone',
+        'mgt-config',
+        'users',
+        'password-complexity',
+        'default-security-rules',
+        'crypto-profiles',
+        'profiles',
+        'interface',
+        'ethernet',
+        'deviceconfig',
+        'system',
+    ),
+    'aruba':
+    (
+        'aaa',
+        'authentication',
+        'auth',
+        'position',
+        'jitter',
+        'frequency',
+        'vpnc',
+        'data',
+        'dot11g',
+        'dot11a',
+        'bcast',
+        'hide',
+        'eirp',
+        '20mhz',
+        'dot11h',
+        '160mhz',
+        'url',
+        'php',
+        'page',
+        'pause',
+        'redirect',
+        'ipv4',
+        'ipv6',
+        'dpi',
+        'conductor',
+        'factory',
+        'dst',
+        'src',
+        'ipsecmap10',
+        'map',
+        'source',
+        'guestcppm',
+        '30mb',
+        'roleui',
+        '10mbdownstreamper',
+        'mbits',
+        'chi',
+        'minh',
+        'ho',
+        ''
+    ),
+    'cisco':
+    (
+        'ip',
+        'address',
+        'description',
+        'network',
+        'id',
+        'area',
+        'access'
+        'list',
+        'eq',
+        'udp',
+        'tcp',
+        'range',
+        'host',
+        'any',
+        'remark',
+        'permit',
+        'gt',
+        'lt',
+        'fragments',
+        'position',
+        'standard',
+        'extended',
+        'log',
+        'prefer',
+        'ftp',
+        'ssh',
+        'tftp',
+        'http',
+        'tacacs',
+        'ntp',
+        'destination',
+        'tunnel',
+        'source',
+        'snmp',
+        'bfd',
+        'eigrp',
+        'ospf',
+        'router',
+        'loopback',
+        'wan',
+        'routing',
+        'for',
+        'snmptrap',
+        'bootpc',
+        'bootps',
+        'single',
+        'acl',
+        'deny',
+        'permit',
+        'and',
+        'or',
+        'not',
+        'if',
+        'logging',
+        'route',
+        'static',
+        'port',
+        'ports',
+        'netbios',
+        'the',
+        'to',
+        'gre',
+        'tunnel',
+        'interface',
+        'vlan',
+        'isakmp',
+        'crypto',
+        'keyring',
+        'all',
+        'protocol',
+        'ldap',
+        'citrix',
+        'keepalives',
+        'dscp',
+        'shell',
+        'trap',
+        'domain',
+        'traffic',
+        'queue',
+        'sequence',
+        'ipv6',
+        'loopbacks',
+        'mgmnt',
+        'icmp',
+        'audio',
+        'video',
+        'catchall',
+        'voice',
+        'classify',
+        'catch',
+        'acct',
+        'port',
+        'auth',
+        'ipv4',
+        'vtp',
+        'mode',
+        'z1',
+        'zc',
+        'default',
+        'gateway',
+        'line',
+        'vty',
+        'nhs',
+        'nbma',
+        'shortcut',
+        'user',
+        'printer',
+        'hold',
+        'hostname:',
+        'location:',
+        'source',
+        'icmp',
+        'echo',
+        'vrf',
+        'office',
+        'client',
+        'md',
+        'management',
+        'cost',
+        '6to4',
+        'addresses',
+        'site',
+        'local',
+        'multicast',
+        'packets',
+        'source',
+        'route',
+        'transport',
+        'every',
+        'subnet',
+        'everything',
+        'it',
+        'else',
+        'routing-type',
+        'mobile-ipv6',
+        'undetermined',
+        'site',
+        'preference',
+        'less',
+        'from',
+        'loopback',
+        'allow',
+        'lan',
+        'owner',
+        'sdwan',
+        'filter',
+        'udp',
+        'jitter',
+        'default',
+        'community',
+        'denycommunity',
+        'distance',
+        'route',
+        'reflector',
+        'client',
+        'setmedsecondary',
+        'denycommunity',
+        'both',
+        'summary',
+        'only',
+        'aggregate',
+        'ebgp',
+        'multihop',
+        'tag',
+        'summary',
+        'address',
+        'suppress',
+        'link',
+        'nd',
+        'ra',
+        'suppress',
+        'enable',
+        'original',
+        'input',
+        'netflow',
+        'ratio',
+        'of',
+        'record',
+        'entries',
+        'active',
+        'cache',
+        'timeout',
+        'collector',
+        'exporter',
+        'unicast',
+        'expiry',
+        'time',
+        'watch',
+        'admission',
+        'unreachable',
+        'traceroute',
+        'time',
+        'exceeded',
+        'echo',
+        'ftp',
+        'data',
+        'established',
+        'packet',
+        'too',
+        'big',
+        'administratively',
+        'prohibited',
+        'esp',
+        'www',
+        'block',
+        'routes',
+        'an',
+        'list',
+        'netbios',
+        'default',
+        'originate',
+        'activate',
+        'next',
+        'hop',
+        'self',
+        'path',
+        'update',
+        'timers',
+        'peer',
+        'group',
+        'listen',
+        'dhcp',
+        'dns',
+        'lookup',
+        'key',
+        'multipoint',
+        'protection',
+        'forced',
+        'path',
+        'redirect',
+        'holdtime',
+        'network',
+        'authentication',
+        'nhrp',
+        'esp',
+        'aes',
+        'transform',
+        'set',
+        'idle',
+        'seconds',
+        'security',
+        'association',
+        'ipsec',
+        'invalid',
+        'spi',
+        'recovery',
+        'mtu',
+        'fragmentation',
+        'dial',
+        'limit',
+        'periodic',
+        'local',
+        'dpd',
+        'identity',
+        'lifetime',
+        'profile',
+        'pre',
+        'shared',
+        'key',
+        'peer',
+        'group',
+        'integrity',
+        'proposal',
+        'encryption',
+        'management',
+        'network',
+        'clock',
+        'synchronization',
+        'automatic',
+        'exit',
+        'seq',
+        'le',
+        'inboud',
+        'outbound',
+        'pim',
+        'no',
+        'with',
+        'community',
+        'new',
+        'format',
+        'null0',
+        'mask',
+        'neighbor',
+        'access',
+        'in',
+        'out',
+        'send',
+        'soft',
+        'reconfiguration',
+        'prefix',
+        'media',
+        'type',
+        'unicast',
+        'verify',
+        'reverse'
+        'path',
+        'decrement',
+        'increment',
+        'priority',
+        'track',
+        'standby',
+        'policy',
+        'route',
+        'map',
+        'policy',
+        'keepalice',
+        'adjust',
+        'mss',
+        'up',
+        'down',
+        'delay',
+        'extended',
+        'standard',
+        'description',
+    ),
+    }
+
 
 console = Console()
 
@@ -82,11 +1132,20 @@ subnet_regexp = re.compile(r'(?:(?:25[0-5]|(?:2[0-4]|1\d|[1-9]|)\d)\.?\b){4}\/((
 
 def measure_execution_time(func):
     def wrapper(*args, **kwargs):
+        # args[0] should be logger
+        # print(args[1])
+        if args and len(args) > 1 and type(args[1]) is logging.Logger:
+            logger = args[1]
+        else:
+            logger = None
         start_time = perf_counter()
         result = func(*args, **kwargs)
         end_time = perf_counter()
         execution_time = end_time - start_time
-        print(f"Function {func.__name__} took {execution_time:.4f} seconds to execute")
+        if logger:
+            logger.info(f"Function {func.__name__} took {execution_time:.4f} seconds to execute")
+        else:
+            print(f"Function {func.__name__} took {execution_time:.4f} seconds to execute")
         return result
     return wrapper
 
@@ -149,6 +1208,8 @@ def read_config(cfg: dict, config_file: str = ".cn") -> dict:
             "store": os.path.expanduser(config.get("config_repository", "storage_directory", fallback=cfg["store"])),
             "regions": config.get("config_repository", "regions", fallback="ap,eu,am").split(','),
             "vendors": config.get("config_repository", "vendors", fallback="cisco,aruba,f5,bluecoat,paloalto").split(','),
+            "cache_directory": os.path.expanduser(config.get("cache", "directory", fallback=cfg["cache_directory"])),
+            "cache": config.get("cache", "enabled", fallback=cfg["cache"]),
         }
     else:
         read_cfg = cfg
@@ -210,7 +1271,7 @@ def print_search_config_data(data: list) -> None:
 
     for row in data:
         device = row[1].upper()
-        line_number = row[2]
+        line_number = int(row[2])
         line = row[3]
 
         if device != current_device:
@@ -274,8 +1335,11 @@ def search_config(logger: logging.Logger, cfg: dict, folder: str, nets: list[ipa
     matched_nets = set()
     dir_list = os.listdir(folder)
     parts = folder.split('/')
+    vendor = str(parts[4]).capitalize()
+    device_type = str(parts[5]).upper()
+    region = str(parts[6]).upper()    
     with console.status(
-        f'[yellow]Searching through [green bold]{parts[4].upper()}/{parts[5].upper()}[/green bold] configurations in [green bold]{parts[6].upper()}[/green bold] region...[/yellow]',
+        f'[yellow]Searching through [green bold]{vendor}/{device_type}[/green bold] configurations in [green bold]{region}[/green bold] region...[/yellow]',
         spinner="dots12"
     ):
 
@@ -285,6 +1349,7 @@ def search_config(logger: logging.Logger, cfg: dict, folder: str, nets: list[ipa
                     matched_lines,
                     logger,
                     os.path.join(folder, device),
+                    vendor,
                     nets,
                     search_terms,
                     search_input
@@ -373,7 +1438,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
 
         # Try to compile the input as a regular expression
         try:
-            keyword_regexp = re.compile(search_input, re.IGNORECASE)
+            re.compile(search_input, re.IGNORECASE)
         except re.error as e:
             logger.info(f'User input - Invalid regexp: {e}')
             console.print(f'[red]Invalid regular expression - {e.msg}')
@@ -382,7 +1447,8 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
         else:
             # Last added regexp or string line is considered as search term.
             # However, if subnets were supplied, we ignore it
-            keyword_regexps.append(keyword_regexp)
+            # keyword_regexps.append(keyword_regexp)
+            keyword_regexps.append(search_input)
             continue
 
     if networks and len(networks) > 0:
@@ -401,14 +1467,18 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
     matched_nets = set()
 
     start = perf_counter()
-    for dir in make_dir_list(logger, cfg):
-        lines, nets = search_config(logger, cfg, dir, networks, keyword_regexps, search_input)
-        data_to_save.extend(lines)
-        matched_nets.update(nets)
+
+    if not cfg['cache'] or (cfg['cache'] and not cfg['dc'].get('updated', False)):
+        for folder in make_dir_list(logger, cfg):
+            lines, nets = search_config(logger, cfg, folder, networks, keyword_regexps, search_input)
+            data_to_save.extend(lines)
+            matched_nets.update(nets)
+    else:
+        data_to_save, matched_nets = search_cache_config(logger, cfg, '', networks, keyword_regexps, search_input)
 
     end = perf_counter()
-    logger.info(f'Configuration Repository - Search took {round(end-start, 2)} seconds!')
-    console.print(f'Configuration Repository - Search took {round(end-start, 2)} seconds!')
+    logger.info(f'Configuration Repository - Search took {round(end-start, 3)} seconds!')
+    console.print(f'Configuration Repository - Search took {round(end-start, 3)} seconds!')
 
     if len(data_to_save) == 0:
         logger.info('Configuration Repository - No matches found!')
@@ -424,15 +1494,16 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
     else:
         missing_nets = None
 
-    data = [
-        [search_input, device, line_num, line_content] for search_input, device, line_num, line_content, _ in data_to_save
-    ]
-    sorted_data = sorted(data, key=itemgetter(1, 2))
+    # data = [
+    #     [search_input, device, line_num, line_content] for search_input, device, line_num, line_content, _ in data_to_save
+    # ]
+    # sorted_data = sorted(data, key=itemgetter(1, 2))
+    sorted_data = remove_duplicate_rows_sorted_by_col(data_to_save, 2)
     print_search_config_data(sorted_data)
 
     # Saving data automatically unless user requested not to (relies on global auto_save flag)
     if cfg["auto_save"]:
-        save_found_data(logger, cfg, data_to_save, missing_nets, matched_nets, 'Config Check')
+        save_found_data(logger, cfg, sorted_data, missing_nets, matched_nets, 'Config Check')
 
 
 def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
@@ -507,8 +1578,11 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
     locations = processed_data["location"]
     networks = []
     skipped_networks = []
+    country = None
     for location in locations:
         net = ipaddress.ip_network(location["network"])
+        if country is None:
+            country = location['comment'][:2].upper()
         if net.is_multicast or net.is_unspecified:
             skipped_networks.append(location["network"])
         else:
@@ -524,20 +1598,27 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
         for skipped_net in skipped_networks:
             console.print(f'[cyan]Skipping reserved/mulicast network: [magenta bold]{skipped_net}[/]')
         console.print('\n')
-    # Creating single search term to match WLC configs (Shell specific)
-    pattern = rf'\b(?:[A-Z-]{{2,3}}{re.escape(sitecode.replace("-", ""))}|{re.escape(sitecode)}[_0-9]+[-\w\d]*)\b'
 
-    compiled_pattern = re.compile(pattern)
-    search_terms.append(compiled_pattern)
-    for folder in make_dir_list(logger, cfg):
-        # Searching for IP addresses
-        lines, nets = search_config(logger, cfg, folder, networks, search_terms, search_input=sitecode)
-        data_to_save.extend(lines)
-        matched_nets.update(nets)
+    # Creating single search term to match WLC configs (Shell specific)
+    if country:
+        pattern = rf'\b(?:{country}{re.escape(sitecode.replace("-", ""))}|{re.escape(sitecode)}[_0-9]+[-\w\d]*)\b'
+    else:
+        pattern = rf'\b(?:[A-Z]{{2}}{re.escape(sitecode.replace("-", ""))}|{re.escape(sitecode)}[_0-9]+[-\w\d]*)\b'
+
+    # compiled_pattern = re.compile(pattern)
+    search_terms.append(pattern)
+
+    if not cfg['cache'] or (cfg['cache'] and cfg['dc'].get('updated', False)):
+        data_to_save, matched_nets = search_cache_config(logger, cfg, '', networks, search_terms, search_input=sitecode)
+    else:
+        for folder in make_dir_list(logger, cfg):
+            lines, nets = search_config(logger, cfg, folder, networks, search_terms, search_input=sitecode)
+            data_to_save.extend(lines)
+            matched_nets.update(nets)
 
     end = perf_counter()
-    console.print(f'Configuration Repository - Search took {round(end-start, 2)} seconds!')
-    logger.info(f'Configuration Repository - Search took {round(end-start, 2)} seconds!')
+    console.print(f'Configuration Repository - Search took {round(end-start, 3)} seconds!')
+    logger.info(f'Configuration Repository - Search took {round(end-start, 3)} seconds!')
 
     if len(data_to_save) == 0:
         logger.info(f'Configuration Repository - No matches for {sitecode} found!')
@@ -553,10 +1634,11 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
     else:
         missing_nets = None
 
-    data = [
-        [search_input, device, line_num, line_content] for search_input, device, line_num, line_content, _ in data_to_save
-    ]
-    sorted_data = sorted(data, key=itemgetter(1, 2))
+    # data = [
+    #     [search_input, device, line_num, line_content] for search_input, device, line_num, line_content in data_to_save
+    # ]
+    # sorted_data = sorted(data, key=itemgetter(1, 2))
+    sorted_data = remove_duplicate_rows_sorted_by_col(data_to_save, 2)
     print_search_config_data(sorted_data)
 
     # Saving data automatically unless user requested not to (relies on global auto_save flag)
@@ -583,14 +1665,14 @@ def save_found_data(logger: logging.Logger, cfg: dict, data: list, missed_nets: 
                 spinner="dots12"
             ):
         # Adding search results information about subnets
-        search_input = data[0][0]
+        search_input = str(data[0][0])
 
         if missed_nets or matched_nets:
             missed_nets_data = [
-                [search_input, net, "No match"] for net in missed_nets if net
+                [search_input, str(net), "No match"] for net in missed_nets if net
             ]
             matched_nets_data = [
-                [search_input, net, "Used"] for net in matched_nets if net
+                [search_input, str(net), "Used"] for net in matched_nets if net
             ]
 
             save_nets_data = []
@@ -630,7 +1712,11 @@ def save_found_data(logger: logging.Logger, cfg: dict, data: list, missed_nets: 
         )
 
     # Adding device configurations to the report
-    device_list = {(device_name, fname) for _, device_name, _, _, fname in data}
+    # If cache exists get full filename from cache, else rely on additional column provided in sorted_data
+    if cfg['cache'] and cfg['dc'].get('updated', False):
+        device_list = {(device_name, cfg['dev_idx'][device_name.lower()].get('fname')) for _, device_name, _, _, _ in data}
+    else:
+        device_list = {(device_name, fname) for _, device_name, _, _, fname in data}
     # Not saving configs if we have more than 50 devices matched
     if len(device_list) > 50:
         console.print(f'Too many devices({len(device_list)}) have matches, skipping report update')
@@ -656,13 +1742,14 @@ def save_found_data(logger: logging.Logger, cfg: dict, data: list, missed_nets: 
 
 
 # @measure_execution_time
-def matched_lines(logger: logging.Logger, filename: str, ip_nets: list[ipaddress.IPv4Network], search_terms: list[re.Pattern], search_input: str) -> tuple[list, set]:
+def matched_lines(logger: logging.Logger, filename: str, vendor: str, ip_nets: list[ipaddress.IPv4Network], search_terms: list[re.Pattern], search_input: str) -> tuple[list, set]:
     """
     Looks up for matches in a file for a given list of IP networks or search patterns
     Returns data list
 
     @param logger(Logger): logger instance
     @param filename(str): filename to match data on
+    @param vendor(str): vendor to filter lines with stopwords
     @param ip_nets(IPv4Network): subnets to lookup
     @param search_terms(list re.Pattern): list of keyword regexps to match
     @search_input(str): to save in file as info if provided
@@ -689,10 +1776,13 @@ def matched_lines(logger: logging.Logger, filename: str, ip_nets: list[ipaddress
             # console.print(device)
 
             for index, current_line in enumerate(current_config):
+                # if line starts with one of the frequent config commands with no key data - skip it
+                if current_line.strip().startswith(stop_words.get(vendor.lower(), ('NEVERMATCHED'))):
+                    continue
                 # if there is a match in line check if we have ip_data and verify found IP within the subnet range
                 if ip_nets:
                     found_matches = re.findall(ip_regexp, current_line)
-                    # import ipdb; ipdb.set_trace()                    
+
                     for match in found_matches:
                         try:
                             found_ip = ipaddress.ip_address(match)
@@ -707,8 +1797,8 @@ def matched_lines(logger: logging.Logger, filename: str, ip_nets: list[ipaddress
                                 rows_to_save[index] = f'{current_config[index]}'
                 if search_terms:
                     for search_term in search_terms:
-                        # console.print(f'DEBUG - Searching for {str(search_term)}')
-                        matched = re.search(search_term, current_line)
+                        # logger.debug(f'DEBUG - Searching for {str(search_term)} in {current_line}')
+                        matched = re.search(search_term, current_line, re.IGNORECASE)
                         if matched:
                             logger.debug(f'Config Check - Found expressison "{matched.group()}" in {device.upper()} line {index}')
                             rows_to_save[index] = f'{current_config[index]}'
@@ -736,7 +1826,7 @@ def append_df_to_excel(
     columns: list,
     raw_data: list,
     sheet_name: str = "Sheet1",
-    startrow: int = None,
+    startrow: int = 0,
     truncate_sheet: bool = False,
     skip_if_exists: bool = False,
     force_header: bool = False,
@@ -794,6 +1884,14 @@ def append_df_to_excel(
         # Log report creation
         logger.info(f"Export - Report {filename} doesn't exist - creating...")
 
+        # export_excel(
+        #     logger,
+        #     df,
+        #     startrow,
+        #     sheet_name,
+        #     filename,
+        #     force_header
+        #     )
         df.to_excel(
             filename,
             sheet_name=sheet_name,
@@ -807,7 +1905,7 @@ def append_df_to_excel(
 
     # ignore [engine] parameter if it was passed
     if "engine" in to_excel_kwargs:
-        to_excel_kwargs.pop("engine")
+        to_excel_kwargs.pop("engine", None)
 
     # To find out if there is any data in existing file and if it is there how many rows occupied
     try:
@@ -861,10 +1959,41 @@ def append_df_to_excel(
             **to_excel_kwargs,
         )
 
+        # if columns and force_header:
+        #     header = True
+        # elif columns:
+        #     header = not bool(filled_rows)
+        # else:
+        #     header = False
+
+        # export_excel(logger, df, startrow, sheet_name, filename, header)
         # log success
         logger.info(f'Export - Updated {filename} successfully')
 
     return
+
+
+def export_excel(logger: logging.Logger, df: pd.DataFrame, start_row: int, sheet: str, filename: str, header: bool = False):
+    with Workbook(filename, ) as workbook:
+
+        if start_row > 0:
+            worksheet = workbook.get_worksheet_by_name(sheet)
+        else:
+            worksheet = workbook.add_worksheet(name=sheet)
+
+        if not worksheet:
+            logger.info(f'Unable to save data in the report {filename}')
+            return
+
+        if header:
+            worksheet.write_row(start_row+1, 0, [col for col in df.columns])
+            start_row += 1
+
+        # worksheet.write_row(start_row+1, 0, [col for col in df.columns])
+
+        for index, row in df.iterrows():
+            worksheet.write_row(start_row+index+1, 0, [col for col in row])
+        # workbook.close()
 
 
 def configure_logging(logfile_location: str, log_level=logging.INFO) -> logging.Logger:
@@ -928,9 +2057,9 @@ def is_valid_site(sitecode: str) -> bool:
 
     # This regex allows for either three alphanumeric characters followed by a hyphen and another three alphanumeric characters,
     # or simply three alphanumeric characters without the hyphen.
-    valid_site_regex = "^[A-Za-z0-9]{3}(?:-[A-Za-z0-9]{2,3})?$"
+    valid_site_regex = "^[a-z0-9]{3}(?:-[a-z0-9]{2,3})?$"
 
-    if re.search(valid_site_regex, sitecode):
+    if re.search(valid_site_regex, sitecode, re.IGNORECASE):
         return True
 
     return False
@@ -2280,6 +3409,385 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
     return
 
 
+def remove_duplicate_rows_sorted_by_col(data, col):
+    """
+    Removes duplicate rows from a list while preserving order
+    and sorting the result by column number (col).
+
+    Args:
+        data: A list.
+
+    Returns:
+        A new list with duplicates removed and sorted by col.
+    """
+    seen = set()
+    result = []
+    for sublist in data:
+        sublist_tuple = tuple(sublist)
+        if sublist_tuple not in seen:
+            seen.add(sublist_tuple)
+            result.append(sublist)
+    # Sort the result list based on the index value
+    result.sort(key=lambda sublist: sublist[col])  # Sort by index (third element)
+    return result
+
+
+def extract_keywords(text):
+    keywords = []
+    # Remove non-alphanumeric chars
+    text = re.sub(r'[\W_]+', ' ', text)
+    # Find both keywords and IP addresses in a single pass
+    for match in re.findall(r"(?:[a-zA-Z0-9]{10,13})\b|(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3})|(?:\d{3,})|(?:[a-zA-Z]{3,})", text):
+        if match:  # Check if the match is not empty
+            # discard to short keywords
+            if len(match) < 3:
+                continue
+            keywords.append(match)
+    return keywords
+
+
+# @measure_execution_time
+def index_configurations(logger, cfg):
+    """Indexes configuration files and stores IP addresses and keywords in DiskCache"""
+
+    devices_local = {}
+    ip_list_local = {}
+    keywords_local = {}
+    if time() - cfg['dc'].get('updated', 0) <= 30:
+        logger.info('Index has been just refreshed, skipping checks...')
+        return ip_list_local, keywords_local
+
+    start = perf_counter()
+    for folder in make_dir_list(logger, cfg):
+        parts = folder.split('/')
+        filelist = os.listdir(folder)
+        vendor = str(parts[4]).capitalize()
+        device_type = str(parts[5]).upper()
+        region = str(parts[6]).upper()
+
+        for filename in filelist:
+            if filename.endswith('.cfg'):
+                # filename without .cfg - equals hostname
+                hostname = filename[:-4].lower()
+                creation_time = os.path.getctime(f'{folder}/{filename}')
+                updated_time = cfg['dev_idx'].get(hostname, {}).get('updated', 0)
+                if not cfg['dev_idx'].get(hostname, False) or creation_time - updated_time >= 0:
+
+                    # Get filled device dict and device configuration
+                    device, config = retreive_device_data(f'{folder}/{filename}', region, vendor, device_type)
+
+                    # Update device Index with device info
+                    devices_local[hostname] = device
+
+                    # Get list of found IP addresses and keywords
+                    ip_addresses, keywords = store_facts(logger, cfg, hostname, vendor, config)
+
+                    # Update Indexes with received data
+                    if ip_addresses:
+                        for ip_key, ip_data in ip_addresses.items():
+                            ip_list_local.setdefault(ip_key, {}).update(ip_data)
+                            for host_key, host_data in ip_data.items():
+                                # Create the host_key dictionary if it doesn't exist
+                                ip_list_local[ip_key].setdefault(host_key, {})
+                                # Update 'lines' key specifically if it exists in both dictionaries
+                                if 'lines' in ip_list_local[ip_key][host_key] and 'lines' in host_data:
+                                    ip_list_local[ip_key][host_key]['lines'].update(host_data['lines'])
+                                # Update other keys in host_data if they don't exist in ip_list_local[ip_key][host_key]
+                                for key, value in host_data.items():
+                                    if key != 'lines' and key not in ip_list_local[ip_key][host_key]:
+                                        ip_list_local[ip_key][host_key][key] = value
+
+                    if keywords:
+                        for word_key, word_data in keywords.items():
+                            keywords_local.setdefault(word_key, {}).update(word_data)
+                            for data_key in word_data.keys():
+                                keywords_local[word_key].setdefault(data_key, '')
+
+    # Update global Index with new device data
+    cfg['dev_idx'].update(devices_local)
+
+    # Update global index with IP
+    if ip_list_local:
+        cfg['ip_idx'].update(ip_list_local)
+    # Update global index with key words
+    if keywords_local:
+        cfg['kw_idx'].update(keywords_local)
+    end = perf_counter()
+
+    # Set last update time in diskcache
+    cfg['dc']['updated'] = time()
+
+    # Set/Update cache version to current release
+    if cfg['dc'].get('version', 0) != cache_version:
+        cfg['dc']['version'] = cache_version
+
+    logger.info(f'Index Cache - Indexed {len(devices_local)} devices')
+    logger.info(f'Index Cache - Indexed {len(ip_list_local)} IP addresses')
+    logger.info(f'Index Cache - Indexed {len(keywords_local)} keywords')
+    logger.info(f'Index Cache - Update Time: {round(end-start, 2)} seconds')
+    logger.info(f'Index Cache - Version: {cache_version} Devices: {len(cfg["dev_idx"])}, IP Addresses: {len(cfg["ip_idx"])}, Words:{len(cfg["kw_idx"])}')
+
+
+# @measure_execution_time
+def prune_configurations(logger, cfg):
+    """Compares files existing in the repository and in the local cache and
+    deleting missing devices from the cache
+    """
+    devices_local = []
+
+    for folder in make_dir_list(logger, cfg):
+        filelist = os.listdir(folder)
+
+        for filename in filelist:
+            if filename.endswith('.cfg'):
+                # filename without .cfg - equals hostname
+                hostname = filename[:-4]
+                devices_local.append(hostname)
+    # A set prune_candidates containing hostnames present in devices_index but not in devices_local.
+    # These devices were cleaned from configuration repository so we need to purge any data related to them
+    # from the local cache Indexes
+    prune_candidates = [hostname for hostname in cfg['dev_idx'] if hostname not in devices_local]
+
+    # Deleting devices from device_index
+    for prune_candidate in prune_candidates:
+        delete_index_data_by_hostname(logger, cfg, prune_candidate)
+
+    return
+
+
+def retreive_device_data(fname, region, vendor, device_type) -> list:
+    with open(f'{fname}', 'r', encoding='utf-8') as f:
+        config = f.readlines()
+        device = {
+            'fname': fname,
+            'region': region,
+            'type': device_type,
+            'vendor': vendor,
+            'updated': time()
+        }
+        # Store device info in diskcache Index
+    return device, config
+
+
+# @measure_execution_time
+def store_facts(logger: logging.Logger, cfg: dict, hostname: str, vendor: str, config: list) -> tuple[dict, dict]:
+    ip_list = {}
+    keywords = {}
+    # count = 0
+
+    device = cfg['dev_idx'].get(hostname, {})
+
+    # clear old IP data from dev Index
+    device.pop('ip_list', None)
+    device['ip_list'] = []
+
+    # clear old Keyword data from dev Index
+    device.pop('keywords_list', None)
+    device['keyword_list'] = []
+
+    for index, line in enumerate(config):
+        line = line.rstrip('\n')
+        if line.strip().startswith(stop_words.get(vendor.lower(), ('NEVERMATCHED'))):
+            continue
+
+        # skip all lines with 8 hexadecimal characters inside - certificate stuff like
+        # 03820101 00507F24 D3932A66 86025D9F E838AE5C 6D4DF6B0 49631C78 240DA905
+
+        if re.match(r'^[0-9A-F]{8}\b', line.strip()):
+            # logger.info(f'Matched cert data!')
+            continue
+
+        ip_matches = re.findall(ip_regexp, line)
+        for match in ip_matches:
+            try:
+                ip = ipaddress.ip_address(match)
+            except (re.error, ValueError):
+                pass
+            else:
+                if ip.is_multicast or ip.is_reserved:
+                    continue
+                if ip.compressed.startswith(('255.', '0.'), 0):
+                    continue
+
+                ip_list.setdefault(ip.compressed, {}).setdefault(hostname, {}).setdefault('lines', {})[index] = line.strip()
+
+                # add ip to the list in dev index
+                device['ip_list'].append(ip.compressed)
+
+        # Remove any non-alphanumeric chars
+        # words = re.sub(r'[\W_]+', ' ', line).split()
+
+        words = extract_keywords(line)
+        buzz_words = standard_keywords.get(vendor.lower(), ())
+
+        for word in words:
+            word = word.lower()
+            if (word in buzz_words or re.match(ip_regexp, word)):
+                continue
+            keywords.setdefault(word, {}).update({hostname: ''})
+
+            # add keyword to the list in dev index
+            device['keyword_list'].append(word)
+
+    return ip_list, keywords
+
+
+# @measure_execution_time
+def search_cache_config(logger: logging.Logger, cfg: dict, folder: str, nets: list[ipaddress.IPv4Network], search_terms: list[re.Pattern], search_input: str) -> tuple[list, set]:
+
+    data_to_save = []
+    data, matched_nets = search_cache_subnets(logger, cfg, nets)
+    data_to_save.extend(data)
+
+    data = search_cache_keywords(logger, cfg, search_terms)
+    data_to_save.extend(data)
+
+    return data_to_save, matched_nets
+
+
+# @measure_execution_time
+def search_cache_keywords(logger: logging.Logger, cfg: dict, search_terms: list) -> list:
+    data_to_save = []
+    for term in search_terms:
+        words = extract_keywords(term)
+        # logger.debug(f'Debug Words: {words}')
+        for word in words:
+            hostnames = None
+            try:
+                ip = ipaddress.ip_address(word)
+            except ValueError:
+                # if word is not valid IP address then it is keyword and obtain list of hostnames for keyword
+                hostnames = cfg['kw_idx'].get(word.lower(), None)
+                pass
+            else:
+                hostnames = cfg['ip_idx'].get(ip.compressed, None)
+
+            if hostnames:
+
+                # for hostname in hostnames.keys():
+                #     if hostname:
+                #         # print(f'{word} matched at {hostname}')
+                #         fname = cfg['dev_idx'][hostname].get('fname', None)
+                #         vendor = cfg['dev_idx'][hostname].get('vendor', '')
+                #         if fname:
+                #             data, _ = matched_lines(logger, fname, vendor, None, [term], str(term))
+                #             data_to_save.extend(data)               
+
+                with ThreadPoolExecutor() as executor:
+                    futures = {
+                        hostname: executor.submit(
+                            matched_lines,
+                            logger,
+                            cfg['dev_idx'][hostname].get('fname', None),
+                            cfg['dev_idx'][hostname].get('vendor', ''),
+                            None,
+                            [term],
+                            str(term)
+                        ) for hostname in hostnames.keys()
+                    }
+                    results = {hostname: future.result() for hostname, future in futures.items()}
+                for _, result in results.items():
+                    # result has a tuple with two lists:
+                    # list 1 - actual config matches
+                    # list 2 - matched subnets
+                    if result and len(result[0]) > 0:
+                        data_to_save.extend(result[0])
+
+    return data_to_save
+
+
+# @measure_execution_time
+def search_cache_subnets(logger: logging.Logger, cfg: dict, nets: list) -> tuple[list, set]:
+    matched_nets = set()
+    data_to_save = []
+    rows_to_save = {}
+    if nets is None or len(nets) == 0:
+        return (data_to_save, matched_nets)
+
+    # Create pool of all possible IP addresses in requested subnets
+    network_ip_map = {}
+    for net in nets:
+        network_ip_map.setdefault(net, []).extend(ipaddress.ip_network(net).hosts())
+        network_ip_map[net].extend([ipaddress.ip_network(net).network_address])
+
+    # import ipdb; ipdb.set_trace()
+    for subnet, ip_addresses in network_ip_map.items():
+        for ip_address in ip_addresses:
+            # if IP is in index, get device data dict where we can loop over devices and get configuration
+            if cfg['ip_idx'].get(ip_address.compressed, None):
+                device_data = cfg['ip_idx'][ip_address.compressed]
+                matched_nets.add(subnet)
+                for found_device, device in device_data.items():
+                    lines = device.get('lines', None)
+                    if lines:
+                        for index, line in lines.items():
+                            rows_to_save.setdefault(found_device, {})[index] = (subnet.compressed, ip_address.compressed, line.strip())
+
+    # Saving all gathered data to data_to_save array
+    if len(rows_to_save) > 0:
+        for hostname, indices in sorted(rows_to_save.items()):
+            for index, (subnet, _, line) in sorted(indices.items()):
+                data_to_save.append([str(subnet), hostname.upper(), int(index), line, ''])
+            # For future update
+            # for index, (subnet, ip, line) in sorted(indices.items()):
+            #     data_to_save.append([subnet, hostname, ip, index, line])
+    return (data_to_save, matched_nets)
+
+
+def background_cache_init(logger, cfg):
+    """ Initialize cache in the background in a separate thread or refresh if cache already exists
+    """
+
+    if not cfg['cache']:
+        # do nothing if cache is disabled
+        return
+
+    cache_ver = cfg['dc'].get('version', 0)
+    updated = cfg['dc'].get('updated', False)
+    if cache_ver != cache_version or not updated:
+        # if updated key exists then cache has data and needs to be re-created due to version mismatch
+        if updated:
+            logger.info(f'Current cache version: {cache_ver}. Required version: {cache_version}. Indexing data...')
+            cfg['dc'].clear()
+            cfg['dev_idx'].clear()
+            cfg['ip_idx'].clear()
+            cfg['kw_idx'].clear()
+        else:
+            logger.info('No cache found. Indexing data...')
+
+    if time() - cfg['dc'].get('updated', 0) <= 300:
+        logger.info('Cache is up-to-date, skipping checks...')
+        return
+
+    try:
+        index_configurations(logger, cfg)
+    except Exception as e:
+        logger.error(f'Error during cache initialization: {e}')
+
+    try:
+        prune_configurations(logger, cfg)
+    except Exception as e:
+        logger.error(f'Error during cache pruning: {e}')
+
+
+def delete_index_data_by_hostname(logger: logging.Logger, cfg: dict, hostname: str) -> None:
+
+    # Clean up IP index
+    for ip_key in cfg['dev_idx'].get(hostname, {}).get('ip_list', []):
+        cfg['ip_idx'].get(ip_key, {}).pop(hostname, None)
+    # Clean up Keword index
+    for kw_key in cfg['dev_idx'].get(hostname, {}).get('keyword_list', []):
+        cfg['kw_idx'].get(kw_key, {}).pop(hostname, None)
+
+    logger.debug(f'Cache Pruning - Indexes for {hostname} deleted')
+
+    device = cfg['dev_idx'].pop(hostname, None)
+    if device:
+        logger.debug(f'Cache Pruning - Main Index for {hostname} deleted')
+
+    logger.info(f'Cache Pruning - Cache pruned from {hostname}')
+
+
 def check_file_accessibility(file_path: str, logger: logging.Logger) -> bool:
     """Check if the file exists and is readable."""
     if not os.path.isfile(file_path) or not os.access(file_path, os.R_OK):
@@ -2414,6 +3922,9 @@ def main() -> None:
         "store": "/opt/data/configs",
         "regions": ["ap", "eu", "am"],
         "vendors": ["cisco", "aruba", "paloalto", "f5", "bluecoat"],
+        # Diskcache control
+        "cache_directory": os.path.expanduser("~/.cn-cache"),
+        "cache": True,
     }
 
     switch = {
@@ -2491,6 +4002,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
     parser.add_argument("-r", "--report-file", help='report filename(default $HOME/report.xlsx)')
     parser.add_argument("-g", "--gpg-file", help='GPG credentials file')
     parser.add_argument("-v", "--version", action="version", version=version_message, help='show version number and exit')
+    parser.add_argument("-nc", "--no-cache", action="store_true", help='run without cache use', )
     args = parser.parse_args()
 
     # Read configuration
@@ -2505,6 +4017,9 @@ Please send any feedback/feature requests to evdanil@gmail.com
 
     if args.gpg_file and args.gpg_file != cfg['gpg_credentials']:
         cfg['gpg_credentials'] = os.path.expanduser(args.gpg_file)
+
+    if args.no_cache:
+        cfg['cache'] = False
 
     # Configure logging
     cfg["log_level"] = logging.getLevelName(cfg["log_level_str"].upper())
@@ -2552,6 +4067,23 @@ Please send any feedback/feature requests to evdanil@gmail.com
         )
         exit_now(logger, exit_code=1)
 
+    # Define cache variables
+    if cfg['cache']:
+        logger.info(f'Cache - Cache Directory {cfg["cache_directory"]}')
+        cfg['dc'] = FanoutCache(directory=cfg['cache_directory'], shards=4, timeout=1, disk=JSONDisk, compress_level=3)
+        cfg['dev_idx'] = cfg['dc'].index('d_idx')
+        cfg['ip_idx'] = cfg['dc'].index('i_idx')
+        cfg['kw_idx'] = cfg['dc'].index('w_idx')
+
+        cache_ver = cfg['dc'].get('version', None)
+        if cache_ver:
+            logger.info(f'Index Cache - Version: {cache_ver} Devices: {len(cfg["dev_idx"])}, IP Addresses: {len(cfg["ip_idx"])}, Words:{len(cfg["kw_idx"])}')
+
+        thread = threading.Thread(target=background_cache_init, args=(logger, cfg))
+        thread.daemon = True  # Allow the main program to exit even if the thread is still running
+        thread.start()
+
+    # import ipdb; ipdb.set_trace()
     while choice != '0':
         console.clear()
         console.print(menu)
