@@ -52,11 +52,11 @@ from rich._emoji_codes import EMOJI
 
 del EMOJI["cd"]
 
-MIN_INPUT_LEN = 6
-version = '0.1.94 hash a00bef9'
+MIN_INPUT_LEN = 5
+version = '0.1.95 hash 054f307'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
-cache_version = 6
+cache_version = 7
 
 # Disable SSL self-signed cert warnings, comment out line below if Infoblox
 # deployment uses proper certificate
@@ -1099,6 +1099,76 @@ standard_keywords = {
         'extended',
         'standard',
         'description',
+        'ewlc',
+        'control',
+        'topology',
+        'control',
+        'forwarding',
+        'lvx',
+        'transit',
+        'ewlc',
+        'inter',
+        'fed',
+        'openflow',
+        'exception',
+        'egr',
+        'exception',
+        'nfl',
+        'sampled',
+        'rpf',
+        'failed',
+        'punt',
+        'webauth',
+        'lvx',
+        'control',
+        'forus',
+        'resolution',
+        'end',
+        'station',
+        'high',
+        'rate',
+        'applications',
+        'mcast',
+        'control',
+        'dot',
+        'gen',
+        'broadcast',
+        'stackwise',
+        'virtual',
+        'oob',
+        'low',
+        'latency',
+        'snooping',
+        'topology',
+        'system',
+        'critical',
+        'gold',
+        'pkt',
+        'icmpgen',
+        'broadcast',
+        'l2lvxcntrl',
+        'protosnoop',
+        'puntwebauth',
+        'mcastdata',
+        'transit',
+        'dot',
+        'xauth',
+        'swfwd',
+        'lvxdata',
+        'forustraffic',
+        'forusarp',
+        'mcastendstn',
+        'openflow',
+        'exception',
+        'egrexcption',
+        'nflsampled',
+        'rpffailed',
+        'twe',
+        'eth',
+        'channel',
+        'systems',
+        'channel',
+        'ipv',
     ),
     }
 
@@ -3400,6 +3470,13 @@ def extract_keywords(text):
             # discard to short keywords
             if len(match) < 3:
                 continue
+            try:
+                val = int(match)
+            except ValueError:
+                pass
+            else:
+                if val < 1000:
+                    continue
             keywords.append(match)
     return keywords
 
@@ -3411,8 +3488,11 @@ def index_configurations(logger, cfg):
     devices_local = {}
     ip_list_local = {}
     keywords_local = {}
-    if time() - cfg['dc'].get('updated', 0) <= 30:
-        logger.info('Index has been just refreshed, skipping checks...')
+
+    # get cache last update time
+    cache_updated = cfg['dc'].get('updated', 0)
+    if time() - cache_updated <= 300:
+        logger.info('Index Cache - Index has been just refreshed, skipping checks...')
         return ip_list_local, keywords_local
 
     start = perf_counter()
@@ -3422,44 +3502,48 @@ def index_configurations(logger, cfg):
         vendor = str(parts[4]).capitalize()
         device_type = str(parts[5]).upper()
         region = str(parts[6]).upper()
-
+        # logger.info(f'Index Cache - Processing {vendor} devices...')
         for filename in filelist:
             if filename.endswith('.cfg'):
                 # filename without .cfg - equals hostname
                 hostname = filename[:-4].lower()
                 creation_time = os.path.getctime(f'{folder}/{filename}')
                 updated_time = cfg['dev_idx'].get(hostname, {}).get('updated', 0)
-                if not cfg['dev_idx'].get(hostname, False) or creation_time - updated_time >= 0:
 
-                    # Get filled device dict and device configuration
+                if creation_time - updated_time >= 0:
+
+                    # Only log messages about devices for existing cache to avoid excessive logging
+                    if cache_updated > 0:
+                        if cfg['dev_idx'].get(hostname, False):
+                            logger.info(f'Index Cache - {hostname.upper()} has configuration changed...')
+                            # need to clear existing indexes
+                            delete_index_data_by_hostname(logger, cfg, hostname)
+                        else:
+                            # if cache already exists, but device key is not in cache, then new device found
+                            # which is not in cache yet, and then log meaningful record about it
+                            logger.info(f'Index Cache - New device {hostname.upper()} configuration found...')
+
+                        logger.info(f'Index Cache - Building {hostname.upper()} index data...')
+
+                    # Get new filled device dict and device configuration
                     device, config = retreive_device_data(f'{folder}/{filename}', region, vendor, device_type)
 
-                    # Update device Index with device info
-                    devices_local[hostname] = device
-
                     # Get list of found IP addresses and keywords
-                    ip_addresses, keywords = store_facts(logger, cfg, hostname, vendor, config)
+                    ip_addresses, keywords = store_facts(logger, cfg, hostname, vendor, config, device)
+
+                    # Update device Index with device info
+                    devices_local.setdefault(hostname, {}).update(device)
 
                     # Update Indexes with received data
                     if ip_addresses:
                         for ip_key, ip_data in ip_addresses.items():
-                            ip_list_local.setdefault(ip_key, {}).update(ip_data)
-                            for host_key, host_data in ip_data.items():
-                                # Create the host_key dictionary if it doesn't exist
-                                ip_list_local[ip_key].setdefault(host_key, {})
-                                # Update 'lines' key specifically if it exists in both dictionaries
-                                if 'lines' in ip_list_local[ip_key][host_key] and 'lines' in host_data:
-                                    ip_list_local[ip_key][host_key]['lines'].update(host_data['lines'])
-                                # Update other keys in host_data if they don't exist in ip_list_local[ip_key][host_key]
-                                for key, value in host_data.items():
-                                    if key != 'lines' and key not in ip_list_local[ip_key][host_key]:
-                                        ip_list_local[ip_key][host_key][key] = value
+                            ip_list_local.setdefault(ip_key, {}).update(cfg['ip_idx'].get(ip_key, {}))
+                            ip_list_local[ip_key].update(ip_data)
 
                     if keywords:
                         for word_key, word_data in keywords.items():
-                            keywords_local.setdefault(word_key, {}).update(word_data)
-                            for data_key in word_data.keys():
-                                keywords_local[word_key].setdefault(data_key, '')
+                            keywords_local.setdefault(word_key, {}).update(cfg['kw_idx'].get(word_key, {}))
+                            keywords_local[word_key].update(word_data)
 
     # Update global Index with new device data
     cfg['dev_idx'].update(devices_local)
@@ -3521,27 +3605,21 @@ def retreive_device_data(fname, region, vendor, device_type) -> list:
             'region': region,
             'type': device_type,
             'vendor': vendor,
-            'updated': time()
+            'updated': time(),
+            'ip_list': [],
+            'keyword_list': [],
         }
         # Store device info in diskcache Index
     return device, config
 
 
 # @measure_execution_time
-def store_facts(logger: logging.Logger, cfg: dict, hostname: str, vendor: str, config: list) -> tuple[dict, dict]:
+def store_facts(logger: logging.Logger, cfg: dict, hostname: str, vendor: str, config: list, device: dict) -> tuple[dict, dict]:
     ip_list = {}
     keywords = {}
-    # count = 0
 
-    device = cfg['dev_idx'].get(hostname, {})
-
-    # clear old IP data from dev Index
-    device.pop('ip_list', None)
-    device['ip_list'] = []
-
-    # clear old Keyword data from dev Index
-    device.pop('keywords_list', None)
-    device['keyword_list'] = []
+    device_ip_list = []
+    device_kw_list = []
 
     for index, line in enumerate(config):
         line = line.rstrip('\n')
@@ -3570,10 +3648,7 @@ def store_facts(logger: logging.Logger, cfg: dict, hostname: str, vendor: str, c
                 ip_list.setdefault(ip.compressed, {}).setdefault(hostname, {}).setdefault('lines', {})[index] = line.strip()
 
                 # add ip to the list in dev index
-                device['ip_list'].append(ip.compressed)
-
-        # Remove any non-alphanumeric chars
-        # words = re.sub(r'[\W_]+', ' ', line).split()
+                device_ip_list.append(ip.compressed)
 
         words = extract_keywords(line)
         buzz_words = standard_keywords.get(vendor.lower(), ())
@@ -3585,7 +3660,10 @@ def store_facts(logger: logging.Logger, cfg: dict, hostname: str, vendor: str, c
             keywords.setdefault(word, {}).update({hostname: ''})
 
             # add keyword to the list in dev index
-            device['keyword_list'].append(word)
+            device_kw_list.append(word)
+
+    device['ip_list'] = list(dict.fromkeys(device_ip_list))
+    device['keyword_list'] = list(dict.fromkeys(device_kw_list))
 
     return ip_list, keywords
 
@@ -3621,15 +3699,6 @@ def search_cache_keywords(logger: logging.Logger, cfg: dict, search_terms: list)
                 hostnames = cfg['ip_idx'].get(ip.compressed, None)
 
             if hostnames:
-
-                # for hostname in hostnames.keys():
-                #     if hostname:
-                #         # print(f'{word} matched at {hostname}')
-                #         fname = cfg['dev_idx'][hostname].get('fname', None)
-                #         vendor = cfg['dev_idx'][hostname].get('vendor', '')
-                #         if fname:
-                #             data, _ = matched_lines(logger, fname, vendor, None, [term], str(term))
-                #             data_to_save.extend(data)
 
                 with ThreadPoolExecutor() as executor:
                     futures = {
@@ -3711,39 +3780,49 @@ def background_cache_init(logger, cfg):
             cfg['ip_idx'].clear()
             cfg['kw_idx'].clear()
         else:
-            logger.info('No cache found. Indexing data...')
+            logger.info('Index Cache - No cache found. Indexing data...')
 
     if time() - cfg['dc'].get('updated', 0) <= 300:
-        logger.info('Cache is up-to-date, skipping checks...')
+        logger.info('Index Cache - Cache is up-to-date, skipping checks...')
         return
 
     try:
         index_configurations(logger, cfg)
     except Exception as e:
-        logger.error(f'Error during cache initialization: {e}')
+        logger.error(f'Index Cache - Error during cache initialization: {e}')
 
     try:
         prune_configurations(logger, cfg)
     except Exception as e:
-        logger.error(f'Error during cache pruning: {e}')
+        logger.error(f'Index Cache - Error during cache pruning: {e}')
 
 
 def delete_index_data_by_hostname(logger: logging.Logger, cfg: dict, hostname: str) -> None:
 
     # Clean up IP index
     for ip_key in cfg['dev_idx'].get(hostname, {}).get('ip_list', []):
-        cfg['ip_idx'].get(ip_key, {}).pop(hostname, None)
+        ip_data = cfg['ip_idx'].get(ip_key, {})
+        ip_data.pop(hostname, None)
+        if ip_data or len(ip_data) > 0:
+            cfg['ip_idx'][ip_key] = ip_data
+        else:
+            cfg['ip_idx'].pop(ip_key, None)
     # Clean up Keword index
     for kw_key in cfg['dev_idx'].get(hostname, {}).get('keyword_list', []):
-        cfg['kw_idx'].get(kw_key, {}).pop(hostname, None)
+        kw_data = cfg['kw_idx'].get(kw_key, {})
+        kw_data.pop(hostname, None)
+        if kw_data or len(kw_data) > 0:
+            cfg['kw_idx'][kw_key] = kw_data
+        else:
+            cfg['kw_idx'].pop(kw_key, None)
 
-    logger.debug(f'Cache Pruning - Indexes for {hostname} deleted')
+    logger.debug(f'Cache Pruning - Data Indexes for {hostname.upper()} deleted')
 
     device = cfg['dev_idx'].pop(hostname, None)
     if device:
-        logger.debug(f'Cache Pruning - Main Index for {hostname} deleted')
+        logger.debug(f'Cache Pruning - Main Index for {hostname.upper()} deleted')
 
-    logger.info(f'Cache Pruning - Cache pruned from {hostname}')
+    logger.info(f'Cache Pruning - Cache pruned from {hostname.upper()}')
 
 
 def check_file_accessibility(file_path: str, logger: logging.Logger) -> bool:
@@ -4028,7 +4107,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
 
     # Define cache variables
     if cfg['cache']:
-        logger.info(f'Cache - Cache Directory {cfg["cache_directory"]}')
+        logger.info(f'Index Cache - Cache Directory {cfg["cache_directory"]}')
         cfg['dc'] = FanoutCache(directory=cfg['cache_directory'], shards=4, timeout=1, disk=JSONDisk, compress_level=3)
         cfg['dev_idx'] = cfg['dc'].index('d_idx')
         cfg['ip_idx'] = cfg['dc'].index('i_idx')
@@ -4042,7 +4121,6 @@ Please send any feedback/feature requests to evdanil@gmail.com
         thread.daemon = True  # Allow the main program to exit even if the thread is still running
         thread.start()
 
-    # import ipdb; ipdb.set_trace()
     while choice != '0':
         console.clear()
         console.print(menu)
