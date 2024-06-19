@@ -20,6 +20,7 @@ import json
 import sys
 import termios
 import tty
+import itertools
 
 # from operator import itemgetter
 from time import perf_counter, sleep
@@ -53,10 +54,10 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.95 hash 054f307'
+version = '0.1.96 hash 1e86cb5'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
-cache_version = 7
+cache_version = 2
 
 # Disable SSL self-signed cert warnings, comment out line below if Infoblox
 # deployment uses proper certificate
@@ -529,6 +530,7 @@ stop_words = {
             '!',
             '*',
             '^C',
+            '#',
             'end',
             'Building',
             'Current',
@@ -581,6 +583,29 @@ stop_words = {
             'threshold',
             'timeout',
             'frequency',
+            'limit-resource',
+            'feature',
+            'hardware',
+            'copp',
+            'bfd',
+            'rmon event',
+            'rd auto',
+            'route-target',
+            'vpc domain',
+            'host-reachability',
+            'vpc peer-link',
+            'nve1',
+            'ip forward',
+            'advertise virtual-rmac',
+            'medium p2p',
+            'ip router ospf',
+            'port-type',
+            'icam ',
+            'boot ',
+            'log-neighbor-changes',
+            'update-source',
+            'nv overlay',
+            'tacacs-server',
             # Shell specific
             'access-list 1 ',
             'access-list 16 ',
@@ -651,7 +676,6 @@ stop_words = {
             'license',
             'errdisable',
             'memory',
-            'class-map',
             'match',
             'policy-map',
             'class',
@@ -707,7 +731,54 @@ stop_words = {
             'conform-',
             'multilink',
             'subscriber',
-
+            'config rogue',
+            'config qos',
+            'config license',
+            'config logging syslog level',
+            'config snmp v3user',
+            'config media-stream',
+            'config advanced',
+            'config radius',
+            'config mgmtuser',
+            'config rf-profile',
+            'config custom-web',
+            'config flexconnect',
+            'config acl rule source port',
+            'config acl rule destination port',
+            'config acl rule add',
+            'config spann',
+            'config wlan aaa-',
+            'config wlan mfp',
+            'config wlan broadcast',
+            'config wlan create',
+            'config wlan band-',
+            'config wlan exclusionlist',
+            'config wlan dms',
+            'config wlan qos',
+            'config wlan security',
+            'config wlan interface',
+            'config wlan media-stream',
+            'config wlan session-',
+            'config wlan nac',
+            'config wlan mac-filtering',
+            'config aaa',
+            'config wps',
+            'config rfid',
+            'config 802.11a',
+            'config tacacs',
+            'config trapflags',
+            'config ap',
+            'config mdns',
+            'config location',
+            'config interface vlan',
+            'config database',
+            'config network secureweb',
+            'config nmsp',
+            'config wlan radius_server',
+            'config 802.11b',
+            'transfer ',
+            'config wlan wmm',
+            'config wlan enable',
         )
     }
 
@@ -786,6 +857,9 @@ standard_keywords = {
     'cisco':
     (
         'ip',
+        'config',
+        'acl',
+        'action',
         'address',
         'description',
         'network',
@@ -806,8 +880,42 @@ standard_keywords = {
         'fragments',
         'position',
         'standard',
+        'setmedprimary'
+        'crashinfo',
+        'mls',
+        'interval',
+        'setcommunity',
+        'ffff',
+        'ffe',
+        'buffersize',
+        'table',
+        'null',
+        'software',
+        'upgrade',
+        'auto',
+        'docker',
+        'hosting',
+        'pkg',
+        'start',
         'extended',
         'log',
+        'gigabitethernet',
+        'overload',
+        'hmac',
+        'vti',
+        'ikev',
+        'cbc',
+        'sha',
+        'inside',
+        'outside',
+        'cssm',
+        'sampler',
+        'interval',
+        'keys',
+        'mgcp',
+        'none',
+        'force',
+        'model',
         'prefer',
         'ftp',
         'ssh',
@@ -1067,7 +1175,7 @@ standard_keywords = {
         'format',
         'null0',
         'mask',
-        'neighbor',
+        # 'neighbor',
         'access',
         'in',
         'out',
@@ -1535,7 +1643,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
 
     start = perf_counter()
 
-    if cfg['cache'] and cfg['dc'].get('updated', False):
+    if cfg['cache'] and cfg['dc'].get('updated', 0) > 0:
         data_to_save, matched_nets = search_cache_config(logger, cfg, '', networks, keyword_regexps, search_input)
     else:
         for folder in make_dir_list(logger, cfg):
@@ -1675,7 +1783,7 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
     # compiled_pattern = re.compile(pattern)
     search_terms.append(pattern)
 
-    if cfg['cache'] and cfg['dc'].get('updated', False):
+    if cfg['cache'] and cfg['dc'].get('updated', 0) > 0:
         data_to_save, matched_nets = search_cache_config(logger, cfg, '', networks, search_terms, search_input=sitecode)
     else:
         for folder in make_dir_list(logger, cfg):
@@ -1795,6 +1903,10 @@ def save_found_data(logger: logging.Logger, cfg: dict, data: list, missed_nets: 
             ):
 
         for device, fname in device_list:
+            # logger.debug(f'DEBUG Saving {device}, path {fname}')
+            if fname is None:
+                logger.error(f'{device} is missing full pathname information.. unable to save')
+                continue
             with open(fname, 'r', encoding='utf-8') as f:
                 file_content = f.readlines()
                 append_df_to_excel(
@@ -3477,76 +3589,114 @@ def extract_keywords(text):
             else:
                 if val < 1000:
                     continue
-            keywords.append(match)
+            keywords.append(match.lower())
     return keywords
 
 
-# @measure_execution_time
-def index_configurations(logger, cfg):
-    """Indexes configuration files and stores IP addresses and keywords in DiskCache"""
-
+def get_facts_helper(logger: logging.Logger, cfg: dict, folder: str, region: str, vendor: str, device_type: str, filename: str) -> dict:
+    """
+    Function is a helper to run get_device_config in Multithreaded fashion
+    """
     devices_local = {}
     ip_list_local = {}
     keywords_local = {}
 
-    # get cache last update time
-    cache_updated = cfg['dc'].get('updated', 0)
-    if time() - cache_updated <= 300:
-        logger.info('Index Cache - Index has been just refreshed, skipping checks...')
-        return ip_list_local, keywords_local
+    # filename without .cfg - equals hostname
+    hostname = filename[:-4].lower()
+    creation_time = os.path.getctime(f'{folder}/{filename}')
+    updated_time = cfg['dev_idx'].get(hostname, {}).get('updated', 0)
+    if creation_time - updated_time >= 0:
+        # device = cfg['dev_idx'].get(hostname, {})
+        # Get new filled device dict and device configuration
+        data = get_device_facts(logger, cfg, hostname, region, vendor, device_type, f'{folder}/{filename}')
+        # if returned None - means device in cache has configuration up to date go to next one
+        if data is None:
+            devices_local.setdefault(hostname, {}).update(cfg['dev_idx'].get(hostname, {}))
+            devices_local[hostname]['updated'] = time()
+            logger.debug(f'Index Cache - {hostname.upper()} has no configuration changes, skipping...')
+            return {}
+        # Only log messages about devices for existing cache to avoid excessive logging
+        # if device has updated key in index, it needs to be checked (and log message is different)
+        if updated_time > 0:
+            logger.debug(f'Index Cache - Configuration file for {hostname.upper()} has changed...')
+        logger.debug(f'Index Cache - Building {hostname.upper()} index data...')
+        # Update Indexes with received data
+        if data.get('ip_list', None):
+            for ip_key, ip_data in data['ip_list'].items():
+                ip_list_local.setdefault(ip_key, {}).update(cfg['ip_idx'].get(ip_key, {}))
+                ip_list_local[ip_key].update(ip_data)
+        if data.get('kw_list', None):
+            for word_key, word_data in data['kw_list'].items():
+                keywords_local.setdefault(word_key, {}).update(cfg['kw_idx'].get(word_key, {}))
+                keywords_local[word_key].update(word_data)
+        # Update device Index with device info
+        if data.get('device', None):
+            devices_local.setdefault(hostname, {}).update(cfg['dev_idx'].get(hostname, {}))
+            devices_local[hostname].update(data.get('device'))
+
+    return {'devices': devices_local, 'ip_list': ip_list_local, 'kw_list': keywords_local}
+
+
+def mt_index_configurations(logger, cfg):
+    """Multithreaded version indexes configuration files and stores IP addresses and keywords in DiskCache
+    at the moment there is an issue with the returned data and how it is being merged to dictionary, it is non-working properly function right now
+    TODO: need to be fixed
+    """
+
+    # use devices_total to compare with total in cache to deduct ones for deletion
+    devices_total = []
 
     start = perf_counter()
+    # Set indexing flag, other instances should avoid writing/indexing if flag is set
+    cfg['dc'].set('indexing', True, expire=120)
+    # Set updated to 0 to force fallback to old search method as cache might be inconsistent during indexing
+    cfg['dc'].set('updated', 0)
+    
+    devices_local = {}
+    ip_list_local = {}
+    keywords_local = {}
+
     for folder in make_dir_list(logger, cfg):
+        logger.info(f'Index Cache - Indexing directory {folder}')
+        # local dicts to update global indexes in a single update operation(per device type)
         parts = folder.split('/')
         filelist = os.listdir(folder)
         vendor = str(parts[4]).capitalize()
         device_type = str(parts[5]).upper()
         region = str(parts[6]).upper()
-        # logger.info(f'Index Cache - Processing {vendor} devices...')
-        for filename in filelist:
-            if filename.endswith('.cfg'):
-                # filename without .cfg - equals hostname
-                hostname = filename[:-4].lower()
-                creation_time = os.path.getctime(f'{folder}/{filename}')
-                updated_time = cfg['dev_idx'].get(hostname, {}).get('updated', 0)
+        
+        filelist = [f for f in filelist if f.endswith(".cfg")]
+        devices_total.extend([os.path.splitext(os.path.basename(f))[0] for f in filelist])
 
-                if creation_time - updated_time >= 0:
+        # Update indexing flag
+        cfg['dc'].touch('indexing', expire=120)
 
-                    # Only log messages about devices for existing cache to avoid excessive logging
-                    if cache_updated > 0:
-                        if cfg['dev_idx'].get(hostname, False):
-                            logger.info(f'Index Cache - {hostname.upper()} has configuration changed...')
-                            # need to clear existing indexes
-                            delete_index_data_by_hostname(logger, cfg, hostname)
-                        else:
-                            # if cache already exists, but device key is not in cache, then new device found
-                            # which is not in cache yet, and then log meaningful record about it
-                            logger.info(f'Index Cache - New device {hostname.upper()} configuration found...')
-
-                        logger.info(f'Index Cache - Building {hostname.upper()} index data...')
-
-                    # Get new filled device dict and device configuration
-                    device, config = retreive_device_data(f'{folder}/{filename}', region, vendor, device_type)
-
-                    # Get list of found IP addresses and keywords
-                    ip_addresses, keywords = store_facts(logger, cfg, hostname, vendor, config, device)
-
-                    # Update device Index with device info
-                    devices_local.setdefault(hostname, {}).update(device)
-
-                    # Update Indexes with received data
-                    if ip_addresses:
-                        for ip_key, ip_data in ip_addresses.items():
-                            ip_list_local.setdefault(ip_key, {}).update(cfg['ip_idx'].get(ip_key, {}))
-                            ip_list_local[ip_key].update(ip_data)
-
-                    if keywords:
-                        for word_key, word_data in keywords.items():
-                            keywords_local.setdefault(word_key, {}).update(cfg['kw_idx'].get(word_key, {}))
-                            keywords_local[word_key].update(word_data)
-
-    # Update global Index with new device data
-    cfg['dev_idx'].update(devices_local)
+        if filelist:
+            # Limiting to 2 workers, but this can be changed depending on the system it runs on
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {
+                    filename: executor.submit(
+                        get_facts_helper,
+                        logger,
+                        cfg,
+                        folder,
+                        region,
+                        vendor,
+                        device_type,
+                        filename
+                    ) for filename in filelist
+                }
+                results = {filename: future.result() for filename, future in futures.items()}
+            for _, result in results.items():
+                # result has a tuple with two lists:
+                # list 1 - actual config matches
+                # list 2 - returned dictionary
+                if result and len(result.get('devices', {})) > 0:
+                    devices_local.update(result['devices'])
+                if result and len(result.get('ip_list', [])) > 0:
+                    ip_list_local.update(result['ip_list'])
+                if result and len(result.get('kw_list', [])) > 0:
+                    keywords_local.update(result['kw_list'])
 
     # Update global index with IP
     if ip_list_local:
@@ -3554,7 +3704,21 @@ def index_configurations(logger, cfg):
     # Update global index with key words
     if keywords_local:
         cfg['kw_idx'].update(keywords_local)
+    # Update global Index with new device data
+    if devices_local:
+        cfg['dev_idx'].update(devices_local)
+        logger.info(f'Index Cache - Indexed {len(devices_local)} devices')
+        logger.info(f'Index Cache - Indexed {len(ip_list_local)} IP addresses')
+        logger.info(f'Index Cache - Indexed {len(keywords_local)} keywords')
+
     end = perf_counter()
+
+    prune_candidates = [hostname for hostname in cfg['dev_idx'] if hostname not in devices_total]
+
+    # Deleting devices from device_index
+    for prune_candidate in prune_candidates:
+        cfg['dev_idx'].pop(prune_candidate, None)
+        logger.info(f'Index Cache - Deleted cache data for {prune_candidate}')
 
     # Set last update time in diskcache
     cfg['dc']['updated'] = time()
@@ -3563,109 +3727,221 @@ def index_configurations(logger, cfg):
     if cfg['dc'].get('version', 0) != cache_version:
         cfg['dc']['version'] = cache_version
 
-    logger.info(f'Index Cache - Indexed {len(devices_local)} devices')
-    logger.info(f'Index Cache - Indexed {len(ip_list_local)} IP addresses')
-    logger.info(f'Index Cache - Indexed {len(keywords_local)} keywords')
-    logger.info(f'Index Cache - Update Time: {round(end-start, 2)} seconds')
+    # Remove indexing flag
+    cfg['dc'].pop('indexing', None)
+    logger.info(f'Index Cache - Processing Time: {round(end-start, 2)} seconds')
     logger.info(f'Index Cache - Version: {cache_version} Devices: {len(cfg["dev_idx"])}, IP Addresses: {len(cfg["ip_idx"])}, Words:{len(cfg["kw_idx"])}')
 
 
 # @measure_execution_time
-def prune_configurations(logger, cfg):
-    """Compares files existing in the repository and in the local cache and
-    deleting missing devices from the cache
-    """
-    devices_local = []
+def index_configurations(logger, cfg):
+    """Indexes configuration files and stores IP addresses and keywords in DiskCache"""
+
+    # use devices_total to compare with total in cache to deduct ones for deletion
+    devices_total = []
+
+    devices_local = {}
+    ip_list_local = {}
+    keywords_local = {}
+
+    start = perf_counter()
+
+    # Set indexing flag, other instances should avoid writing/indexing if flag is set
+    cfg['dc'].set('indexing', True, expire=120)
+    # Set updated to 0 to force fallback to old search method as cache might be inconsistent during indexing
+    cfg['dc'].set('updated', 0)
 
     for folder in make_dir_list(logger, cfg):
+        # local dicts to update global indexes in a single update operation(per device type)
+
+        parts = folder.split('/')
         filelist = os.listdir(folder)
+        vendor = str(parts[4]).capitalize()
+        device_type = str(parts[5]).upper()
+        region = str(parts[6]).upper()
+        
+        filelist = [f for f in filelist if f.endswith(".cfg")]
+        devices_total.extend([os.path.splitext(os.path.basename(f))[0] for f in filelist])
+
+        # Update indexing flag
+        cfg['dc'].touch('indexing', expire=120)
 
         for filename in filelist:
-            if filename.endswith('.cfg'):
-                # filename without .cfg - equals hostname
-                hostname = filename[:-4]
-                devices_local.append(hostname)
-    # A set prune_candidates containing hostnames present in devices_index but not in devices_local.
-    # These devices were cleaned from configuration repository so we need to purge any data related to them
-    # from the local cache Indexes
-    prune_candidates = [hostname for hostname in cfg['dev_idx'] if hostname not in devices_local]
+
+            # filename without .cfg - equals hostname
+            hostname = filename[:-4].lower()
+
+            creation_time = os.path.getctime(f'{folder}/{filename}')
+
+            updated_time = cfg['dev_idx'].get(hostname, {}).get('updated', 0)
+
+            if creation_time - updated_time >= 0:
+                # device = cfg['dev_idx'].get(hostname, {})
+                # Get new filled device dict and device configuration
+                data = get_device_facts(logger, cfg, hostname, region, vendor, device_type, f'{folder}/{filename}')
+
+                # if returned None - means device in cache has configuration up to date go to next one
+                if data is None:
+                    devices_local.setdefault(hostname, {}).update(cfg['dev_idx'].get(hostname, {}))
+                    devices_local[hostname]['updated'] = time()
+                    logger.debug(f'Index Cache - {hostname.upper()} has no configuration changes, skipping...')
+                    continue
+
+                # Only log messages about devices for existing cache to avoid excessive logging
+                # if device has updated key in index, it needs to be checked (and log message is different)
+                if updated_time > 0:
+                    logger.debug(f'Index Cache - Configuration file for {hostname.upper()} has changed...')
+
+                logger.debug(f'Index Cache - Building {hostname.upper()} index data...')
+
+                # Update Indexes with received data
+                if data.get('ip_list', None):
+                    for ip_key, ip_data in data['ip_list'].items():
+                        ip_list_local.setdefault(ip_key, {}).update(cfg['ip_idx'].get(ip_key, {}))
+                        ip_list_local[ip_key].update(ip_data)
+
+                if data.get('kw_list', None):
+                    for word_key, word_data in data['kw_list'].items():
+                        keywords_local.setdefault(word_key, {}).update(cfg['kw_idx'].get(word_key, {}))
+                        keywords_local[word_key].update(word_data)
+
+                # Update device Index with device info
+                if data.get('device', None):
+                    devices_local.setdefault(hostname, {}).update(cfg['dev_idx'].get(hostname, {}))
+                    devices_local[hostname].update(data.get('device'))
+
+    # Update global index with IP
+    if ip_list_local:
+        cfg['ip_idx'].update(ip_list_local)
+    # Update global index with key words
+    if keywords_local:
+        cfg['kw_idx'].update(keywords_local)
+
+    # Update global Index with new device data
+    if devices_local:
+        cfg['dev_idx'].update(devices_local)
+        # logger.info(f'Index Cache - Indexed directory {folder}')
+        logger.info(f'Index Cache - Indexed {len(devices_local)} devices')
+        logger.info(f'Index Cache - Indexed {len(ip_list_local)} IP addresses')
+        logger.info(f'Index Cache - Indexed {len(keywords_local)} keywords')
+
+    end = perf_counter()
+
+    prune_candidates = [hostname for hostname in cfg['dev_idx'] if hostname not in devices_total]
 
     # Deleting devices from device_index
     for prune_candidate in prune_candidates:
-        delete_index_data_by_hostname(logger, cfg, prune_candidate)
+        cfg['dev_idx'].pop(prune_candidate, None)
+        logger.info(f'Index Cache - Deleted cache data for {prune_candidate}')
 
-    return
+    # Set last update time in diskcache
+    cfg['dc']['updated'] = time()
+
+    # Set/Update cache version to current release
+    if cfg['dc'].get('version', 0) != cache_version:
+        cfg['dc']['version'] = cache_version
+
+    # Remove indexing flag
+    cfg['dc'].pop('indexing', None)
+    logger.info(f'Index Cache - Processing Time: {round(end-start, 2)} seconds')
+    logger.info(f'Index Cache - Version: {cache_version} Devices: {len(cfg["dev_idx"])}, IP Addresses: {len(cfg["ip_idx"])}, Words:{len(cfg["kw_idx"])}')
 
 
-def retreive_device_data(fname, region, vendor, device_type) -> list:
-    with open(f'{fname}', 'r', encoding='utf-8') as f:
-        config = f.readlines()
-        device = {
+# @measure_execution_time
+def get_device_facts(logger: logging.Logger, cfg: dict, hostname: str, region: str, vendor: str, device_type: str, fname: str) -> dict:
+    """
+    Function will check if device configuration changed by reading first few lines for Cisco and Bluecoat as they have last change date saved
+    if changed date is the same, function will return empty tuple otherwise it will process full configuration
+    """
+    device = {
             'fname': fname,
             'region': region,
             'type': device_type,
             'vendor': vendor,
-            'updated': time(),
+            'updated': 0,
             'ip_list': [],
             'keyword_list': [],
         }
-        # Store device info in diskcache Index
-    return device, config
 
-
-# @measure_execution_time
-def store_facts(logger: logging.Logger, cfg: dict, hostname: str, vendor: str, config: list, device: dict) -> tuple[dict, dict]:
     ip_list = {}
     keywords = {}
 
     device_ip_list = []
     device_kw_list = []
 
-    for index, line in enumerate(config):
-        line = line.rstrip('\n')
-        if line.strip().startswith(stop_words.get(vendor.lower(), ('NEVERMATCHED'))):
-            continue
+    dc_cfg_ts = None
+    cfg_ts = None
 
-        # skip all lines with 8 hexadecimal characters inside - certificate stuff like
-        # 03820101 00507F24 D3932A66 86025D9F E838AE5C 6D4DF6B0 49631C78 240DA905
+    # last config update time from local cached data (only Cisco devices have it), added if to avoid extra read from global Index
+    if vendor == 'cisco':
+        dc_cfg_ts = cfg["dev_idx"].get(hostname, {}).get('config_update', None)
+    
+    # Set small chunk size to read only few initial lines to check Cisco data
+    # chunk_size = 512
+    # index = 0
+    with open(f'{fname}', 'r', encoding='utf-8') as f:
 
-        if re.match(r'^[0-9A-F]{8}\b', line.strip()):
-            # logger.info(f'Matched cert data!')
-            continue
+        # Get config timestamp
+        for index, line in enumerate(f):
+            # This line only exist with Cisco devices so no need for specific check for vendor
+            if index < 5 and vendor == 'cisco' and line.strip().startswith('! Last configuration change at'):
+                # config timestamp as far it seems to be a fixed format line for all Cisco devices
+                cfg_ts = line[31:].split(' by')[0]
 
-        ip_matches = re.findall(ip_regexp, line)
-        for match in ip_matches:
-            try:
-                ip = ipaddress.ip_address(match)
-            except (re.error, ValueError):
-                pass
-            else:
-                if ip.is_multicast or ip.is_reserved:
-                    continue
-                if ip.compressed.startswith(('255.', '0.'), 0):
-                    continue
+                if dc_cfg_ts == cfg_ts:
+                    logging.debug(f"Index Cache - Skipping config processing for {hostname}, config hasn't changed")
+                    return None
+                # else:
+                    # set large chunksize to read the rest of configuration
+                    # chunk_size = 64*1024
 
-                ip_list.setdefault(ip.compressed, {}).setdefault(hostname, {}).setdefault('lines', {})[index] = line.strip()
-
-                # add ip to the list in dev index
-                device_ip_list.append(ip.compressed)
-
-        words = extract_keywords(line)
-        buzz_words = standard_keywords.get(vendor.lower(), ())
-
-        for word in words:
-            word = word.lower()
-            if (word in buzz_words or re.match(ip_regexp, word)):
+            if line.strip().startswith(stop_words.get(vendor.lower(), ('NEVERMATCHED'))):
                 continue
-            keywords.setdefault(word, {}).update({hostname: ''})
 
-            # add keyword to the list in dev index
-            device_kw_list.append(word)
+            line = line.rstrip('\n')
+
+            # skip all lines with 8 hexadecimal characters inside - certificate stuff like
+            # 03820101 00507F24 D3932A66 86025D9F E838AE5C 6D4DF6B0 49631C78 240DA905
+
+            if re.match(r'^[0-9A-F]{8}\b', line.strip()):
+                # logger.info(f'Matched cert data!')
+                continue
+
+            ip_matches = re.findall(ip_regexp, line)
+            for match in ip_matches:
+                try:
+                    ip = ipaddress.ip_address(match)
+                except (re.error, ValueError):
+                    pass
+                else:
+                    if ip.is_multicast or ip.is_reserved:
+                        continue
+                    if ip.compressed.startswith(('255.', '0.'), 0):
+                        continue
+
+                    ip_list.setdefault(ip.compressed, {}).setdefault(hostname, {}).setdefault('lines', {})[index] = line.strip()
+                    # add ip to the list in dev index
+                    device_ip_list.append(ip.compressed)
+
+            words = extract_keywords(line)
+            buzz_words = standard_keywords.get(vendor.lower(), ())
+
+            for word in words:
+                if (word in buzz_words or re.match(ip_regexp, word)):
+                    continue
+                keywords.setdefault(word, {}).update({hostname: ''})
+                # add keyword to the list in dev index
+                device_kw_list.append(word)
 
     device['ip_list'] = list(dict.fromkeys(device_ip_list))
     device['keyword_list'] = list(dict.fromkeys(device_kw_list))
 
-    return ip_list, keywords
+    if cfg_ts is not None:
+        device['config_update'] = cfg_ts
+
+    device['updated'] = time()
+
+    return {'device': device, 'ip_list': ip_list, 'kw_list': keywords}
 
 
 # @measure_execution_time
@@ -3688,18 +3964,23 @@ def search_cache_keywords(logger: logging.Logger, cfg: dict, search_terms: list)
         words = extract_keywords(term)
         # logger.debug(f'Debug Words: {words}')
         for word in words:
-            hostnames = None
-            try:
-                ip = ipaddress.ip_address(word)
-            except ValueError:
-                # if word is not valid IP address then it is keyword and obtain list of hostnames for keyword
-                hostnames = cfg['kw_idx'].get(word.lower(), None)
-                pass
-            else:
-                hostnames = cfg['ip_idx'].get(ip.compressed, None)
+            hostnames = cfg['kw_idx'].get(word, {})
+            prune_candidates = []
+            for hostname in hostnames:
+                # Cross check if found keyword is listed under main dev Index, if it is not 
+                # delete this hostname from kw_idx as a stale record
+                if word not in cfg['dev_idx'].get(hostname, {}).get('keyword_list', []):
+                    prune_candidates.append(hostname)
+                    continue
+
+            for candidate in prune_candidates:
+                hostnames.pop(candidate, None)
+                logger.debug(f'Index Cache - Deleting stale kw {word} index for {hostname.upper()}')
+            
+            if prune_candidates:
+                cfg['kw_idx'][word] = hostnames
 
             if hostnames:
-
                 with ThreadPoolExecutor() as executor:
                     futures = {
                         hostname: executor.submit(
@@ -3741,14 +4022,27 @@ def search_cache_subnets(logger: logging.Logger, cfg: dict, nets: list) -> tuple
     for subnet, ip_addresses in network_ip_map.items():
         for ip_address in ip_addresses:
             # if IP is in index, get device data dict where we can loop over devices and get configuration
-            if cfg['ip_idx'].get(ip_address.compressed, None):
-                device_data = cfg['ip_idx'][ip_address.compressed]
-                matched_nets.add(subnet)
+            device_data = cfg['ip_idx'].get(ip_address.compressed, None)
+            if device_data:
+                prune_candidates = []
                 for found_device, device in device_data.items():
-                    lines = device.get('lines', None)
-                    if lines:
-                        for index, line in lines.items():
-                            rows_to_save.setdefault(found_device, {})[index] = (subnet.compressed, ip_address.compressed, line.strip())
+                    # cross check if IP address still listed under devices Index, if it is then we continue, if not we need to delete reference to device from ip_idx
+                    if ip_address.compressed in cfg['dev_idx'].get(found_device, {}).get('ip_list', []):
+                        lines = device.get('lines', None)
+                        if lines:
+                            for index, line in lines.items():
+                                rows_to_save.setdefault(found_device, {})[index] = (subnet.compressed, ip_address.compressed, line.strip())
+                            # Only adding matches subnet if 'lines' do actually exist
+                            matched_nets.add(subnet)
+                    else:
+                        # deleting stale device data because IP is not found in main device Index ip_list
+                        prune_candidates.append(found_device)
+                    
+                for candidate in prune_candidates:
+                    device_data.pop(candidate, None)
+                    logger.debug(f'Index Cache - Deleting stale ip {ip_address.compressed} index for {candidate.upper()}')
+                if len(prune_candidates) > 0:
+                    cfg['ip_idx'][ip_address.compressed] = device_data
 
     # Saving all gathered data to data_to_save array
     if len(rows_to_save) > 0:
@@ -3769,60 +4063,32 @@ def background_cache_init(logger, cfg):
         # do nothing if cache is disabled
         return
 
-    cache_ver = cfg['dc'].get('version', 0)
-    updated = cfg['dc'].get('updated', False)
-    if cache_ver != cache_version or not updated:
-        # if updated key exists then cache has data and needs to be re-created due to version mismatch
-        if updated:
-            logger.info(f'Current cache version: {cache_ver}. Required version: {cache_version}. Indexing data...')
-            cfg['dc'].clear()
-            cfg['dev_idx'].clear()
-            cfg['ip_idx'].clear()
-            cfg['kw_idx'].clear()
-        else:
-            logger.info('Index Cache - No cache found. Indexing data...')
+    if cfg['dc'].get('indexing', None):
+        # skip indexing if cache is already being indexed
+        logger.info('Index Cache - Another process performs indexing, skipping checks...')
+        return
 
     if time() - cfg['dc'].get('updated', 0) <= 300:
-        logger.info('Index Cache - Cache is up-to-date, skipping checks...')
+        logger.info('Index Cache - State is up-to-date, skipping checks...')
         return
+
+    cache_ver = cfg['dc'].get('version', 0)
+    if cache_ver == 0:
+        logger.info('Index Cache - No cache found. Indexing data...')
+    elif cache_ver != cache_version:
+        # if updated key exists then cache has data and needs to be re-created due to version mismatch
+        logger.info(f'Index Cache - Version: {cache_ver}. Required Version: {cache_version}. Indexing data...')
+        cfg['dc'].clear()
+        cfg['dev_idx'].clear()
+        cfg['ip_idx'].clear()
+        cfg['kw_idx'].clear()
+    else:
+        pass
 
     try:
         index_configurations(logger, cfg)
     except Exception as e:
         logger.error(f'Index Cache - Error during cache initialization: {e}')
-
-    try:
-        prune_configurations(logger, cfg)
-    except Exception as e:
-        logger.error(f'Index Cache - Error during cache pruning: {e}')
-
-
-def delete_index_data_by_hostname(logger: logging.Logger, cfg: dict, hostname: str) -> None:
-
-    # Clean up IP index
-    for ip_key in cfg['dev_idx'].get(hostname, {}).get('ip_list', []):
-        ip_data = cfg['ip_idx'].get(ip_key, {})
-        ip_data.pop(hostname, None)
-        if ip_data or len(ip_data) > 0:
-            cfg['ip_idx'][ip_key] = ip_data
-        else:
-            cfg['ip_idx'].pop(ip_key, None)
-    # Clean up Keword index
-    for kw_key in cfg['dev_idx'].get(hostname, {}).get('keyword_list', []):
-        kw_data = cfg['kw_idx'].get(kw_key, {})
-        kw_data.pop(hostname, None)
-        if kw_data or len(kw_data) > 0:
-            cfg['kw_idx'][kw_key] = kw_data
-        else:
-            cfg['kw_idx'].pop(kw_key, None)
-
-    logger.debug(f'Cache Pruning - Data Indexes for {hostname.upper()} deleted')
-
-    device = cfg['dev_idx'].pop(hostname, None)
-    if device:
-        logger.debug(f'Cache Pruning - Main Index for {hostname.upper()} deleted')
-
-    logger.info(f'Cache Pruning - Cache pruned from {hostname.upper()}')
 
 
 def check_file_accessibility(file_path: str, logger: logging.Logger) -> bool:
@@ -4108,7 +4374,8 @@ Please send any feedback/feature requests to evdanil@gmail.com
     # Define cache variables
     if cfg['cache']:
         logger.info(f'Index Cache - Cache Directory {cfg["cache_directory"]}')
-        cfg['dc'] = FanoutCache(directory=cfg['cache_directory'], shards=4, timeout=1, disk=JSONDisk, compress_level=3)
+        cfg['dc'] = FanoutCache(directory=cfg['cache_directory'], shards=4, timeout=1, disk=JSONDisk, compress_level=6)
+        # cfg['dc'] = FanoutCache(directory=cfg['cache_directory'], shards=16, timeout=1)
         cfg['dev_idx'] = cfg['dc'].index('d_idx')
         cfg['ip_idx'] = cfg['dc'].index('i_idx')
         cfg['kw_idx'] = cfg['dc'].index('w_idx')
