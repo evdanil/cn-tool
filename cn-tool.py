@@ -20,7 +20,6 @@ import json
 import sys
 import termios
 import tty
-import itertools
 
 # from operator import itemgetter
 from time import perf_counter, sleep
@@ -54,7 +53,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.96 hash 1e86cb5'
+version = '0.1.97 hash 3aaac57'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -1514,7 +1513,7 @@ def search_config(logger: logging.Logger, cfg: dict, folder: str, nets: list[ipa
     device_type = str(parts[5]).upper()
     region = str(parts[6]).upper()
     with console.status(
-        f'[yellow]Searching through [green bold]{vendor}/{device_type}[/green bold] configurations in [green bold]{region}[/green bold] region...[/yellow]',
+        f'[yellow]Searching through [green bold]{vendor}/{device_type}[/green bold] configurations in [green bold]{region}[/green bold] region...[/]',
         spinner="dots12"
     ):
 
@@ -1562,14 +1561,14 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
     console.print(
         "\n"
         "[yellow]Enter subnet([green]IP_ADDRESS/\\[MASK][/]) or keyword(regular expression), one item per line[/]\n"
-        "[yellow]Empty input line starts the process[/yellow]\n"
+        "[yellow]Empty input line starts the process[/]\n"
         "\n"
-        "[magenta]Subnet Examples:[/magenta]\n"
-        "[green bold]10.10.10.0/24[/green bold]\n"
-        "[green bold]134.143.169.176/29[/green bold]\n"
-        "[magenta]Keywords Regex Examples:[/magenta]\n"
-        "[green bold]router bgp 655\\d+$[/green bold]\n"
-        "[green bold]neighbor \\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3} description VOCUS\\s+[/green bold]\n"
+        "[magenta]Subnet Examples:[/]\n"
+        "[green bold]10.10.10.0/24[/]\n"
+        "[green bold]134.143.169.176/29[/]\n"
+        "[magenta]Keywords Regex Examples:[/]\n"
+        "[green bold]router bgp 655\\d+$[/]\n"
+        "[green bold]neighbor \\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3} description VOCUS\\s+[/]\n"
         )
 
     search_input = 'none'
@@ -1697,13 +1696,13 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
 
     console.print(
         "\n"
-        "[yellow bold]This request is to verify if any subnets exist on the devices for a given sitecode, subnets pulled from Infoblox matching description field[/yellow bold]\n"
-        "[red bold]Always check provided results[/red bold]\n"
-        "[yellow]Request has a limit of [red bold]50[/red bold] subnet records per site[/yellow]\n"
-        "[yellow]Type in location site code to perform search[/yellow]\n"
-        "[yellow]Supported site code format: [green bold]XXX[/green bold] or [green bold]XXX-XX\\[X][/green bold][/yellow]\n"
-        "[magenta]Site Code Examples:[/magenta]\n"
-        "[green bold]AMS-DC, WND-RYD[/green bold]\n"
+        "[yellow bold]This request is to verify if any subnets exist on the devices for a given sitecode, subnets pulled from Infoblox matching description field[/]\n"
+        "[red bold]Always check provided results[/]\n"
+        "[yellow]Request has a limit of [red bold]50[/red bold] subnet records per site[/]\n"
+        "[yellow]Type in location site code to perform search[/]\n"
+        "[yellow]Supported site code format: [green bold]XXX, XXXXXXX, XXX-XX\\[XX][/green bold][/]\n"
+        "[magenta]Site Code Examples:[/]\n"
+        "[green bold]AMS-DC, WND-RYD[/]\n"
     )
 
     raw_input = read_user_input(logger, "Enter location site code: ").strip()
@@ -2197,7 +2196,7 @@ def is_valid_site(sitecode: str) -> bool:
 
     # This regex allows for either three alphanumeric characters followed by a hyphen and another three alphanumeric characters,
     # or simply three alphanumeric characters without the hyphen.
-    valid_site_regex = "^[a-z0-9]{3}(?:-[a-z0-9]{2,3})?$"
+    valid_site_regex = "^[a-z0-9]{7}$|^[a-z0-9]{3}$|^[a-z0-9]{3}(?:-[a-z0-9]{2,4})?$"
 
     if re.search(valid_site_regex, sitecode, re.IGNORECASE):
         return True
@@ -2282,7 +2281,7 @@ def print_table_data(
     if len(data) == 0:
         console.print('No data to display')
         return
-
+    # import ipdb; ipdb.set_trace()
     for key, value_list in data.items():
         # Capitalize the first letter of the key
         section_title = key
@@ -2301,12 +2300,13 @@ def print_table_data(
             continue
 
         # Since we get list of dict objects - each has same keys() which we can use as column names
-        # import ipdb; ipdb.set_trace()
+        
         for name in value_list[0].keys():
             columns.append(name.upper())
 
         for record in value_list:
             table_data.extend([record.values()])
+        # import ipdb; ipdb.set_trace()
 
         table = create_table(logger, section_title, columns, table_data)
         console.print(table)
@@ -2874,17 +2874,17 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
 
     console.print(
         "\n"
-        "[yellow]Type in location site code to obtain a list of registered [yellow bold]subnets[/yellow bold]\n"
-        "Supported location format [green bold]XXX[/green bold] or [green bold]XXX-XX\\[X][/green bold]\n"
-        "Request has a limit of [red bold]1000[/red bold] records[/yellow]\n"
-        "[magenta bold]Examples:[/magenta bold]\n"
+        "[yellow]Type in location site code to obtain a list of registered [yellow bold]subnets[/]\n"
+        "[yellow]Supported site code format: [green bold]XXX, XXXXXXX, XXX-XX\\[XX][/green bold][/]\n"
+        "[yellow]Request has a limit of [red bold]1000[/red bold] records[/]\n"
+        "[magenta bold]Examples:[/]\n"
         "[green][bold]CIC[/bold] fetches [yellow bold]subnets[/yellow bold] for Chinchilla location\n"
-        "[bold]WND-RYD[/bold] fetches [yellow bold]subnets[/yellow bold] for Wandoan office[/green]\n"
+        "[bold]WND-RYD[/bold] fetches [yellow bold]subnets[/yellow bold] for Wandoan office[/]\n"
         "\n"
-        "[yellow]Type in '[green bold]+[/green bold]' as a first symbol followed by arbitrary keyword(cannot have spaces)[/yellow]\n"
-        "[magenta bold]Examples:[/magenta bold]\n"
-        "[green][bold]+[/bold]CNBEJWTCMP610[/green] [yellow]fetches subnets with [bold]CNBEJWTCMP610[/bold] in description[/yellow]\n"
-        "[green][bold]+[/bold]PRJ18[/green] [yellow]fetches subnets with [bold]PRJ18[/bold] in description[/yellow]\n"
+        "[yellow]Type in '[green bold]+[/green bold]' as a first symbol followed by arbitrary keyword(cannot have spaces)[/]\n"
+        "[magenta bold]Examples:[/]\n"
+        "[green][bold]+[/bold]CNBEJWTCMP610[/green] [yellow]fetches subnets with [bold]CNBEJWTCMP610[/bold] in description[/]\n"
+        "[green][bold]+[/bold]PRJ18[/green] [yellow]fetches subnets with [bold]PRJ18[/bold] in description[/]\n"
     )
 
     raw_input = read_user_input(logger, "Enter location code or '+'keyword: ").lower()
@@ -2914,19 +2914,19 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
             logger.info(f'User input - Sitecode search for {search_term}')
         else:
             logger.info(f'User input -  Incorrect site code {raw_input}')
-            console.print("[red]Incorrect site code[/red]")
+            console.print("[red]Incorrect site code[/]")
             return
 
     if len(search_term) == 0:
         logger.info('User input -  Empty input')
-        console.print("[red]Incorrect input provided[/red]")
+        console.print("[red]Incorrect input provided[/]")
         return
 
     uri = f'network?comment:~={search_term}&_max_results=1000'
 
     data = do_fancy_request(
         logger,
-        message=f'Fetching data for [magenta]{search_term.upper()}[/magenta]...',
+        message=f'Fetching data for [magenta]{search_term.upper()}[/]...',
         endpoint=cfg["api_endpoint"],
         uri=uri,
     )
@@ -2938,7 +2938,7 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
 
     if len(processed_data.get("location", '')) == 0:
         logger.info('Request Type - Location Information - No information received')
-        console.print('[red]No information received[/red]')
+        console.print('[red]No information received[/]')
         return
 
     print_table_data(
@@ -2989,7 +2989,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
 
     console.print(
         "\n"
-        "[yellow]Enter a network addresses in the format 'x.x.x.x\\[/x]' one subnet per line\n"
+        "[yellow]Enter a network addresses in the format 'x.x.x.x\\[/x]' one subnet per line[/]\n"
     )
 
     net_addresses = []
@@ -3072,7 +3072,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
     # Request general network information for each subnet
     for network in net_addresses:
         with ThreadPoolExecutor() as executor:
-            with console.status(status=f'Fetching [magenta]{network}[/magenta] information...'):
+            with console.status(status=f'Fetching [magenta]{network}[/] information...'):
                 futures = {
                     label: executor.submit(
                         do_fancy_request,
@@ -3200,21 +3200,53 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
     console.print('\n\n')
     console.print(f'[yellow]Request Type - Subnet Information - Search took [green]{round(end-start, 2)}[/green] seconds![/]\n')
 
-    num_results = 0
-    for network in net_addresses:
-        if len(processed_data[network].get("general")) == 0:
-            console.print(f'[yellow]No data received for network: [magenta bold]{network}[/]')
-        else:
-            num_results += 1
-    sleep(1)
+    # Block will output just general subnet information with only subnet, subnet status and description fields
+    missing_data_nets = 0
+    if len(net_addresses) > 1:
+        summary_data = {'summary data': []}
+        for network in net_addresses:
+            data = processed_data[network].get("general", [])
+            summary_net = {}
+            if len(data) > 0:
+                summary_net['subnet'] = data[0].get("subnet")
+                summary_net['status'] = 'Used'
+                summary_net['description'] = data[0].get("description", "")
+            else:
+                missing_data_nets += 1
+                summary_net['subnet'] = str(network)
+                summary_net['status'] = 'Unknown'
+                summary_net['description'] = 'No data in Infoblox'
 
+            summary_data['summary data'].append(summary_net)
+        print_table_data(logger, summary_data)
+        console.print('([green]Press [bold red]Q[/bold red] to return to main menu(data will not be saved) / Any key - to get through detailed subnet data[/]\n')
+        key = read_single_keypress().lower()
+        if key == 'q':
+            return
+
+    # Block will print detailed subnet information one by one
+    missing_data_nets = 0
     for network in net_addresses:
         if len(processed_data[network].get("general")) > 0:
             console.clear()
             print_table_data(logger, processed_data[network], suffix={"general": "Information"})
-            if len(net_addresses) == 1 or num_results == 1:
-                continue
-            console.print('([green]Press [bold]space[/bold] to see next result / Any key - return to the menu(request data will be saved in report file)[/]\n')
+            if missing_data_nets == net_addresses:
+                return
+            if len(net_addresses) - missing_data_nets > 1:
+                console.print('([green]Press [bold]SPACE[/bold] to see next result / Any key - return to the menu(request data will be saved in report file)[/]\n')
+                key = read_single_keypress()
+                if key == ' ':
+                    continue
+                else:
+                    break
+        else:
+            missing_data_nets += 1
+            if missing_data_nets == net_addresses:
+                console.print(f'([green]Network [red bold]{network}[/red bold] has no data in Infoblox[/]\n')
+                return
+            else:
+                console.print(f'([green]Network [red bold]{network}[/red bold] has no data in Infoblox / Press [bold]SPACE[/bold] to see next result[/]\n')
+
             key = read_single_keypress()
             if key == ' ':
                 continue
@@ -3291,7 +3323,7 @@ def read_user_input(logger: logging.Logger, prompt: str = " ", read_pass: bool =
     raw_input = ''
     try:
         raw_input = console.input(
-            f'[bold green]{prompt}[/bold green]', password=read_pass, markup=True
+            f'[bold green]{prompt}[/]', password=read_pass, markup=True
         )
     except EOFError:
         pass
@@ -3324,7 +3356,7 @@ def show_config_search_help(logger: logging.Logger, cfg: dict) -> None:
         "[yellow]Unable to access configuration repository\n"
         "Check [magenta bold]\\[config_repository][/magenta bold] section in the configuration file,\n"
         "Verify that [green bold]storage_directory[/bold green] parameter set to a proper path\n"
-        "If path is correct, verify that your account has read access to it[/yellow]\n"
+        "If path is correct, verify that your account has read access to it[/]\n"
     )
 
 
@@ -3338,7 +3370,7 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
     console.print(
         "\n"
         "[yellow]Enter IPs/FQDNs to ping, one per line, non-valid IP/FQDNs are ignored.\n"
-        "Empty input line starts ping process:[/yellow]"
+        "Empty input line starts ping process:[/]"
     )
     hosts = []
     raw_input = 'none'
@@ -3439,7 +3471,7 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
     console.print(
         "\n"
         "[yellow]Enter FQDNs/IP addresses, one FQDN/IP address per line. Non-valid FQDNs/IPs are ignored.\n"
-        "Empty input line starts lookup process:[/yellow]"
+        "Empty input line starts lookup process:[/]"
     )
 
     data_lines = {'ip': [], 'name': []}
@@ -3608,7 +3640,7 @@ def get_facts_helper(logger: logging.Logger, cfg: dict, folder: str, region: str
     if creation_time - updated_time >= 0:
         # device = cfg['dev_idx'].get(hostname, {})
         # Get new filled device dict and device configuration
-        data = get_device_facts(logger, cfg, hostname, region, vendor, device_type, f'{folder}/{filename}')
+        data = get_device_facts(logger, cfg, hostname, region, vendor.lower(), device_type, f'{folder}/{filename}')
         # if returned None - means device in cache has configuration up to date go to next one
         if data is None:
             devices_local.setdefault(hostname, {}).update(cfg['dev_idx'].get(hostname, {}))
@@ -3681,7 +3713,7 @@ def mt_index_configurations(logger, cfg):
                         cfg,
                         folder,
                         region,
-                        vendor,
+                        vendor.lower(),
                         device_type,
                         filename
                     ) for filename in filelist
@@ -3778,7 +3810,7 @@ def index_configurations(logger, cfg):
             if creation_time - updated_time >= 0:
                 # device = cfg['dev_idx'].get(hostname, {})
                 # Get new filled device dict and device configuration
-                data = get_device_facts(logger, cfg, hostname, region, vendor, device_type, f'{folder}/{filename}')
+                data = get_device_facts(logger, cfg, hostname, region, vendor.lower(), device_type, f'{folder}/{filename}')
 
                 # if returned None - means device in cache has configuration up to date go to next one
                 if data is None:
@@ -3810,6 +3842,14 @@ def index_configurations(logger, cfg):
                     devices_local.setdefault(hostname, {}).update(cfg['dev_idx'].get(hostname, {}))
                     devices_local[hostname].update(data.get('device'))
 
+    # Deleting stale devices from device_index
+    prune_candidates = [hostname for hostname in cfg['dev_idx'] if hostname not in devices_total]
+
+    for prune_candidate in prune_candidates:
+        cfg['dev_idx'].pop(prune_candidate, None)
+        logger.info(f'Index Cache - Device {prune_candidate} is not in configuration repository')
+        logger.info(f'Index Cache - Device {prune_candidate} deleted from cache')
+
     # Update global index with IP
     if ip_list_local:
         cfg['ip_idx'].update(ip_list_local)
@@ -3826,13 +3866,6 @@ def index_configurations(logger, cfg):
         logger.info(f'Index Cache - Indexed {len(keywords_local)} keywords')
 
     end = perf_counter()
-
-    prune_candidates = [hostname for hostname in cfg['dev_idx'] if hostname not in devices_total]
-
-    # Deleting devices from device_index
-    for prune_candidate in prune_candidates:
-        cfg['dev_idx'].pop(prune_candidate, None)
-        logger.info(f'Index Cache - Deleted cache data for {prune_candidate}')
 
     # Set last update time in diskcache
     cfg['dc']['updated'] = time()
@@ -3888,14 +3921,14 @@ def get_device_facts(logger: logging.Logger, cfg: dict, hostname: str, region: s
                 # config timestamp as far it seems to be a fixed format line for all Cisco devices
                 cfg_ts = line[31:].split(' by')[0]
 
-                if dc_cfg_ts == cfg_ts:
+                if dc_cfg_ts is not None and dc_cfg_ts == cfg_ts:
                     logging.debug(f"Index Cache - Skipping config processing for {hostname}, config hasn't changed")
                     return None
                 # else:
                     # set large chunksize to read the rest of configuration
                     # chunk_size = 64*1024
 
-            if line.strip().startswith(stop_words.get(vendor.lower(), ('NEVERMATCHED'))):
+            if line.strip().startswith(stop_words.get(vendor, ('NEVERMATCHED'))):
                 continue
 
             line = line.rstrip('\n')
@@ -3924,7 +3957,7 @@ def get_device_facts(logger: logging.Logger, cfg: dict, hostname: str, region: s
                     device_ip_list.append(ip.compressed)
 
             words = extract_keywords(line)
-            buzz_words = standard_keywords.get(vendor.lower(), ())
+            buzz_words = standard_keywords.get(vendor, ())
 
             for word in words:
                 if (word in buzz_words or re.match(ip_regexp, word)):
@@ -4176,11 +4209,11 @@ def get_auth_creds(logger: logging.Logger, cfg: dict) -> tuple:
                     "\n"
                     "[cyan]Set up '[red]TACACS_PW[/red]' environment variable to avoid typing in credential\n"
                     "with each run or create/update [red]device-apply.gpg[/red] credentials file\n"
-                    f"For more infrmation run {os.path.basename(__file__)} with -h argument[/cyan]\n"
+                    f"For more infrmation run {os.path.basename(__file__)} with -h argument[/]\n"
                 )
                 password = read_user_input(
                     logger,
-                    '[yellow bold]Provide security credential:[/yellow bold]',
+                    '[yellow bold]Provide security credential:[/]',
                     True,
                 )
         else:
@@ -4197,7 +4230,7 @@ def main() -> None:
     """
 
     menu = """
-    [red bold]MENU[/red bold]
+    [red bold]MENU[/]
     [cyan]
     1. IP Information
     2. Subnet Information
@@ -4207,10 +4240,10 @@ def main() -> None:
     6. Bulk PING
     7. Bulk DNS Lookup
     8. Site Demobilization Check
-    d. Delete Report[/cyan]
+    d. Delete Report[/]
     [bold yellow]
     0. Exit
-    [/bold yellow]
+    [/]
     """
 
     # default params if config is missing
@@ -4367,7 +4400,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
     if cfg['api_endpoint'] == "API_URL":
         logger.error('API Error - Infoblox API endpoint URL is not set')
         console.print(
-            '[red]Correct Infoblox API URL is required(update configuration)[/red]'
+            '[red]Correct Infoblox API URL is required(update configuration)[/]'
         )
         exit_now(logger, exit_code=1)
 
@@ -4388,6 +4421,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
         thread.daemon = True  # Allow the main program to exit even if the thread is still running
         thread.start()
 
+    # import ipdb; ipdb.set_trace()
     while choice != '0':
         console.clear()
         console.print(menu)
@@ -4396,7 +4430,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
 
         switch.get(choice, exit_now)(logger, cfg)
 
-        console.print('Press [red]Enter[/red] key to continue')
+        console.print('Press [red]Enter[/] key to continue')
         read_user_input(logger, '')
 
 
