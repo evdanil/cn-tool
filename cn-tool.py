@@ -4515,7 +4515,7 @@ EOF
 Re-login and start using cn-tool by running:
 cn
 
-Please send any feedback/feature requests to evdanil@gmail.com
+Please send any feedback/feature requests to =EMAIL=
 """.format(
         version=version, exec_file=os.path.basename(__file__)
     )
@@ -4523,7 +4523,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
     version_message = """
 cn-tool v{version}
 
-Please send any feedback/feature requests to evdanil@gmail.com
+Please send any feedback/feature requests to =EMAIL=
 """.format(
         version=version
     )
