@@ -1,0 +1,59 @@
+Copyright 2024 - Evgeny Danilchenko evdanil@gmail.com
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+# cn-tool.py
+Utility allowing to receive information from Infoblox API
+
+## Features:
+- Performs IP/Subnet/DNS/Site information lookups using Infoblox API
+- Performs bulk ping operations
+- Performs bulk FQDN/IP lookups using system resolver
+- Performs configuration checks across configuration storage (`/opt/data/configs/`) for obsolete configuration when device being removed (cleanups on BGP borders/prefixes/ACLs)
+- Saves all requested information for later information processing(by default `report.xlsx` in current directory) 
+- Keeps log of requests/responses(by default `cn.log` in current directory)
+- Supports several levels of logging
+- Supports ini-style configfile to set logging level/filenames/api endpoint/autosaving(default filename `.cn`)
+
+# How to use
+1. Copy `cn-tool.py`, `requirements.txt` to terminal server
+2. Install required python packages (json, rich, pandas, argparse) using command:
+```
+pip install -r requirements.txt
+```
+3. Set execute bit on the python script file:
+```
+chmod +x cn-tool.py
+```
+4. [Optional] To avoid being asked each time executing cn-tool - set up environmental variable `TACACS_PW`, if it is not set - program will request for credential(password). Script uses env['USER'] as login name for devices
+```
+export TACACS_PW=secret
+```
+5. [Optional] Add request to read `TACACS_PW` credential during login by adding to `.bash_profile`:
+```bash
+cat >> ~/.bash_profile <<EOF
+echo -n "Enter current TACACS_PW:"
+read -s TACACS_PW
+export TACACS_PW
+EOF
+```
+6. [Optional] Create alias for convenience by adding line to `.bash_profile`
+```bash
+cat >> ~/.bash_profile <<EOF
+alias cn=/path/to/cn-tool.py
+EOF
+```
+7. Start using this tool using created alias or `cn-tool.py`
+```
+cn
+```
