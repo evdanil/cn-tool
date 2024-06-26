@@ -54,7 +54,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.113 hash f41ceda'
+version = '0.1.114 hash 9fcd368'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -3960,8 +3960,8 @@ def mt_index_configurations(logger, cfg):
         for _, ip_lst, _ in results:
             for key in ip_lst:
                 ip, host = key
-                # print(ip, host, el[key])
-                merged_ip_result[ip][host] = sorted([*merged_ip_result[ip][host], *list(ip_lst[key])])
+                merged_ip_result[ip][host] = sorted(set(merged_ip_result[ip][host] + list(ip_lst[key])))
+
         cfg["ip_idx"].update(merged_ip_result)
         logger.info("Index Cache - IP Index saved...")
         del merged_ip_result
@@ -3970,7 +3970,7 @@ def mt_index_configurations(logger, cfg):
             for key in kw_lst:
                 kw, host = key
                 # print(ip, host, el[key])
-                merged_kw_result[kw][host] = sorted([*merged_kw_result[kw][host], *list(kw_lst[key])])
+                merged_kw_result[kw][host] = sorted(set(merged_kw_result[kw][host] + list(kw_lst[key])))
         cfg["kw_idx"].update(merged_kw_result)
         logger.info("Index Cache - Keyword Index saved...")
         del merged_kw_result
