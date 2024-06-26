@@ -26,7 +26,7 @@ from time import perf_counter
 from socket import gaierror, herror, timeout
 import socket
 from concurrent.futures import ThreadPoolExecutor
-
+from collections import defaultdict
 import re
 import configparser
 from argparse import RawTextHelpFormatter
@@ -54,7 +54,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.107 hash 88a1c8a'
+version = '0.1.108 hash b5412a8'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -1613,7 +1613,7 @@ def search_config(
 
         with ThreadPoolExecutor() as executor:
             futures = {
-                device: executor.submit(
+                executor.submit(
                     matched_lines,
                     logger,
                     os.path.join(folder, device),
@@ -1624,8 +1624,8 @@ def search_config(
                 )
                 for device in dir_list
             }
-            results = {device: future.result() for device, future in futures.items()}
-        for _, result in results.items():
+            results = [future.result() for future in futures]
+        for result in results:
             # result has a tuple with two lists:
             # list 1 - actual config matches
             # list 2 - matched subnets
@@ -2160,7 +2160,7 @@ def matched_lines(
                     key=lambda x: (x[0] if isinstance(x[0], int) else float("inf")),
                 )
             ]
-            
+
             data_to_save.extend(rows)
 
     return (data_to_save, matched_nets)
@@ -3962,7 +3962,7 @@ def mt_index_configurations(logger, cfg):
     if filelist:
         fn_len = len(filelist)
         processed_count = 0
-        results = {}
+        results = []
 
         # Limiting to 2 workers, but this can be changed depending on the system it runs on
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -3972,34 +3972,43 @@ def mt_index_configurations(logger, cfg):
             }
             # results = {filename: future.result() for filename, future in futures.items()}
             for filename, future in futures.items():
-                results[filename] = future.result()
+                results.append(future.result())
                 if processed_count % 100 == 0:
                     cfg["dc"].touch("indexing", expire=120)
                     logger.info(
                         f"Index Cache - {round(processed_count / fn_len * 100, 2)}% completed..."
                     )
                 processed_count += 1
-        merged_result = merge_dicts(*[item for item in results.values()])
+        # merged_result = merge_dicts(*[item for item in results.values()])
+        logger.info("Index Cache - 100% completed!")
+        logger.info("Index Cache - Saving index data...")
 
-    # logger.info(f'Results size: {sys.getsizeof(merged_result)}')
+        merged_devices = defaultdict(lambda: defaultdict)
+        merged_ip_result = defaultdict(lambda: defaultdict(list))
+        merged_kw_result = defaultdict(lambda: defaultdict(list))
+        for _, ip_lst, _ in results:
+            for key in ip_lst:
+                ip, host = key
+                # print(ip, host, el[key])
+                merged_ip_result[ip][host] = sorted([*merged_ip_result[ip][host], *list(ip_lst[key])])
+        cfg["ip_idx"].update(merged_ip_result)
+        logger.info("Index Cache - IP Index saved...")
+        del merged_ip_result
 
-    logger.info("Index Cache - 100% completed!")
-    logger.info("Index Cache - Saving index data...")
+        for _, _, kw_lst in results:
+            for key in kw_lst:
+                kw, host = key
+                # print(ip, host, el[key])
+                merged_kw_result[kw][host] = sorted([*merged_kw_result[kw][host], *list(kw_lst[key])])
+        cfg["kw_idx"].update(merged_kw_result)
+        logger.info("Index Cache - Keyword Index saved...")
+        del merged_kw_result
 
-    # import ipdb;ipdb.set_trace()
-
-    # Update global index with IP
-    cfg["ip_idx"].update(merged_result.get("ip_list", {}))
-    logger.info("Index Cache - IP Index saved...")
-    merged_result["ip_list"].clear()
-    # Update global index with key words
-    cfg["kw_idx"].update(merged_result.get("kw_list", {}))
-    logger.info("Index Cache - Keyword Index saved...")
-    merged_result["kw_list"].clear()
-    # Update global Index with new device data
-    cfg["dev_idx"].update(merged_result.get("devices", {}))
-    logger.info("Index Cache - Device Index saved...")
-    merged_result["devices"].clear()
+        for dev, _, _ in results:
+            merged_devices = merge_dicts(merged_devices, dev)
+        cfg["dev_idx"].update(merged_devices)
+        logger.info("Index Cache - Device Index saved...")
+        del merged_devices
 
     end = perf_counter()
 
@@ -4136,7 +4145,7 @@ def index_configurations(logger, cfg):
     )
 
 
-def get_device_facts(logger, cfg, hostname, region, vendor, device_type, fname):
+def get_device_facts(logger, cfg, hostname, region, vendor, device_type, fname) -> tuple:
     device = {
         "fname": fname,
         "region": region,
@@ -4145,8 +4154,8 @@ def get_device_facts(logger, cfg, hostname, region, vendor, device_type, fname):
         "updated": time(),
     }
 
-    ip_list = {}
-    kw_list = {}
+    ip_list = defaultdict(lambda: tuple([]))
+    kw_list = defaultdict(lambda: tuple([]))
 
     def process_line(index, line):
         line = line.strip()
@@ -4161,21 +4170,18 @@ def get_device_facts(logger, cfg, hostname, region, vendor, device_type, fname):
             try:
                 ip = ipaddress.ip_address(match.group())
                 if not (ip.is_multicast or ip.is_reserved or ip.compressed.startswith(("255.", "0."))):
-                    # ip_list.setdefault(ip.compressed, {}).setdefault(hostname, {})[index] = line
-                    ip_list.setdefault(int(ip), {}).setdefault(hostname, []).append(index)
+                    ip_list[(int(ipaddress.ip_address(ip)), hostname)] = ip_list[(int(ipaddress.ip_address(ip)), hostname)] + tuple([index])
             except ValueError:
                 pass
 
         for word in set(extract_keywords(line)) - set(standard_keywords.get(vendor, ())):
-            # if not re.match(ip_regexp, word):
-            # kw_list.setdefault(word, {}).setdefault(hostname, {})[index] = line
-            kw_list.setdefault(word, {}).setdefault(hostname, []).append(index)
+            kw_list[(word, hostname)] = kw_list[(word, hostname)] + tuple([index])
 
     with open(fname, "r", encoding="utf-8") as f:
         for index, line in enumerate(f):
             process_line(index, line)
 
-    return {"devices": {hostname: device}, "ip_list": ip_list, "kw_list": kw_list}
+    return ({hostname: device}, ip_list, kw_list)
 
 
 # @measure_execution_time
