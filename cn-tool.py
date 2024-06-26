@@ -54,7 +54,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.108 hash b5412a8'
+version = '0.1.109 hash d4681e2'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -3519,15 +3519,6 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
         else:
             common_search_results.append([network, "No match"])
 
-    # Print all data
-    # print_data = [dict(zip(columns, row)) for row in data_combined]
-    # import ipdb; ipdb.set_trace()
-    # print_table_data(
-    # logger,
-    # {'Subnet': print_data},
-    # suffix={"Subnet": "Information"},
-    # )
-
     # save data
     with console.status(
         f'Saving data to {cfg["report_filename"]}...', spinner="dots12"
@@ -3648,17 +3639,13 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
                 if proc.poll() is not None:
                     # remove from the process list
                     del p[host]
-                    # console.print(host, proc)
                     if proc.returncode == 0:
-                        # console.print('%s active' % host)
                         results["Bulk PING"].append({"Host": f"{host}", "Result": "OK"})
                     elif proc.returncode == 1:
-                        # console.print('%s no response' % host)
                         results["Bulk PING"].append(
                             {"Host": f"{host}", "Result": "NO RESPONSE"}
                         )
                     else:
-                        # console.print('%s error' % host)
                         results["Bulk PING"].append(
                             {"Host": f"{host}", "Result": "ERROR"}
                         )
@@ -3855,23 +3842,7 @@ def remove_duplicate_rows_sorted_by_col(data, col):
             seen.add(sublist_tuple)
             result.append(sublist)
     # Sort the result list based on col value
-    result.sort(key=lambda sublist: sublist[col])  
-    return result
-
-
-def merge_dicts(*dicts):
-    def merge_two(a, b):
-        for key in b:
-            if key in a:
-                if isinstance(a[key], dict) and isinstance(b[key], dict):
-                    merge_two(a[key], b[key])
-            else:
-                a[key] = b[key]
-        return a
-
-    result = {}
-    for d in dicts:
-        merge_two(result, d)
+    result.sort(key=lambda sublist: sublist[col])
     return result
 
 
@@ -3900,7 +3871,7 @@ def extract_keywords(text):
     return keywords
 
 
-def get_facts_helper(logger: logging.Logger, cfg: dict, filename: str) -> dict:
+def get_facts_helper(logger: logging.Logger, cfg: dict, filename: str) -> tuple:
     """
     Function is a helper to run get_device_config in Multithreaded fashion
     """
@@ -3966,12 +3937,12 @@ def mt_index_configurations(logger, cfg):
 
         # Limiting to 2 workers, but this can be changed depending on the system it runs on
         with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                filename: executor.submit(get_facts_helper, logger, cfg, filename)
+            futures = (
+                executor.submit(get_facts_helper, logger, cfg, filename)
                 for filename in filelist
-            }
+            )
             # results = {filename: future.result() for filename, future in futures.items()}
-            for filename, future in futures.items():
+            for future in futures:
                 results.append(future.result())
                 if processed_count % 100 == 0:
                     cfg["dc"].touch("indexing", expire=120)
@@ -4005,7 +3976,7 @@ def mt_index_configurations(logger, cfg):
         del merged_kw_result
 
         for dev, _, _ in results:
-            merged_devices = merge_dicts(merged_devices, dev)
+            merged_devices.update(dev)
         cfg["dev_idx"].update(merged_devices)
         logger.info("Index Cache - Device Index saved...")
         del merged_devices
@@ -4024,121 +3995,6 @@ def mt_index_configurations(logger, cfg):
     # Remove indexing flag
     cfg["dc"].pop("indexing", None)
 
-    logger.info(f"Index Cache - Processing Time: {round(end-start, 2)} seconds")
-    logger.info(
-        f'Index Cache - Version: {cache_version} Devices: {len(cfg["dev_idx"])}, IP Addresses: {len(cfg["ip_idx"])}, Words:{len(cfg["kw_idx"])}'
-    )
-
-
-# @measure_execution_time
-def index_configurations(logger, cfg):
-    """Indexes configuration files and stores IP addresses and keywords in DiskCache"""
-
-    filelist = []
-
-    devices_local = {}
-    ip_list_local = {}
-    keywords_local = {}
-    # Skip indexing by default
-    skip_indexing = True
-
-    start = perf_counter()
-
-    # Set indexing flag, other instances should avoid writing/indexing if flag is set
-    cfg["dc"].set("indexing", True, expire=120)
-    # Set updated to 0 to force fallback to old search method as cache might be inconsistent during indexing
-    cfg["dc"].set("updated", 0)
-
-    for folder in make_dir_list(logger, cfg):
-        fn_list = os.listdir(folder)
-        filelist.extend([f"{folder}/{f}" for f in fn_list if f.endswith(".cfg")])
-
-    for filename in filelist:
-        hostname = filename.split("/")[7][:-4]
-        updated_time = cfg["dev_idx"].get(hostname, {}).get("updated", 0)
-        creation_time = os.path.getctime(filename)
-        if creation_time - updated_time >= 0:
-            skip_indexing = False
-
-    if skip_indexing:
-        logger.info("Index Cache - No configuration changes found...")
-        cfg["dc"].pop("indexing", None)
-        cfg["dc"].set("updated", time())
-        return
-    elif len(cfg["dev_idx"]) > 0:
-        logger.info("Index Cache - Configuration repository updated. Indexing data...")
-        cfg["ip_idx"].clear()
-        cfg["kw_idx"].clear()
-        cfg["dev_idx"].clear()
-    else:
-        pass
-
-    for n, filename in enumerate(filelist):
-        # Update indexing flag every 100s device
-        if n % 100 == 0:
-            cfg["dc"].touch("indexing", expire=120)
-            logger.info(
-                f"Index Cache - {round(n / len(filelist) * 100, 2)}% completed..."
-            )
-
-        parts = filename.split("/")
-        vendor = str(parts[4]).capitalize()
-        device_type = str(parts[5]).upper()
-        region = str(parts[6]).upper()
-        # filename without .cfg - equals hostname
-        hostname = parts[7][:-4].lower()
-
-        data = get_device_facts(
-            logger, cfg, hostname, region, vendor, device_type, filename
-        )
-
-        logger.debug(f"Index Cache - Building {hostname.upper()} index data...")
-        # Update Indexes with received data
-        for ip_key, ip_data in data["ip_list"].items():
-            ip_list_local.setdefault(ip_key, {}).update(
-                cfg["ip_idx"].get(ip_key, {})
-            )
-            ip_list_local[ip_key].update(ip_data)
-
-        for word_key, word_data in data["kw_list"].items():
-            keywords_local.setdefault(word_key, {}).update(
-                cfg["kw_idx"].get(word_key, {})
-            )
-            keywords_local[word_key].update(word_data)
-        # Update device Index with device info
-        devices_local.setdefault(hostname, {}).update(
-            cfg["dev_idx"].get(hostname, {})
-        )
-        devices_local[hostname].update(data.get("device"))
-
-    logger.info("Index Cache - 100% completed!")
-    logger.info("Index Cache - Saving index data...")
-    # Update global index with IP
-    if ip_list_local:
-        cfg["ip_idx"].update(ip_list_local)
-    # Update global index with key words
-    if keywords_local:
-        cfg["kw_idx"].update(keywords_local)
-
-    # Update global Index with new device data
-    if devices_local:
-        cfg["dev_idx"].update(devices_local)
-        # logger.info(f'Index Cache - Indexed directory {folder}')
-        logger.info(f"Index Cache - Indexed {len(devices_local)} devices")
-        logger.info(f"Index Cache - Indexed {len(ip_list_local)} IP addresses")
-        logger.info(f"Index Cache - Indexed {len(keywords_local)} keywords")
-
-    end = perf_counter()
-
-    # Set last update time in diskcache
-    cfg["dc"].set("updated", time())
-
-    # Set/Update cache version to current release
-    if cfg["dc"].get("version", 0) != cache_version:
-        cfg["dc"].set("version", cache_version)
-
-    # Remove indexing flag
-    cfg["dc"].pop("indexing", None)
     logger.info(f"Index Cache - Processing Time: {round(end-start, 2)} seconds")
     logger.info(
         f'Index Cache - Version: {cache_version} Devices: {len(cfg["dev_idx"])}, IP Addresses: {len(cfg["ip_idx"])}, Words:{len(cfg["kw_idx"])}'
