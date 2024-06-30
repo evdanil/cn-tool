@@ -45,6 +45,7 @@ import subprocess
 from subprocess import Popen, DEVNULL, STDOUT
 from datetime import datetime, timedelta
 from diskcache import FanoutCache, JSONDisk
+from queue import Queue
 import threading
 from time import time
 
@@ -54,7 +55,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.114 hash 9fcd368'
+version = '0.1.115 hash 88c8348'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -62,6 +63,11 @@ cache_version = 2
 # Disable SSL self-signed cert warnings, comment out line below if Infoblox
 # deployment uses proper certificate
 urllib3.disable_warnings()
+
+# Adding another thread to save data into xlsx in the background
+save_queue = Queue()
+save_lock = threading.Lock()
+worker_thread = None
 
 
 class ThreadSafeFileHandler(logging.FileHandler):
@@ -1360,6 +1366,46 @@ subnet_regexp = re.compile(
 )
 
 
+def worker():
+    """
+    Thread waiting for data to get saved in a report file (whatever received as args,kwargs passed into append_df_to_excel)
+    """
+    while True:
+        save_task = save_queue.get()
+        with save_lock:
+            append_df_to_excel(*save_task['args'], **save_task['kwargs'])
+        save_queue.task_done()
+
+
+def start_worker():
+    """
+    Start the file saving thread
+    """
+    global worker_thread
+    if worker_thread is None or not worker_thread.is_alive():
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
+
+
+def queue_save(*args, **kwargs):
+    """
+    Queing received data for saving thread to process
+    """
+    start_worker()
+    save_task = {
+        'args': args,
+        'kwargs': kwargs
+    }
+    save_queue.put(save_task)
+
+
+def wait_for_all_saves():
+    """
+    Waiting for all saving tasks to finish here
+    """
+    save_queue.join()
+
+
 def yieldlines(thefile, whatlines):
     return ((i, x) for i, x in enumerate(thefile) if i in whatlines)
 
@@ -1997,7 +2043,8 @@ def save_found_data(
                 columns = ["Search Terms", "Subnet", "Status"]
             # Saving Missed Subnet Data first
             if save_nets_data:
-                append_df_to_excel(
+                # append_df_to_excel(
+                queue_save(
                     logger,
                     cfg["report_filename"],
                     columns,
@@ -2020,7 +2067,8 @@ def save_found_data(
             for search_input, device, index, line, _ in data
         ]
         # Saving Check data
-        append_df_to_excel(
+        # append_df_to_excel(
+        queue_save(
             logger,
             cfg["report_filename"],
             columns,
@@ -2060,7 +2108,8 @@ def save_found_data(
                 continue
             with open(fname, "r", encoding="utf-8") as f:
                 file_content = f.readlines()
-                append_df_to_excel(
+                queue_save(
+                # append_df_to_excel(
                     logger,
                     cfg["report_filename"],
                     columns=None,
@@ -2229,13 +2278,13 @@ def append_df_to_excel(
     if not check_file_accessibility(filename, logger):
         # Log report creation
         logger.info(f"Export - Report {filename} doesn't exist - creating...")
-
         df.to_excel(
             filename,
             sheet_name=sheet_name,
             startrow=startrow if startrow is not None else 0,
             **to_excel_kwargs,
         )
+
         # Log success
         logger.info(f"Export - {filename} - created successfully")
 
@@ -2492,6 +2541,11 @@ def exit_now(logger: logging.Logger, cfg: dict = None, exit_code: int = 0) -> No
 
     @return: exit_code
     """
+    if worker_thread:
+        logger.info("Closing report file...")
+        console.print("[green]Closing report file...[/green]")
+        wait_for_all_saves()
+    
     if not exit_code:
         logger.info("Terminating by user request - Have a nice day!")
         console.print("[green]Have a nice day![/green] :smiley:")
@@ -2943,7 +2997,8 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
                     [str(ip), "No Information"] for ip in missing_ip_addresses
                 ]
                 # Saving IP Data with missed IPs first
-                append_df_to_excel(
+                queue_save(
+                # append_df_to_excel(
                     logger,
                     cfg["report_filename"],
                     ["IP", "Status"],
@@ -2955,7 +3010,8 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
 
             # Saving IP Data with found IP information
             if len(save_data_all) > 0:
-                append_df_to_excel(
+                queue_save(
+                # append_df_to_excel(
                     logger,
                     cfg["report_filename"],
                     columns,
@@ -3044,7 +3100,8 @@ def fqdn_request(logger: logging.Logger, cfg: dict) -> None:
             for fqdn in processed_data["fqdn"]:
                 save_data.append([value for value in fqdn.values()])
 
-            append_df_to_excel(
+            # append_df_to_excel(
+            queue_save(
                 logger,
                 cfg["report_filename"],
                 columns,
@@ -3158,7 +3215,8 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
         for subnet in processed_data["location"]:
             save_data.append([value for value in subnet.values()])
 
-        append_df_to_excel(
+        # append_df_to_excel(
+        queue_save(
             logger,
             cfg["report_filename"],
             columns,
@@ -3525,7 +3583,8 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
     ):
         if cfg["auto_save"]:
             # Save general data
-            append_df_to_excel(
+            queue_save(
+            # append_df_to_excel(
                 logger,
                 cfg["report_filename"],
                 columns_common,
@@ -3536,7 +3595,8 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
             )
             # Save main data
             if len(data_combined) > 0:
-                append_df_to_excel(
+                queue_save(
+                # append_df_to_excel(
                     logger,
                     cfg["report_filename"],
                     columns,
@@ -3671,7 +3731,8 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
             for ping_result in sorted_results["Bulk PING"]:
                 save_data.append([ping_result["Host"], ping_result["Result"]])
 
-            append_df_to_excel(
+            queue_save(
+            # append_df_to_excel(
                 logger,
                 cfg["report_filename"],
                 columns,
@@ -3811,7 +3872,8 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
             for ip_result in results["Bulk IP Lookup"]:
                 save_data.append([ip_result["IP"], ip_result["Name"]])
 
-            append_df_to_excel(
+            queue_save(
+            # append_df_to_excel(
                 logger,
                 cfg["report_filename"],
                 columns,
@@ -4511,6 +4573,9 @@ Please send any feedback/feature requests to evdanil@gmail.com
             True  # Allow the main program to exit even if the thread is still running
         )
         thread.start()
+
+    # Start thread responsible for saving report files
+    start_worker()
 
     while choice != "0":
         console.clear()
