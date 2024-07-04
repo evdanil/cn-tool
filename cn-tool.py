@@ -51,7 +51,7 @@ from diskcache import FanoutCache, JSONDisk
 from queue import Queue
 import threading
 from time import time
-from netmiko import ConnLogOnly
+from netmiko import ConnLogOnly, SSHDetect
 
 # Fix MAC address emoji issue
 from rich._emoji_codes import EMOJI
@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.118 hash 75773b3'
+version = '0.1.119 hash c518565'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -2985,16 +2985,28 @@ def process_device_commands(logger: logging.Logger, cfg: dict, device: str, cmd_
         device = dns_name
 
     output = {}
-    # with console.status(f"Interrogating [bright_green]{device}[/]...", spinner="dots12"):
-    username = session.auth[0]
-    password = session.auth[1]
-    conn = ConnLogOnly(
-        device_type=type, host=device, username=username, password=password, secret='', log_level=cfg["log_level_str"]
-        )
+
+    dev = {
+        "device_type": "autodetect",
+        "host": device,
+        "username": session.auth[0],
+        "password": session.auth[1],
+        "secret": ''
+        }
+
+    guesser = SSHDetect(**dev)
+    dev["device_type"] = guesser.autodetect()
+
+    if "cisco" not in dev["device_type"]:
+        logger.info(f'{device} - [yellow bold]Not supported device type![/]')
+        return {device: 'Not supported device type'}
+
+    conn = ConnLogOnly(**dev)
+
     if conn is None:
         # console.print(f'{device} - [yellow bold]Unable to connect![/]')
         logger.info(f'{device} - Unable to connect!')
-        return {}
+        return {device: 'Unable to connect'}
 
     for cmd_key, funcs in cmd_list.items():
         data = conn.send_command(f"{cmd_key.replace('_', ' ')}\n", auto_find_prompt=True)
@@ -5320,6 +5332,7 @@ Features:
 - Saves all requested information for later information processing(by default `report.xlsx` in $HOME directory)
 - Keeps log of requests/responses(by default `cn.log` in $HOME directory)
 - Can be easily configured by creating/changing configuration file(by default `.cn` in $HOME directory)
+- Supports several color themes (default, monochrome, pastel, dark)
 
 Useful tips:
 
@@ -5375,10 +5388,13 @@ Please send any feedback/feature requests to evdanil@gmail.com
         help="specify configuration file(default $HOME/.cn)",
     )
     parser.add_argument(
-        "-l", "--log-file", help="specify logfile(default $HOME/cn.log)"
+        "-nc", "--no-cache", action="store_true", help="run without cache use"
     )
     parser.add_argument(
-        "-nc", "--no-cache", action="store_true", help="run without cache use"
+        "-t", "--theme", help="color theme: default, monochrome, pastel, dark"
+    )
+    parser.add_argument(
+        "-l", "--log-file", help="specify logfile(default $HOME/cn.log)"
     )
     parser.add_argument(
         "-r", "--report-file", help="report filename(default $HOME/report.xlsx)"
@@ -5397,10 +5413,6 @@ Please send any feedback/feature requests to evdanil@gmail.com
     # Read configuration
     cfg = read_config(cfg, os.path.expanduser(args.config))
 
-    # Set color theme
-    set_global_color_scheme(cfg["theme"])
-    # set_global_color_scheme("pastel")
-
     # Overwrite config values with values from args
     if args.report_file and args.report_file != cfg["report_filename"]:
         cfg["report_filename"] = os.path.expanduser(args.report_file)
@@ -5418,10 +5430,18 @@ Please send any feedback/feature requests to evdanil@gmail.com
     cfg["log_level"] = logging.getLevelName(cfg["log_level_str"].upper())
     logger = configure_logging(cfg["logfile_location"], cfg["log_level"])
 
+    if args.theme and args.theme in ['default', 'monochrome', 'pastel', 'dark']:
+        cfg["theme"] = args.theme
+    else:
+        console.print('Please specify one of the correct themes: default, monochrome, pastel or dark')
+        exit_now(logger, 0, f"Wrong color theme as argument {args.theme}")
+
     # TODO add support for xls output format in parallel to console
     logger.info(
-        f'cn-tool v{version} - api_endpoint: {cfg["api_endpoint"]} config_file: {args.config}'
+        f'cn-tool v{version} - api_endpoint: {cfg["api_endpoint"]} config_file: {args.config} color theme: {cfg["theme"]}'
     )
+    # Set color theme
+    set_global_color_scheme(cfg["theme"])
 
     # Auth tuple
     session.auth = get_auth_creds(logger, cfg)
