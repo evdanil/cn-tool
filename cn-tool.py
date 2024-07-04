@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.120 hash f5a3e33'
+version = '0.1.121 hash adc2c28'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -2891,10 +2891,10 @@ def process_device_data(logger: logging.Logger, cfg: dict, device_name: str, dat
     rows = []
     base_info = {
         'Device Name': device_name,
-        'Software Version': data['show_version'].get('Software Version', ''),
-        'Software Image': data['show_version'].get('Software Image', ''),
-        'Uptime': data['show_version'].get('Uptime', ''),
-        'Serial Number': data['show_version'].get('Serial Number', ''),
+        'Software Version': data.get('show_version', {}).get('Software Version', ''),
+        'Software Image': data.get('show_version', {}).get('Software Image', ''),
+        'Uptime': data.get('show_version', {}).get('Uptime', ''),
+        'Serial Number': data.get('show_version', {}).get('Serial Number', ''),
         'Product ID (PID)': '',
         'Stack Role': 'N/A',
         'Parent Device Name': None,
