@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.119 hash c518565'
+version = '0.1.120 hash f5a3e33'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -3456,15 +3456,19 @@ def exit_now(logger: logging.Logger, cfg: dict = {}, exit_code: int = 0, message
 
     if worker_thread:
         logger.info("Closing report file...")
-        console.print(f"[{colors['success']}]Closing report file...[/]")
-        wait_for_all_saves()
+        with console.status(f"[{colors['success']}]Closing report file... Please do not interrupt... [/]"):
+            wait_for_all_saves()
 
     if not exit_code:
         console.print(f"[{colors['success']}]Have a nice day![/] :smiley:")
         logger.info("Terminating by user request - Have a nice day!")
-    else:
+    elif exit_code == 1:
         console.print(f"[{colors['error']}]{message}[/]")
         logger.info("Abnormal termination - Hoping for a patch!")
+    else:
+        exit_code = 0
+        console.print(f"{message}")
+        logger.info("Terminating by user request - Have a nice day!")
 
     exit(exit_code)
 
@@ -5430,11 +5434,12 @@ Please send any feedback/feature requests to evdanil@gmail.com
     cfg["log_level"] = logging.getLevelName(cfg["log_level_str"].upper())
     logger = configure_logging(cfg["logfile_location"], cfg["log_level"])
 
-    if args.theme and args.theme in ['default', 'monochrome', 'pastel', 'dark']:
-        cfg["theme"] = args.theme
-    else:
-        console.print('Please specify one of the correct themes: default, monochrome, pastel or dark')
-        exit_now(logger, 0, f"Wrong color theme as argument {args.theme}")
+    if args.theme:
+        if args.theme in ['default', 'monochrome', 'pastel', 'dark']:
+            cfg["theme"] = args.theme
+        else:
+            console.print('Please specify one of the correct themes: default, monochrome, pastel or dark')
+            exit_now(logger, cfg, 2, f"Wrong color theme as argument - {args.theme}")
 
     # TODO add support for xls output format in parallel to console
     logger.info(
