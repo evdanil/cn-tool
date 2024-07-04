@@ -24,3 +24,7 @@
 [cache]
 #directory = ~/.cn-cache
 #enabled = True
+
+[theme]
+#Supported themes: default, monochrome, pastel, dark
+#theme=default
