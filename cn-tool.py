@@ -20,10 +20,10 @@ import json
 import sys
 import termios
 import tty
-
+from itertools import cycle
 # from operator import itemgetter
 from time import perf_counter
-from socket import gaierror, herror, timeout
+from socket import gaierror, herror, timeout, gethostbyaddr
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
@@ -38,9 +38,12 @@ from requests.exceptions import HTTPError, Timeout, RequestException, MissingSch
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import urllib3
-from rich.console import Console
+from rich.console import Console, Group
 from rich.table import Table
 from rich import box
+from rich.style import Style
+from rich.panel import Panel
+from rich.theme import Theme
 import subprocess
 from subprocess import Popen, DEVNULL, STDOUT
 from datetime import datetime, timedelta
@@ -48,6 +51,7 @@ from diskcache import FanoutCache, JSONDisk
 from queue import Queue
 import threading
 from time import time
+from netmiko import ConnLogOnly
 
 # Fix MAC address emoji issue
 from rich._emoji_codes import EMOJI
@@ -55,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.115 hash 88c8348'
+version = '0.1.116 hash 12db1b6'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -79,6 +83,169 @@ class ThreadSafeFileHandler(logging.FileHandler):
         with self._lock:
             super().emit(record)
 
+
+COLOR_SCHEMES = {
+    "default": {
+        "title": "bold #FF69B4",  # Hot Pink
+        "header": "bold #00CED1",  # Dark Turquoise
+        "hostname": "#20B2AA",  # Light Sea Green
+        "sn": "#32CD32",  # Lime Green
+        "type": "#4169E1",  # Royal Blue
+        "pid": "#FFD700",  # Gold
+        "status": "#DA70D6",  # Orchid
+        "date": "#40E0D0",  # Turquoise
+        "export": "#FF6347",  # Tomato
+        "code": "#3CB371",  # Medium Sea Green
+        "license_name": "#1E90FF",  # Dodger Blue
+        "license_full": "#00FFFF",  # Cyan
+        "description": "#F0E68C",  # Khaki
+        "reserved": "#DDA0DD",  # Plum
+        "enforcement": "#DC143C",  # Crimson
+        "auth_type": "#2E8B57",  # Sea Green
+        "license_type": "#4682B4",  # Steel Blue
+        "start_date": "#5F9EA0",  # Cadet Blue
+        "end_date": "#BDB76B",  # Dark Khaki
+        "term_count": "#BA55D3",  # Medium Orchid
+        "license": "#228B22",  # Forest Green
+        "tag": "#DAA520",  # Goldenrod
+        "count": "#0000CD",  # Medium Blue
+        "feature": "#48D1CC",  # Medium Turquoise
+        "value": "#F4A460",  # Sandy Brown
+        "success": "#2E8B57",  # Sea Green
+        "warning": "#FFA500",  # Orange
+        "error": "#B22222",  # Firebrick
+        "info": "#4682B4",  # Steel Blue
+        "default": "#D2691E",  # Chocolate
+        "red": "#DC143C",  # Crimson
+        "green": "#228B22",  # Forest Green
+        "yellow": "#FFD700",  # Gold
+        "blue": "#4169E1",  # Royal Blue
+        "magenta": "#FF00FF",  # Magenta
+        "cyan": "#00CED1",  # Dark Turquoise
+        "white": "#F0F8FF",  # Alice Blue
+        "bold": "bold"
+    },
+    "monochrome": {
+        "title": "bold #FFFFFF",  # Pure White
+        "header": "bold #E0E0E0",  # Light Gray
+        "hostname": "#D3D3D3",  # Light Gray
+        "sn": "#C0C0C0",  # Silver
+        "type": "#A9A9A9",  # Dark Gray
+        "pid": "#DCDCDC",  # Gainsboro
+        "status": "#F5F5F5",  # White Smoke
+        "date": "#E8E8E8",
+        "export": "#B8B8B8",
+        "code": "#D9D9D9",
+        "license_name": "#CFCFCF",
+        "license_full": "#EBEBEB",
+        "description": "#C8C8C8",
+        "reserved": "#DBDBDB",
+        "enforcement": "#BDBDBD",
+        "auth_type": "#DEDEDE",
+        "license_type": "#E3E3E3",
+        "start_date": "#F0F0F0",
+        "end_date": "#F8F8F8",
+        "term_count": "#E6E6E6",
+        "license": "#D6D6D6",
+        "tag": "#CCCCCC",
+        "count": "#EFEFEF",
+        "feature": "#FAFAFA",
+        "value": "#F2F2F2",
+        "success": "#EAEAEA",
+        "warning": "#DFDFDF",
+        "error": "#C6C6C6",
+        "info": "#EDEDED",
+        "default": "#D0D0D0",
+        "red": "#B0B0B0",
+        "green": "#BEBEBE",
+        "yellow": "#CDCDCD",
+        "blue": "#DADADA",
+        "magenta": "#E9E9E9",
+        "cyan": "#F7F7F7",
+        "white": "#FFFFFF",  # Pure White
+        "bold": "bold"
+    },
+    "pastel": {
+        "title": "bold #87CEFA",  # Light Sky Blue
+        "header": "bold #98FB98",  # Pale Green
+        "hostname": "#DDA0DD",  # Plum
+        "sn": "#90EE90",  # Light Green
+        "type": "#ADD8E6",  # Light Blue
+        "pid": "#F0E68C",  # Khaki
+        "status": "#E0FFFF",  # Light Cyan
+        "date": "#FFB6C1",  # Light Pink
+        "export": "#FFA07A",  # Light Salmon
+        "code": "#98FB98",  # Pale Green
+        "license_name": "#87CEFA",  # Light Sky Blue
+        "license_full": "#E0FFFF",  # Light Cyan
+        "description": "#FAFAD2",  # Light Goldenrod Yellow
+        "reserved": "#D8BFD8",  # Thistle
+        "enforcement": "#FFA07A",  # Light Salmon
+        "auth_type": "#90EE90",  # Light Green
+        "license_type": "#ADD8E6",  # Light Blue
+        "start_date": "#AFEEEE",  # Pale Turquoise
+        "end_date": "#FFFACD",  # Lemon Chiffon
+        "term_count": "#DDA0DD",  # Plum
+        "license": "#98FB98",  # Pale Green
+        "tag": "#F0E68C",  # Khaki
+        "count": "#ADD8E6",  # Light Blue
+        "feature": "#E0FFFF",  # Light Cyan
+        "value": "#FFF5EE",  # Seashell
+        "success": "#90EE90",  # Light Green
+        "warning": "#FAFAD2",  # Light Goldenrod Yellow
+        "error": "#FFA07A",  # Light Salmon
+        "info": "#E6E6FA",  # Lavender
+        "default": "#FFF5EE",  # Seashell
+        "red": "#FFA07A",  # Light Salmon
+        "green": "#98FB98",  # Pale Green
+        "yellow": "#F0E68C",  # Khaki
+        "blue": "#ADD8E6",  # Light Blue
+        "magenta": "#DDA0DD",  # Plum
+        "cyan": "#E0FFFF",  # Light Cyan
+        "white": "#FFF5EE",  # Seashell
+        "bold": "bold"
+    },
+    "dark": {
+        "title": "bold #E0FFFF",  # Light Cyan
+        "header": "bold #00CED1",  # Dark Turquoise
+        "hostname": "#20B2AA",  # Light Sea Green
+        "sn": "#32CD32",  # Lime Green
+        "type": "#4169E1",  # Royal Blue
+        "pid": "#DAA520",  # Goldenrod
+        "status": "#9370DB",  # Medium Purple
+        "date": "#40E0D0",  # Turquoise
+        "export": "#B22222",  # Firebrick
+        "code": "#2E8B57",  # Sea Green
+        "license_name": "#4682B4",  # Steel Blue
+        "license_full": "#008B8B",  # Dark Cyan
+        "description": "#CD853F",  # Peru
+        "reserved": "#8A2BE2",  # Blue Violet
+        "enforcement": "#8B0000",  # Dark Red
+        "auth_type": "#006400",  # Dark Green
+        "license_type": "#00008B",  # Dark Blue
+        "start_date": "#008080",  # Teal
+        "end_date": "#BDB76B",  # Dark Khaki
+        "term_count": "#9932CC",  # Dark Orchid
+        "license": "#228B22",  # Forest Green
+        "tag": "#B8860B",  # Dark Goldenrod
+        "count": "#0000CD",  # Medium Blue
+        "feature": "#20B2AA",  # Light Sea Green
+        "value": "#A9A9A9",  # Dark Gray
+        "success": "#3CB371",  # Medium Sea Green
+        "warning": "#FF8C00",  # Dark Orange
+        "error": "#DC143C",  # Crimson
+        "info": "#4682B4",  # Steel Blue
+        "default": "#D2691E",  # Chocolate
+        "red": "#B22222",  # Firebrick
+        "green": "#228B22",  # Forest Green
+        "yellow": "#DAA520",  # Goldenrod
+        "blue": "#4169E1",  # Royal Blue
+        "magenta": "#8A2BE2",  # Blue Violet
+        "cyan": "#008B8B",  # Dark Cyan
+        "white": "#D3D3D3",  # Light Gray
+        "bold": "bold"
+    }
+}
 
 stop_words = {
     "bluecoat": (
@@ -1340,7 +1507,42 @@ standard_keywords = {
 }
 
 
-console = Console()
+class ThemedConsole:
+    def __init__(self, color_scheme="default"):
+        self.set_color_scheme(color_scheme)
+
+    def set_color_scheme(self, color_scheme):
+        if color_scheme not in COLOR_SCHEMES:
+            print(f"Warning: Unknown color scheme '{color_scheme}'. Using default.")
+            color_scheme = "default"
+
+        self.color_scheme = color_scheme
+        self.colors = COLOR_SCHEMES[color_scheme]
+
+        # Create a custom theme that maps all color names to our scheme
+        theme_styles = {}
+        for color in ["red", "green", "yellow", "blue", "magenta", "cyan", "white"]:
+            theme_styles[color] = Style(color=self.colors.get(color, color))
+
+        # Add special styles
+        theme_styles["bold"] = Style(bold=True)
+
+        self.theme = Theme(theme_styles)
+        self.console = Console(theme=self.theme)
+
+    def print(self, *objects, sep=" ", end="\n", style=None, **kwargs):
+        if style:
+            style = self.colors.get(style, style)
+        self.console.print(*objects, sep=sep, end=end, style=style, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.console, name)
+
+    # def __setattr__(self, name, *args, **kwargs):
+    #     return setattr(self.console, name, *args, **kwargs)
+
+
+console = ThemedConsole()
 
 # Define session object to handle all https requests
 # Handle rate-limit and server errors
@@ -1445,8 +1647,7 @@ def interrupt_handler(logger: logging.Logger, signum: int, frame: any) -> None:
     if isinstance(logger, logging.Logger):
         logger.info(f"CTRL-C Interrupt({signum}) - Terminating... Stack:{frame}")
 
-    console.print("[red bold]Interrupted... Exiting...[/red bold]")
-    exit_now(logger, exit_code=1)
+    exit_now(logger, exit_code=1, message="Interrupted... Exiting...")
 
 
 def read_single_keypress():
@@ -1513,6 +1714,7 @@ def read_config(cfg: dict, config_file: str = ".cn") -> dict:
                 config.get("cache", "directory", fallback=cfg["cache_directory"])
             ),
             "cache": config.get("cache", "enabled", fallback=cfg["cache"]),
+            "theme": config.get("theme", "theme", fallback=cfg["theme"]),
         }
     else:
         read_cfg = cfg
@@ -1553,7 +1755,7 @@ def data_to_dict(column_names: list, data: list) -> dict:
     return result_dict
 
 
-def print_search_config_data(data: list) -> None:
+def print_search_config_data(data: list, color_scheme: str = "default") -> None:
     """
     Prints the configuration search data in a formatted manner.
     Sort the data array based on the device name and line number, then prints out data per device.
@@ -1566,6 +1768,12 @@ def print_search_config_data(data: list) -> None:
     if len(data) == 0:
         # Nothing to print
         return
+
+    if color_scheme not in COLOR_SCHEMES:
+        # print(f"Warning: Unknown color scheme '{color_scheme}'. Using default.")
+        color_scheme = "default"
+
+    colors = COLOR_SCHEMES[color_scheme]
 
     data.sort(key=lambda x: (x[1], x[2]))
 
@@ -1580,13 +1788,14 @@ def print_search_config_data(data: list) -> None:
         if device != current_device:
             current_device = device
             current_line = line_number
-            console.print(f"\n[purple bold]Device {current_device}[/purple bold]:")
-            console.print(f"[yellow bold]Line[/yellow bold] {current_line}:")
+            console.print(f"\n[{colors['title']}]Device {current_device}[/]:", highlight=False)
+            console.print(f"[{colors['header']}]Line {current_line}:[/]", highlight=False)
         elif line_number - current_line >= 100:
             current_line = line_number
-            console.print(f"\n[yellow bold]Line[/yellow bold] {current_line}:")
 
-        console.print(line)
+            console.print(f"\n[{colors['header']}]Line {current_line}:[/]", highlight=False)
+
+        console.print(f"[{colors['value']}]{line}[/]", highlight=False)
     console.print("\n")
 
     return
@@ -1644,6 +1853,7 @@ def search_config(
 
     @return None
     """
+    colors = get_global_color_scheme(cfg)
 
     data_to_save = []
     matched_nets = set()
@@ -1652,8 +1862,8 @@ def search_config(
     vendor = str(parts[4]).capitalize()
     device_type = str(parts[5]).upper()
     region = str(parts[6]).upper()
-    with console.status(
-        f"[yellow]Searching through [green bold]{vendor}/{device_type}[/green bold] configurations in [green bold]{region}[/green bold] region...[/]",
+    with console.status(  
+        f"[{colors['description']}]Searching through [{colors['type']}]{vendor.upper()}/{device_type}[/] configurations in [{colors['hostname']}]{region}[/] region...[/]",
         spinner="dots12",
     ):
 
@@ -1698,18 +1908,20 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
 
     @return None
     """
+    colors = get_global_color_scheme(cfg)
+
     logger.info("Configuration Repository - Search Request")
+
     console.print(
+        f"[{colors['description']}]Enter subnet([{colors['code']}]IP_ADDRESS/[MASK][/]) or keyword(regular expression), one item per line[/]\n"
+        f"[{colors['description']}]Empty input line starts the process[/]\n"
         "\n"
-        "[yellow]Enter subnet([green]IP_ADDRESS/\\[MASK][/]) or keyword(regular expression), one item per line[/]\n"
-        "[yellow]Empty input line starts the process[/]\n"
-        "\n"
-        "[magenta]Subnet Examples:[/]\n"
-        "[green bold]10.10.10.0/24[/]\n"
-        "[green bold]134.143.169.176/29[/]\n"
-        "[magenta]Keywords Regex Examples:[/]\n"
-        "[green bold]router bgp 655\\d+$[/]\n"
-        "[green bold]neighbor \\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3} description VOCUS\\s+[/]\n"
+        f"[{colors['header']}]Subnet Examples:[/]\n"
+        f"[{colors['success']} {colors['bold']}]10.10.10.0/24[/]\n"
+        f"[{colors['success']} {colors['bold']}]134.143.169.176/29[/]\n"
+        f"[{colors['header']}]Keywords Regex Examples:[/]\n"
+        f"[{colors['success']} {colors['bold']}]router bgp 655\\d+$[/]\n"
+        f"[{colors['success']} {colors['bold']}]neighbor \\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}} description VOCUS\\s+[/]\n"
     )
 
     search_input = "none"
@@ -1727,7 +1939,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
             search_input += "/32"
             validated_search_input.append(search_input)
 
-        if "/" in search_input and re.match(subnet_regexp, search_input):
+        if "/" in search_input and re.match(ip_regexp, search_input):
             # IP address with mask
             try:
                 network = ipaddress.ip_network(search_input, strict=False)
@@ -1736,7 +1948,8 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
                     f"User input - Not matching network address: {search_input}"
                 )
                 console.print(
-                    "[red]Invalid subnet format. Enter a valid subnet or IP (e.g., 192.168.1.0/24 or 192.168.1.10)[/red]"
+                    f"[{colors['error']}]Invalid subnet format.\n[/]"
+                    f"[{colors['info']}]Enter a valid subnet or IP (e.g., 192.168.1.0/24 or 192.168.1.10)[/]"
                 )
                 continue
             else:
@@ -1748,8 +1961,8 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
                 ):
                     logger.info(f"User input - Invalid subnet: {search_input}")
                     console.print(
-                        "[red]Invalid IP - multicast, broadcast and reserved subnets excluded.\n"
-                        "Enter a valid non-reserved subnet or IP (e.g., 10.10.1.0/24 or 192.168.1.10)[/red]"
+                        f"[{colors['error']}]Invalid IP - multicast, broadcast and reserved subnets excluded.[/]\n"
+                        f"[{colors['info']}]Enter a valid non-reserved subnet or IP (e.g., 10.10.1.0/24 or 192.168.1.10)[/]"
                     )
                     continue
                 if networks is None:
@@ -1760,7 +1973,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
 
         if len(search_input) < MIN_INPUT_LEN and not is_valid_site(search_input):
             logger.info(f"User input - Input keyword is too short: {search_input}")
-            console.print(f"[red]Input keyword is too short: {search_input}")
+            console.print(f"[{colors['error']}]Input keyword is too short: {search_input}[/]")
             # Skipping wrong line
             continue
 
@@ -1769,7 +1982,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
             re.compile(search_input, re.IGNORECASE)
         except re.error as e:
             logger.info(f"User input - Invalid regexp: {e}")
-            console.print(f"[red]Invalid regular expression - {e.msg}")
+            console.print(f"[{colors['error']}]Invalid regular expression - {e.msg}[/]")
             # Skipping wrong line
             continue
         else:
@@ -1792,7 +2005,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
     start = perf_counter()
 
     if cfg["cache"] and cfg["dc"].get("updated", 0) > 0:
-        with console.status('Searching...', spinner="dots12"):
+        with console.status(f"[{colors['description']}]Searching through configurations...[/]", spinner="dots12"):
             data_to_save, matched_nets = search_cache_config(
                 logger, cfg, "", networks, keyword_regexps, "\n".join(validated_search_input)
             )
@@ -1809,12 +2022,12 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
         f"Configuration Repository - Search took {round(end-start, 3)} seconds!"
     )
     console.print(
-        f"Configuration Repository - Search took {round(end-start, 3)} seconds!"
+        f"[{colors['description']}]Configuration Repository - Search took [{colors['success']}]{round(end-start, 3)}[/] seconds![/]"
     )
 
     if len(data_to_save) == 0:
         logger.info("Configuration Repository - No matches found!")
-        console.print("No matches found!")
+        console.print(f"[{colors['error']}]No matches found![/]")
         return
 
     if networks:
@@ -1823,7 +2036,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
             if str(missed_net).endswith("/32"):
                 missed_net = str(missed_net)[:-3]
             console.print(
-                f"[yellow]Subnet [green bold]{missed_net}[/green bold] - [red]No matches found[/red]"
+                f"[{colors['description']}]Subnet [{colors['hostname']}]{missed_net}[/] - [{colors['error']}]No matches found[/]"
             )
     else:
         missing_nets = None
@@ -1833,7 +2046,7 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
     # ]
     # sorted_data = sorted(data, key=itemgetter(1, 2))
     sorted_data = remove_duplicate_rows_sorted_by_col(data_to_save, 2)
-    print_search_config_data(sorted_data)
+    print_search_config_data(sorted_data, cfg["theme"])
 
     # Saving data automatically unless user requested not to (relies on global auto_save flag)
     if cfg["auto_save"]:
@@ -1855,16 +2068,17 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
 
     @return: None
     """
+    colors = get_global_color_scheme(cfg)
 
     console.print(
         "\n"
-        "[yellow bold]This request is to verify if any subnets exist on the devices for a given sitecode, subnets pulled from Infoblox matching description field[/]\n"
-        "[red bold]Always check provided results[/]\n"
-        "[yellow]Request has a limit of [red bold]50[/red bold] subnet records per site[/]\n"
-        "[yellow]Type in location site code to perform search[/]\n"
-        "[yellow]Supported site code format: [green bold]XXX, XXXXXXX, XXX-XX\\[XX][/green bold][/]\n"
-        "[magenta]Site Code Examples:[/]\n"
-        "[green bold]AMS-DC, WND-RYD[/]\n"
+        f"[{colors['warning']} {colors['bold']}]This request is to verify if any subnets exist on the devices for a given sitecode, subnets pulled from Infoblox matching description field[/]\n"
+        f"[{colors['error']} {colors['bold']}]Always check provided results[/]\n"
+        f"[{colors['description']}]Request has a limit of [{colors['error']} {colors['bold']}]50[/] subnet records per site[/]\n"
+        f"[{colors['description']}]Type in location site code to perform search[/]\n"
+        f"[{colors['description']}]Supported site code format: [{colors['success']} {colors['bold']}]XXX, XXXXXXX, XXX-XX\\[XX][/]\n"
+        f"[{colors['header']}]Site Code Examples:[/]\n"
+        f"[{colors['success']} {colors['bold']}]AMS-DC, WND-RYD[/]\n"
     )
 
     raw_input = read_user_input(logger, "Enter location site code: ").strip()
@@ -1875,7 +2089,7 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
         logger.info(f"User input - Sitecode search for {sitecode}")
     else:
         logger.info(f"User input - Incorrect site code {raw_input}")
-        console.print("[red]Incorrect site code[/red]")
+        console.print(f"[{colors['error']}]Incorrect site code[/]")
         return
 
     uri = f"network?comment:~={sitecode}&_max_results=50"
@@ -1883,7 +2097,8 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
 
     data = do_fancy_request(
         logger,
-        message=f"Fetching data for [magenta]{sitecode}[/magenta]...",
+        cfg,
+        message=f"[{colors['description']}]Fetching data for [{colors['header']}]{sitecode}[/]...[/]",
         endpoint=cfg["api_endpoint"],
         uri=uri,
     )
@@ -1894,19 +2109,20 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
 
     if len(processed_data.get("location", "")) == 0:
         logger.info("Request Type - Location Information - No information received")
-        console.print(f"[red]No [green bold]{sitecode.upper()}[/green bold] subnets registered in Infoblox[/red]")
+        console.print(f"[{colors['error']}]No [{colors['success']} {colors['bold']}]{sitecode.upper()}[/] subnets registered in Infoblox[/]")
     else:
 
-        print_table_data(logger, processed_data)
+        print_table_data(logger, cfg, processed_data)
 
-        message = f'Received {len(processed_data["location"])} subnet records registered for {sitecode}'
-        console.print(message)
-        logger.info(f"Request Type - Location Information - {message}")
+        console.print(
+            f'[{colors["description"]}]Received {len(processed_data["location"])} subnet records registered for [{colors["success"]} {colors["bold"]}]{sitecode}[/]'
+        )
+        logger.info(f"Request Type - Location Information - Received {len(processed_data['location'])} subnet records")
         logger.debug(
             f"Request Type - Location Information - Processed data {processed_data}"
         )
 
-    if read_user_input(logger, "Would you like to proceed searching configuration files(Y/N)? ").lower() != "y":
+    if read_user_input(logger, f"[{colors['warning']}]Would you like to proceed searching configuration files(Y/N)? [/]").lower() != "y":
         return
 
     # Now for each location subnet we have to perform configuration lookup, it might take longer than we expect
@@ -1930,11 +2146,11 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
 
     if len(skipped_networks) > 0:
         console.print(
-            f"[yellow bold]Site {sitecode} has reserved/mulicast networks registered in Infoblox[/]\n"
+            f"[{colors['warning']} {colors['bold']}]Site {sitecode} has reserved/mulicast networks registered in Infoblox[/]\n"
         )
         for skipped_net in skipped_networks:
             console.print(
-                f"[cyan]Skipping reserved/mulicast network: [magenta bold]{skipped_net}[/]"
+                f"[{colors['info']} {colors['bold']}]Skipping reserved/mulicast network: [{colors['header']} {colors['bold']}]{skipped_net}[/]"
             )
         console.print("\n")
 
@@ -1948,7 +2164,7 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
     search_terms.append(pattern)
 
     if cfg["cache"] and cfg["dc"].get("updated", 0) > 0:
-        with console.status('Searching...', spinner="dots12"):
+        with console.status(f"[{colors['description']}]Searching through configurations...[/]", spinner="dots12"):
             data_to_save, matched_nets = search_cache_config(
                 logger, cfg, "", networks, search_terms, search_input=sitecode
             )
@@ -1962,7 +2178,7 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
 
     end = perf_counter()
     console.print(
-        f"Configuration Repository - Search took {round(end-start, 3)} seconds!"
+         f"[{colors['description']}]Configuration Repository - Search took [{colors['success']}]{round(end-start, 3)}[/] seconds![/]"
     )
     logger.info(
         f"Configuration Repository - Search took {round(end-start, 3)} seconds!"
@@ -1970,7 +2186,7 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
 
     if len(data_to_save) == 0:
         logger.info(f"Configuration Repository - No matches for {sitecode} found!")
-        console.print("No matches found!")
+        console.print(f"[{colors['error']}]No matches found![/]")
         return
 
     missing_nets = list(set(networks) - set(matched_nets))
@@ -1979,7 +2195,7 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
             if str(missed_net).endswith("/32"):
                 missed_net = str(missed_net)[:-3]
             console.print(
-                f"[yellow]Subnet [green bold]{missed_net}[/green bold] - [red]No matches found[/red]"
+                f"[{colors['description']}]Subnet [{colors['success']} {colors['bold']}]{missed_net}[/] - [{colors['error']}]No matches found[/]"
             )
     else:
         missing_nets = None
@@ -1989,7 +2205,7 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
     # ]
     # sorted_data = sorted(data, key=itemgetter(1, 2))
     sorted_data = remove_duplicate_rows_sorted_by_col(data_to_save, 2)
-    print_search_config_data(sorted_data)
+    print_search_config_data(sorted_data, cfg["theme"])
 
     # Saving data automatically unless user requested not to (relies on global auto_save flag)
     if cfg["auto_save"]:
@@ -2019,64 +2235,57 @@ def save_found_data(
 
     logger.info(f"Configuration Search - {sheet} saving configuration matches")
 
-    with console.status(
-        f'Saving data to {cfg["report_filename"]}...', spinner="dots12"
-    ):
-        # Adding search results information about subnets
-        search_input = str(data[0][0])
-
-        if missed_nets or matched_nets:
-            missed_nets_data = [
-                [search_input, str(net), "No match"] for net in missed_nets if net
-            ]
-            matched_nets_data = [
-                [search_input, str(net), "Used"] for net in matched_nets if net
-            ]
-
-            save_nets_data = []
-            save_nets_data.extend(missed_nets_data)
-            save_nets_data.extend(matched_nets_data)
-
-            if is_valid_site(search_input):
-                columns = ["Site Code", "Subnet", "Status"]
-            else:
-                columns = ["Search Terms", "Subnet", "Status"]
-            # Saving Missed Subnet Data first
-            if save_nets_data:
-                # append_df_to_excel(
-                queue_save(
-                    logger,
-                    cfg["report_filename"],
-                    columns,
-                    save_nets_data,
-                    sheet_name=sheet,
-                    index=False,
-                    force_header=True,
-                )
-
-        # Adding hyperlinks to Line number
-        columns = ["Search Terms", "Device", "Line number", "Line"]
-        sorted_data = [
-            [
-                search_input,
-                device,
-                "=HYPERLINK(\"#'{}'!A{}\", {})".format(device, int(index) + 1, index),
-                line,
-                _,
-            ]
-            for search_input, device, index, line, _ in data
+    # Adding search results information about subnets
+    search_input = str(data[0][0])
+    if missed_nets or matched_nets:
+        missed_nets_data = [
+            [search_input, str(net), "No match"] for net in missed_nets if net
         ]
-        # Saving Check data
-        # append_df_to_excel(
-        queue_save(
-            logger,
-            cfg["report_filename"],
-            columns,
-            sorted_data,
-            sheet_name=sheet,
-            index=False,
-            force_header=True,
-        )
+        matched_nets_data = [
+            [search_input, str(net), "Used"] for net in matched_nets if net
+        ]
+        save_nets_data = []
+        save_nets_data.extend(missed_nets_data)
+        save_nets_data.extend(matched_nets_data)
+        if is_valid_site(search_input):
+            columns = ["Site Code", "Subnet", "Status"]
+        else:
+            columns = ["Search Terms", "Subnet", "Status"]
+        # Saving Missed Subnet Data first
+        if save_nets_data:
+            # append_df_to_excel(
+            queue_save(
+                logger,
+                cfg["report_filename"],
+                columns,
+                save_nets_data,
+                sheet_name=sheet,
+                index=False,
+                force_header=True,
+            )
+    # Adding hyperlinks to Line number
+    columns = ["Search Terms", "Device", "Line number", "Line"]
+    sorted_data = [
+        [
+            search_input,
+            device,
+            "=HYPERLINK(\"#'{}'!A{}\", {})".format(device, int(index) + 1, index),
+            line,
+            _,
+        ]
+        for search_input, device, index, line, _ in data
+    ]
+    # Saving Check data
+    # append_df_to_excel(
+    queue_save(
+        logger,
+        cfg["report_filename"],
+        columns,
+        sorted_data,
+        sheet_name=sheet,
+        index=False,
+        force_header=True,
+    )
 
     # Adding device configurations to the report
     # If cache exists get full filename from cache, else rely on additional column provided in sorted_data
@@ -2089,35 +2298,30 @@ def save_found_data(
         device_list = {(device_name, fname) for _, device_name, _, _, fname in data}
     # Not saving configs if we have more than 50 devices matched
     if len(device_list) > 50:
-        console.print(
+        logger.info(
             f"Too many devices({len(device_list)}) have matches, skipping report update"
         )
         return
     logger.info(f"Configuration Search - {sheet} saving device configs")
-    with console.status(
-        f'Appending device configuration to {cfg["report_filename"]}...',
-        spinner="dots12",
-    ):
 
-        for device, fname in device_list:
-            # logger.debug(f'DEBUG Saving {device}, path {fname}')
-            if fname is None:
-                logger.error(
-                    f"{device} is missing full pathname information.. unable to save"
-                )
-                continue
-            with open(fname, "r", encoding="utf-8") as f:
-                file_content = f.readlines()
-                queue_save(
-                # append_df_to_excel(
-                    logger,
-                    cfg["report_filename"],
-                    columns=None,
-                    raw_data=file_content,
-                    sheet_name=device.upper(),
-                    index=False,
-                    skip_if_exists=True,
-                )
+    for device, fname in device_list:
+        # logger.debug(f'DEBUG Saving {device}, path {fname}')
+        if fname is None:
+            logger.error(
+                f"{device} is missing full pathname information.. unable to save"
+            )
+            continue
+        with open(fname, "r", encoding="utf-8") as f:
+            file_content = f.readlines()
+            queue_save(
+                logger,
+                cfg["report_filename"],
+                columns=None,
+                raw_data=file_content,
+                sheet_name=device.upper(),
+                index=False,
+                skip_if_exists=True,
+            )
 
 
 # @measure_execution_time
@@ -2451,13 +2655,697 @@ def is_fqdn(hostname: str) -> bool:
     return all(fqdn.match(label) for label in labels)
 
 
+def parse_show_version(output: str) -> dict:
+    # This function parses 'show version' output
+
+    result = {
+        "Software Version": "",
+        "Software Image": "",
+        "Part Number": "",
+        "Uptime": "",
+        "Serial Number": "",
+        "Switches": []
+    }
+
+    # Extract Software Version
+    version_match = re.search(r'(Version|Cisco IOS XE Software, Version)\s+([\d.()]+[A-Z]?\d*)', output)
+    if version_match:
+        result["Software Version"] = version_match.group(2)
+
+    # Extract Software Image
+    image_match = re.search(r'System image file is\s+"(.+)"', output)
+    if image_match:
+        result["Software Image"] = image_match.group(1)
+
+    # Extract Uptime
+    uptime_match = re.search(r'(\S+)?\s*uptime is (.+?)(?=\n)', output)
+    if uptime_match:
+        result["Uptime"] = f"{uptime_match.group(2)}"
+
+    # Extract Serial Number
+    serial_match = re.search(r'(Processor board ID|System Serial Number\s+:)\s*(\S+)', output)
+    if serial_match:
+        result["Serial Number"] = serial_match.group(2)
+
+    return result
+
+
+def parse_show_license_reservation(output: str) -> dict:
+    # This function parses 'show license reservation' output
+
+    result = {}
+
+    # Extract License Reservation status
+    license_reservation_match = re.search(r'License reservation: (\S+)', output)
+    license_reservation = license_reservation_match.group(1) if license_reservation_match else 'UNKNOWN'
+
+    sections = output.split('Specified license reservations:')
+    overall_status = sections[0].strip()
+    license_info = sections[1].strip() if len(sections) > 1 else ''
+
+    # Parse overall status
+    for block in re.split(r'\n\s+(?=(?:Active|Standby|Member))', overall_status):
+        match = re.match(r'\s*(Active|Standby|Member): PID:([^,]+),SN:(\S+)', block)
+        if match:
+            device_type, pid, sn = match.groups()
+            device_info = {
+                'TYPE': device_type,
+                'PID': pid,
+                'SN': sn,
+                'LICENSE_RESERVATION': license_reservation,
+                'LICENSES': []
+            }
+            for line in block.split('\n')[1:]:
+                if 'Status:' in line or 'Reservation status:' in line:
+                    status_match = re.search(r'(?:Reservation )?[Ss]tatus: (.+?)(?: on (.+))?$', line)
+                    if status_match:
+                        device_info['RESERVATION_STATUS'] = status_match.group(1)
+                        device_info['RESERVATION_DATE'] = status_match.group(2) if status_match.group(2) else ''
+                elif 'Export-Controlled Functionality:' in line:
+                    device_info['EXPORT_CONTROLLED'] = line.split(':')[1].strip()
+                elif 'Last Confirmation code:' in line:
+                    device_info['CONFIRMATION_CODE'] = line.split(':')[1].strip()
+            result[sn] = device_info
+
+    # Parse license info
+    license_blocks = re.split(r'\n\s+(?=\S+\s+\()', license_info)
+    for block in license_blocks:
+        license_match = re.search(r'(\S+.*?) \((.*?)\):\s+Description: (.+?)\s+Total reserved count: (\d+)', block, re.DOTALL)
+        if license_match:
+            license_name, license_full_name, description, total_reserved = license_match.groups()
+            enforcement_type = re.search(r'Enforcement type: (.+)', block)
+            enforcement_type = enforcement_type.group(1) if enforcement_type else ''
+
+            for device_block in re.findall(r'((?:Active|Standby|Member): PID:[^,]+,SN:\S+\s+(?:Authorization type:[^\n]+\s+)?License type:[^\n]+(?:\s+Start Date:[^\n]+\s+End Date:[^\n]+)?\s+Term Count: \d+)', block):
+                device_match = re.search(r'(?:Active|Standby|Member): PID:[^,]+,SN:(\S+)', device_block)
+                if device_match:
+                    sn = device_match.group(1)
+                    if sn in result:
+                        license_info = {
+                            'LICENSE_NAME': license_name,
+                            'LICENSE_FULL_NAME': license_full_name,
+                            'LICENSE_DESCRIPTION': description,
+                            'TOTAL_RESERVED': total_reserved,
+                            'ENFORCEMENT_TYPE': enforcement_type
+                        }
+                        auth_type = re.search(r'Authorization type: (.+)', device_block)
+                        license_info['AUTHORIZATION_TYPE'] = auth_type.group(1) if auth_type else ''
+
+                        license_type = re.search(r'License type: (\S+)', device_block)
+                        license_info['LICENSE_TYPE'] = license_type.group(1) if license_type else ''
+
+                        start_date = re.search(r'Start Date: (.+)', device_block)
+                        license_info['START_DATE'] = start_date.group(1) if start_date else ''
+
+                        end_date = re.search(r'End Date: (.+)', device_block)
+                        license_info['END_DATE'] = end_date.group(1) if end_date else ''
+
+                        term_count = re.search(r'Term Count: (\d+)', device_block)
+                        license_info['TERM_COUNT'] = term_count.group(1) if term_count else ''
+
+                        result[sn]['LICENSES'].append(license_info)
+    return result
+
+
+def parse_show_license_summary(output: str) -> list:
+    # This function parses 'show license summary' output
+
+    licenses = []
+    lines = output.strip().split('\n')
+    if 'Index' in lines[0]:
+        # This is not expected for show license summary on modern devices, however it happens on 4500-x platform
+        # call parse_show_license as the output matches it
+        # import ipdb; ipdb.set_trace()
+        return parse_show_license(output)
+
+    # Skip header lines
+    for line in lines[3:]:
+        match = re.match(r'^\s*(\S+)\s+\(([^)]+)\)\s+(\d+)\s+(.+)$', line)
+        if match:
+            license = {
+                'License': match.group(1),
+                'Entitlement Tag': match.group(2),
+                'Count': match.group(3),
+                'Status': match.group(4).strip()
+            }
+            licenses.append(license)
+
+    return licenses
+
+
+def parse_show_license(output: str) -> list:
+    # This function parses 'show license' output
+    features = []
+    current_feature = None
+
+    for line in output.strip().split('\n'):
+        index_match = re.match(r'Index (\d+)\s+Feature: (.+)', line)
+        # import ipdb; ipdb.set_trace()
+        if index_match:
+            if current_feature:
+                features.append(current_feature)
+            current_feature = {
+                'Index': index_match.group(1),
+                'Feature': index_match.group(2)
+            }
+        elif current_feature:
+            key_value_match = re.match(r'\s+(.+?): (.+)', line)
+            if key_value_match:
+                key = key_value_match.group(1)
+                value = key_value_match.group(2)
+                current_feature[key] = value
+
+    if current_feature:
+        features.append(current_feature)
+
+    return features
+
+
+def prepare_device_data(device_data_list: list) -> tuple:
+    # This function prepares data gathered by process_device_data to a format suitable for saving in excel table
+    all_columns = set()
+    devices = {}
+
+    def merge_device_info(info1: dict, info2: dict) -> dict:
+        merged = info1.copy()
+        for key, value in info2.items():
+            if not merged.get(key) and value:
+                merged[key] = value
+        return merged
+
+    for device_data in device_data_list:
+        for row in device_data:
+            all_columns.update(row.keys())
+            device_key = (row['Device Name'], row.get('Serial Number', ''), row.get('License Name', ''))
+
+            if device_key not in devices:
+                devices[device_key] = row.copy()
+            else:
+                devices[device_key] = merge_device_info(devices[device_key], row)
+
+    # Create final rows
+    rows = list(devices.values())
+
+    # Define priority columns
+    priority_columns = [
+        'Device Name',
+        'Serial Number',
+        'Product ID (PID)',
+        'Parent Device Name',
+        'Stack Role',
+        'Software Version',
+        'Software Image',
+        'License Name',
+        'License Type',
+        'Confirmation Code',
+        'License Count',
+        'License Entitlement Tag',
+        'License Period Left',
+        'License Priority',
+        'License Reservation Status',
+        'License State',
+        'License Status',
+        'Uptime'
+        ]
+
+    # Sort columns with priority columns first, no other than priority columns expected, 
+    # but if they present they will be added at the end
+    other_columns = sorted(col for col in all_columns if col not in priority_columns)
+    columns = priority_columns + other_columns
+
+    # Ensure all rows have all columns (fill with empty string if missing)
+    for row in rows:
+        for col in columns:
+            if col not in row:
+                row[col] = ''
+
+    # Convert rows to list format
+    row_data = [[row.get(col, '') for col in columns] for row in rows]
+
+    return columns, row_data
+
+
+def process_device_data(logger: logging.Logger, cfg: dict, device_name: str, data: dict) -> list:
+    # Function processes responses from a set of prepared dictionaries with different command results and returns a list
+    # of dictionaries with merged data
+    rows = []
+    base_info = {
+        'Device Name': device_name,
+        'Software Version': data['show_version'].get('Software Version', ''),
+        'Software Image': data['show_version'].get('Software Image', ''),
+        'Uptime': data['show_version'].get('Uptime', ''),
+        'Serial Number': data['show_version'].get('Serial Number', ''),
+        'Product ID (PID)': '',
+        'Stack Role': 'N/A',
+        'Parent Device Name': None,
+        'License Name': '',
+        'License Type': '',
+        'Confirmation Code': '',
+        'License Count': '',
+        'License Entitlement Tag': '',
+        'License Period Left': '',
+        'License Priority': '',
+        'License Reservation Status': '',
+        'License State': '',
+        'License Status': '',
+    }
+
+    # Process license reservation data
+    reservation_data = data.get('show_license_reservation', {})
+    for sn, info in reservation_data.items():
+        row = base_info.copy()
+        row['Serial Number'] = sn
+        row['Product ID (PID)'] = info.get('PID', '')
+        row['Stack Role'] = info.get('TYPE', 'N/A')
+        row['License Reservation Status'] = info.get('LICENSE_RESERVATION', '')
+        row['Confirmation Code'] = info.get('CONFIRMATION_CODE', '')
+
+        if row['Stack Role'] == 'Standby' or row['Stack Role'] == 'Member':
+            row['Parent Device Name'] = device_name
+
+        for license in info.get('LICENSES', []):
+            license_row = row.copy()
+            license_timeframe = f"{license.get('START_DATE', '')} to {license.get('END_DATE', '')}"
+            if license_timeframe == " to ":
+                license_timeframe = ""
+            license_row.update({
+                'License Name': license.get('LICENSE_NAME', ''),
+                'License Type': license.get('LICENSE_TYPE', ''),
+                'License Period Left': license_timeframe,
+            })
+            rows.append(license_row)
+
+        if not info.get('LICENSES'):
+            rows.append(row)
+
+    # Process license summary data
+    for license in data.get('show_license_summary', []):
+        row = base_info.copy()
+        row.update({
+            'License Name': license.get('License', ''),
+            'License Entitlement Tag': license.get('Entitlement Tag', ''),
+            'License Count': license.get('Count', ''),
+            'License Status': license.get('Status', ''),
+        })
+        rows.append(row)
+
+    # Process detailed license data
+    for license in data.get('show_license', []):
+        row = base_info.copy()
+        row.update({
+            'License Name': license.get('Feature', ''),
+            'License Type': license.get('License Type', ''),
+            'License State': license.get('License State', ''),
+            'License Period Left': license.get('Period left', ''),
+            'License Priority': license.get('License Priority', ''),
+            'License Count': license.get('License Count', ''),
+        })
+        rows.append(row)
+
+    # If no license data was found, add at least one row with base info
+    if not rows:
+        rows.append(base_info)
+
+    return rows
+
+
+def process_device_commands(logger: logging.Logger, cfg: dict, device: str, cmd_list: dict, type: str = 'cisco_ios') -> dict:
+    # interrogate device and get serial/mac/license data
+    # check for reverse DNS entry
+
+    dns_name = None
+    try:
+        dns_name = gethostbyaddr(device)[0]
+    except:
+        pass
+    if dns_name and not re.search(r'(es|mp|vi|bl|sp|lf)\d{3}', dns_name):
+        logger.info(f'{device} - [yellow bold]Not supported device type![/]')
+        return {device: 'Not supported device type'}
+    elif dns_name:
+        device = dns_name
+
+    output = {}
+    # with console.status(f"Interrogating [bright_green]{device}[/]...", spinner="dots12"):
+    username = session.auth[0]
+    password = session.auth[1]
+    conn = ConnLogOnly(
+        device_type=type, host=device, username=username, password=password, secret='', log_level=cfg["log_level_str"]
+        )
+    if conn is None:
+        # console.print(f'{device} - [yellow bold]Unable to connect![/]')
+        logger.info(f'{device} - Unable to connect!')
+        return {}
+
+    for cmd_key, funcs in cmd_list.items():
+        data = conn.send_command(f"{cmd_key.replace('_', ' ')}\n", auto_find_prompt=True)
+        # funcs[0] - parse function, funcs[1] - create tables
+        output[cmd_key] = funcs[0](data)
+
+    conn.disconnect()
+    return output
+
+
+def device_query(logger: logging.Logger, cfg: dict) -> None:
+    """
+    Requests user to provide IP address(es) or hostname(es)
+    Validates user input
+    Works on the input calling other functions
+    Prints data if present
+    Saves data if auto_save enabled
+
+    @param logger(Logger): logger instance.
+
+    @return: None
+    """
+    cmd_list = {
+        "show_version": (parse_show_version, create_show_version_table,),
+        "show_license_reservation": (parse_show_license_reservation, create_license_reservation_tables,),
+        "show_license_summary": (parse_show_license_summary, create_license_summary_table,),
+        "show_license": (parse_show_license, create_show_license_table,),
+    }
+
+    colors = get_global_color_scheme(cfg)
+
+    logger.info("User input phase")
+    console.print(
+        "\n"
+        f"[{colors['description']}]Please provide a list of IP addresses or hostnames one per line[/]\n"
+        f"[{colors['description']}]Empty input line starts the process[/]\n"
+        f"[{colors['header']}]Example:[/]\n"
+        f"[{colors['success']} {colors['bold']}]134.162.104.110[/]\n"
+        f"[{colors['success']} {colors['bold']}]aucicvi660[/]\n"
+    )
+
+    devices = []
+    while True:
+        search_input = read_user_input(logger, "").strip()
+        if search_input == "":
+            break
+
+        # Check if input looks like an IP address or subnet
+        if "/" not in search_input and re.match(ip_regexp, search_input):
+            # IP address provided
+            try:
+                ip = ipaddress.ip_address(search_input)
+            except ValueError:
+                logger.info(
+                    f"User input - Input not matching IP address: {search_input}"
+                )
+                console.print(
+                    f"[{colors['error']}]Invalid IP format.[/]\n"
+                    f"[{colors['description']}]Enter a valid IP (e.g. 192.168.1.10)[/]"
+                )
+                continue
+            else:
+                if (
+                    ip.is_multicast
+                    or ip.is_unspecified
+                    or ip.is_reserved
+                    or ip.is_link_local
+                ):
+                    logger.info(f"User input - Invalid IP address type: {search_input}")
+                    console.print(
+                        f"[{colors['error']}]Invalid IP - multicast, broadcast, and reserved IPs are excluded.[/]\n"
+                        f"[{colors['description']}]Enter a valid non-reserved IP (e.g. 192.168.1.10)[/]"
+                    )
+                    continue
+                devices.append(search_input)
+                continue
+        else:
+            if not is_fqdn(search_input):
+                logger.info(f"User input - Invalid FQDN: {search_input}")
+                console.print(
+                    f"[{colors['error']}]Please use proper hostname format or full FQDN.[/]\n"
+                    f"[{colors['description']}]Enter a valid hostname (e.g. aucicvi660 or aucicvi660.net-equip.shell.net)[/]"
+                )
+            else:
+                devices.append(search_input)
+                continue
+
+    if devices and len(devices) > 0:
+        log_value = ", ".join([str(device) for device in devices])
+        # log_value = search_input.replace(",", " ")
+        logger.info(f"User input - {log_value}")
+
+        # One liner remove duplicates from net_addresses
+        devices = list(dict.fromkeys(devices))
+    else:
+        return
+
+    # start = perf_counter()
+
+    results = {}
+
+    with console.status(f"[{colors['description']}]Talking to devices...[/]", spinner="dots12"):
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                device:
+                executor.submit(
+                    process_device_commands,
+                    logger,
+                    cfg,
+                    device,
+                    cmd_list,
+                )
+                for device in devices
+            }
+            results = {device: future.result() for device, future in futures.items()}
+
+    for hostname, device_data in results.items():
+        # import ipdb; ipdb.set_trace()
+        print_data = []
+        for key in device_data.keys():
+            # key will be equal to hostname if there was an error processing device
+            if key == hostname:
+                print_data.append(create_device_error_table(hostname, cfg["theme"]))
+                continue
+            # cmd_list has tuple with functions and function 1 used to process data and create table object(s)
+            tables = cmd_list[key][1](device_data[key], hostname, cfg['theme'])
+            if tables and isinstance(tables, list):
+                for t in tables:
+                    if t:
+                        print_data.append(t)
+            elif tables:
+                print_data.append(tables)
+
+        # Print device data in the panel
+        if len(print_data) > 0:
+            print_multi_table_panel(print_data, f'Device {hostname.upper()}', cfg['theme'])
+
+    if cfg["auto_save"]:
+        processed_data = []
+        # Get all gathered data processed and then prepared for saving in the report 
+        for hostname, device_data in results.items():
+            processed_data.append(process_device_data(logger, cfg, hostname, device_data))
+
+        columns, data_to_save = prepare_device_data(processed_data)
+
+        queue_save(
+            logger,
+            cfg["report_filename"],
+            columns,
+            data_to_save,
+            sheet_name="Device Data",
+            index=False,
+            force_header=True,
+        )
+
+
+def print_multi_table_panel(tables, title, color_scheme="default"):
+    if color_scheme not in COLOR_SCHEMES:
+        color_scheme = "default"
+
+    colors = COLOR_SCHEMES[color_scheme]
+
+    # Create a Group of tables if tables is a list
+    if isinstance(tables, list):
+        group = Group(*tables)
+    else:
+        group = tables
+
+    # Wrap the Group in a Panel
+    panel = Panel(group, title=title, border_style=colors["title"], title_align="left", padding=1, expand=False)
+
+    # Print the panel
+    console.print(panel)
+
+
+def create_show_version_table(data: list, hostname: str, color_scheme="default"):
+    if color_scheme not in COLOR_SCHEMES:
+        color_scheme = "default"
+
+    colors = COLOR_SCHEMES[color_scheme]
+
+    if data is None or len(data) == 0:
+        return None
+
+    table = Table(title="General Information", show_header=True, header_style=colors["header"], box=box.MINIMAL, title_justify="left")
+    table.add_column("Hostname", style=colors["hostname"])
+    table.add_column("Serial", style=colors["sn"])
+    table.add_column("Uptime", style=colors["date"])
+    table.add_column("Software Version", style=colors["license_type"])
+    table.add_column("Software Image", style=colors["description"], overflow='fold')
+
+    table.add_row(
+        hostname.upper(),
+        data.get("Serial Number", 'N/A'),
+        data.get("Uptime", 'N/A'),
+        data.get("Software Version", 'N/A'),
+        data.get("Software Image", 'N/A')
+        )
+    return table
+
+
+def create_device_error_table(hostname: str, color_scheme="default"):
+    if color_scheme not in COLOR_SCHEMES:
+        color_scheme = "default"
+
+    colors = COLOR_SCHEMES[color_scheme]
+
+    table = Table(title="General Information", show_header=True, header_style=colors["header"], box=box.MINIMAL, title_justify="left")
+    table.add_column("Hostname", style=colors["hostname"])
+    table.add_column("Information", style=colors["sn"])
+
+    table.add_row(
+        hostname.upper(),
+        "Unable to access device",
+        )
+    return table
+
+
+def create_show_license_table(data: list, hostname: str, color_scheme="default"):
+    if color_scheme not in COLOR_SCHEMES:
+        color_scheme = "default"
+
+    colors = COLOR_SCHEMES[color_scheme]
+
+    if data is None or len(data) == 0:
+        return None
+
+    table = Table(title="License Information", show_header=True, header_style=colors["header"], box=box.MINIMAL, title_justify="left")
+    table.add_column("Feature", style=colors["feature"])
+    table.add_column("Attribute", style=colors["feature"])
+    table.add_column("Value", style=colors["value"])
+
+    for feature in data:
+        table.add_row(feature['Feature'], '', '')
+        for key, value in feature.items():
+            if key not in ['Index', 'Feature']:
+                table.add_row('', key, value)
+    return table
+
+
+def create_license_summary_table(data: list, hostname: str, color_scheme="default"):
+    if color_scheme not in COLOR_SCHEMES:
+        color_scheme = "default"
+
+    colors = COLOR_SCHEMES[color_scheme]
+
+    if data is None or len(data) == 0:
+        return None
+
+    if 'Index' in data[0]:
+        # looks like an old device calling standard create_show_license_table
+        return create_show_license_table(data, hostname, color_scheme)
+
+    table = Table(title="License Summary", show_header=True, header_style=colors["header"], box=box.MINIMAL, title_justify="left")
+    table.add_column("License", style=colors["license"])
+    table.add_column("Entitlement Tag", style=colors["tag"])
+    table.add_column("Count", style=colors["count"])
+    table.add_column("Status", style=colors["status"])
+
+    for license in data:
+        table.add_row(
+            license['License'],
+            license['Entitlement Tag'],
+            license['Count'],
+            license['Status']
+        )
+
+    return table
+
+
+def create_license_reservation_tables(data: dict, hostname: str, color_scheme: str = "default"):
+
+    if color_scheme not in COLOR_SCHEMES:
+        color_scheme = "default"
+
+    colors = COLOR_SCHEMES[color_scheme]
+
+    if data is None or len(data) == 0:
+        return None
+
+    license_reservation = "UNKNOWN"
+    # Process all devices in data and print information on the rest of the devices
+    # Create and print the device information table
+    device_table = Table(title="Overall License Information", show_header=True, header_style=colors["title"], box=box.MINIMAL, title_justify="left")
+    device_table.add_column("Hostname", style=colors["hostname"], no_wrap=True)
+    device_table.add_column("Serial Number", style=colors["sn"], no_wrap=True)
+    device_table.add_column("Type", style=colors["type"])
+    device_table.add_column("PID", style=colors["pid"])
+    device_table.add_column("Reservation Status", style=colors["status"])
+    device_table.add_column("Reservation Date", style=colors["date"])
+    device_table.add_column("Export Controlled", style=colors["export"])
+    device_table.add_column("Confirmation Code", style=colors["code"])
+    device_table.add_column("License Reservation", style=colors["reserved"])
+
+    for sn, info in data.items():
+        device_table.add_row(
+            hostname.upper(),
+            sn,
+            info['TYPE'],
+            info['PID'],
+            info.get('RESERVATION_STATUS', 'N/A'),
+            info.get('RESERVATION_DATE', 'N/A'),
+            info.get('EXPORT_CONTROLLED', 'N/A'),
+            info.get('CONFIRMATION_CODE', 'N/A'),
+            info.get('LICENSE_RESERVATION', license_reservation)
+        )
+    # # Create and print a license table for each device
+    license_table = Table(title="Extended License Information", show_header=True, header_style=colors["title"], box=box.MINIMAL, title_justify="left")
+    license_table.add_column("Serial", style=colors["sn"], no_wrap=True)
+    license_table.add_column("Type", style=colors["license_type"], no_wrap=True)
+    license_table.add_column("License Name", style=colors["license_name"], no_wrap=True)
+    license_table.add_column("Full Name", style=colors["license_full"])
+    license_table.add_column("Description", style=colors["description"])
+    license_table.add_column("Total Reserved", style=colors["reserved"])
+    license_table.add_column("Enforcement Type", style=colors["enforcement"])
+    license_table.add_column("Authorization Type", style=colors["auth_type"])
+    license_table.add_column("License Type", style=colors["license_type"])
+    license_table.add_column("Start Date", style=colors["start_date"])
+    license_table.add_column("End Date", style=colors["end_date"])
+    license_table.add_column("Term Count", style=colors["term_count"])
+    for sn, info in data.items():
+        for license in info['LICENSES']:
+            license_table.add_row(
+                sn,
+                info['TYPE'],
+                license['LICENSE_NAME'],
+                license['LICENSE_FULL_NAME'],
+                license['LICENSE_DESCRIPTION'],
+                license['TOTAL_RESERVED'],
+                license.get('ENFORCEMENT_TYPE', 'N/A'),
+                license.get('AUTHORIZATION_TYPE', 'N/A'),
+                license['LICENSE_TYPE'],
+                license.get('START_DATE', 'N/A'),
+                license.get('END_DATE', 'N/A'),
+                license['TERM_COUNT']
+            )
+
+    if license_table.row_count == 0:
+        license_table = None
+    return [device_table, license_table]
+
+
 def create_table(
     logger: logging.Logger,
     title: str,
     columns: list,
     data: list[list],
+    color_scheme: str = "default",
     title_style: str = "bold yellow",
     box: box = box.MINIMAL,
+    **kwargs
 ) -> Table:
     """
     Creates a Rich table with the provided parameters.
@@ -2466,6 +3354,7 @@ def create_table(
     @param    title (str): The title of the table.
     @param    columns (list[str]): A list of column names.
     @param    data (list[list]): A list of rows, where each row is a list of data values.
+    @param    color_scheme (str, optional): The color scheme to use. Defaults to "default".
     @param    title_style (str, optional): The style for the table title. Defaults to "bold yellow".
     @param    box (box, optional): The box style for the table. Defaults to box.MINIMAL.
 
@@ -2476,18 +3365,26 @@ def create_table(
 
     logger.debug(f"Table - title = {title} columns = {len(columns)} rows = {len(data)}")
 
-    table = Table(title=title, title_style=title_style, box=box)
+    if color_scheme not in COLOR_SCHEMES:
+        color_scheme = "default"
+
+    colors = COLOR_SCHEMES[color_scheme]
+    color_cycle = cycle(colors.values())
+
+    table = Table(title=title, title_style=colors.get("title", title_style), box=box, **kwargs)
     for column in columns:
         table.add_column(
-            column, justify="left", style="spring_green3", no_wrap=False
-        )  # You can customize styles here
+            column, justify="left", style=next(color_cycle, color_cycle), no_wrap=False
+        )
+
     for row in data:
         table.add_row(*row)
+
     return table
 
 
 def print_table_data(
-    logger: logging.Logger, data: dict, prefix: dict = {}, suffix: dict = {}
+    logger: logging.Logger, cfg: dict, data: dict, prefix: dict = {}, suffix: dict = {}
 ) -> None:
     """
     Prints data using keys as column names, can use prefix/suffix dictionary to add additional information to title (main keys)
@@ -2501,7 +3398,8 @@ def print_table_data(
     if len(data) == 0:
         console.print("No data to display")
         return
-    # import ipdb; ipdb.set_trace()
+
+    tables = []
     for key, value_list in data.items():
         # Capitalize the first letter of the key
         section_title = key
@@ -2526,13 +3424,14 @@ def print_table_data(
 
         for record in value_list:
             table_data.extend([record.values()])
-        # import ipdb; ipdb.set_trace()
 
-        table = create_table(logger, section_title, columns, table_data)
-        console.print(table)
+        tables.append(create_table(logger, section_title, columns, table_data, cfg["theme"], title_justify="left"))
+        # console.print(table)
+
+    print_multi_table_panel(tables, '', cfg['theme'])
 
 
-def exit_now(logger: logging.Logger, cfg: dict = None, exit_code: int = 0) -> None:
+def exit_now(logger: logging.Logger, cfg: dict = {}, exit_code: int = 0, message: str = '') -> None:
     """
     Gracefully exits from application
 
@@ -2541,21 +3440,24 @@ def exit_now(logger: logging.Logger, cfg: dict = None, exit_code: int = 0) -> No
 
     @return: exit_code
     """
+    colors = get_global_color_scheme(cfg)
+
     if worker_thread:
         logger.info("Closing report file...")
-        console.print("[green]Closing report file...[/green]")
+        console.print(f"[{colors['success']}]Closing report file...[/]")
         wait_for_all_saves()
-    
+
     if not exit_code:
+        console.print(f"[{colors['success']}]Have a nice day![/] :smiley:")
         logger.info("Terminating by user request - Have a nice day!")
-        console.print("[green]Have a nice day![/green] :smiley:")
     else:
+        console.print(f"[{colors['error']}]{message}[/]")
         logger.info("Abnormal termination - Hoping for a patch!")
 
     exit(exit_code)
 
 
-def make_api_call(logger: logging.Logger, endpoint: str, uri: str) -> any:
+def make_api_call(logger: logging.Logger, cfg: dict, endpoint: str, uri: str) -> any:
     """
     Performs Infoblox API requests, handles exceptions and validates that response.content is a valid json object
     in case of API errors logs error and terminates program execution
@@ -2571,36 +3473,31 @@ def make_api_call(logger: logging.Logger, endpoint: str, uri: str) -> any:
 
     except (Timeout, ConnectionError) as e:
         logger.error(f"API Error - {e.response.status_code} - {e.response.text}")
-        console.print(f"[red]API Error[/red] - {e.response.text}")
-        exit_now(logger, exit_code=1)
+        exit_now(logger, exit_code=1, message=f"API Error - {e.response.text}")
 
     except (HTTPError, RequestException, MissingSchema) as e:
         if response.status_code == 400:
             logger.info(f"API - Missing data - {e.response.text}")
         elif response.status_code == 401:
             logger.error(f"API Error - Authentication error - {e.response.text}")
-            console.print(
-                f"[red]Authentication error - verify credentials[/red] - {e.response.text}"
-            )
-            exit_now(logger, exit_code=1)
+            exit_now(logger, exit_code=1, message=f'Authentication error - verify credentials - {e.response.text}')
         else:
             logger.error(f"API Error - {e}")
-            console.print("[red]API Error[/red]")
-
+            exit_now(logger, exit_code=1, message=f'API Error - {e}')
         logger.debug(f"API response: {response.content}")
 
         try:
             json.loads(response.content)
         except json.JSONDecodeError as e:
             logger.error(f"API Error - Failed to parse JSON response - {e}")
-            console.print("[red]Failed[/red] to parse JSON response|Check API URL!")
-            exit_now(logger, exit_code=1)
+            exit_now(logger, exit_code=1, message='Failed to parse JSON response|Check API URL!')
 
     return response
 
 
 def do_fancy_request(
     logger: logging.Logger,
+    cfg: dict,
     message: str,
     endpoint: str,
     uri: str,
@@ -2616,7 +3513,7 @@ def do_fancy_request(
     """
 
     def execute_request():
-        response = make_api_call(logger, endpoint, uri)
+        response = make_api_call(logger, cfg, endpoint, uri)
         if response.ok:
             return response.content
         else:
@@ -2652,8 +3549,7 @@ def process_data(logger: logging.Logger, type: str, content: str) -> dict:
         raw_data = json.loads(content)
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse JSON response - {e}")
-        console.print("[red]Failed[/red] to parse JSON response|Check API URL!")
-        exit_now(logger, exit_code=1)
+        exit_now(logger, exit_code=1, error_message="Failed to parse JSON response|Check API URL!")
 
     # If data present, process it and return corresponding dict
     if len(raw_data) == 0:
@@ -2820,15 +3716,17 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
     @return: None
     """
 
+    colors = get_global_color_scheme(cfg)
+
     logger.info("Request Type - IP Information")
     console.print(
         "\n"
-        "[yellow]Please provide IP address or a list of IP addresses one per line, tool will request API and return detailed information,\n"
-        "such as its hostname, location, and network configuration[/]\n"
-        "[yellow]Empty input line starts the process[/]\n"
-        "[magenta]Example:[/]\n"
-        "[green bold]134.162.104.110[/]\n"
-        "[green bold]134.143.104.145[/]\n"
+        f"[{colors['description']}]Please provide IP address or a list of IP addresses one per line, tool will request API and return detailed information,\n"
+        f"such as its hostname, location, and network configuration[/]\n"
+        f"[{colors['description']}]Empty input line starts the process[/]\n"
+        f"[{colors['header']}]Example:[/]\n"
+        f"[{colors['success']} {colors['bold']}]134.162.104.110[/]\n"
+        f"[{colors['success']} {colors['bold']}]134.143.104.145[/]\n"
     )
     search_input = "none"
     ip_addresses = None
@@ -2847,7 +3745,8 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
                     f"User input - Input not matching IP address: {search_input}"
                 )
                 console.print(
-                    "[red]Invalid IP format. Enter a valid IP (e.g. 192.168.1.10)[/]"
+                    f"[{colors['error']}]Invalid IP format.[/]\n"
+                    f"[{colors['info']}]Enter a valid IP (e.g. 192.168.1.10)[/]"
                 )
                 continue
             else:
@@ -2859,14 +3758,22 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
                 ):
                     logger.info(f"User input - Invalid IP address type: {search_input}")
                     console.print(
-                        "[red]Invalid IP - multicast, broadcast, and reserved IPs are excluded.\n"
-                        "Enter a valid non-reserved IP (e.g. 192.168.1.10)[/]"
+                        f"[{colors['error']}]Invalid IP - multicast, broadcast, and reserved IPs are excluded.[/]\n"
+                        f"[{colors['info']}]Enter a valid non-reserved IP (e.g. 192.168.1.10)[/]"
                     )
                     continue
                 if ip_addresses is None:
                     ip_addresses = []
                 ip_addresses.append((ip, None))
                 continue
+        else:
+            logger.info(
+                f"User input - Input not matching IP address: {search_input}"
+            )
+            console.print(
+                f"[{colors['error']}]Invalid IP format.[/]\n"
+                f"[{colors['info']}]Enter a valid IP (e.g. 192.168.1.10)[/]"
+            )            
 
     if ip_addresses and len(ip_addresses) > 0:
         log_value = ", ".join([str(ip) for ip, _ in ip_addresses])
@@ -2892,11 +3799,12 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
 
     # Request general network information
     with ThreadPoolExecutor() as executor:
-        with console.status(status="[yellow]Fetching IP information...[/]"):
+        with console.status(status=f"[{colors['description']}]Fetching IP information...[/]"):
             futures = {
                 ip: executor.submit(
                     do_fancy_request,
                     logger=logger,
+                    cfg=cfg,
                     message="",
                     endpoint=cfg["api_endpoint"],
                     uri=uri,
@@ -2918,15 +3826,15 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
                 ip_addresses.append((ip, True))
 
     end = perf_counter()
-    logger.info(f"Search took {round(end-start, 2)} seconds!")
+    logger.info(f"Search took {round(end-start, 3)} seconds!")
     console.print(
-        f"[yellow]Request Type - IP Information - Search took {round(end-start, 2)} seconds![/]"
+        f"[{colors['description']}]Request Type - IP Information - Search took [{colors['success']}]{round(end-start, 3)}[/] seconds![/]"
     )
 
     for ip, status in ip_addresses:
         if not status:
             console.print(
-                f"[yellow][green bold]{ip}[/green bold] - [red]No data received[/]"
+                f"[{colors['success']} {colors['bold']}]{ip}[/] - [{colors['error']}]No data received[/]"
             )
 
     save_data_all = []
@@ -2978,48 +3886,42 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
     print_data = [dict(zip(columns, row)) for row in save_data_all]
     print_table_data(
         logger,
+        cfg,
         {"IP": print_data},
         suffix={"IP": "Information"},
     )
 
     # Saving data automatically unless user requested not to (relies on global auto_save flag)
     if cfg["auto_save"]:
-        with console.status(
-            f'Saving data to {cfg["report_filename"]}...', spinner="dots12"
-        ):
-            missing_ip_addresses = []
-            for ip, status in ip_addresses:
-                if not status:
-                    missing_ip_addresses.append(ip)
-
-            if len(missing_ip_addresses) > 0:
-                missed_ip_data = [
-                    [str(ip), "No Information"] for ip in missing_ip_addresses
-                ]
-                # Saving IP Data with missed IPs first
-                queue_save(
-                # append_df_to_excel(
-                    logger,
-                    cfg["report_filename"],
-                    ["IP", "Status"],
-                    missed_ip_data,
-                    sheet_name="IP Data",
-                    index=False,
-                    force_header=True,
-                )
-
-            # Saving IP Data with found IP information
-            if len(save_data_all) > 0:
-                queue_save(
-                # append_df_to_excel(
-                    logger,
-                    cfg["report_filename"],
-                    columns,
-                    save_data_all,
-                    sheet_name="IP Data",
-                    index=False,
-                    force_header=True,
-                )
+        missing_ip_addresses = []
+        for ip, status in ip_addresses:
+            if not status:
+                missing_ip_addresses.append(ip)
+        if len(missing_ip_addresses) > 0:
+            missed_ip_data = [
+                [str(ip), "No Information"] for ip in missing_ip_addresses
+            ]
+            # Saving IP Data with missed IPs first
+            queue_save(
+                logger,
+                cfg["report_filename"],
+                ["IP", "Status"],
+                missed_ip_data,
+                sheet_name="IP Data",
+                index=False,
+                force_header=True,
+            )
+        # Saving IP Data with found IP information
+        if len(save_data_all) > 0:
+            queue_save(
+                logger,
+                cfg["report_filename"],
+                columns,
+                save_data_all,
+                sheet_name="IP Data",
+                index=False,
+                force_header=True,
+            )
 
     return
 
@@ -3037,18 +3939,19 @@ def fqdn_request(logger: logging.Logger, cfg: dict) -> None:
 
     @return: None
     """
+    colors = get_global_color_scheme(cfg)
 
     logger.info("Request Type - FQDN Search - DNS A records")
 
     console.print(
         "\n"
-        "[yellow]Type in just a part of the name or complete FQDN name(not less than 3 chars)\n"
-        "Request fetches DNS A records matching or containing prefix, short hostname or full FQDN\n"
-        "Request has a limit of [red bold]1000[/red bold] records\n"
-        "[magenta]Examples:[/magenta]\n"
-        "[green][bold]'aucicbst'[/bold] fetches records starting with [white bold]aucicbst[/white bold] prefix\n"
-        "[bold]'aucicbstwc010'[/bold] fetches record for the device\n"
-        "[bold]'aucicbstwc010.net-equip.shell.net'[/bold] fetches record for the device[/green]\n"
+        f"[{colors['description']}]Type in just a part of the name or complete FQDN name(not less than 3 chars)\n"
+        f"Request fetches DNS A records matching or containing prefix, short hostname or full FQDN\n"
+        f"Request has a limit of [{colors['error']} {colors['bold']}]1000[/] records[/]\n"
+        f"[{colors['header']}]Examples:[/]\n"
+        f"[{colors['success']}][{colors['bold']}]'aucicbst'[/] fetches records starting with [{colors['white']} {colors['bold']}]aucicbst[/] prefix\n"
+        f"[{colors['bold']}]'aucicbstwc010'[/] fetches record for the device\n"
+        f"[{colors['bold']}]'aucicbstwc010.net-equip.shell.net'[/] fetches record for the device[/]\n"
     )
 
     fqdn = read_user_input(
@@ -3059,18 +3962,19 @@ def fqdn_request(logger: logging.Logger, cfg: dict) -> None:
 
     if not is_fqdn(fqdn):
         logger.info(f"User input - FQDN Search - Incorrect FQDN/prefix - {fqdn}")
-        console.print("[red]Incorrect FQDN/prefix[/red]")
+        console.print(f"[{colors['error']}]Incorrect FQDN/prefix[/]")
         return
 
     if len(fqdn) < 3:
         logger.info("User input - FQDN Search - Prefix is less than 3 chars")
-        console.print("[red]Please use longer prefix(at least 3 characters)[/red]")
+        console.print(f"[{colors['error']}]Please use longer prefix(at least 3 characters)[/]")
         return
 
     uri = f"search?fqdn~={fqdn}&_max_results=1000"
     data = do_fancy_request(
         logger,
-        message=f"Fetching data for [magenta]{fqdn}[/magenta]...",
+        cfg,
+        message=f"[{colors['description']}]Fetching data for [{colors['header']}]{fqdn}[/]...[/]",
         endpoint=cfg["api_endpoint"],
         uri=uri,
     )
@@ -3083,33 +3987,29 @@ def fqdn_request(logger: logging.Logger, cfg: dict) -> None:
 
     if len(processed_data) == 0:
         logger.info("Request Type - FQDN Search - No information received")
-        console.print("[red]No information received[/red]")
+        console.print(f"[{colors['error']}]No information received[/]")
         logger.debug(f"Request Type - FQDN Search - raw data {data}")
         return
 
-    print_table_data(logger, processed_data, suffix={"general": "Search Results"})
+    print_table_data(logger, cfg, processed_data, suffix={"general": "Search Results"})
     logger.debug(f"Request Type - FQDN Search - processed data {processed_data}")
 
     # Saving data automatically unless user requested to not to(relies on global auto_save flag)
     if cfg["auto_save"]:
-        with console.status(
-            f'Saving data to {cfg["report_filename"]}...', spinner="dots12"
-        ):
-            columns = ["IP Address", "Device Name"]
-            save_data = []
-            for fqdn in processed_data["fqdn"]:
-                save_data.append([value for value in fqdn.values()])
+        columns = ["IP Address", "Device Name"]
+        save_data = []
+        for fqdn in processed_data["fqdn"]:
+            save_data.append([value for value in fqdn.values()])
 
-            # append_df_to_excel(
-            queue_save(
-                logger,
-                cfg["report_filename"],
-                columns,
-                save_data,
-                sheet_name="FQDN Data",
-                index=False,
-                force_header=True,
-            )
+        queue_save(
+            logger,
+            cfg["report_filename"],
+            columns,
+            save_data,
+            sheet_name="FQDN Data",
+            index=False,
+            force_header=True,
+        )
     return
 
 
@@ -3126,24 +4026,29 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
 
     @return: None
     """
+    colors = get_global_color_scheme(cfg)
+
     logger.info("Request Type - Search for site subnet records")
 
     console.print(
         "\n"
-        "[yellow]Type in location site code to obtain a list of registered [yellow bold]subnets[/]\n"
-        "[yellow]Supported site code format: [green bold]XXX, XXXXXXX, XXX-XX\\[XX][/green bold][/]\n"
-        "[yellow]Request has a limit of [red bold]1000[/red bold] records[/]\n"
-        "[magenta bold]Examples:[/]\n"
-        "[green][bold]CIC[/bold] fetches [yellow bold]subnets[/yellow bold] for Chinchilla location\n"
-        "[bold]WND-RYD[/bold] fetches [yellow bold]subnets[/yellow bold] for Wandoan office[/]\n"
+        f"[{colors['description']}]Type in location site code to obtain a list of registered [{colors['bold']}]subnets[/]\n"
+        f"[{colors['description']}]Supported site code format: [{colors['success']} {colors['bold']}]XXX, XXXXXXX, XXX-XX\\[XX][/]\n"
+        f"[{colors['description']}]Request has a limit of [{colors['error']} {colors['bold']}]1000[/] records[/]\n"
+        f"[{colors['header']} {colors['bold']}]Examples:[/]\n"
+        f"[{colors['success']} {colors['bold']}]CIC[/] fetches subnets for [{colors['warning']} {colors['bold']}]Chinchilla site[/]\n"
+        f"[{colors['success']} {colors['bold']}]WND-RYD[/] fetches subnets for [{colors['warning']} {colors['bold']}]Wandoan site[/]\n"
         "\n"
-        "[yellow]Type in '[green bold]+[/green bold]' as a first symbol followed by arbitrary keyword(cannot have spaces)[/]\n"
-        "[magenta bold]Examples:[/]\n"
-        "[green][bold]+[/bold]CNBEJWTCMP610[/green] [yellow]fetches subnets with [bold]CNBEJWTCMP610[/bold] in description[/]\n"
-        "[green][bold]+[/bold]PRJ18[/green] [yellow]fetches subnets with [bold]PRJ18[/bold] in description[/]\n"
+        f"[{colors['description']}]Type in '[{colors['error']} {colors['bold']}]+[/]' as a first symbol followed by arbitrary keyword(cannot have spaces)[/]\n"
+        f"[{colors['header']} {colors['bold']}]Examples:[/]\n"
+        f"[{colors['error']} {colors['bold']}]+[/][{colors['success']} {colors['bold']}]CNBEJWTCMP610[/] [{colors['description']}]fetches subnets with [{colors['bold']}]CNBEJWTCMP610[/] in description[/]\n"
+        f"[{colors['error']} {colors['bold']}]+[/][{colors['success']} {colors['bold']}]PRJ18[/] [{colors['description']}]fetches subnets with [{colors['bold']}]PRJ18[/] in description[/]\n"
     )
 
-    raw_input = read_user_input(logger, "Enter location code or '+'keyword: ").lower()
+    raw_input = read_user_input(
+        logger,
+        f"Enter [{colors['success']} {colors['bold']}]location code[/] or '[{colors['error']} {colors['bold']}]+[/]'[{colors['success']} {colors['bold']}]keyword[/]: "
+        ).lower()
 
     logger.info(f"User input - {raw_input}")
 
@@ -3158,7 +4063,7 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
             search_type = "keyword"
         else:
             logger.info(f"User input -  Incorrect input {raw_input}")
-            console.print("[red]Incorrect input provided[/red]")
+            console.print(f"[{colors['error']}]Incorrect input provided[/]")
             return
     else:
         if is_valid_site(raw_input):
@@ -3170,19 +4075,19 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
             logger.info(f"User input - Sitecode search for {search_term}")
         else:
             logger.info(f"User input -  Incorrect site code {raw_input}")
-            console.print("[red]Incorrect site code[/]")
+            console.print(f"[{colors['error']}]Incorrect site code[/]")
             return
 
     if len(search_term) == 0:
         logger.info("User input -  Empty input")
-        console.print("[red]Incorrect input provided[/]")
+        console.print(f"[{colors['error']}]Incorrect input provided[/]")
         return
 
     uri = f"network?comment:~={search_term}&_max_results=1000"
-
     data = do_fancy_request(
         logger,
-        message=f"Fetching data for [magenta]{search_term.upper()}[/]...",
+        cfg,
+        message=f"[{colors['description']}]Fetching data for [{colors['header']}]{search_term.upper()}[/]...[/]",
         endpoint=cfg["api_endpoint"],
         uri=uri,
     )
@@ -3196,11 +4101,12 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
 
     if len(processed_data.get("location", "")) == 0:
         logger.info("Request Type - Location Information - No information received")
-        console.print("[red]No information received[/]")
+        console.print(f"[{colors['error']}]No information received[/]")
         return
 
     print_table_data(
         logger,
+        cfg,
         processed_data,
         prefix=prefix,
         suffix=suffix,
@@ -3243,12 +4149,13 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
 
     @return: None
     """
+    colors = get_global_color_scheme(cfg)
 
     logger.info("Request Type - Subnet Information")
 
     console.print(
         "\n"
-        "[yellow]Enter a network addresses in the format 'x.x.x.x\\[/x]' one subnet per line[/]\n"
+        f"[{colors['description']}]Enter a network addresses in the format 'x.x.x.x\\[/x]' one subnet per line[/]\n"
     )
 
     net_addresses = []
@@ -3267,7 +4174,8 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                     f"User input - Input not matching IP address: {search_input}"
                 )
                 console.print(
-                    "[red]Invalid IP format. Enter a valid IP (e.g. 192.168.1.10)[/]"
+                    f"[{colors['error']}]Invalid IP format.[/]\n"
+                    f"[{colors['info']}]Enter a valid IP (e.g. 192.168.1.10)[/]"
                 )
                 continue
             else:
@@ -3279,8 +4187,8 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                 ):
                     logger.info(f"User input - Invalid IP address type: {search_input}")
                     console.print(
-                        "[red]Invalid IP - multicast, broadcast, and reserved IPs are excluded.\n"
-                        "Enter a valid non-reserved IP[/]"
+                        f"[{colors['error']}]Invalid IP - multicast, broadcast, and reserved IPs are excluded.[/]\n"
+                        f"[{colors['info']}]Enter a valid non-reserved IP[/]"
                     )
                     continue
                 net_addresses.append(ip)
@@ -3293,7 +4201,8 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                     f"User input - Input not matching valid IP/MASK: {search_input}"
                 )
                 console.print(
-                    "[red]Invalid IP format. Enter a valid IP/MASK (e.g. 192.168.1.10/24)[/]"
+                    f"[{colors['error']}]Invalid IP format.[/]\n"
+                    f"[{colors['info']}]Enter a valid IP/MASK (e.g. 192.168.1.10/24)[/]"
                 )
                 continue
             else:
@@ -3306,8 +4215,8 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
 
                     logger.info(f"User input - Invalid IP address type: {search_input}")
                     console.print(
-                        "[red]Invalid IP - multicast, broadcast, and reserved IPs are excluded.\n"
-                        "Enter a valid non-reserved IP[/]"
+                        f"[{colors['error']}]Invalid IP - multicast, broadcast, and reserved IPs are excluded.[/]\n"
+                        f"[{colors['info']}]Enter a valid non-reserved IP[/]"
                     )
                     continue
                 net_addresses.append(net)
@@ -3352,12 +4261,13 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
     for network in net_addresses:
         with ThreadPoolExecutor() as executor:
             with console.status(
-                status=f"Fetching [magenta]{network}[/] information..."
+                status=f"[{colors['description']}]Fetching [{colors['header']}]{network}[/] information...[/]"
             ):
                 futures = {
                     label: executor.submit(
                         do_fancy_request,
                         logger=logger,
+                        cfg=cfg,
                         message="",
                         endpoint=cfg["api_endpoint"],
                         uri=uri,
@@ -3482,12 +4392,12 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
     end = perf_counter()
 
     logger.info(
-        f"Request Type - Subnet Information - Search took {round(end-start, 2)} seconds!"
+        f"Request Type - Subnet Information - Search took {round(end-start, 3)} seconds!"
     )
 
     console.print("\n\n")
     console.print(
-        f"[yellow]Request Type - Subnet Information - Search took [green]{round(end-start, 2)}[/green] seconds![/]\n"
+        f"[{colors['description']}]Request Type - Subnet Information - Search took [{colors['success']}]{round(end-start, 3)}[/] seconds![/]\n"
     )
 
     # Block will output just general subnet information with only subnet, subnet status and description fields
@@ -3506,9 +4416,9 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                 summary_net["description"] = "No data in Infoblox"
 
             summary_data["summary data"].append(summary_net)
-        print_table_data(logger, summary_data)
+        print_table_data(logger, cfg, summary_data)
         console.print(
-            "([green]Press [bold red]Q[/bold red] to return to main menu(data will not be saved) / Any key - to get through detailed subnet data[/]\n"
+            f"([{colors['success']}]Press [{colors['error']} {colors['bold']}]Q[/] to return to main menu(data will not be saved) / Any key - to get through detailed subnet data[/]\n"
         )
         key = read_single_keypress().lower()
         if key == "q":
@@ -3520,13 +4430,13 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
         if len(processed_data[network].get("general")) > 0:
             console.clear()
             print_table_data(
-                logger, processed_data[network], suffix={"general": "Information"}
+                logger, cfg, processed_data[network], suffix={"general": "Information"}
             )
             if missing_data_nets == net_addresses:
                 return
             if len(net_addresses) - missing_data_nets > 1:
                 console.print(
-                    "([green]Press [bold]SPACE[/bold] to see next result / Any key - return to the menu(request data will be saved in report file)[/]\n"
+                    f"[{colors['success']}]Press [{colors['bold']}]SPACE[/] to see next result / Any key - return to the menu(request data will be saved in report file)[/]\n"
                 )
                 key = read_single_keypress()
                 if key == " ":
@@ -3537,12 +4447,12 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
             missing_data_nets += 1
             if missing_data_nets == net_addresses:
                 console.print(
-                    f"([green]Network [red bold]{network}[/red bold] has no data in Infoblox[/]\n"
+                    f"[{colors['success']}]Network [{colors['error']} {colors['bold']}]{network}[/] has no data in Infoblox[/]\n"
                 )
                 return
             else:
                 console.print(
-                    f"([green]Network [red bold]{network}[/red bold] has no data in Infoblox / Press [bold]SPACE[/bold] to see next result[/]\n"
+                    f"[[{colors['success']}]]Network [{colors['error']} {colors['bold']}]{network}[/] has no data in Infoblox / Press [{colors['bold']}]SPACE[/] to see next result[/]\n"
                 )
 
             key = read_single_keypress()
@@ -3578,33 +4488,28 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
             common_search_results.append([network, "No match"])
 
     # save data
-    with console.status(
-        f'Saving data to {cfg["report_filename"]}...', spinner="dots12"
-    ):
-        if cfg["auto_save"]:
-            # Save general data
+    if cfg["auto_save"]:
+        # Save general data
+        queue_save(
+            logger,
+            cfg["report_filename"],
+            columns_common,
+            common_search_results,
+            sheet_name="Subnet Data",
+            force_header=True,
+            index=False,
+        )
+        # Save main data
+        if len(data_combined) > 0:
             queue_save(
-            # append_df_to_excel(
                 logger,
                 cfg["report_filename"],
-                columns_common,
-                common_search_results,
+                columns,
+                data_combined,
                 sheet_name="Subnet Data",
                 force_header=True,
                 index=False,
             )
-            # Save main data
-            if len(data_combined) > 0:
-                queue_save(
-                # append_df_to_excel(
-                    logger,
-                    cfg["report_filename"],
-                    columns,
-                    data_combined,
-                    sheet_name="Subnet Data",
-                    force_header=True,
-                    index=False,
-                )
     return
 
 
@@ -3618,7 +4523,7 @@ def read_user_input(
     raw_input = ""
     try:
         raw_input = console.input(
-            f"[bold green]{prompt}[/]", password=read_pass, markup=True
+            f"{prompt}", password=read_pass, markup=True
         )
     except EOFError:
         pass
@@ -3634,24 +4539,29 @@ def clear_report(logger: logging.Logger, cfg: dict) -> None:
 
     @param logger: Logger instance.
     """
+    colors = get_global_color_scheme(cfg)
+
     filename = cfg["report_filename"]
     if os.path.exists(filename):
         if logger:
             logger.info(f"Clear report - Deleting {filename}")
 
         os.remove(filename)
-        console.print(f"Report {filename} deleted")
+        console.print(f"[{colors['info']}]Report {filename} deleted[/]")
     else:
-        console.print(f"Report {filename} already deleted")
+        console.print(f"[{colors['info']}]Report {filename} already deleted[/]")
 
 
 def show_config_search_help(logger: logging.Logger, cfg: dict) -> None:
+
+    colors = get_global_color_scheme(cfg)
+
     console.print(
         "\n"
-        "[yellow]Unable to access configuration repository\n"
-        "Check [magenta bold]\\[config_repository][/magenta bold] section in the configuration file,\n"
-        "Verify that [green bold]storage_directory[/bold green] parameter set to a proper path\n"
-        "If path is correct, verify that your account has read access to it[/]\n"
+        f"[{colors['warning']}]Unable to access configuration repository\n"
+        f"Check [{colors['header']} {colors['bold']}][config_repository][/] section in the configuration file,\n"
+        f"Verify that [{colors['success']} {colors['bold']}]storage_directory[/] parameter set to a proper path\n"
+        f"If path is correct, verify that your account has read access to it[/]\n"
     )
 
 
@@ -3660,12 +4570,14 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
     Runs multiple parallel ping processes against list of user supplied IP addresses
     """
 
+    colors = get_global_color_scheme(cfg)
+
     logger.info("Request Type - Bulk PING")
 
     console.print(
         "\n"
-        "[yellow]Enter IPs/FQDNs to ping, one per line, non-valid IP/FQDNs are ignored.\n"
-        "Empty input line starts ping process:[/]"
+        f"[{colors['description']}]Enter IPs/FQDNs to ping, one per line, non-valid IP/FQDNs are ignored.\n"
+        "Empty input line starts ping process:[/]\n"
     )
     hosts = []
     raw_input = "none"
@@ -3680,12 +4592,16 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
     # One liner remove duplicates from hosts
     hosts = list(dict.fromkeys(hosts))
 
+    if len(hosts) == 0:
+        logger.info("No input data")
+        return
+
     # Stackoverflow good example on how to run multiple pings at once
     # ip -> process
     p = {}
     results = {"Bulk PING": []}
 
-    with console.status("Pinging...", spinner="dots12"):
+    with console.status(f"[{colors['description']}]Pinging...[/]", spinner="dots12"):
 
         for host in hosts:
             # start ping processes - wait for 5 seconds to get 3 successful pings
@@ -3718,29 +4634,25 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
             if result["Host"] == host:
                 sorted_results["Bulk PING"].append(result)
 
-    print_table_data(logger, sorted_results)
+    print_table_data(logger, cfg, sorted_results)
 
     logger.debug(f"Request Type - Bulk PING - processed data {sorted_results}")
 
     if cfg["auto_save"] and len(sorted_results["Bulk PING"]) > 0:
-        with console.status(
-            f'Saving data to {cfg["report_filename"]}...', spinner="dots12"
-        ):
-            columns = ["Host", "Result"]
-            save_data = []
-            for ping_result in sorted_results["Bulk PING"]:
-                save_data.append([ping_result["Host"], ping_result["Result"]])
+        columns = ["Host", "Result"]
+        save_data = []
+        for ping_result in sorted_results["Bulk PING"]:
+            save_data.append([ping_result["Host"], ping_result["Result"]])
 
-            queue_save(
-            # append_df_to_excel(
-                logger,
-                cfg["report_filename"],
-                columns,
-                save_data,
-                sheet_name="Bulk PING",
-                index=False,
-                force_header=True,
-            )
+        queue_save(
+            logger,
+            cfg["report_filename"],
+            columns,
+            save_data,
+            sheet_name="Bulk PING",
+            index=False,
+            force_header=True,
+        )
     return
 
 
@@ -3748,6 +4660,9 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
     """
     Resolves user supplied IP/FQDNs using system resolver using parallel threads
     """
+    colors = get_global_color_scheme(cfg)
+
+    logger.info("Request Type - Bulk PING")
 
     def resolve_ip(ip):
         try:
@@ -3769,8 +4684,8 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
 
     console.print(
         "\n"
-        "[yellow]Enter FQDNs/IP addresses, one FQDN/IP address per line. Non-valid FQDNs/IPs are ignored.\n"
-        "Empty input line starts lookup process:[/]"
+        f"[{colors['description']}]Enter FQDNs/IP addresses, one FQDN/IP address per line. Non-valid FQDNs/IPs are ignored.\n"
+        "Empty input line starts lookup process:[/]\n"
     )
 
     data_lines = {"ip": [], "name": []}
@@ -3796,13 +4711,12 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
 
     results = {"Bulk Name Lookup": [], "Bulk IP Lookup": []}
 
-    with console.status("Resolving...", spinner="dots12"):
+    with console.status(f"[{colors['description']}]Resolving...[/]", spinner="dots12"):
 
         with ThreadPoolExecutor() as executor:
             ip_data = executor.map(resolve_ip, data_lines["ip"])
             name_data = executor.map(resolve_name, data_lines["name"])
 
-    # bulk_ip_results = [{'IP': req, 'Name': f'{",".join([data[0],*data[1]])}'} if data else {'IP': req, 'Name': 'Not Resolved'} for req, data in ip_data]
     bulk_ip_results = []
 
     for req, data in ip_data:
@@ -3816,7 +4730,6 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
 
     results["Bulk IP Lookup"].extend(bulk_ip_results)
 
-    # bulk_name_results = [{'Name': req, 'IP': f'{",".join(data[2])}'} if data else {'Name': req, 'IP': 'Not Resolved'} for req, data in name_data]
     bulk_name_results = []
 
     for req, data in name_data:
@@ -3853,35 +4766,32 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
         results["Bulk Name Lookup"].extend(
             list({"Name": name, "IP": "Not Resolved"} for name in data_lines["name"])
         )
-        print_table_data(logger, results)
+        print_table_data(logger, cfg, results)
         logger.debug("Request Type - Bulk DNS Lookup - unable to resolve any")
     else:
-        print_table_data(logger, results)
+        print_table_data(logger, cfg, results)
 
     logger.debug(f"Request Type - Bulk DNS Lookup - processed data {results}")
 
     if cfg["auto_save"]:
-        with console.status(
-            f'Saving data to {cfg["report_filename"]}...', spinner="dots12"
-        ):
-            columns = ["Query", "Result"]
-            save_data = []
-            for name_result in results["Bulk Name Lookup"]:
-                save_data.append([name_result["Name"], name_result["IP"]])
+        columns = ["Query", "Result"]
+        save_data = []
 
-            for ip_result in results["Bulk IP Lookup"]:
-                save_data.append([ip_result["IP"], ip_result["Name"]])
+        for name_result in results["Bulk Name Lookup"]:
+            save_data.append([name_result["Name"], name_result["IP"]])
 
-            queue_save(
-            # append_df_to_excel(
-                logger,
-                cfg["report_filename"],
-                columns,
-                save_data,
-                sheet_name="Bulk DNS Lookup",
-                index=False,
-                force_header=True,
-            )
+        for ip_result in results["Bulk IP Lookup"]:
+            save_data.append([ip_result["IP"], ip_result["Name"]])
+
+        queue_save(
+            logger,
+            cfg["report_filename"],
+            columns,
+            save_data,
+            sheet_name="Bulk DNS Lookup",
+            index=False,
+            force_header=True,
+        )
     return
 
 
@@ -4045,8 +4955,6 @@ def mt_index_configurations(logger, cfg):
 
     end = perf_counter()
 
-    # import ipdb; ipdb.set_trace()
-
     # Set last update time in diskcache
     cfg["dc"].set("updated", time())
 
@@ -4057,7 +4965,7 @@ def mt_index_configurations(logger, cfg):
     # Remove indexing flag
     cfg["dc"].pop("indexing", None)
 
-    logger.info(f"Index Cache - Processing Time: {round(end-start, 2)} seconds")
+    logger.info(f"Index Cache - Processing Time: {round(end-start, 3)} seconds")
     logger.info(
         f'Index Cache - Version: {cache_version} Devices: {len(cfg["dev_idx"])}, IP Addresses: {len(cfg["ip_idx"])}, Words:{len(cfg["kw_idx"])}'
     )
@@ -4307,6 +5215,9 @@ def get_gpg_credentials(logger: logging.Logger, cfg: dict) -> any:
 
 
 def get_auth_creds(logger: logging.Logger, cfg: dict) -> tuple:
+
+    colors = get_global_color_scheme(cfg)
+
     # Read login credentials
     username = os.getenv("USER")
     password = os.getenv("TACACS_PW")
@@ -4326,13 +5237,13 @@ def get_auth_creds(logger: logging.Logger, cfg: dict) -> tuple:
                 console.clear()
                 console.print(
                     "\n"
-                    "[cyan]Set up '[red]TACACS_PW[/red]' environment variable to avoid typing in credential\n"
-                    "with each run or create/update [red]device-apply.gpg[/red] credentials file\n"
+                    f"[{colors['description']}]Set up '[{colors['error']}]TACACS_PW[/]' environment variable to avoid typing in credential\n"
+                    f"with each run or create/update [{colors['error']}]device-apply.gpg[/] credentials file\n"
                     f"For more infrmation run {os.path.basename(__file__)} with -h argument[/]\n"
                 )
                 password = read_user_input(
                     logger,
-                    "[yellow bold]Provide security credential:[/]",
+                    f"[{colors['header']} {colors['bold']}]Provide security credential:[/]",
                     True,
                 )
         else:
@@ -4343,28 +5254,23 @@ def get_auth_creds(logger: logging.Logger, cfg: dict) -> tuple:
     return (username, password)
 
 
+def get_global_color_scheme(cfg: dict) -> dict:
+    color_scheme = cfg.get("theme", 'default')
+    if color_scheme not in COLOR_SCHEMES:
+        # print(f"Warning: Unknown color scheme '{color_scheme}'. Using default.")
+        color_scheme = "default"
+
+    return COLOR_SCHEMES[color_scheme]
+
+
+def set_global_color_scheme(color_scheme):
+    console.set_color_scheme(color_scheme)
+
+
 def main() -> None:
     """
     Main function that orchestrates the execution of the script.
     """
-
-    menu = """
-    [red bold]MENU[/]
-    [cyan]
-    1. IP Information
-    2. Subnet Information
-    3. FQDN Prefix Lookup
-    4. Subnet Lookup (by site code or keyword)
-    5. Configuration Lookup (by subnet address or keyword)
-    6. Bulk PING
-    7. Bulk DNS Lookup
-    8. Site Demobilization Check
-    d. Delete Report[/]
-    [bold yellow]
-    0. Exit
-    [/]
-    """
-
     # default params if config is missing
     cfg = {
         "gpg_credentials": os.path.expanduser("~/device-apply.gpg"),
@@ -4380,6 +5286,8 @@ def main() -> None:
         # Diskcache control
         "cache_directory": os.path.expanduser("~/.cn-cache"),
         "cache": True,
+        # Other themes - monochrome, pastel, dark
+        "theme": "default"
     }
 
     switch = {
@@ -4391,6 +5299,7 @@ def main() -> None:
         "6": bulk_ping_request,
         "7": bulk_resolve_request,
         "8": demob_site_request,
+        "9": device_query,
         "d": clear_report,
         "0": exit_now,
     }
@@ -4407,6 +5316,7 @@ Features:
 - Performs bulk FQDN/IP ping operations
 - Performs bulk FQDN/IP lookups using system resolver
 - Performs search configuration storage (`/opt/data/configs/`) for obsolete data(cleanups on BGP borders/prefixes/ACLs)
+- Obtains device information (sn, ios version and image, license data) in parallel
 - Saves all requested information for later information processing(by default `report.xlsx` in $HOME directory)
 - Keeps log of requests/responses(by default `cn.log` in $HOME directory)
 - Can be easily configured by creating/changing configuration file(by default `.cn` in $HOME directory)
@@ -4487,6 +5397,10 @@ Please send any feedback/feature requests to evdanil@gmail.com
     # Read configuration
     cfg = read_config(cfg, os.path.expanduser(args.config))
 
+    # Set color theme
+    set_global_color_scheme(cfg["theme"])
+    # set_global_color_scheme("pastel")
+
     # Overwrite config values with values from args
     if args.report_file and args.report_file != cfg["report_filename"]:
         cfg["report_filename"] = os.path.expanduser(args.report_file)
@@ -4541,10 +5455,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
 
     if cfg["api_endpoint"] == "API_URL":
         logger.error("API Error - Infoblox API endpoint URL is not set")
-        console.print(
-            "[red]Correct Infoblox API URL is required(update configuration)[/]"
-        )
-        exit_now(logger, exit_code=1)
+        exit_now(logger, exit_code=1, message='Correct Infoblox API URL is required(update configuration)')
 
     # Define cache variables
     if cfg["cache"]:
@@ -4577,6 +5488,26 @@ Please send any feedback/feature requests to evdanil@gmail.com
     # Start thread responsible for saving report files
     start_worker()
 
+    colors = get_global_color_scheme(cfg)
+
+    menu = f"""
+    [{colors['error']} {colors['bold']}]MENU[/]
+    [{colors['cyan']}]
+    1. IP Information
+    2. Subnet Information
+    3. FQDN Prefix Lookup
+    4. Subnet Lookup (by site code or keyword)
+    5. Configuration Lookup (by subnet address or keyword)
+    6. Bulk PING
+    7. Bulk DNS Lookup
+    8. Site Demobilization Check
+    9. Device Information Request (Serial Number/IOS/License - only Cisco R&S)
+    d. Delete Report[/]
+    [{colors['warning']} {colors['bold']}]
+    0. Exit
+    [/]
+    """
+
     while choice != "0":
         console.clear()
         console.print(menu)
@@ -4585,7 +5516,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
 
         switch.get(choice, exit_now)(logger, cfg)
 
-        console.print("Press [red]Enter[/] key to continue")
+        console.print(f"[{colors['description']}]Press [{colors['error']}]Enter[/] key to continue[/]")
         read_user_input(logger, "")
 
 
