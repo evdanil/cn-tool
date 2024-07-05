@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.121 hash adc2c28'
+version = '0.1.122 hash ff68468'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -1954,14 +1954,14 @@ def search_config_request(logger: logging.Logger, cfg: dict) -> None:
                 continue
             else:
                 if (
-                    network.is_multicast
-                    or network.is_unspecified
+                    # network.is_multicast
+                    network.is_unspecified
                     or network.is_reserved
                     or network.is_link_local
                 ):
                     logger.info(f"User input - Invalid subnet: {search_input}")
                     console.print(
-                        f"[{colors['error']}]Invalid IP - multicast, broadcast and reserved subnets excluded.[/]\n"
+                        f"[{colors['error']}]Invalid IP - broadcast and reserved subnets excluded.[/]\n"
                         f"[{colors['info']}]Enter a valid non-reserved subnet or IP (e.g., 10.10.1.0/24 or 192.168.1.10)[/]"
                     )
                     continue
@@ -2128,31 +2128,31 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
     # Now for each location subnet we have to perform configuration lookup, it might take longer than we expect
     locations = processed_data["location"]
     networks = []
-    skipped_networks = []
+    # skipped_networks = []
     country = None
     for location in locations:
         net = ipaddress.ip_network(location["network"])
         if country is None:
             country = location["comment"][:2].upper()
-        if net.is_multicast or net.is_unspecified:
-            skipped_networks.append(location["network"])
-        else:
-            networks.append(net)
+        # if net.is_multicast or net.is_unspecified:
+        #     skipped_networks.append(location["network"])
+        # else:
+        networks.append(net)
 
     start = perf_counter()
     data_to_save = []
     search_terms = []
     matched_nets = set()
 
-    if len(skipped_networks) > 0:
-        console.print(
-            f"[{colors['warning']} {colors['bold']}]Site {sitecode} has reserved/mulicast networks registered in Infoblox[/]\n"
-        )
-        for skipped_net in skipped_networks:
-            console.print(
-                f"[{colors['info']} {colors['bold']}]Skipping reserved/mulicast network: [{colors['header']} {colors['bold']}]{skipped_net}[/]"
-            )
-        console.print("\n")
+    # if len(skipped_networks) > 0:
+    #     console.print(
+    #         f"[{colors['warning']} {colors['bold']}]Site {sitecode} has reserved/mulicast networks registered in Infoblox[/]\n"
+    #     )
+    #     for skipped_net in skipped_networks:
+    #         console.print(
+    #             f"[{colors['info']} {colors['bold']}]Skipping reserved/mulicast network: [{colors['header']} {colors['bold']}]{skipped_net}[/]"
+    #         )
+    #     console.print("\n")
 
     # Creating single search term to match WLC configs (Shell specific)
     if country:
@@ -3070,14 +3070,14 @@ def device_query(logger: logging.Logger, cfg: dict) -> None:
                 continue
             else:
                 if (
-                    ip.is_multicast
-                    or ip.is_unspecified
+                    # ip.is_multicast
+                    ip.is_unspecified
                     or ip.is_reserved
                     or ip.is_link_local
                 ):
                     logger.info(f"User input - Invalid IP address type: {search_input}")
                     console.print(
-                        f"[{colors['error']}]Invalid IP - multicast, broadcast, and reserved IPs are excluded.[/]\n"
+                        f"[{colors['error']}]Invalid IP - broadcast and reserved IPs are excluded.[/]\n"
                         f"[{colors['description']}]Enter a valid non-reserved IP (e.g. 192.168.1.10)[/]"
                     )
                     continue
@@ -3767,14 +3767,14 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
                 continue
             else:
                 if (
-                    ip.is_multicast
-                    or ip.is_unspecified
+                    # ip.is_multicast
+                    ip.is_unspecified
                     or ip.is_reserved
                     or ip.is_link_local
                 ):
                     logger.info(f"User input - Invalid IP address type: {search_input}")
                     console.print(
-                        f"[{colors['error']}]Invalid IP - multicast, broadcast, and reserved IPs are excluded.[/]\n"
+                        f"[{colors['error']}]Invalid IP - broadcast and reserved IPs are excluded.[/]\n"
                         f"[{colors['info']}]Enter a valid non-reserved IP (e.g. 192.168.1.10)[/]"
                     )
                     continue
@@ -4198,12 +4198,12 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                 if (
                     ip.is_unspecified
                     or ip.is_reserved
-                    or ip.is_multicast
+                    # or ip.is_multicast
                     or ip.is_loopback
                 ):
                     logger.info(f"User input - Invalid IP address type: {search_input}")
                     console.print(
-                        f"[{colors['error']}]Invalid IP - multicast, broadcast, and reserved IPs are excluded.[/]\n"
+                        f"[{colors['error']}]Invalid IP - broadcast and reserved IPs are excluded.[/]\n"
                         f"[{colors['info']}]Enter a valid non-reserved IP[/]"
                     )
                     continue
@@ -4225,13 +4225,13 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                 if (
                     net.is_unspecified
                     or net.is_reserved
-                    or net.is_multicast
+                    # or net.is_multicast
                     or net.is_loopback
                 ):
 
                     logger.info(f"User input - Invalid IP address type: {search_input}")
                     console.print(
-                        f"[{colors['error']}]Invalid IP - multicast, broadcast, and reserved IPs are excluded.[/]\n"
+                        f"[{colors['error']}]Invalid IP - broadcast and reserved IPs are excluded.[/]\n"
                         f"[{colors['info']}]Enter a valid non-reserved IP[/]"
                     )
                     continue
@@ -5011,7 +5011,7 @@ def get_device_facts(logger, cfg, hostname, region, vendor, device_type, fname) 
         for match in re.finditer(ip_regexp, line):
             try:
                 ip = ipaddress.ip_address(match.group())
-                if not (ip.is_multicast or ip.is_reserved or ip.compressed.startswith(("255.", "0."))):
+                if not (ip.is_reserved or ip.compressed.startswith(("255.", "0."))):
                     ip_list[(int(ipaddress.ip_address(ip)), hostname)] = ip_list[(int(ipaddress.ip_address(ip)), hostname)] + tuple([index])
             except ValueError:
                 pass
