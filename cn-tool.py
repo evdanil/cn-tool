@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.122 hash ff68468'
+version = '0.1.123 hash 3edf0a2'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -1093,7 +1093,8 @@ standard_keywords = {
         "network",
         "id",
         "area",
-        "access" "list",
+        "access",
+        "list",
         "eq",
         "udp",
         "tcp",
@@ -1287,7 +1288,6 @@ standard_keywords = {
         "summary",
         "address",
         "suppress",
-        "link",
         "nd",
         "ra",
         "suppress",
@@ -1327,7 +1327,6 @@ standard_keywords = {
         "block",
         "routes",
         "an",
-        "list",
         "netbios",
         "default",
         "originate",
