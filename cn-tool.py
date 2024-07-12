@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.123 hash 3edf0a2'
+version = '0.1.124 hash 999bec9'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -3455,7 +3455,10 @@ def exit_now(logger: logging.Logger, cfg: dict = {}, exit_code: int = 0, message
 
     if worker_thread:
         logger.info("Closing report file...")
-        with console.status(f"[{colors['success']}]Closing report file... Please do not interrupt... [/]"):
+        if exit_code == 0:
+            with console.status(f"[{colors['success']}]Closing report file... Please do not interrupt... [/]"):
+                wait_for_all_saves()
+        else:
             wait_for_all_saves()
 
     if not exit_code:
@@ -3491,6 +3494,7 @@ def make_api_call(logger: logging.Logger, cfg: dict, endpoint: str, uri: str) ->
         exit_now(logger, exit_code=1, message=f"API Error - {e.response.text}")
 
     except (HTTPError, RequestException, MissingSchema) as e:
+        logger.debug(f"API response: {response.content}")
         if response.status_code == 400:
             logger.info(f"API - Missing data - {e.response.text}")
         elif response.status_code == 401:
@@ -3499,7 +3503,6 @@ def make_api_call(logger: logging.Logger, cfg: dict, endpoint: str, uri: str) ->
         else:
             logger.error(f"API Error - {e}")
             exit_now(logger, exit_code=1, message=f'API Error - {e}')
-        logger.debug(f"API response: {response.content}")
 
         try:
             json.loads(response.content)
