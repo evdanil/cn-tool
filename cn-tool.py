@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.124 hash 999bec9'
+version = '0.1.125 hash 608f816'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -2091,7 +2091,8 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
         console.print(f"[{colors['error']}]Incorrect site code[/]")
         return
 
-    uri = f"network?comment:~={sitecode}&_max_results=50"
+    padded_sitecode = f"%20{sitecode}%20"
+    uri = f"network?comment:~={padded_sitecode}&_max_results=1000"
     processed_data = {}
 
     data = do_fancy_request(
@@ -2105,6 +2106,11 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
     if data and len(data) > 0:
         # process_data if not empty has 'location' key with subnet data
         processed_data = process_data(logger, type=f"location_{sitecode}", content=data)
+
+    if len(processed_data.get("location", "")) > 50:
+        logger.info("Request Type - Location Information - Too many results returned(>50)")
+        console.print(f"[{colors['error']}]Too many results returned(>50)[/]")
+        return
 
     if len(processed_data.get("location", "")) == 0:
         logger.info("Request Type - Location Information - No information received")
@@ -2774,7 +2780,6 @@ def parse_show_license_summary(output: str) -> list:
     if 'Index' in lines[0]:
         # This is not expected for show license summary on modern devices, however it happens on 4500-x platform
         # call parse_show_license as the output matches it
-        # import ipdb; ipdb.set_trace()
         return parse_show_license(output)
 
     # Skip header lines
@@ -2799,7 +2804,6 @@ def parse_show_license(output: str) -> list:
 
     for line in output.strip().split('\n'):
         index_match = re.match(r'Index (\d+)\s+Feature: (.+)', line)
-        # import ipdb; ipdb.set_trace()
         if index_match:
             if current_feature:
                 features.append(current_feature)
@@ -3123,7 +3127,6 @@ def device_query(logger: logging.Logger, cfg: dict) -> None:
             results = {device: future.result() for device, future in futures.items()}
 
     for hostname, device_data in results.items():
-        # import ipdb; ipdb.set_trace()
         print_data = []
         for key in device_data.keys():
             # key will be equal to hostname if there was an error processing device
@@ -4077,6 +4080,7 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
     if raw_input.startswith("+"):
         if re.match(r"^[a-zA-Z0-9_]*$", raw_input[1:]):
             search_term = raw_input[1:]
+            padded_search_term = search_term
             logger.info(f"User input - Keyword search for {search_term}")
             search_type = "keyword"
         else:
@@ -4086,6 +4090,7 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
     else:
         if is_valid_site(raw_input):
             search_term = raw_input
+            padded_search_term = f"%20{raw_input}%20"
             # to handle in the process_data sitecodes
             search_type = raw_input
             prefix.update({"location": f"{search_term.upper()}"})
@@ -4101,7 +4106,7 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
         console.print(f"[{colors['error']}]Incorrect input provided[/]")
         return
 
-    uri = f"network?comment:~={search_term}&_max_results=1000"
+    uri = f"network?comment:~={padded_search_term}&_max_results=1000"
     data = do_fancy_request(
         logger,
         cfg,
@@ -5094,13 +5099,11 @@ def search_cache_subnets(
         network_ip_map.setdefault(net, []).extend(ipaddress.ip_network(net).hosts())
         network_ip_map[net].extend([ipaddress.ip_network(net).network_address])
 
-    # import ipdb; ipdb.set_trace()
     for subnet, ip_addresses in network_ip_map.items():
         for ip_address in ip_addresses:
             # if IP is in index, get device data dict where we can loop over devices and get configuration
             device_data = cfg["ip_idx"].get(int(ip_address), {})
             for found_device, device in device_data.items():
-                # import ipdb; ipdb.set_trace()
                 with open(cfg["dev_idx"].get(found_device, {}).get('fname', None), "r", encoding="utf-8") as f:
                     for index, line in yieldlines(f, device):
                         rows_to_save.setdefault(found_device, {})[index] = (
