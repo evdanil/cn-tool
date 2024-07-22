@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.125 hash 608f816'
+version = '0.1.126 hash c6e2751'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -3505,7 +3505,7 @@ def make_api_call(logger: logging.Logger, cfg: dict, endpoint: str, uri: str) ->
             exit_now(logger, exit_code=1, message=f'Authentication error - verify credentials - {e.response.text}')
         else:
             logger.error(f"API Error - {e}")
-            exit_now(logger, exit_code=1, message=f'API Error - {e}')
+            # exit_now(logger, exit_code=0, message=f'API Error - {e}')
 
         try:
             json.loads(response.content)
@@ -3617,7 +3617,12 @@ def process_data(logger: logging.Logger, type: str, content: str) -> dict:
                     "mac": mac_address,
                 }
             )
-
+    elif type == "supernet":
+        processed_data = {"subnets": []}
+        processed_data["subnets"] = [
+            net["network"] for net in raw_data
+            if net.get("network")
+        ]
     elif type == "location_keyword":
         processed_data = {"location": []}
         processed_data["location"] = [
@@ -3639,9 +3644,9 @@ def process_data(logger: logging.Logger, type: str, content: str) -> dict:
     elif type == "fqdn":
         processed_data = {"fqdn": []}
         processed_data["fqdn"] = [
-            {"ip": f"{fqdn.get('ipv4addr')}", "name": f"{fqdn.get('name')}"}
+            {"ip": f"{fqdn.get('ipv4addr') or fqdn.get('ipv6addr')}", "name": f"{fqdn.get('name')}"}
             for fqdn in raw_data
-            if fqdn.get("ipv4addr")
+            if fqdn.get("ipv4addr") or fqdn.get('ipv6addr')
         ]
     elif type == "general":
         processed_data = {"general": []}
@@ -4107,20 +4112,54 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
         return
 
     uri = f"network?comment:~={padded_search_term}&_max_results=1000"
-    data = do_fancy_request(
+    uri_ipv6 = f"ipv6network?comment:~={padded_search_term}&_max_results=1000"
+
+    # Requesting IPv4 networks
+    data_ipv4 = do_fancy_request(
         logger,
         cfg,
-        message=f"[{colors['description']}]Fetching data for [{colors['header']}]{search_term.upper()}[/]...[/]",
+        message=f"[{colors['description']}]Fetching IPv4 data for [{colors['header']}]{search_term.upper()}[/]...[/]",
         endpoint=cfg["api_endpoint"],
         uri=uri,
     )
+    # Requesting IPv6 networks
+    data_ipv6 = do_fancy_request(
+        logger,
+        cfg,
+        message=f"[{colors['description']}]Fetching IPv6 data for [{colors['header']}]{search_term.upper()}[/]...[/]",
+        endpoint=cfg["api_endpoint"],
+        uri=uri_ipv6,
+    )
+
+    processed_data_ipv4 = {}
+    if data_ipv4 and len(data_ipv4) > 0:
+        # process_data if not empty has 'location' key with subnet data
+        processed_data_ipv4 = process_data(
+            logger, type=f"location_{search_type}", content=data_ipv4
+        )
+
+    processed_data_ipv6 = {}
+    if data_ipv4 and len(data_ipv4) > 0:
+        # process_data if not empty has 'location' key with subnet data
+        processed_data_ipv6 = process_data(
+            logger, type=f"location_{search_type}", content=data_ipv6
+        )
+
+    # Combine the 'location' lists from both dictionaries
+    united_locations = processed_data_ipv4.get('location', []) + processed_data_ipv6.get('location', [])
+
+    # Use a set to keep track of unique networks
+    unique_networks = set()
+    merged_locations = []
+
+    for item in united_locations:
+        network = item['network']
+        if network not in unique_networks:
+            unique_networks.add(network)
+            merged_locations.append(item)
 
     processed_data = {}
-    if data and len(data) > 0:
-        # process_data if not empty has 'location' key with subnet data
-        processed_data = process_data(
-            logger, type=f"location_{search_type}", content=data
-        )
+    processed_data['location'] = merged_locations
 
     if len(processed_data.get("location", "")) == 0:
         logger.info("Request Type - Location Information - No information received")
@@ -4256,6 +4295,25 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
 
     start = perf_counter()
 
+    # Require to perform supernet checks first (if provided subnet has inner subnets and expand original list with them)
+    extra_nets = []
+    with console.status(
+        status=f"[{colors['description']}]Fetching [{colors['header']}]extra[/] information...[/]"
+    ):
+        for network in net_addresses:
+            uri = f'network?network_container={network.compressed}'
+            if network.prefixlen < 30:
+                # Here run parallel requests to get inner subnets
+                response = make_api_call(logger=logger, cfg=cfg, endpoint=cfg["api_endpoint"], uri=uri)
+                if response.ok:
+                    supernet = process_data(logger, type='supernet', content=response.content)
+                    extra_nets.extend(supernet.get("subnets", []))
+
+    if len(extra_nets) > 0:
+        # append subnets to net_addresses
+        for net in extra_nets:
+            net_addresses.append(ipaddress.IPv4Network(net))
+    
     req_urls = {}
     processed_data = {}
     data_to_save = {}
@@ -4475,7 +4533,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                 return
             else:
                 console.print(
-                    f"[[{colors['success']}]]Network [{colors['error']} {colors['bold']}]{network}[/] has no data in Infoblox / Press [{colors['bold']}]SPACE[/] to see next result[/]\n"
+                    f"[{colors['success']}]Network [{colors['error']} {colors['bold']}]{network}[/] has no data in Infoblox / Press [{colors['bold']}]SPACE[/] to see next result[/]\n"
                 )
 
             key = read_single_keypress()
@@ -4697,9 +4755,25 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
 
     def resolve_name(name):
         try:
-            result = socket.gethostbyname_ex(name)
+            # AF_UNSPEC means it can return both IPv4 and IPv6
+            # SOCK_STREAM means we're interested in TCP connections
+            addrinfo = socket.getaddrinfo(name, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+
+            result = []
+            for addr in addrinfo:
+                ip = addr[4][0]  # The IP address is in this position of the tuple
+                if ip not in result:
+                    result.append(ip)
+            # return result
         except (gaierror, herror, timeout):
             result = None
+        # in case if we had short name
+        labels = name.split(".")
+        if len(labels) == 1:
+            # determine FQDN by looking ip PTR for the first returned IP
+            if result and len(result) > 0:
+                _, fqdn = resolve_ip(result[0])
+                name = fqdn[0]
 
         return (name, result)
 
@@ -4757,14 +4831,9 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
 
     for req, data in name_data:
         if data:
-            # data[0] has proper fqdn if short hostname has been used
-            # data[2] has a list of IPs resolved for the given fqdn
-            if req != data[0]:
-                name = f"{req}, {data[0]}"
-            else:
-                name = req
-            for ip in data[2]:
-                bulk_name_results.append({"Name": name, "IP": ip})
+            bulk_name_results.extend(
+                [{"Name": req, "IP": ip} for ip in data]
+            )
         else:
             bulk_name_results.append({"Name": req, "IP": "Not Resolved"})
 
