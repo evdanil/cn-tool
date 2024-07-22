@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.126 hash c6e2751'
+version = '0.1.127 hash 5e264d4'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -4302,7 +4302,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
     ):
         for network in net_addresses:
             uri = f'network?network_container={network.compressed}'
-            if network.prefixlen < 30:
+            if isinstance(network, ipaddress.IPv4Network) and network.prefixlen < 30:
                 # Here run parallel requests to get inner subnets
                 response = make_api_call(logger=logger, cfg=cfg, endpoint=cfg["api_endpoint"], uri=uri)
                 if response.ok:
