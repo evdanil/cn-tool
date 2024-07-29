@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.127 hash 5e264d4'
+version = '0.1.128 hash b5d2938'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -3570,7 +3570,7 @@ def process_data(logger: logging.Logger, type: str, content: str) -> dict:
         raw_data = json.loads(content)
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse JSON response - {e}")
-        exit_now(logger, exit_code=1, error_message="Failed to parse JSON response|Check API URL!")
+        exit_now(logger, exit_code=1, message="Failed to parse JSON response|Check API URL!")
 
     # If data present, process it and return corresponding dict
     if len(raw_data) == 0:
