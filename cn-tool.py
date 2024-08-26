@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.128 hash b5d2938'
+version = '0.1.129 hash f76c173'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -1861,7 +1861,7 @@ def search_config(
     vendor = str(parts[4]).capitalize()
     device_type = str(parts[5]).upper()
     region = str(parts[6]).upper()
-    with console.status(  
+    with console.status(
         f"[{colors['description']}]Searching through [{colors['type']}]{vendor.upper()}/{device_type}[/] configurations in [{colors['hostname']}]{region}[/] region...[/]",
         spinner="dots12",
     ):
@@ -2871,7 +2871,7 @@ def prepare_device_data(device_data_list: list) -> tuple:
         'Uptime'
         ]
 
-    # Sort columns with priority columns first, no other than priority columns expected, 
+    # Sort columns with priority columns first, no other than priority columns expected,
     # but if they present they will be added at the end
     other_columns = sorted(col for col in all_columns if col not in priority_columns)
     columns = priority_columns + other_columns
@@ -2979,7 +2979,7 @@ def process_device_commands(logger: logging.Logger, cfg: dict, device: str, cmd_
     dns_name = None
     try:
         dns_name = gethostbyaddr(device)[0]
-    except:
+    except Exception:
         pass
     if dns_name and not re.search(r'(es|mp|vi|bl|sp|lf)\d{3}', dns_name):
         logger.info(f'{device} - [yellow bold]Not supported device type![/]')
@@ -3148,7 +3148,7 @@ def device_query(logger: logging.Logger, cfg: dict) -> None:
 
     if cfg["auto_save"]:
         processed_data = []
-        # Get all gathered data processed and then prepared for saving in the report 
+        # Get all gathered data processed and then prepared for saving in the report
         for hostname, device_data in results.items():
             processed_data.append(process_device_data(logger, cfg, hostname, device_data))
 
@@ -3799,7 +3799,7 @@ def ip_request(logger: logging.Logger, cfg: dict) -> None:
             console.print(
                 f"[{colors['error']}]Invalid IP format.[/]\n"
                 f"[{colors['info']}]Enter a valid IP (e.g. 192.168.1.10)[/]"
-            )            
+            )
 
     if ip_addresses and len(ip_addresses) > 0:
         log_value = ", ".join([str(ip) for ip, _ in ip_addresses])
@@ -4313,7 +4313,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
         # append subnets to net_addresses
         for net in extra_nets:
             net_addresses.append(ipaddress.IPv4Network(net))
-    
+
     req_urls = {}
     processed_data = {}
     data_to_save = {}
@@ -4657,16 +4657,28 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
 
     console.print(
         "\n"
-        f"[{colors['description']}]Enter IPs/FQDNs to ping, one per line, non-valid IP/FQDNs are ignored.\n"
+        f"[{colors['description']}]Enter IPs/FQDNs to ping, one per line\n"
+        f"[{colors['header']} {colors['bold']}]Example IP formats[/]: 192.168.0.1, 192.168.0.0/24, 192.168.0.0/255.255.255.0\n"
+        f"[{colors['warning']}]Subnets will be expanded and every subnet IP attempted to ping[/]\n"
         "Empty input line starts ping process:[/]\n"
     )
     hosts = []
     raw_input = "none"
     while raw_input != "":
         raw_input = read_user_input(logger, "").strip()
-        if not validate_ip(raw_input) and not is_fqdn(raw_input):
+        if is_fqdn(raw_input):
+            hosts.append(raw_input)
             continue
-        hosts.append(raw_input)
+
+        try:
+            ip_object = ipaddress.ip_network(raw_input, False)
+        except Exception:
+            pass
+        else:
+            for ip in ipaddress.ip_network(ip_object).hosts():
+                if ipaddress.IPv4Address(ip).is_loopback or ipaddress.IPv4Address(ip).is_multicast or ipaddress.IPv4Address(ip).is_reserved:
+                    continue
+                hosts.append(ipaddress.IPv4Address(ip).compressed)
 
     logger.info(f'User input - {", ".join(hosts)}')
 
