@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.129 hash f76c173'
+version = '0.1.130 hash 5a4ac6a'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -3421,7 +3421,7 @@ def print_table_data(
         prefix_text = prefix.get(key, "")
         suffix_text = suffix.get(key, "")
         section_title = f"{prefix_text} {section_title} {suffix_text}"
-        section_title.upper()
+        section_title = section_title.upper()
         # Define colums
         columns = []
         # Define table data
@@ -4513,7 +4513,10 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
             print_table_data(
                 logger, cfg, processed_data[network], suffix={"general": "Information"}
             )
-            if missing_data_nets == net_addresses:
+            if missing_data_nets == len(net_addresses):
+                console.print(
+                    f"[{colors['success']}]Network [{colors['error']} {colors['bold']}]{network}[/] has no data in Infoblox[/]\n"
+                )
                 return
             if len(net_addresses) - missing_data_nets > 1:
                 console.print(
@@ -4526,7 +4529,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                     break
         else:
             missing_data_nets += 1
-            if missing_data_nets == net_addresses:
+            if missing_data_nets == len(net_addresses):
                 console.print(
                     f"[{colors['success']}]Network [{colors['error']} {colors['bold']}]{network}[/] has no data in Infoblox[/]\n"
                 )
