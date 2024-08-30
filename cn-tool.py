@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.130 hash 5a4ac6a'
+version = '0.1.131 hash 0590fe9'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -1564,6 +1564,10 @@ ip_regexp = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
 
 subnet_regexp = re.compile(
     r"(?:(?:25[0-5]|(?:2[0-4]|1\d|[1-9]|)\d)\.?\b){4}\/((?:[1-2][0-9])|(?:3[0-2])|(?:[0-9]\b))"
+)
+
+str_ip_subnet_regexp = re.compile(
+    r".*?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})[^\d]*(?:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|\/(\d{1,2}))"
 )
 
 
@@ -4673,15 +4677,33 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
             hosts.append(raw_input)
             continue
 
-        try:
-            ip_object = ipaddress.ip_network(raw_input, False)
-        except Exception:
-            pass
-        else:
-            for ip in ipaddress.ip_network(ip_object).hosts():
-                if ipaddress.IPv4Address(ip).is_loopback or ipaddress.IPv4Address(ip).is_multicast or ipaddress.IPv4Address(ip).is_reserved:
+        # Process string and grab IPs
+        if len(raw_input.split(' ')) > 1 or raw_input.count('/') > 0:
+            matched = re.match(str_ip_subnet_regexp, raw_input)
+            if matched is not None:
+                try:
+                    if matched.group(2) is not None:
+                        ip_object = ipaddress.ip_network(f'{matched.group(1)}/{matched.group(2)}', False)
+                    else:
+                        ip_object = ipaddress.ip_network(f'{matched.group(1)}/{matched.group(3)}', False)
+                except Exception:
+                    pass
+                else:
+                    for ip in ipaddress.ip_network(ip_object).hosts():
+                        if ipaddress.IPv4Address(ip).is_loopback or ipaddress.IPv4Address(ip).is_multicast or ipaddress.IPv4Address(ip).is_reserved:
+                            continue
+                        hosts.append(ipaddress.IPv4Address(ip).compressed)
                     continue
-                hosts.append(ipaddress.IPv4Address(ip).compressed)
+
+            for word in raw_input.split(' '):
+                match = re.match(ip_regexp, word)
+                if match:
+                    hosts.append(word)
+            # At this point multi word string does not have valid IPs
+            continue
+
+        if validate_ip(raw_input):
+            hosts.append(raw_input)
 
     logger.info(f'User input - {", ".join(hosts)}')
 
@@ -4697,31 +4719,44 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
     p = {}
     results = {"Bulk PING": []}
 
-    with console.status(f"[{colors['description']}]Pinging...[/]", spinner="dots12"):
+    # Batch processing, execute {batch_size} pings at a time
+    # TODO make it configurable?
+    batch_size = 100
+    # if len(hosts) < batch_size:
+    #     batch_size = len(hosts)
+    for run in range(0, int(len(hosts)/batch_size) + 1):
+        with console.status(f"[{colors['description']}]Pinging hosts...[/]", spinner="dots12"):
+            if (run + 1) * batch_size <= len(hosts):
+                start = run * batch_size
+                end = (run + 1) * batch_size
+            else:
+                start = run * batch_size
+                end = run * batch_size + int(len(hosts) % batch_size)
 
-        for host in hosts:
-            # start ping processes - wait for 5 seconds to get 3 successful pings
-            p[host] = Popen(
-                ["ping", "-n", "-w5", "-c3", host], stdout=DEVNULL, stderr=STDOUT
-            )
+            for idx in range(start, end):
+                # start ping processes - wait for 3 seconds to get 3 successful pings
+                host = hosts[idx]
+                p[host] = Popen(
+                    ["ping", "-n", "-w3", "-c3", host], stdout=DEVNULL, stderr=STDOUT
+                )
 
-        while p:
-            for host, proc in p.items():
-                # ping finished
-                if proc.poll() is not None:
-                    # remove from the process list
-                    del p[host]
-                    if proc.returncode == 0:
-                        results["Bulk PING"].append({"Host": f"{host}", "Result": "OK"})
-                    elif proc.returncode == 1:
-                        results["Bulk PING"].append(
-                            {"Host": f"{host}", "Result": "NO RESPONSE"}
-                        )
-                    else:
-                        results["Bulk PING"].append(
-                            {"Host": f"{host}", "Result": "ERROR"}
-                        )
-                    break
+            while p:
+                for host, proc in p.items():
+                    # ping finished
+                    if proc.poll() is not None:
+                        # remove from the process list
+                        del p[host]
+                        if proc.returncode == 0:
+                            results["Bulk PING"].append({"Host": f"{host}", "Result": "OK"})
+                        elif proc.returncode == 1:
+                            results["Bulk PING"].append(
+                                {"Host": f"{host}", "Result": "NO RESPONSE"}
+                            )
+                        else:
+                            results["Bulk PING"].append(
+                                {"Host": f"{host}", "Result": "ERROR"}
+                            )
+                        break
 
     # Sort data per key
     sorted_results = {"Bulk PING": []}
@@ -4783,12 +4818,15 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
         except (gaierror, herror, timeout):
             result = None
         # in case if we had short name
-        labels = name.split(".")
-        if len(labels) == 1:
-            # determine FQDN by looking ip PTR for the first returned IP
-            if result and len(result) > 0:
-                _, fqdn = resolve_ip(result[0])
-                name = fqdn[0]
+        else:
+            labels = name.split(".")
+            if len(labels) == 1:
+                # determine FQDN by looking ip PTR for the first returned IP
+                if result is not None and len(result) > 0:
+                    _, fqdn = resolve_ip(result[0])
+                    # Check if PTR Resolve successful
+                    if fqdn is not None:
+                        name = fqdn[0]
 
         return (name, result)
 
@@ -4796,7 +4834,9 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
 
     console.print(
         "\n"
-        f"[{colors['description']}]Enter FQDNs/IP addresses, one FQDN/IP address per line. Non-valid FQDNs/IPs are ignored.\n"
+        f"[{colors['description']}]Enter FQDNs/IP addresses/IP Subnets, one FQDN/IP address/IP Subnet per line. Non-valid FQDNs/IPs are ignored.\n"
+        f"[{colors['header']} {colors['bold']}]Example IP formats[/]: 192.168.0.1, 192.168.0.0/24, 192.168.0.0/255.255.255.0\n"
+        f"[{colors['warning']}]Subnets will be expanded and every subnet IP attempted to resolve[/]\n"
         "Empty input line starts lookup process:[/]\n"
     )
 
@@ -4804,6 +4844,37 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
     raw_input = "none"
     while raw_input != "":
         raw_input = read_user_input(logger, "").strip()
+        #  if there are multiple words, sift through to pick up IPs
+        # console.print(f"Len: {len(raw_input.split(' '))}")
+        if len(raw_input.split(' ')) > 1 or raw_input.count('/') > 0:
+            matched = re.match(str_ip_subnet_regexp, raw_input)
+            if matched is not None:
+                try:
+                    if matched.group(2) is not None:
+                        ip_object = ipaddress.ip_network(f'{matched.group(1)}/{matched.group(2)}', False)
+                    else:
+                        ip_object = ipaddress.ip_network(f'{matched.group(1)}/{matched.group(3)}', False)
+                except Exception:
+                    pass
+                else:
+                    for ip in ipaddress.ip_network(ip_object).hosts():
+                        if ipaddress.IPv4Address(ip).is_loopback or ipaddress.IPv4Address(ip).is_multicast or ipaddress.IPv4Address(ip).is_reserved:
+                            continue
+                        data_lines["ip"].append(ipaddress.IPv4Address(ip).compressed)
+                    continue
+            for word in raw_input.split(' '):
+                match = re.match(ip_regexp, word)
+                if match:
+                    data_lines["ip"].append(word)
+
+            for word in raw_input.split(' '):
+                match = re.match(ip_regexp, word)
+                if match:
+                    data_lines["ip"].append(word)
+            # At this point multi word string does not have valid IPs
+            continue
+
+
         if validate_ip(raw_input):
             data_lines["ip"].append(raw_input)
         elif is_fqdn(raw_input):
