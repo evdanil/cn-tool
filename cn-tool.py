@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.131 hash 0590fe9'
+version = '0.1.132 hash b8a99f7'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -4683,6 +4683,9 @@ def bulk_ping_request(logger: logging.Logger, cfg: dict) -> None:
             if matched is not None:
                 try:
                     if matched.group(2) is not None:
+                        # If we got 0.0.0.0 wildcard mask - skip the line
+                        if matched.group(2) == '0.0.0.0':
+                            continue
                         ip_object = ipaddress.ip_network(f'{matched.group(1)}/{matched.group(2)}', False)
                     else:
                         ip_object = ipaddress.ip_network(f'{matched.group(1)}/{matched.group(3)}', False)
@@ -4851,6 +4854,9 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
             if matched is not None:
                 try:
                     if matched.group(2) is not None:
+                        # If we got 0.0.0.0 wildcard mask - skip the line
+                        if matched.group(2) == '0.0.0.0':
+                            continue
                         ip_object = ipaddress.ip_network(f'{matched.group(1)}/{matched.group(2)}', False)
                     else:
                         ip_object = ipaddress.ip_network(f'{matched.group(1)}/{matched.group(3)}', False)
