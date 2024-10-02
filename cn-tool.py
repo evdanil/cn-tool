@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.133 hash 4a65268'
+version = '0.1.134 hash e0dd111'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -1758,7 +1758,36 @@ def data_to_dict(column_names: list, data: list) -> dict:
     return result_dict
 
 
-def wired_mac_to_bssids(wired_mac: str, bssid: int) -> list:
+def validate_and_normalize_mac_address(mac):
+    # Remove any whitespace and convert to lowercase
+    mac = mac.strip().lower()
+
+    # Define regex patterns for each format
+    patterns = [
+        r'^([0-9a-f]{2})[:-]([0-9a-f]{2})[:-]([0-9a-f]{2})[:-]([0-9a-f]{2})[:-]([0-9a-f]{2})[:-]([0-9a-f]{2})$',  # xx:xx:xx:xx:xx:xx or xx-xx-xx-xx-xx-xx
+        r'^([0-9a-f]{4})\.([0-9a-f]{4})\.([0-9a-f]{4})$',    # xxxx.xxxx.xxxx
+        r'^([0-9a-f]{12})$'                         # xxxxxxxxxxxx
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, mac)
+        if match:
+            if len(match.groups()) == 6:
+                # Already in the correct format, just uppercase it
+                return ':'.join(group.upper() for group in match.groups())
+            elif len(match.groups()) == 3:
+                # xxxx.xxxx.xxxx format
+                mac_parts = ''.join(match.groups())
+                return ':'.join(mac_parts[i:i+2].upper() for i in range(0, 12, 2))
+            else:
+                # xxxxxxxxxxxx format
+                return ':'.join(mac[i:i+2].upper() for i in range(0, 12, 2))
+
+    # Return None for invalid MAC addresses
+    return None
+
+
+def wired_mac_to_bssids(wired_mac: str, bssid: str) -> list:
     """
     Aruba BSSID from Ethernet MAC
     Author - Kieran Morton - mortonese.com
@@ -5505,6 +5534,83 @@ def set_global_color_scheme(color_scheme):
     console.set_color_scheme(color_scheme)
 
 
+def aruba_bssids(logger: logging.Logger, cfg: dict) -> None:
+    """
+    Requests user to provide list of MAC addresses
+    Validates user input
+    Converts and prints MAC address data to BSSID MAC addresses for 5G and 2.4G
+    Saves data if auto_save enabled
+
+    @param logger(Logger): logger instance.
+
+    @return: None
+    """
+    colors = get_global_color_scheme(cfg)
+
+    logger.info("Request Type - Aruba BSSID MAC Information")
+
+    console.print(
+        "\n"
+        f"[{colors['description']}]Enter MAC addresses(one MAC per line)\n"
+        "Empty input line starts the process\n"
+        "[cyan]Supported MAC formats\n[/]"
+        "[red]xx:xx:xx:xx:xx:xx\n"
+        "xx-xx-xx-xx-xx-xx\n"
+        "xxxx.xxxx.xxxx\n"
+        "xxxxxxxxxxxx\n[/]"
+    )
+
+    mac_addresses = []
+
+    while True:
+        search_input = read_user_input(logger, "").strip()
+        if search_input == "":
+            break
+        mac = validate_and_normalize_mac_address(search_input)
+        if mac:
+            mac_addresses.append(mac)
+
+    # One liner remove duplicates from mac_addresses
+    mac_addresses = list(dict.fromkeys(mac_addresses))
+
+    if mac_addresses and len(mac_addresses) > 0:
+        log_value = ", ".join([mac for mac in mac_addresses])
+        logger.info(f"User input - {log_value}")
+    else:
+        return
+
+    aruba_mac_set = {}
+    aruba_mac_set["Aruba BSSIDs"] = []
+
+    for wired_mac in mac_addresses:
+        mac24, mac5 = wired_mac_to_bssids(wired_mac, '16')
+        aruba_mac_set["Aruba BSSIDs"].append({
+            "Wired MAC": wired_mac,
+            "5GHz MAC": mac5,
+            "2.4GHz MAC": mac24
+            })
+
+    print_table_data(logger, cfg, aruba_mac_set)
+
+    if cfg["auto_save"]:
+        columns = ["Wired MAC", "5Ghz MAC", "2.4Ghz MAC"]
+        save_data = []
+
+        for result in aruba_mac_set["Aruba BSSIDs"]:
+            save_data.append([result["Wired MAC"], result["5GHz MAC"], result["2.4GHz MAC"]])
+
+        queue_save(
+            logger,
+            cfg["report_filename"],
+            columns,
+            save_data,
+            sheet_name="Aruba BSSIDs",
+            index=False,
+            force_header=True,
+        )
+    return
+
+
 def main() -> None:
     """
     Main function that orchestrates the execution of the script.
@@ -5538,6 +5644,7 @@ def main() -> None:
         "7": bulk_resolve_request,
         "8": demob_site_request,
         "9": device_query,
+        "b": aruba_bssids,
         "d": clear_report,
         "0": exit_now,
     }
@@ -5749,6 +5856,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
     7. Bulk DNS Lookup
     8. Site Demobilization Check
     9. Device Information Request (Serial Number/IOS/License - only Cisco R&S)
+    b. Aruba BSSID MACs
     d. Delete Report[/]
     [{colors['warning']} {colors['bold']}]
     0. Exit
