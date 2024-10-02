@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.132 hash b8a99f7'
+version = '0.1.133 hash 4a65268'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -1758,6 +1758,61 @@ def data_to_dict(column_names: list, data: list) -> dict:
     return result_dict
 
 
+def wired_mac_to_bssids(wired_mac: str, bssid: int) -> list:
+    """
+    Aruba BSSID from Ethernet MAC
+    Author - Kieran Morton - mortonese.com
+    """
+
+    # Remove Colons from inputted Wired MAC Address
+    clean_mac = wired_mac.replace(":", "")
+
+    # Extract NIC from total Wired MAC Address
+    nic = clean_mac[6:16]
+    # Remove first character from the NIC
+    nic = nic[1:16]
+    # Convert to binary string
+    binary_nic = format(int(nic, 16), "020b")
+    # Append 0000 to binary string
+    binary_nic = binary_nic + "0000"
+
+    # XOR first four digits with 8 (in binary)
+    # Get first 4 binary digits of the NIC
+    a = binary_nic[0:4]
+    # Decimal 8 in binary
+    b = "1000"
+    # XOR with 8 or 1000 in binary
+    y = int(a, 2) ^ int(b, 2)
+    # Remove '0b' and pad to make length 4
+    z = bin(y)[2:].zfill(len(a))
+    # Replace first four digits with the XOR result to derive Radio 0 NIC
+    binary_r0_nic = z + binary_nic[4:]
+
+    # Get other base MAC
+    # Convert number of BSSIDs to binary number
+    binary_bssid = format(int(bssid, 10), "020b").zfill(len(binary_r0_nic))
+    # Add Binary NO. BSSIDs to the Binary NIC to derive Radio 1 NIC
+    binary_r1_nic = bin(int(binary_r0_nic, 2) + int(binary_bssid, 2))[2:]
+
+    # Convert binary NICs back to HEX (and remove '0x')
+    r0_nic = hex(int(binary_r0_nic, 2))[2:]
+    r1_nic = hex(int(binary_r1_nic, 2))[2:]
+
+    # Add NICs back to original OUI
+    r0_mac = clean_mac[0:6] + r0_nic
+    r1_mac = clean_mac[0:6] + r1_nic
+
+    # Add the colons back
+    r0_mac = (':'.join(r0_mac[i:i+2] for i in range(0, len(r0_mac), 2))).upper()
+    r1_mac = (':'.join(r1_mac[i:i+2] for i in range(0, len(r1_mac), 2))).upper()
+
+    # return results
+    # print("Radio 0 Base MAC Address: " + r0_mac)
+    # print("Radio 1 Base MAC Address: " + r1_mac)
+
+    return [r0_mac, r1_mac]
+
+
 def print_search_config_data(data: list, color_scheme: str = "default") -> None:
     """
     Prints the configuration search data in a formatted manner.
@@ -2119,6 +2174,7 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
     if len(processed_data.get("location", "")) == 0:
         logger.info("Request Type - Location Information - No information received")
         console.print(f"[{colors['error']}]No [{colors['success']} {colors['bold']}]{sitecode.upper()}[/] subnets registered in Infoblox[/]")
+        return
     else:
 
         print_table_data(logger, cfg, processed_data)
@@ -2627,9 +2683,9 @@ def is_valid_site(sitecode: str) -> bool:
     @return: True if the site code is valid, False otherwise.
     """
 
-    # This regex allows for either three alphanumeric characters followed by a hyphen and another three alphanumeric characters,
+    # This regex allows for either three alphanumeric characters followed by a hyphen and another one to four alphanumeric characters,
     # or simply three alphanumeric characters without the hyphen.
-    valid_site_regex = "^[a-z0-9]{7}$|^[a-z0-9]{3}$|^[a-z0-9]{3}(?:-[a-z0-9]{2,4})?$"
+    valid_site_regex = "^[a-z0-9]{7}$|^[a-z0-9]{3}$|^[a-z0-9]{3}(?:-[a-z0-9]{1,4})?$"
 
     if re.search(valid_site_regex, sitecode, re.IGNORECASE):
         return True
@@ -2988,8 +3044,9 @@ def process_device_commands(logger: logging.Logger, cfg: dict, device: str, cmd_
     if dns_name and not re.search(r'(es|mp|vi|bl|sp|lf)\d{3}', dns_name):
         logger.info(f'{device} - [yellow bold]Not supported device type![/]')
         return {device: 'Not supported device type'}
-    elif dns_name:
-        device = dns_name
+    # TODO this causes key issue if we use short hostname, but lookup returns fqdn
+    # elif dns_name:
+    #     device = dns_name
 
     output = {}
 
@@ -3001,19 +3058,19 @@ def process_device_commands(logger: logging.Logger, cfg: dict, device: str, cmd_
         "secret": ''
         }
 
-    guesser = SSHDetect(**dev)
-    dev["device_type"] = guesser.autodetect()
-
-    if "cisco" not in dev["device_type"]:
-        logger.info(f'{device} - [yellow bold]Not supported device type![/]')
-        return {device: 'Not supported device type'}
-
     conn = ConnLogOnly(**dev)
 
     if conn is None:
         # console.print(f'{device} - [yellow bold]Unable to connect![/]')
         logger.info(f'{device} - Unable to connect!')
         return {device: 'Unable to connect'}
+
+    guesser = SSHDetect(**dev)
+    dev["device_type"] = guesser.autodetect()
+
+    if "cisco" not in dev["device_type"]:
+        logger.info(f'{device} - [yellow bold]Not supported device type![/]')
+        return {device: 'Not supported device type'}
 
     for cmd_key, funcs in cmd_list.items():
         data = conn.send_command(f"{cmd_key.replace('_', ' ')}\n", auto_find_prompt=True)
@@ -4879,7 +4936,6 @@ def bulk_resolve_request(logger: logging.Logger, cfg: dict) -> None:
                     data_lines["ip"].append(word)
             # At this point multi word string does not have valid IPs
             continue
-
 
         if validate_ip(raw_input):
             data_lines["ip"].append(raw_input)
