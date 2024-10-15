@@ -7,3 +7,4 @@ configparser
 openpyxl
 diskcache
 netmiko
+ldap3
