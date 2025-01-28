@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.136 hash f17bffa'
+version = '0.1.137 hash 982762a'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -2171,36 +2171,23 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
     raw_input = read_user_input(logger, "Enter location site code: ").strip()
 
     logger.info(f"User input - {raw_input}")
-    if is_valid_site(raw_input):
-        sitecode = raw_input.upper()
-        logger.info(f"User input - Sitecode search for {sitecode}")
-    else:
+    if not is_valid_site(raw_input):
         logger.info(f"User input - Incorrect site code {raw_input}")
         console.print(f"[{colors['error']}]Incorrect site code[/]")
         return
 
-    padded_sitecode = f"%20{sitecode}%20"
-    uri = f"network?comment:~={padded_sitecode}&_max_results=1000"
-    processed_data = {}
+    sitecode = raw_input.upper()
+    logger.info(f"User input - Sitecode search for {sitecode}")
 
-    data = do_fancy_request(
-        logger,
-        cfg,
-        message=f"[{colors['description']}]Fetching data for [{colors['header']}]{sitecode}[/]...[/]",
-        endpoint=cfg["api_endpoint"],
-        uri=uri,
-    )
+    # Fetch data using helper
+    processed_data = fetch_network_data(logger, cfg, sitecode)
 
-    if data and len(data) > 0:
-        # process_data if not empty has 'location' key with subnet data
-        processed_data = process_data(logger, type=f"location_{sitecode}", content=data)
-
-    if len(processed_data.get("location", "")) > 50:
+    if len(processed_data.get("location", [])) > 50:
         logger.info("Request Type - Location Information - Too many results returned(>50)")
         console.print(f"[{colors['error']}]Too many results returned(>50)[/]")
         return
 
-    if len(processed_data.get("location", "")) == 0:
+    if len(processed_data.get("location", [])) == 0:
         logger.info("Request Type - Location Information - No information received")
         console.print(f"[{colors['error']}]No [{colors['success']} {colors['bold']}]{sitecode.upper()}[/] subnets registered in Infoblox[/]")
         return
@@ -2306,6 +2293,67 @@ def demob_site_request(logger: logging.Logger, cfg: dict) -> None:
         save_found_data(
             logger, cfg, data_to_save, missing_nets, matched_nets, "Demob Site Check"
         )
+
+
+def fetch_network_data(logger: logging.Logger, cfg: dict, search_term: str, keyword: bool = False) -> dict:
+    """
+    Fetches and processes IPv4 and IPv6 network data based on a search term.
+    Merges results, removes duplicates, and returns the processed data.
+    """
+    colors = get_global_color_scheme(cfg)
+    search_type = ''
+
+    if not keyword:
+        # Build regex pattern for site code search
+        padded_search_term = rf'^[^;]+;\s*{search_term}\s*;'
+        encoded_pattern = selective_url_encode(padded_search_term)
+        search_type = f"location_{search_term}"
+    else:
+        encoded_pattern = selective_url_encode(search_term)
+        search_type = "location_keyword"
+
+    uri_ipv4 = f"network?comment:~={encoded_pattern}&_max_results=1000"
+    uri_ipv6 = f"ipv6network?comment:~={encoded_pattern}&_max_results=1000"
+
+    # Fetch IPv4 data
+    data_ipv4 = do_fancy_request(
+        logger,
+        cfg,
+        message=f"[{colors['description']}]Fetching IPv4 data for [{colors['header']}]{search_term.upper()}[/]...[/]",
+        endpoint=cfg["api_endpoint"],
+        uri=uri_ipv4,
+    )
+
+    # Fetch IPv6 data
+    data_ipv6 = do_fancy_request(
+        logger,
+        cfg,
+        message=f"[{colors['description']}]Fetching IPv6 data for [{colors['header']}]{search_term.upper()}[/]...[/]",
+        endpoint=cfg["api_endpoint"],
+        uri=uri_ipv6,
+    )
+
+    # Process data
+    processed_data_ipv4 = process_data(
+        logger, type=search_type, content=data_ipv4
+    ) if data_ipv4 else {}
+
+    processed_data_ipv6 = process_data(
+        logger, type=search_type, content=data_ipv6
+    ) if data_ipv6 else {}
+
+    # Merge and deduplicate
+    united_locations = processed_data_ipv4.get('location', []) + processed_data_ipv6.get('location', [])
+    unique_networks = set()
+    merged_locations = []
+
+    for item in united_locations:
+        network = item['network']
+        if network not in unique_networks:
+            unique_networks.add(network)
+            merged_locations.append(item)
+
+    return {'location': merged_locations}
 
 
 def save_found_data(
@@ -2682,6 +2730,19 @@ def configure_logging(logfile_location: str, log_level=logging.INFO) -> logging.
     logger.addHandler(file_handler)
 
     return logger
+
+
+# Function to selectively encode the regex pattern for Infoblox WAPI
+def selective_url_encode(pattern):
+    # Characters that need to be URL-encoded
+    chars_to_encode = {"%", ";", "/", "?", ":", "@", "&", "=", "+", "$", ",", " "}
+    encoded_pattern = ""
+    for char in pattern:
+        if char in chars_to_encode:
+            encoded_pattern += f"%{ord(char):02X}"  # URL-encode the character
+        else:
+            encoded_pattern += char  # Leave the character as-is
+    return encoded_pattern
 
 
 def validate_ip(ip: str) -> bool:
@@ -4168,88 +4229,35 @@ def location_request(logger: logging.Logger, cfg: dict) -> None:
 
     logger.info(f"User input - {raw_input}")
 
-    search_term = ""
-    search_type = ""
-    prefix = {}
-    suffix = {}
-    if raw_input.startswith("+"):
-        if re.match(r"^[a-zA-Z0-9_]*$", raw_input[1:]):
-            search_term = raw_input[1:]
-            padded_search_term = search_term
-            logger.info(f"User input - Keyword search for {search_term}")
-            search_type = "keyword"
-        else:
-            logger.info(f"User input -  Incorrect input {raw_input}")
-            console.print(f"[{colors['error']}]Incorrect input provided[/]")
-            return
-    else:
-        if is_valid_site(raw_input):
-            search_term = raw_input
-            padded_search_term = f"%20{raw_input}%20"
-            # to handle in the process_data sitecodes
-            search_type = raw_input
-            prefix.update({"location": f"{search_term.upper()}"})
-            suffix.update({"location": "Subnets"})
-            logger.info(f"User input - Sitecode search for {search_term}")
-        else:
-            logger.info(f"User input -  Incorrect site code {raw_input}")
-            console.print(f"[{colors['error']}]Incorrect site code[/]")
-            return
-
-    if len(search_term) == 0:
+    if len(raw_input.strip()) == 0:
         logger.info("User input -  Empty input")
         console.print(f"[{colors['error']}]Incorrect input provided[/]")
         return
 
-    uri = f"network?comment:~={padded_search_term}&_max_results=1000"
-    uri_ipv6 = f"ipv6network?comment:~={padded_search_term}&_max_results=1000"
+    search_term = ""
+    prefix = {}
+    suffix = {}
+    keyword = False
+    if raw_input.startswith("+"):
+        if not re.match(r"^[a-zA-Z0-9_-]*$", raw_input[1:]):
+            logger.info(f"User input -  Incorrect input {raw_input}")
+            console.print(f"[{colors['error']}]Incorrect input provided[/]")
+            return
+        search_term = raw_input[1:]
+        logger.info(f"User input - Keyword search for {search_term}")
+        keyword = True
+    else:
+        if not is_valid_site(raw_input):
+            logger.info(f"User input -  Incorrect site code {raw_input}")
+            console.print(f"[{colors['error']}]Incorrect site code[/]")
+            return
+        search_term = raw_input
+        prefix = {"location": search_term.upper()}
+        suffix = {"location": "Subnets"}
+        logger.info(f"User input - Sitecode search for {search_term}")
 
-    # Requesting IPv4 networks
-    data_ipv4 = do_fancy_request(
-        logger,
-        cfg,
-        message=f"[{colors['description']}]Fetching IPv4 data for [{colors['header']}]{search_term.upper()}[/]...[/]",
-        endpoint=cfg["api_endpoint"],
-        uri=uri,
-    )
-    # Requesting IPv6 networks
-    data_ipv6 = do_fancy_request(
-        logger,
-        cfg,
-        message=f"[{colors['description']}]Fetching IPv6 data for [{colors['header']}]{search_term.upper()}[/]...[/]",
-        endpoint=cfg["api_endpoint"],
-        uri=uri_ipv6,
-    )
-
-    processed_data_ipv4 = {}
-    if data_ipv4 and len(data_ipv4) > 0:
-        # process_data if not empty has 'location' key with subnet data
-        processed_data_ipv4 = process_data(
-            logger, type=f"location_{search_type}", content=data_ipv4
-        )
-
-    processed_data_ipv6 = {}
-    if data_ipv4 and len(data_ipv4) > 0:
-        # process_data if not empty has 'location' key with subnet data
-        processed_data_ipv6 = process_data(
-            logger, type=f"location_{search_type}", content=data_ipv6
-        )
-
-    # Combine the 'location' lists from both dictionaries
-    united_locations = processed_data_ipv4.get('location', []) + processed_data_ipv6.get('location', [])
-
-    # Use a set to keep track of unique networks
-    unique_networks = set()
-    merged_locations = []
-
-    for item in united_locations:
-        network = item['network']
-        if network not in unique_networks:
-            unique_networks.add(network)
-            merged_locations.append(item)
-
-    processed_data = {}
-    processed_data['location'] = merged_locations
+    # Fetch data using helper
+    processed_data = fetch_network_data(logger, cfg, search_term, keyword)
 
     if len(processed_data.get("location", "")) == 0:
         logger.info("Request Type - Location Information - No information received")
