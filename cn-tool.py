@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.143 hash 048bc4f'
+version = '0.1.144 hash 54ec8e2'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
