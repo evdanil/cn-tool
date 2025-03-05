@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.144 hash 54ec8e2'
+version = '0.1.145 hash e8d1a09'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -4395,7 +4395,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                         f"[{colors['info']}]Enter a valid non-reserved IP[/]"
                     )
                     continue
-                if isinstance(net, ipaddress.IPv4Address):
+                if isinstance(net, ipaddress.IPv4Network):
                     net_addresses.append(net)
                 else:
                     logger.info(f"User input - IPv6 address type is not supported -  {net}")
