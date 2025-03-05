@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.137 hash 982762a'
+version = '0.1.138 hash 71f5c8c'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -3800,14 +3800,24 @@ def process_data(logger: logging.Logger, type: str, content: str) -> dict:
             if fqdn.get("ipv4addr") or fqdn.get('ipv6addr')
         ]
     elif type == "general":
+        logger.info(f"DEBUG!!!: {type}")
+        logger.info(data)
         processed_data = {"general": []}
         # General subnet information
         if data and len(data) > 0:
             processed_data["general"] = [
                 {
                     "subnet": data.get("network", ""),
-                    "description": data.get("comment", ""),
+                    "description": data.get("comment", "")
                 }
+            ]
+            
+            processed_data["Extensible Attributes"] = [
+                {
+                    "Attribute": key,
+                    "Value": record.get("value")
+                }
+                for key, record in data.get("extattrs",{}).items()
             ]
 
     elif type == "DNS records":
@@ -4351,7 +4361,13 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                         f"[{colors['info']}]Enter a valid non-reserved IP[/]"
                     )
                     continue
-                net_addresses.append(ip)
+                if isinstance(ip, ipaddress.IPv4Address):
+                    net_addresses.append(ip)
+                else:
+                    logger.info(f"User input - IPv6 address type is not supported - {ip}")
+                    console.print(
+                        f"[{colors['error']}]IPv6 address type is not supported[/]\n"
+                    )
                 continue
         else:
             try:
@@ -4379,7 +4395,13 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
                         f"[{colors['info']}]Enter a valid non-reserved IP[/]"
                     )
                     continue
-                net_addresses.append(net)
+                if isinstance(net, ipaddress.IPv4Address):
+                    net_addresses.append(net)
+                else:
+                    logger.info(f"User input - IPv6 address type is not supported -  {net}")
+                    console.print(
+                        f"[{colors['error']}]IPv6 address type is not supported[/]\n"
+                    )                
                 continue
 
     # One liner remove duplicates from net_addresses
@@ -4418,7 +4440,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
     # Compile API request URIs to obtain general network information for each address
     for network in net_addresses:
         req_urls[network] = {
-            "general": f"network?network={network}",
+            "general": f"network?network={network}&_return_fields=network,comment,extattrs", 
             "DNS records": f"ipv4address?network={network}&usage=DNS&_return_fields=ip_address,names",
             "network options": f"network?network={network}&_return_fields=options,members",
             "DHCP range": f"range?network={network}",
@@ -4434,6 +4456,7 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
             "DHCP range": [],
             "DHCP failover": [],
             "fixed addresses": [],
+            "Extensible Attributes": [],
         }
 
     # Request general network information for each subnet
@@ -4465,8 +4488,11 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
         # display data only if it is available
         data = []
         if len(processed_data[network]["general"]) > 0:
+            # logger.info('DEBUG!!!!:')
+            # logger.info(processed_data[network])
             # print_table_data(logger, processed_data[network], suffix={"general": "Information"})
             # Need to compile single 2d array with all the data to save it in xlsx
+            ext_attrs_data = processed_data[network].get("Extensible Attributes", "")
             dhcp_members_data = processed_data[network].get("DHCP members", "")
             dhcp_options_data = processed_data[network].get("DHCP options", "")
             dhcp_ranges_data = processed_data[network].get("DHCP range", "")
@@ -4523,6 +4549,32 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
             ]
 
             data.append(first_row)
+
+            # Handling Extensible attributes
+            if len(ext_attrs_data) > 0:
+                
+                ext_attrs_rows = [
+                    str(record.get("Attribute", "") + ':' + record.get("Value", ""))
+                    for record in ext_attrs_data
+                ]
+
+                ext_attr_field = "\n".join(ext_attrs_rows)
+                ext_attrs = [
+                    [
+                        subnet[0],
+                        f"/{subnet[1]}",
+                        ext_attr_field,
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "Extensible Attributes Data",
+                    ]
+                ]
+                data.extend(ext_attrs)
 
             # Preparing DNS A records
             if len(dns_data) > 0:
