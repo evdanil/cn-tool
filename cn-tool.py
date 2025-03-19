@@ -59,7 +59,7 @@ from rich._emoji_codes import EMOJI
 del EMOJI["cd"]
 
 MIN_INPUT_LEN = 5
-version = '0.1.146 hash f6f174d'
+version = '0.1.147 hash 4025daa'
 
 # increment cache_version during release if indexes or structures changed and rebuild of the cache is required
 cache_version = 2
@@ -4640,10 +4640,20 @@ def subnet_request(logger: logging.Logger, cfg: dict) -> None:
             if len(data) > 0:
                 summary_net["subnet"] = data[0].get("subnet")
                 summary_net["description"] = data[0].get("description", "")
+                ext_attrs_data = processed_data[network].get("Extensible Attributes", "")
+                if len(ext_attrs_data) > 0:               
+                    ext_attrs_rows = [
+                        { record.get("Attribute", "").lower(): record.get("Value", "") }
+                        for record in ext_attrs_data
+                    ]
+                summary_net["site"] = next((item.get('site') for item in ext_attrs_rows if item.get('site')), None)
+                summary_net["location"] = next((item.get('location') for item in ext_attrs_rows if item.get('location')), None)
             else:
                 missing_data_nets += 1
                 summary_net["subnet"] = str(network)
                 summary_net["description"] = "No data in Infoblox"
+                summary_net["site"] = ''
+                summary_net["location"] = ''
 
             summary_data["summary data"].append(summary_net)
         print_table_data(logger, cfg, summary_data)
