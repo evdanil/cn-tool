@@ -1,11 +1,11 @@
 import sys
-from core.base import BasePlugin, ScriptContext
+from core.base import ScriptContext
 from .display import console, get_global_color_scheme
 from .file_io import wait_for_all_saves, worker_thread
 from .cache import CacheManager
 
 
-def exit_now(ctx: ScriptContext, all_plugins: list[BasePlugin], exit_code: int = 0, message: str = '') -> None:
+def exit_now(ctx: ScriptContext, exit_code: int = 0, message: str = '') -> None:
     """
     Gracefully exits from application, closing resources and logging the exit reason.
     """
@@ -43,7 +43,7 @@ def exit_now(ctx: ScriptContext, all_plugins: list[BasePlugin], exit_code: int =
 
     # Disconnect global plugins >>>
     ctx.logger.info("Shutting down application resources...")
-    for plugin in all_plugins:
+    for plugin in ctx.all_plugins:
         if plugin.manages_global_connection:
             ctx.logger.info(f"Disconnecting plugin: {plugin.name}")
             plugin.disconnect(ctx)

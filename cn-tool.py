@@ -179,7 +179,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
     # Add non-user-configurable values to the config dict
     cfg["version"] = VERSION
 
-    ctx = ScriptContext(cfg=cfg, logger=logger, console=console, cache=None, username='', password='')
+    ctx = ScriptContext(cfg=cfg, logger=logger, console=console, cache=None, username='', password='', all_plugins=all_plugins)
 
     username, password = get_auth_creds(ctx)
     if username and password:
@@ -188,19 +188,19 @@ Please send any feedback/feature requests to evdanil@gmail.com
         ctx.logger.warning("Auth - Incomplete credentials provided; Infoblox API calls may fail.")
 
     # Connect global plugins
-    for plugin in all_plugins:
+    for plugin in ctx.all_plugins:
         if plugin.manages_global_connection:
             plugin.connect(ctx)
 
     set_global_color_scheme(ctx)
-    signal.signal(signal.SIGINT, lambda s, f: exit_now(ctx, all_plugins, 1, "Interrupted... Exiting..."))
+    signal.signal(signal.SIGINT, lambda s, f: exit_now(ctx, 1, "Interrupted... Exiting..."))
 
     if not check_dir_accessibility(logger, cfg["report_file"].parent):
         ctx.logger.warning("Report directory not accessible, using current directory.")
         cfg["report_file"] = Path(cfg["report_file"].name)
 
     if cfg["api_endpoint"] == "API_URL":
-        exit_now(ctx, all_plugins, exit_code=1, message='Infoblox API URL is not set in configuration.')
+        exit_now(ctx, exit_code=1, message='Infoblox API URL is not set in configuration.')
 
     start_background_tasks(ctx)
     start_worker()
@@ -229,7 +229,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
         elif choice == 'd':
             clear_report(ctx)
         elif choice == '0':
-            exit_now(ctx, all_plugins)
+            exit_now(ctx)
         else:
             console.print(f"[{colors['error']}]Invalid choice. Please try again.[/]")
             time.sleep(1)
