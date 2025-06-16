@@ -210,7 +210,6 @@ class SubnetRequestModule(BaseModule):
 
     def _fetch_all_data_for_subnet(self, ctx: ScriptContext, network: NetworkObject) -> dict[str, Any]:
         """Fetches all related data points for a single subnet in parallel."""
-        colors = get_global_color_scheme(ctx.cfg)
         net_str = str(network)
         req_urls = {
             "general": f"network?network={net_str}&_return_fields=network,comment,extattrs",
@@ -222,7 +221,7 @@ class SubnetRequestModule(BaseModule):
         }
 
         processed_data_for_net: dict[str, Any] = defaultdict(list)
-        with ThreadPoolExecutor() as executor, ctx.console.status(f"[{colors['description']}]Fetching {network} information...[/]"):
+        with ThreadPoolExecutor() as executor:
             future_to_label = {
                 executor.submit(do_fancy_request, ctx, "", uri, spinner=None): label
                 for label, uri in req_urls.items()
