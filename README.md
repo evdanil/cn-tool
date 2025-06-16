@@ -36,7 +36,7 @@ pip install -r requirements.txt
 ```
 4. Set execute bit on the python script file:
 ```
-chmod +x cn-tool.py
+chmod +x main.py
 ```
 5. [Optional] To avoid being asked each time executing cn-tool - set up environmental variable `TACACS_PW`, if it is not set - program will request for credential(password). Script uses env['USER'] as login name for devices
 ```
