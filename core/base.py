@@ -30,6 +30,7 @@ class ScriptContext:
     cache: Optional["CacheManager"]  # Use quotes for forward reference
     username: str
     password: str
+    all_plugins: list["BasePlugin"]
 
 
 class BaseModule(ABC):
