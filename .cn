@@ -31,8 +31,8 @@ directory=~/.cn-cache
 
 # Only works if subnet AD enrichment plugin present
 [ad]
-#enabled = false
-enabled = true
+# Default is false
+#enabled = true
 uri = ldap://your-ad-server.com
 user = your-user@yourdomain.com or domain\login
 # Optional: Override the default search base if needed
