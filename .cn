@@ -38,4 +38,4 @@ user = your-user@yourdomain.com or domain\login
 # Optional: Override the default search base if needed
 search_base = CN=Subnets,CN=Sites,CN=Configuration,DC=domain,DC=com
 # Default false, allows to connect to AD as soon as script started(saves time if performing multiple subnet(opt 2) requests)
-connect_on_startup = true
+#connect_on_startup = true

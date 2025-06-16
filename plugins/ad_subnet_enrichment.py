@@ -40,6 +40,9 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
 
     def connect(self, ctx: ScriptContext) -> None:
         """Called by main.py on startup."""
+        if not ctx.cfg.get("ad_enabled"):
+            return  # Don't do anything if the plugin is disabled
+
         # Only connect if the user wants to in their config
         if ctx.cfg.get("ad_connect_on_startup"):
             ctx.logger.info("AD Plugin: Establishing global connection as configured...")
@@ -86,7 +89,7 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
         if not self.conn or not self.ad_lock:
             return data
 
-        ctx.logger.info("AD Plugin: Attempting to enrich data.")
+        ctx.logger.debug("AD Plugin: Attempting to enrich data.")
 
         # Extract the subnet string from the data provided by the module
         # The data structure is based on what subnet_request module produces
@@ -112,7 +115,7 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
             )
 
         if ad_info:
-            ctx.logger.info(f"AD Plugin: Successfully enriched data for {subnet_str} using persistent connection.")
+            ctx.logger.debug(f"AD Plugin: Successfully enriched data for {subnet_str} using persistent connection.")
             data['Active Directory'] = [ad_info]
 
         return data
