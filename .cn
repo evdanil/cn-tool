@@ -1,18 +1,18 @@
 [api]
-#endpoint = API_URL
+endpoint = API_URL
 
 [logging]
-#logfile = ~/cn.log
-#Levels supported DEBUG,INFO,WARNING,ERROR
-#Defaults to INFO
-#level = DEBUG
+logfile = ~/cn.log
+# Levels supported DEBUG,INFO,WARNING,ERROR
+# Defaults to INFO
+#level = INFO
 
-[output]
-#filename = ~/report.xlsx
-#auto_save = True
+[report]
+filename = ~/report.xlsx
+auto_save = True
 
-[config_repository]
-#storage_directory = /opt/data/configs
+[config_repo]
+directory = /opt/data/configs
 #vendors = cisco,aruba,f5,bluecoat,paloalto
 #vendors = cisco
 #regions = ap, eu, am
@@ -22,9 +22,20 @@
 #credentials = ~/device-apply.gpg
 
 [cache]
-#directory = ~/.cn-cache
-#enabled = True
+#enabled=true
+directory=~/.cn-cache
 
 [theme]
-#Supported themes: default, monochrome, pastel, dark
-#theme=default
+# Supported theme names: default,monochrome,pastel,dark
+#name=default
+
+# Only works if subnet AD enrichment plugin present
+[ad]
+#enabled = false
+enabled = true
+uri = ldap://your-ad-server.com
+user = your-user@yourdomain.com or domain\login
+# Optional: Override the default search base if needed
+search_base = CN=Subnets,CN=Sites,CN=Configuration,DC=domain,DC=com
+# Default false, allows to connect to AD as soon as script started(saves time if performing multiple subnet(opt 2) requests)
+connect_on_startup = true
