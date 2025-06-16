@@ -37,7 +37,7 @@ from utils.user_input import read_user_input
 from core.background import start_background_tasks
 
 # --- Global Constants ---
-VERSION = '0.2.9 hash 847c68b'
+VERSION = '0.2.10 hash 79501ec'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -206,7 +206,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
     start_worker()
 
     colors = get_global_color_scheme(cfg)
-    menu_header = """ """
+    menu_header = """  """
     menu_lines = [menu_header, f"    [{colors['error']} {colors['bold']}]MENU[/]"]
     menu_lines.append(f"    [{colors['cyan']}]")
 
