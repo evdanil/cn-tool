@@ -206,7 +206,8 @@ Please send any feedback/feature requests to evdanil@gmail.com
     start_worker()
 
     colors = get_global_color_scheme(cfg)
-    menu_lines = [f"    [{colors['error']} {colors['bold']}]MENU[/]"]
+    menu_header = """ """
+    menu_lines = [menu_header, f"    [{colors['error']} {colors['bold']}]MENU[/]"]
     menu_lines.append(f"    [{colors['cyan']}]")
 
     for module in sorted(loaded_modules.values(), key=lambda m: m.menu_key):
