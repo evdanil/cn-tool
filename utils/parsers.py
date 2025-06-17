@@ -1,5 +1,5 @@
 from socket import gethostbyaddr
-from typing import Callable, Optional, List, Dict, Any, Set, Tuple
+from typing import Optional, List, Dict, Any, Set, Tuple
 from netmiko import ConnLogOnly, SSHDetect, BaseConnection
 import logging
 import re
@@ -238,12 +238,15 @@ def process_device_data(device_name: str, data: Dict[str, Any]) -> List[Dict[str
     # Function processes responses from a set of prepared dictionaries with different command results and returns a list
     # of dictionaries with merged data
     rows: List[Dict[str, Any]] = []
+    platform = data.get('platform', 'iosxe')
+
+    version_output = data.get('show version', {})  # Both platforms use this key
     base_info: Dict[str, Any] = {
         'Device Name': device_name,
-        'Software Version': data.get('show_version', {}).get('Software Version', ''),
-        'Software Image': data.get('show_version', {}).get('Software Image', ''),
-        'Uptime': data.get('show_version', {}).get('Uptime', ''),
-        'Serial Number': data.get('show_version', {}).get('Serial Number', ''),
+        'Software Version': version_output.get('show_version', {}).get('Software Version', ''),
+        'Software Image': version_output.get('show_version', {}).get('Software Image', ''),
+        'Uptime': version_output.get('show_version', {}).get('Uptime', ''),
+        'Serial Number': version_output.get('show_version', {}).get('Serial Number', ''),
         'Product ID (PID)': '',
         'Stack Role': 'N/A',
         'Parent Device Name': None,
@@ -259,66 +262,89 @@ def process_device_data(device_name: str, data: Dict[str, Any]) -> List[Dict[str
         'License Status': '',
     }
 
-    # Process license reservation data
-    reservation_data = data.get('show_license_reservation', {})
-    for sn, info in reservation_data.items():
-        row = base_info.copy()
-        row['Serial Number'] = sn
-        row['Product ID (PID)'] = info.get('PID', '')
-        row['Stack Role'] = info.get('TYPE', 'N/A')
-        row['License Reservation Status'] = info.get('LICENSE_RESERVATION', '')
-        row['Confirmation Code'] = info.get('CONFIRMATION_CODE', '')
+    if platform == 'iosxe':
+        # --- Handle IOS/XE data (existing logic) ---
+        # Process license reservation data
+        reservation_data = data.get('show_license_reservation', {})
+        for sn, info in reservation_data.items():
+            row = base_info.copy()
+            row['Serial Number'] = sn
+            row['Product ID (PID)'] = info.get('PID', '')
+            row['Stack Role'] = info.get('TYPE', 'N/A')
+            row['License Reservation Status'] = info.get('LICENSE_RESERVATION', '')
+            row['Confirmation Code'] = info.get('CONFIRMATION_CODE', '')
 
-        if row['Stack Role'] in ('Standby', 'Member'):
-            row['Parent Device Name'] = device_name
+            if row['Stack Role'] in ('Standby', 'Member'):
+                row['Parent Device Name'] = device_name
 
-        for license_item in info.get('LICENSES', []):
-            license_row = row.copy()
-            license_timeframe = f"{license_item.get('START_DATE', '')} to {license_item.get('END_DATE', '')}"
-            if license_timeframe == " to ":
-                license_timeframe = ""
-            license_row.update({
-                'License Name': license_item.get('LICENSE_NAME', ''),
-                'License Type': license_item.get('LICENSE_TYPE', ''),
-                'License Period Left': license_timeframe,
+            for license_item in info.get('LICENSES', []):
+                license_row = row.copy()
+                license_timeframe = f"{license_item.get('START_DATE', '')} to {license_item.get('END_DATE', '')}"
+                if license_timeframe == " to ":
+                    license_timeframe = ""
+                license_row.update({
+                    'License Name': license_item.get('LICENSE_NAME', ''),
+                    'License Type': license_item.get('LICENSE_TYPE', ''),
+                    'License Period Left': license_timeframe,
+                })
+                rows.append(license_row)
+
+            if not info.get('LICENSES'):
+                rows.append(row)
+
+        # Process license summary data
+        for license_item in data.get('show_license_summary', []):
+            row = base_info.copy()
+            row.update({
+                'License Name': license_item.get('License', ''),
+                'License Entitlement Tag': license_item.get('Entitlement Tag', ''),
+                'License Count': license_item.get('Count', ''),
+                'License Status': license_item.get('Status', ''),
             })
-            rows.append(license_row)
-
-        if not info.get('LICENSES'):
             rows.append(row)
 
-    # Process license summary data
-    for license_item in data.get('show_license_summary', []):
-        row = base_info.copy()
-        row.update({
-            'License Name': license_item.get('License', ''),
-            'License Entitlement Tag': license_item.get('Entitlement Tag', ''),
-            'License Count': license_item.get('Count', ''),
-            'License Status': license_item.get('Status', ''),
-        })
-        rows.append(row)
+        # Process detailed license data
+        for license_item in data.get('show_license', []):
+            row = base_info.copy()
+            row.update({
+                'License Name': license_item.get('Feature', ''),
+                'License Type': license_item.get('License Type', ''),
+                'License State': license_item.get('License State', ''),
+                'License Period Left': license_item.get('Period left', ''),
+                'License Priority': license_item.get('License Priority', ''),
+                'License Count': license_item.get('License Count', ''),
+            })
+            rows.append(row)
 
-    # Process detailed license data
-    for license_item in data.get('show_license', []):
-        row = base_info.copy()
-        row.update({
-            'License Name': license_item.get('Feature', ''),
-            'License Type': license_item.get('License Type', ''),
-            'License State': license_item.get('License State', ''),
-            'License Period Left': license_item.get('Period left', ''),
-            'License Priority': license_item.get('License Priority', ''),
-            'License Count': license_item.get('License Count', ''),
-        })
-        rows.append(row)
+        # If no license data was found, add at least one row with base info
+        if not rows:
+            rows.append(base_info)
 
-    # If no license data was found, add at least one row with base info
+    elif platform == 'nxos':
+        # --- Handle NX-OS data ---
+        # The 'show license all' command gives us what we need
+        license_data = data.get('show license all', [])
+        for license_item in license_data:
+            row = base_info.copy()
+            row.update({
+                'License Name': license_item.get('License Name', ''),
+                # We need to decide what to map 'License Status' to.
+                # 'License State' or 'License Status' are good candidates. Let's use 'License Status'.
+                'License Status': license_item.get('License Status', ''),
+                'License Count': license_item.get('License Count', ''),
+                'License Type': license_item.get('License Type', 'N/A'),
+                'Description': license_item.get('Description', ''),  # Add this useful field
+            })
+            rows.append(row)
+
+    # If no specific data was found for the platform, add a base row
     if not rows:
         rows.append(base_info)
 
     return rows
 
 
-def process_device_commands(logger: logging.Logger, device: str, cmd_list: Dict[str, Tuple[Callable[[str], Any], Any]], username: Optional[str], password: Optional[str], type: str = 'cisco_ios') -> Dict[str, Any]:
+def process_device_commands(logger: logging.Logger, device: str, platform_commands: Dict[str, Dict[str, Tuple]], username: Optional[str], password: Optional[str], type: str = 'cisco_ios') -> Dict[str, Any]:
     # interrogate device and get serial/mac/license data
     # check for reverse DNS entry
 
@@ -343,30 +369,50 @@ def process_device_commands(logger: logging.Logger, device: str, cmd_list: Dict[
 
     conn: Optional[BaseConnection] = None
     try:
+        # We don't connect right away, we detect first.
+        guesser = SSHDetect(**dev)
+        detected_type = guesser.autodetect()
+
+        if not detected_type:
+            logger.info(f'{device} - Unable to autodetect device type!')
+            return {device: 'Unable to autodetect device type'}
+
+        # Determine platform family (e.g., 'iosxe' or 'nxos')
+        platform_family = 'unknown'
+        if 'nxos' in detected_type:
+            platform_family = 'nxos'
+        elif 'cisco' in detected_type:  # Catches 'cisco_ios', 'cisco_xe'
+            platform_family = 'iosxe'
+
+        if platform_family == 'unknown':
+            logger.info(f'{device} - Not a supported platform family: {detected_type}')
+            return {device: 'Not supported platform family'}
+
+        # Add the detected device_type for the actual connection
+        dev["device_type"] = detected_type
         conn = ConnLogOnly(**dev)
         if not conn:
             logger.info(f'{device} - Unable to create device connection!')
             return {device: 'Unable to create device connection'}
 
-        guesser = SSHDetect(**dev)
-        detected_type = guesser.autodetect()
-        if detected_type:
-            dev["device_type"] = detected_type
-        else:
-            logger.info(f'{device} - Unable to autodetect device type!')
-            return {device: 'Unable to autodetect device type'}
+        # Get the correct command list for the detected platform
+        cmd_list_for_platform = platform_commands.get(platform_family, {})
+        if not cmd_list_for_platform:
+            logger.warning(f"{device} - No commands defined for platform '{platform_family}'")
+            return {device: f"No commands for platform '{platform_family}'"}
 
-        if "cisco" not in dev["device_type"]:
-            logger.info(f'{device} - Not supported device type!')
-            return {device: 'Not supported device type'}
+        # Store the platform in the output for later use
+        output['platform'] = platform_family
 
-        for cmd_key, funcs in cmd_list.items():
-            command_output = conn.send_command(f"{cmd_key.replace('_', ' ')}\n", auto_find_prompt=True)
+        # Execute the commands for this platform
+        for command, funcs in cmd_list_for_platform.items():
+            command_output = conn.send_command(f"{command}\n", auto_find_prompt=True)
+            parser_func = funcs[0]
             if isinstance(command_output, str):
-                output[cmd_key] = funcs[0](command_output)
+                output[command] = parser_func(command_output)  # Use the correct parser
             else:
-                logger.warning(f"Command '{cmd_key}' on {device} did not return a string.")
-                output[cmd_key] = {}
+                logger.warning(f"Command '{command}' on {device} did not return a string.")
+                output[command] = {}
 
     except Exception as e:
         logger.info(f'{device} - Unable to connect or execute command! Error: {e}')
@@ -376,3 +422,90 @@ def process_device_commands(logger: logging.Logger, device: str, cmd_list: Dict[
             conn.disconnect()
 
     return output
+
+
+def parse_nexus_show_version(output: str) -> Dict[str, Any]:
+    """
+    Parses 'show version' output specifically for Cisco Nexus (NX-OS) devices,
+    updated for modern NX-OS output.
+    """
+    result: Dict[str, Any] = {
+        "Software Version": "N/A",
+        "Software Image": "N/A",
+        "Uptime": "N/A",
+        "Serial Number": "N/A",
+    }
+
+    # NX-OS Software Version (more specific regex)
+    # Example: NXOS: version 10.2(7) [Maintenance Release]
+    version_match = re.search(r'NXOS: version\s+([\d.()]+)', output)
+    if version_match:
+        result["Software Version"] = version_match.group(1)
+
+    # NX-OS System Image
+    # Example: NXOS image file is: bootflash:///nxos64-cs.10.2.7.M.bin
+    image_match = re.search(r'NXOS image file is:\s+(.+)', output)
+    if image_match:
+        result["Software Image"] = image_match.group(1).strip()
+
+    # NX-OS Uptime
+    # Example: Kernel uptime is 257 day(s), 17 hour(s), 29 minute(s), 47 second(s)
+    uptime_match = re.search(r'Kernel uptime is\s+(.+)', output)
+    if uptime_match:
+        result["Uptime"] = uptime_match.group(1).strip()
+
+    # NX-OS Serial Number (Processor Board ID is more reliable for chassis)
+    # Example: Processor Board ID FDO272612ZJ
+    serial_match = re.search(r'Processor Board ID\s+(\S+)', output)
+    if serial_match:
+        result["Serial Number"] = serial_match.group(1)
+
+    return result
+
+
+def parse_nexus_show_license_all(output: str) -> List[Dict[str, str]]:
+    """
+    Parses 'show license all' output for modern Smart Licensing on NX-OS.
+    Extracts license usage details.
+    """
+    licenses: List[Dict[str, str]] = []
+
+    # The relevant data is in the "License Usage" section.
+    # We first isolate this block of text.
+    usage_section_match = re.search(r'License Usage\n=+\n(.+?)\n\nProduct Information', output, re.DOTALL)
+    if not usage_section_match:
+        return []  # No usage section found
+
+    usage_text = usage_section_match.group(1)
+
+    # Split the section into blocks for each license. A license block starts with a name in parentheses.
+    license_blocks = re.split(r'\n\((.+?)\):', usage_text)
+
+    # The split results in [garbage, license_name1, license_details1, license_name2, license_details2, ...]
+    # We iterate over pairs.
+    for i in range(1, len(license_blocks), 2):
+        license_name = license_blocks[i]
+        license_details = license_blocks[i+1]
+
+        license_dict = {'License Name': license_name}
+
+        # Now parse the details within the block
+        desc_match = re.search(r'Description:\s*(.+)', license_details)
+        if desc_match:
+            license_dict['Description'] = desc_match.group(1).strip()
+
+        count_match = re.search(r'Count:\s*(\d+)', license_details)
+        if count_match:
+            license_dict['License Count'] = count_match.group(1)
+
+        status_match = re.search(r'Status:\s*(.+)', license_details)
+        if status_match:
+            license_dict['License Status'] = status_match.group(1).strip()
+
+        type_match = re.search(r'License Type:\s*(.+)', license_details)
+        if type_match:
+            license_dict['License Type'] = type_match.group(1).strip()
+
+        licenses.append(license_dict)
+
+    return licenses
