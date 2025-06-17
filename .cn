@@ -39,3 +39,19 @@ user = your-user@yourdomain.com or domain\login
 search_base = CN=Subnets,CN=Sites,CN=Configuration,DC=domain,DC=com
 # Default false, allows to connect to AD as soon as script started(saves time if performing multiple subnet(opt 2) requests)
 #connect_on_startup = true
+
+[email]
+# change send_on_exit to true to receive report once cn-tool terminates
+send_on_exit = false
+to = some_user@example.com
+#from = cn-tool@localhost
+#subject = CN-Tool Execution Report
+#server = smtp.gmail.com
+#port = 587
+#use_tls = true
+#use_ssl = false
+#use_auth = true
+#user = my_account@gmail.com
+# WARNING: Storing passwords in plaintext is a security risk.
+# For services like Gmail, this should be an "App Password".
+#password = abcd-efgh-ijkl-mnop
