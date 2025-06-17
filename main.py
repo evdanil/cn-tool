@@ -20,6 +20,16 @@ import argparse
 import time
 import sys
 from pathlib import Path
+import warnings
+
+# This suppresses the specific CryptographyDeprecationWarning from paramiko
+# which can be noisy on some systems.
+try:
+    from cryptography.utils import CryptographyDeprecationWarning
+    warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
+except ImportError:
+    # If cryptography is not installed, we don't need to do anything.
+    pass
 
 # --- Core Application Imports ---
 from core.base import ScriptContext
@@ -36,8 +46,9 @@ from utils.logging import configure_logging
 from utils.user_input import read_user_input
 from core.background import start_background_tasks
 
+
 # --- Global Constants ---
-VERSION = '0.2.18 hash 8e14a54'
+VERSION = '0.2.19 hash 5a81d27'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
