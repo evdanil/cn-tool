@@ -10,7 +10,7 @@ class EmailReportPlugin(BasePlugin):
 
     @property
     def name(self) -> str:
-        return "Email Report on Exit"
+        return "Email Support"
 
     @property
     def target_module_name(self) -> str:

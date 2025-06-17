@@ -21,7 +21,7 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
 
     @property
     def name(self) -> str:
-        return "Active Directory Subnet Enrichment"
+        return "Active Directory Support"
 
     @property
     def target_module_name(self) -> str:
