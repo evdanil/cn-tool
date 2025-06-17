@@ -78,11 +78,17 @@ def _load_and_register_plugins(path: str, modules: Dict[str, BaseModule], schema
                                     print(f"Info: Loading config schema from plugin '{plugin.name}'")
                                     schema.update(plugin_schema)
 
-                                target_module = modules.get(plugin.target_module_name)
-                                if target_module:
-                                    plugin.register(target_module)
-                                else:
-                                    print(f"Warning: Plugin '{plugin.name}' targets non-existent module '{plugin.target_module_name}'")
+                                target_name = plugin.target_module_name
+                                # Only attempt to register if the plugin specifies a target.
+                                if target_name:
+                                    target_module = modules.get(target_name)
+                                    if target_module:
+                                        plugin.register(target_module)
+                                    else:
+                                        # This warning will now only show for plugins that
+                                        # SPECIFY a target that does not exist.
+                                        print(f"Warning: Plugin '{plugin.name}' targets non-existent module '{target_name}'")
+                                # If target_name is empty, we do nothing. This is expected for lifecycle plugins.
                         except TypeError:
                             continue
             except ImportError as e:

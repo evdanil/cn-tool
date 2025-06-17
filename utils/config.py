@@ -25,78 +25,76 @@ BASE_CONFIG_SCHEMA = {
 }
 
 
-def _apply_types(cfg: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
-    """Helper function to convert raw string values to their proper types."""
+def _apply_types(cfg: Dict[str, Any], schema: Dict[str, Any], logger: logging.Logger) -> Dict[str, Any]:
+    """
+    Helper function to convert raw string values to their proper types and sanitize them.
+    """
     typed_cfg = cfg.copy()
     for key, spec in schema.items():
         if key in typed_cfg:
             raw_value = typed_cfg[key]
             option_type = spec["type"]
+
+            # This check handles the case where the value might already be a bool or int from a default.
+            if not isinstance(raw_value, str):
+                continue  # It's not a string that needs cleaning, so skip.
+
+            # Strip leading/trailing whitespace, then strip standard quote characters.
+            clean_value = raw_value.strip().strip('"\'')
+
             if option_type == 'path':
-                typed_cfg[key] = Path(str(raw_value)).expanduser()
+                typed_cfg[key] = Path(clean_value).expanduser()
             elif option_type == 'list[str]':
-                typed_cfg[key] = [item.strip() for item in str(raw_value).split(',')]
-            elif option_type == 'bool' and isinstance(raw_value, str):
-                typed_cfg[key] = raw_value.lower() in ('true', '1', 't', 'y', 'yes')
+                # Split the raw string, then sanitize each individual item in the list.
+                items = raw_value.split(',')
+                typed_cfg[key] = [item.strip().strip('"\'') for item in items]
+            elif option_type == 'bool':
+                typed_cfg[key] = clean_value.lower() in ('true', '1', 't', 'y', 'yes')
+            elif option_type == 'str':
+                typed_cfg[key] = clean_value
+            # For 'int', we let the final conversion happen in read_config, but we use the clean string.
+            elif option_type == 'int':
+                try:
+                    typed_cfg[key] = int(clean_value)
+                except (ValueError, TypeError):
+                    logger.warning(f"CONFIG: Could not convert '{clean_value}' to int for key '{key}'. Using fallback.")
+                    typed_cfg[key] = spec['fallback']
     return typed_cfg
 
 
 def read_config(config_files: List[Path], schema: Dict[str, Any], logger: logging.Logger) -> Dict[str, Any]:
     """
-    Reads configuration from a prioritized list of files.
-
-    Args:
-        config_files: A list of paths to check for config files, in order
-                      from lowest to highest priority.
-        logger: The application logger.
-
-    Returns:
-        A dictionary of configuration settings.
+    Reads configuration from a prioritized list of files using a dynamic schema.
     """
-
-    # Step 1: Create a dictionary with all default values.
     loaded_cfg = {key: spec['fallback'] for key, spec in schema.items()}
+    logger.debug("CONFIG: Initialized with default values from schema.")
 
-    # --- DEBUG: Show the initial state with defaults ---
-    logger.debug(f"CONFIG: Initialized with default values from schema: {loaded_cfg}")
-
-    # Step 2: Find which of the potential config files actually exist.
     existing_files = [f for f in config_files if f.is_file()]
-
     if not existing_files:
-        logger.warning("CONFIG: No configuration files found. Proceeding with default settings.")
-        return _apply_types(loaded_cfg, schema)
+        logger.warning("CONFIG: No configuration files found. Proceeding with defaults.")
+        return _apply_types(loaded_cfg, schema, logger)
 
     logger.info(f"CONFIG: Reading configuration from files: {existing_files}")
-
-    # Step 3: Read all existing files. configparser handles the overrides.
     config = configparser.ConfigParser()
     try:
-        # This is the key: read() processes the list in order.
-        read_files = config.read(existing_files)
-        logger.debug(f"Read and merged configuration from files: {read_files}")
+        config.read(existing_files)
     except configparser.Error as e:
         logger.error(f"CONFIG: Error parsing configuration files: {e}")
-        return _apply_types(loaded_cfg, schema)  # Fallback to defaults on error
+        return _apply_types(loaded_cfg, schema, logger)
 
+    # Read only RAW strings from the config file. Let _apply_types handle all conversions.
     for key, spec in schema.items():
         section = spec["section"]
-        ini_key = spec["ini_key"]  # Use the key name from the INI file
+        ini_key = spec["ini_key"]
 
         if config.has_option(section, ini_key):
-            original_value = loaded_cfg[key]
-            if spec['type'] == 'bool':
-                new_value = config.getboolean(section, ini_key)
-            else:
-                new_value = config.get(section, ini_key)
+            # Always get the raw string value.
+            new_value = config.get(section, ini_key)
+            loaded_cfg[key] = new_value
 
-            logger.debug(f"CONFIG: Overwriting '{key}' (from [{section}].{ini_key}). Default: '{original_value}' -> New: '{new_value}'")
-            loaded_cfg[key] = new_value  # Store it using the unified key
-
-    # Step 4: Apply final type conversions.
-    final_cfg = _apply_types(loaded_cfg, schema)
-    # --- DEBUG: Log the final configuration dictionary ---
-    logger.debug(f"CONFIG: Final configuration object after type conversion: {final_cfg}")
+    # Apply final type conversions and sanitization to the entire config dict.
+    final_cfg = _apply_types(loaded_cfg, schema, logger)
+    logger.debug(f"CONFIG: Final configuration object after processing: {final_cfg}")
 
     return final_cfg
 
