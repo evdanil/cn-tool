@@ -17,11 +17,13 @@ Utility allowing to receive information from Infoblox API
 
 ## Features modular design with plugin system:
 - Performs IP/Subnet/DNS/Site information lookups using Infoblox API
+- Integrates with Active Directory
 - Performs bulk ping operations
 - Performs bulk FQDN/IP lookups using system resolver
 - Performs configuration checks across configuration storage (`/opt/data/configs/`) for obsolete configuration when device being removed (cleanups on BGP borders/prefixes/ACLs)
 - Obtains device information (serial number, IOS version and image, license data) in parallel
 - Saves all requested information for later information processing(by default `report.xlsx` in current directory) 
+- Supports email as delivery method for report
 - Keeps log of requests/responses(by default `cn.log` in current directory)
 - Supports several levels of logging
 - Supports ini-style configfile to set logging level/filenames/api endpoint/autosaving(default filename `.cn`)
