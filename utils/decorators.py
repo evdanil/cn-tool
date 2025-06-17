@@ -24,4 +24,3 @@ def measure_execution_time(func: Callable[..., Any]) -> Callable[..., Any]:
             )
         return result
     return wrapper
-

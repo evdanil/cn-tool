@@ -21,7 +21,8 @@ from utils.validation import is_fqdn, ip_regexp
 from utils.parsers import (
     process_device_commands, process_device_data, prepare_device_data,
     parse_show_version, parse_show_license_reservation,
-    parse_show_license_summary, parse_show_license
+    parse_show_license_summary, parse_show_license, parse_nexus_show_version, 
+    parse_nexus_show_license_all
 )
 
 
@@ -48,12 +49,17 @@ class DeviceQueryModule(BaseModule):
         console = ctx.console
         colors = get_global_color_scheme(ctx.cfg)
 
-        # This command list is highly specific to this module's function
-        cmd_list: Dict[str, Tuple[Callable[[str], Any], Callable[..., Any]]] = {
-            "show_version": (parse_show_version, create_show_version_table),
-            "show_license_reservation": (parse_show_license_reservation, create_license_reservation_tables),
-            "show_license_summary": (parse_show_license_summary, create_license_summary_table),
-            "show_license": (parse_show_license, create_show_license_table),
+        platform_commands: Dict[str, Dict[str, Tuple[Callable, Callable]]] = {
+            'iosxe': {
+                "show version": (parse_show_version, create_show_version_table),
+                "show license reservation": (parse_show_license_reservation, create_license_reservation_tables),
+                "show license summary": (parse_show_license_summary, create_license_summary_table),
+                "show license": (parse_show_license, create_show_license_table),
+            },
+            'nxos': {
+                "show version": (parse_nexus_show_version, create_show_version_table),
+                "show license all": (parse_nexus_show_license_all, create_show_license_table),  # Re-use display table
+            }
         }
 
         logger.info("Device Query - User input phase")
@@ -99,7 +105,7 @@ class DeviceQueryModule(BaseModule):
         with console.status(f"[{colors['description']}]Connecting to devices and running commands...[/]", spinner="dots12"):
             with ThreadPoolExecutor(max_workers=10) as executor:  # Increased workers for network-bound tasks
                 future_to_device = {
-                    executor.submit(process_device_commands, logger, device, cmd_list, ctx.username, ctx.password): device
+                    executor.submit(process_device_commands, logger, device, platform_commands, ctx.username, ctx.password): device
                     for device in unique_devices
                 }
                 for future in future_to_device:
@@ -120,10 +126,15 @@ class DeviceQueryModule(BaseModule):
                 error_table = create_device_error_table(hostname, ctx.cfg.get("theme_name", "default"))
                 if error_table:
                     tables_to_print.append(error_table)
-            else:
-                for command, parsed_output in device_data.items():
-                    # The second element in the cmd_list tuple is the display function
-                    display_function = cmd_list.get(command, (None, None))[1]
+            else:               
+                platform = device_data.get('platform', 'iosxe')  # Default to iosxe for safety
+                cmd_list = platform_commands.get(platform, {})
+                for command_key, parsed_output in device_data.items():
+                    if command_key == 'platform':
+                        continue
+                    # The command_key from the result should match a key in the cmd_list
+                    # e.g., command_key is "show version"
+                    display_function = cmd_list.get(command_key, (None, None))[1]
                     if display_function:
                         tables = display_function(parsed_output, hostname, ctx.cfg.get("theme_name", "default"))
                         if tables:
