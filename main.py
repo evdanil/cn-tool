@@ -37,7 +37,7 @@ from utils.user_input import read_user_input
 from core.background import start_background_tasks
 
 # --- Global Constants ---
-VERSION = '0.2.14 hash c66c08e'
+VERSION = '0.2.15 hash daf1c26'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -179,7 +179,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
     # Add non-user-configurable values to the config dict
     cfg["version"] = VERSION
 
-    ctx = ScriptContext(cfg=cfg, logger=logger, console=console, cache=None, username='', password='', all_plugins=all_plugins)
+    ctx = ScriptContext(cfg=cfg, logger=logger, console=console, cache=None, username='', password='', plugins=all_plugins)
 
     username, password = get_auth_creds(ctx)
     if username and password:
@@ -188,7 +188,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
         ctx.logger.warning("Auth - Incomplete credentials provided; Infoblox API calls may fail.")
 
     # Connect global plugins
-    for plugin in ctx.all_plugins:
+    for plugin in ctx.plugins:
         if plugin.manages_global_connection:
             plugin.connect(ctx)
 
@@ -211,6 +211,9 @@ Please send any feedback/feature requests to evdanil@gmail.com
     menu_lines.append(f"    [{colors['cyan']}]")
 
     for module in sorted(loaded_modules.values(), key=lambda m: m.menu_key):
+        visibility_key = module.visibility_config_key
+        if visibility_key and not cfg.get(visibility_key, False):
+            continue  # Skip this module if its required config is not True
         menu_lines.append(f"    {module.menu_key}. {module.menu_title}")
 
     menu_lines.append("    d. Delete Report[/]")

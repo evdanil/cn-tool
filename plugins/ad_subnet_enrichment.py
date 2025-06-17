@@ -29,6 +29,16 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
         return "subnet_request"
 
     @property
+    def user_configurable_settings(self) -> list[Dict[str, str]]:
+        return [
+            {'key': 'ad_enabled', 'prompt': 'Enable Active Directory Integration'},
+            {'key': 'ad_connect_on_startup', 'prompt': 'Connect to AD on Start'},
+            # {'key': 'ad_uri', 'prompt': 'Active Directory Server URI (e.g., ldap://ad.domain.com)'},
+            {'key': 'ad_user', 'prompt': 'Active Directory Username (e.g., user@domain.com)'},
+            # {'key': 'ad_password', 'prompt': 'Active Directory Password (will be stored in plaintext)'},
+        ]
+
+    @property
     def config_schema(self) -> Dict[str, Dict[str, Any]]:
         return {
             "ad_enabled":            {"section": "ad", "ini_key": "enabled", "type": "bool", "fallback": False},

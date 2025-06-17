@@ -30,7 +30,7 @@ class ScriptContext:
     cache: Optional["CacheManager"]  # Use quotes for forward reference
     username: str
     password: str
-    all_plugins: list["BasePlugin"]
+    plugins: List["BasePlugin"]
 
 
 class BaseModule(ABC):
@@ -46,6 +46,15 @@ class BaseModule(ABC):
             'pre_save': [],     # Called just before queueing data for saving.
             'post_run': [],     # Called at the very end of a module's run method, for cleanup.
         }
+
+    @property
+    def visibility_config_key(self) -> Optional[str]:
+        """
+        If a string is returned, this module will only be visible in the menu
+        if the corresponding key in the configuration is True.
+        e.g., return 'email_enabled'
+        """
+        return None
 
     @property
     @abstractmethod
@@ -83,6 +92,16 @@ class BaseModule(ABC):
 class BasePlugin(ABC):
     """Abstract Base Class for all plugins."""
 
+    @property
+    def user_configurable_settings(self) -> List[Dict[str, str]]:
+        """
+        A list of settings this plugin exposes to the user via the setup module.
+        Each dict should contain:
+        - 'key': The key in the config context (e.g., 'ad_user')
+        - 'prompt': The user-friendly prompt (e.g., 'Active Directory Username')
+        """
+        return []
+    
     @property
     @abstractmethod
     def name(self) -> str:

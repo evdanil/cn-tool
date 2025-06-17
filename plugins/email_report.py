@@ -24,9 +24,19 @@ class EmailReportPlugin(BasePlugin):
         return True
 
     @property
+    def user_configurable_settings(self) -> list[Dict[str, str]]:
+        return [
+            {'key': 'email_enabled', 'prompt': 'Enable Email Feature'},
+            {'key': 'email_send_on_exit', 'prompt': 'Send Report on Exit'},
+            {'key': 'email_to', 'prompt': 'Recipient Email Address'},
+            # {'key': 'email_server', 'prompt': 'SMTP Server'},
+        ]
+
+    @property
     def config_schema(self) -> Dict[str, Dict[str, Any]]:
         """Defines the configuration needed for sending emails."""
         return {
+            "email_enabled":      {"section": "email", "ini_key": "enabled", "type": "bool", "fallback": False},
             "email_send_on_exit": {"section": "email", "ini_key": "send_on_exit", "type": "bool", "fallback": False},
             "email_to":           {"section": "email", "ini_key": "to", "type": "str", "fallback": ""},
             "email_from":         {"section": "email", "ini_key": "from", "type": "str", "fallback": "cn-tool@localhost"},
@@ -49,7 +59,9 @@ class EmailReportPlugin(BasePlugin):
         """
         This method is called on application exit. It checks the config and sends the email.
         """
-        # 1. Check if the feature is enabled in the config
+        # Check the new general enabled flag first
+        if not ctx.cfg.get("email_enabled"):
+            return
         if not ctx.cfg.get("email_send_on_exit"):
             return
 

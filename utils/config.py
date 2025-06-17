@@ -154,3 +154,38 @@ def make_dir_list(ctx: ScriptContext) -> List[Path]:
                 if check_dir_accessibility(logger, region_path):
                     dir_list.append(region_path)
     return dir_list
+
+
+def write_config_value(
+    logger: logging.Logger,
+    user_config_path: Path,
+    section: str,
+    key: str,
+    value: str
+) -> None:
+    """
+    Writes a single key-value pair to the user's configuration file.
+    Creates the file or section if it doesn't exist.
+    """
+    logger.info(f"CONFIG_WRITER: Attempting to set [{section}] {key} = {value} in {user_config_path}")
+    config = configparser.ConfigParser()
+
+    # Read the existing file to not overwrite other values
+    if user_config_path.is_file():
+        config.read(user_config_path)
+
+    # Create the section if it doesn't exist
+    if not config.has_section(section):
+        logger.debug(f"CONFIG_WRITER: Creating new section [{section}]")
+        config.add_section(section)
+
+    # Set the new value
+    config.set(section, key, str(value))
+
+    # Write the changes back to the file
+    try:
+        with open(user_config_path, 'w') as configfile:
+            config.write(configfile)
+        logger.info("CONFIG_WRITER: Successfully saved configuration.")
+    except IOError as e:
+        logger.error(f"CONFIG_WRITER: Failed to write to config file {user_config_path}: {e}")
