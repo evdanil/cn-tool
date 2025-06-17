@@ -1,3 +1,4 @@
+import time
 from core.base import BaseModule, ScriptContext
 from utils.user_input import read_user_input
 from utils.config import write_config_value
@@ -31,6 +32,7 @@ class SetupModule(BaseModule):
             ctx.console.print("  [green]0.[/green] Return to Main Menu")
 
             choice = read_user_input(ctx, "Select a plugin to configure: ")
+
             if not choice.isdigit():
                 continue
 
@@ -104,4 +106,4 @@ class SetupModule(BaseModule):
             )
 
             ctx.console.print("[green]Setting updated! It will be fully effective on the next application run.[/green]")
-            read_user_input(ctx, "Press Enter to continue...")
+            time.sleep(1.5)
