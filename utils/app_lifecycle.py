@@ -43,7 +43,7 @@ def exit_now(ctx: ScriptContext, exit_code: int = 0, message: str = '') -> None:
 
     # Disconnect global plugins >>>
     ctx.logger.info("Shutting down application resources...")
-    for plugin in ctx.all_plugins:
+    for plugin in ctx.plugins:
         if plugin.manages_global_connection:
             ctx.logger.info(f"Disconnecting plugin: {plugin.name}")
             plugin.disconnect(ctx)

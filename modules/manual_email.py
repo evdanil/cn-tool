@@ -1,3 +1,4 @@
+from typing import Optional
 from core.base import BaseModule, ScriptContext
 from utils.email_helper import send_report_email
 
@@ -6,6 +7,11 @@ class EmailReportModule(BaseModule):
     """
     A module to manually trigger sending the report file via email.
     """
+
+    @property
+    def visibility_config_key(self) -> Optional[str]:
+        # This module is only visible if the email feature is enabled.
+        return "email_enabled"
 
     @property
     def menu_key(self) -> str:
@@ -22,6 +28,11 @@ class EmailReportModule(BaseModule):
         The main entry point for the module. It gathers config, checks for the
         report file, and calls the email helper function.
         """
+        # The first thing we do is check if we should even be running.
+        if not ctx.cfg.get("email_enabled"):
+            ctx.console.print("[red]Email feature is disabled in configuration.[/red]")
+            return
+
         ctx.logger.info("Request Type - Manual Email Report")
         ctx.console.print("[cyan]Attempting to send the report via email...[/]")
 
