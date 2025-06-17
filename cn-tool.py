@@ -37,7 +37,7 @@ from utils.user_input import read_user_input
 from core.background import start_background_tasks
 
 # --- Global Constants ---
-VERSION = '0.2.12 hash d9af3b0'
+VERSION = '0.2.13 hash 5cc4613'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
