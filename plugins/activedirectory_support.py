@@ -34,7 +34,7 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
             {'key': 'ad_enabled', 'prompt': 'Enable Active Directory Integration'},
             {'key': 'ad_connect_on_startup', 'prompt': 'Connect to AD on Start'},
             # {'key': 'ad_uri', 'prompt': 'Active Directory Server URI (e.g., ldap://ad.domain.com)'},
-            {'key': 'ad_user', 'prompt': 'Active Directory Username (e.g., user@domain.com)'},
+            {'key': 'ad_user', 'prompt': 'Active Directory Username (e.g., domain\\username)'},
             # {'key': 'ad_password', 'prompt': 'Active Directory Password (will be stored in plaintext)'},
         ]
 

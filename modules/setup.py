@@ -31,7 +31,10 @@ class SetupModule(BaseModule):
                 ctx.console.print(f"  [green]{i + 1}.[/green] Configure [yellow]{plugin.name}[/yellow]")
             ctx.console.print("  [green]0.[/green] Return to Main Menu")
 
-            choice = read_user_input(ctx, "Select a plugin to configure: ")
+            choice = read_user_input(ctx, "\nSelect a plugin to configure: ")
+
+            if choice == '' or choice == '0':
+                break
 
             if not choice.isdigit():
                 continue
@@ -66,13 +69,16 @@ class SetupModule(BaseModule):
                 ctx.console.print(f"  [green]{i + 1}.[/green] {prompt}: {display_value}")
             ctx.console.print("  [green]0.[/green] Back to Plugin List")
 
-            choice = read_user_input(ctx, "Select a setting to change: ")
+            choice = read_user_input(ctx, "\nSelect a setting to change: ")
+
+            if choice == '' or choice == '0':
+                break
+
             if not choice.isdigit():
                 continue
 
             choice_idx = int(choice)
-            if choice_idx == 0:
-                break
+
             if not (1 <= choice_idx <= len(settings)):
                 continue
 

@@ -3,7 +3,7 @@ import socket
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.base import BaseModule, ScriptContext
-from utils.user_input import read_user_input
+from utils.user_input import press_any_key, read_user_input
 from utils.display import console, get_global_color_scheme, print_table_data
 from utils.file_io import queue_save
 from utils.validation import is_fqdn
@@ -63,6 +63,7 @@ class BulkResolveModule(BaseModule):
         ips_to_resolve, names_to_resolve = self._parse_user_input(ctx)
         if not ips_to_resolve and not names_to_resolve:
             logger.info("Bulk Resolve - No valid targets to resolve.")
+            press_any_key(ctx)
             return
 
         logger.info(f"User input - Resolving {len(ips_to_resolve)} IPs and {len(names_to_resolve)} names.")
@@ -111,7 +112,9 @@ class BulkResolveModule(BaseModule):
         final_results_for_display = self.execute_hook('process_data', ctx, final_results_for_display)
         if not final_results_for_display:
             console.print(f"[{colors['info']}]Resolve process completed with no results.[/]")
+            press_any_key(ctx)
             return
+
         print_table_data(ctx, final_results_for_display)
 
         if ctx.cfg["report_auto_save"]:
@@ -124,6 +127,8 @@ class BulkResolveModule(BaseModule):
             if save_data:
                 final_save_data = self.execute_hook('pre_save', ctx, save_data)
                 queue_save(ctx, ["Query", "Result"], final_save_data, sheet_name="Bulk DNS Lookup", index=False, force_header=True)
+
+        press_any_key(ctx)
 
     def _parse_user_input(self, ctx: ScriptContext) -> Tuple[List[str], List[str]]:
         """

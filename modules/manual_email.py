@@ -1,6 +1,7 @@
 from typing import Optional
 from core.base import BaseModule, ScriptContext
 from utils.email_helper import send_report_email
+from utils.user_input import press_any_key
 
 
 class EmailReportModule(BaseModule):
@@ -28,9 +29,11 @@ class EmailReportModule(BaseModule):
         The main entry point for the module. It gathers config, checks for the
         report file, and calls the email helper function.
         """
+
         # The first thing we do is check if we should even be running.
         if not ctx.cfg.get("email_enabled"):
             ctx.console.print("[red]Email feature is disabled in configuration.[/red]")
+            press_any_key(ctx)
             return
 
         ctx.logger.info("Request Type - Manual Email Report")
@@ -43,6 +46,7 @@ class EmailReportModule(BaseModule):
         if not report_path or not report_path.is_file():
             ctx.console.print(f"[red]Error: Report file not found at '{report_path}'. Please generate a report first.[/red]")
             ctx.logger.warning("Manual email failed: Report file does not exist.")
+            press_any_key(ctx)
             return  # Exit the action
 
         # 2. Check if a recipient is configured.
@@ -50,6 +54,7 @@ class EmailReportModule(BaseModule):
         if not receiver:
             ctx.console.print("[red]Error: Email recipient is not configured. Please set 'to' in the [email] section of your config.[/red]")
             ctx.logger.warning("Manual email failed: Recipient not configured.")
+            press_any_key(ctx)
             return  # Exit the action
 
         # --- Call the Reusable Helper Function ---
@@ -76,3 +81,6 @@ class EmailReportModule(BaseModule):
             ctx.console.print(f"[green]Report has been sent successfully to {receiver}.[/green]")
         else:
             ctx.console.print("[red]Failed to send the report. Please check the logs for details.[/red]")
+
+        press_any_key(ctx)
+

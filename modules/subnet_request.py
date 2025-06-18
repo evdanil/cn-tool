@@ -9,7 +9,7 @@ from collections import defaultdict
 
 # Assuming these are your project's utility modules
 from core.base import BaseModule, ScriptContext
-from utils.user_input import read_user_input, read_single_keypress
+from utils.user_input import press_any_key, read_user_input, read_single_keypress
 from utils.display import get_global_color_scheme, print_table_data
 from utils.api import do_fancy_request, make_api_call
 from utils.file_io import queue_save
@@ -69,6 +69,7 @@ class SubnetRequestModule(BaseModule):
             all_nets_to_query = self._resolve_inputs_to_subnets(ctx, user_inputs)
             if not all_nets_to_query:
                 console.print(f"[{colors['error']}]Could not resolve any of the provided inputs to a valid subnet.[{colors['error']}]")
+                press_any_key(ctx)
                 return
 
             # --- 3. Main Data Fetching and Processing Loop ---
@@ -107,6 +108,8 @@ class SubnetRequestModule(BaseModule):
         finally:
             # Execute post_run hook for cleanup, guaranteed to run
             self.execute_hook('post_run', ctx, None)
+
+        press_any_key(ctx)
 
     def _get_networks_from_user(self, ctx: ScriptContext) -> list[str]:
         """
@@ -273,7 +276,7 @@ class SubnetRequestModule(BaseModule):
 
             print_table_data(ctx, {"Subnet Summary": summary_data})
             console.print(f"\n([{colors['success']}]Press [{colors['error']}{colors['bold']}]Q[/] to return / Any other key for details[/])")
-            if read_single_keypress().lower() == "q":
+            if read_single_keypress(ctx).lower() == "q":
                 return
 
         # Display detailed view for each network
@@ -287,7 +290,7 @@ class SubnetRequestModule(BaseModule):
 
             if len(networks) > 1 and i < len(networks) - 1:
                 console.print(f"\n[{colors['success']}]Press [{colors['bold']}]SPACE[/] for next ({i + 2}/{len(networks)}) / Any other key to exit details view[/]")
-                if read_single_keypress() != ' ':
+                if read_single_keypress(ctx) != ' ':
                     break
 
     def _prepare_subnet_save_data(self, processed_data: dict[str, Any]) -> list[RowDict]:
