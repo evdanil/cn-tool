@@ -1,6 +1,6 @@
 import ipaddress
 from time import perf_counter
-from typing import Dict, Any, List, Set
+from typing import Dict, Any, List, Optional, Set
 from concurrent.futures import ThreadPoolExecutor
 
 from core.base import BaseModule, ScriptContext
@@ -22,6 +22,11 @@ class IPRequestModule(BaseModule):
     @property
     def menu_title(self) -> str:
         return "IP Information"
+
+    @property
+    def visibility_config_key(self) -> Optional[str]:
+        # This module will only appear in the menu if 'infoblox_enabled' is True in the config.
+        return "infoblox_enabled"
 
     def run(self, ctx: ScriptContext) -> None:
         """

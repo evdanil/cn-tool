@@ -1,6 +1,6 @@
 # modules/fqdn_request.py
 import re
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from core.base import BaseModule, ScriptContext
 from utils.user_input import read_user_input
@@ -21,6 +21,11 @@ class FQDNRequestModule(BaseModule):
     @property
     def menu_title(self) -> str:
         return "FQDN Prefix Lookup"
+
+    @property
+    def visibility_config_key(self) -> Optional[str]:
+        # This module will only appear in the menu if 'infoblox_enabled' is True in the config.
+        return "infoblox_enabled"
 
     def run(self, ctx: ScriptContext) -> None:
         """

@@ -32,10 +32,12 @@ def read_user_input(ctx: ScriptContext, prompt: str = " ", read_pass: bool = Fal
     return raw_input
 
 
-def read_single_keypress() -> str:
+def read_single_keypress(ctx: ScriptContext) -> str:
     # Save the current terminal settings
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
+
+    ch = ''
 
     try:
         # Switch terminal to raw mode to capture single key press without enter
@@ -43,6 +45,22 @@ def read_single_keypress() -> str:
 
         # Read a single character
         ch = sys.stdin.read(1)
+
+        # Check for Ctrl+C (End of Text character)
+        if ch == '\x03':
+            # We must restore terminal settings BEFORE exiting, otherwise
+            # the user's terminal will be left in a broken state.
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            ctx.logger.info("CTRL-C (SIGINT) detected in single-keypress mode, initiating clean shutdown.")
+            exit_now(ctx, 1, "Interrupted by user... Exiting...")
+
+        # Check for Ctrl+D (End of Transmission character)
+        if ch == '\x04':
+            # Restore terminal settings before exiting
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            ctx.logger.info("CTRL-D (EOF) detected in single-keypress mode, initiating clean shutdown.")
+            exit_now(ctx, 0, "Exiting...")
+
     finally:
         # Restore the terminal settings
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)

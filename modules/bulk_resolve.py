@@ -1,7 +1,7 @@
 import ipaddress
 import socket
 from typing import Dict, List, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.base import BaseModule, ScriptContext
 from utils.user_input import read_user_input
 from utils.display import console, get_global_color_scheme, print_table_data
@@ -21,6 +21,10 @@ class BulkResolveModule(BaseModule):
     @property
     def menu_title(self) -> str:
         return "Bulk DNS Lookup"
+
+    @property
+    def visibility_config_key(self) -> Optional[str]:
+        return None
 
     def run(self, ctx: ScriptContext) -> None:
         """
@@ -57,59 +61,57 @@ class BulkResolveModule(BaseModule):
 
         # This helper will parse the input and maintain the order of first appearance.
         ips_to_resolve, names_to_resolve = self._parse_user_input(ctx)
-
         if not ips_to_resolve and not names_to_resolve:
             logger.info("Bulk Resolve - No valid targets to resolve.")
             return
 
         logger.info(f"User input - Resolving {len(ips_to_resolve)} IPs and {len(names_to_resolve)} names.")
 
-        # --- Parallel Resolution ---
-        results_ip: List[Dict[str, str]] = []
-        results_name: List[Dict[str, str]] = []
+        # This dictionary will store results as they complete, keyed by the original query.
+        # The value will be a list of result dictionaries.
+        ip_results_map: Dict[str, List[Dict[str, str]]] = {ip: [] for ip in ips_to_resolve}
+        name_results_map: Dict[str, List[Dict[str, str]]] = {name: [] for name in names_to_resolve}
 
         with console.status(f"[{colors['description']}]Resolving...[/]", spinner="dots12"), ThreadPoolExecutor() as executor:
-            # Submit all jobs
-            ip_futures = {executor.submit(resolve_ip, ip): ip for ip in ips_to_resolve}
-            name_futures = {executor.submit(resolve_name, name): name for name in names_to_resolve}
+            ip_futures = {executor.submit(resolve_ip, ip) for ip in ips_to_resolve}
+            name_futures = {executor.submit(resolve_name, name) for name in names_to_resolve}
 
-            # Process IP results
-            ip_results_map = {ip_futures[future]: future.result() for future in ip_futures}
-            for ip in ips_to_resolve:  # Iterate in the original order
-                _, data = ip_results_map[ip]
+            # Process IP results as they complete
+            for future in as_completed(ip_futures):
+                original_ip, data = future.result()
                 if data:
-                    hostname = data[0]
-                    aliases = data[1]
-                    results_ip.append({"IP": ip, "Name": hostname})
+                    hostname, aliases, _ = data
+                    ip_results_map[original_ip].append({"IP": original_ip, "Name": hostname})
                     for alias in aliases:
-                        results_ip.append({"IP": ip, "Name": alias})
+                        ip_results_map[original_ip].append({"IP": original_ip, "Name": alias})
                 else:
-                    results_ip.append({"IP": ip, "Name": "Not Resolved"})
+                    ip_results_map[original_ip].append({"IP": original_ip, "Name": "Not Resolved"})
 
-            # Process Name results
-            name_results_map = {name_futures[future]: future.result() for future in name_futures}
-            for name in names_to_resolve:  # Iterate in the original order
-                _, data = name_results_map[name]
-                if data:
-                    for ip_addr in data:
-                        results_name.append({"Name": name, "IP": ip_addr})
+            # Process Name results as they complete
+            for future in as_completed(name_futures):
+                original_name, ip_list = future.result()
+                if ip_list:
+                    for ip_addr in ip_list:
+                        name_results_map[original_name].append({"Name": original_name, "IP": ip_addr})
                 else:
-                    results_name.append({"Name": name, "IP": "Not Resolved"})
+                    name_results_map[original_name].append({"Name": original_name, "IP": "Not Resolved"})
 
-        # --- Display and Save ---
+        # --- Display and Save (logic is now much simpler) ---
+        # Assemble final results in the original user-provided order.
+        final_results_ip = [result for ip in ips_to_resolve for result in ip_results_map[ip]]
+        final_results_name = [result for name in names_to_resolve for result in name_results_map[name]]
+
         final_results_for_display: Dict[str, List[Dict[str, str]]] = {}
-        if results_ip:
-            final_results_for_display["IP to Name Lookup"] = results_ip
-        if results_name:
-            final_results_for_display["Name to IP Lookup"] = results_name
+        if final_results_ip:
+            final_results_for_display["IP to Name Lookup"] = final_results_ip
+        if final_results_name:
+            final_results_for_display["Name to IP Lookup"] = final_results_name
 
-        # The hook can modify the dictionary containing both result lists
+        # Hooks and saving logic remain the same and should now work correctly.
         final_results_for_display = self.execute_hook('process_data', ctx, final_results_for_display)
-
         if not final_results_for_display:
             console.print(f"[{colors['info']}]Resolve process completed with no results.[/]")
             return
-
         print_table_data(ctx, final_results_for_display)
 
         if ctx.cfg["report_auto_save"]:
@@ -119,48 +121,45 @@ class BulkResolveModule(BaseModule):
                 save_data.append((item.get("Name", ""), item.get("IP", "")))
             for item in final_results_for_display.get("IP to Name Lookup", []):
                 save_data.append((item.get("IP", ""), item.get("Name", "")))
-
             if save_data:
-                # The hook could modify this list of tuples before it gets saved
                 final_save_data = self.execute_hook('pre_save', ctx, save_data)
                 queue_save(ctx, ["Query", "Result"], final_save_data, sheet_name="Bulk DNS Lookup", index=False, force_header=True)
 
     def _parse_user_input(self, ctx: ScriptContext) -> Tuple[List[str], List[str]]:
-        """Parses user input into separate lists for IPs and names, preserving order."""
-        ips = []
-        names = []
-        seen_ips = set()
-        seen_names = set()
+        """
+        Parses user input into separate lists for IPs and names, preserving order.
+        Checks for IP/Subnet format FIRST, then falls back to FQDN.
+        """
+        ips_ordered_set = {}
+        names_ordered_set = {}
 
         while True:
             raw_input = read_user_input(ctx, "").strip()
             if not raw_input:
                 break
 
-            # Check if it's an FQDN first
-            if is_fqdn(raw_input):
-                if raw_input not in seen_names:
-                    names.append(raw_input)
-                    seen_names.add(raw_input)
-                continue
-
-            # If not FQDN, check if it's a subnet or IP
+            # Try to parse as an IP/Subnet FIRST.
+            is_ip_or_subnet = False
             try:
                 net = ipaddress.ip_network(raw_input, strict=False)
-                # Expand subnets, add individual hosts
-                for ip_obj in net.hosts():
-                    ip_str = str(ip_obj)
-                    if ip_str not in seen_ips:
-                        ips.append(ip_str)
-                        seen_ips.add(ip_str)
-                # Also add the /32 address itself if it was just an IP
+                # If this succeeds, it's a valid IP/Subnet.
+                is_ip_or_subnet = True
+
                 if net.num_addresses == 1:
-                    ip_str = str(net.network_address)
-                    if ip_str not in seen_ips:
-                        ips.append(ip_str)
-                        seen_ips.add(ip_str)
-
+                    ips_ordered_set[str(net.network_address)] = True
+                else:
+                    for ip_obj in net.hosts():
+                        ips_ordered_set[str(ip_obj)] = True
             except ValueError:
-                ctx.logger.warning(f"Invalid input for DNS lookup, skipping: {raw_input}")
+                # It's not a valid IP or subnet.
+                is_ip_or_subnet = False
 
-        return ips, names
+            # If it wasn't an IP, NOW we check if it's an FQDN.
+            if not is_ip_or_subnet:
+                if is_fqdn(raw_input):
+                    names_ordered_set[raw_input] = True
+                else:
+                    # It's neither a valid IP/Subnet nor a valid FQDN.
+                    ctx.logger.warning(f"Invalid input for DNS lookup, skipping: {raw_input}")
+
+        return list(ips_ordered_set.keys()), list(names_ordered_set.keys())
