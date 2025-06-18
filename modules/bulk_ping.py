@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 from subprocess import Popen, DEVNULL, STDOUT
 
 from core.base import BaseModule, ScriptContext
-from utils.user_input import read_user_input
+from utils.user_input import press_any_key, read_user_input
 from utils.display import console, get_global_color_scheme, print_table_data
 from utils.file_io import queue_save
 from utils.validation import is_fqdn, validate_ip
@@ -50,6 +50,7 @@ class BulkPingModule(BaseModule):
 
         if not hosts_to_ping:
             logger.info("Bulk PING - No valid hosts to ping.")
+            press_any_key(ctx)
             return
 
         logger.info(f"User input - Pinging {len(hosts_to_ping)} unique hosts.")
@@ -74,6 +75,7 @@ class BulkPingModule(BaseModule):
 
         if not final_results:
             console.print(f"[{colors['info']}]Ping process completed with no results to display.[/]")
+            press_any_key(ctx)
             return
 
         # The sorting logic has been removed to preserve user input order.
@@ -84,6 +86,8 @@ class BulkPingModule(BaseModule):
             final_columns = list(final_results[0].keys())
             save_data_lol = [[row.get(col, '') for col in final_columns] for row in final_results]
             queue_save(ctx, final_columns, save_data_lol, sheet_name="Bulk PING", index=False, force_header=True)
+
+        press_any_key(ctx)
 
     def _parse_user_input(self, ctx: ScriptContext) -> List[str]:
         """Parses multi-format user input into a flat list of unique hosts, preserving order."""

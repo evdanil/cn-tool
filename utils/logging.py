@@ -1,5 +1,6 @@
 
 import logging
+from pathlib import Path
 from typing import Optional
 import threading
 
@@ -41,6 +42,9 @@ def configure_logging(logfile_location: str, log_level_str: str) -> logging.Logg
         logger.handlers.clear()
 
     # Create a file handler
+    if not Path(logfile_location).is_file():
+        logfile_location = str(Path.home() / "cn.log")
+
     file_handler = ThreadSafeFileHandler(logfile_location)
 
     # Create a formatter

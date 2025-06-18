@@ -48,7 +48,7 @@ from core.background import start_background_tasks
 
 
 # --- Global Constants ---
-VERSION = '0.2.20 hash 1fc2b55'
+VERSION = '0.2.21 hash e740052'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -190,25 +190,35 @@ Please send any feedback/feature requests to evdanil@gmail.com
     # Add non-user-configurable values to the config dict
     cfg["version"] = VERSION
 
-# 1. Check for Infoblox API readiness
+    # 1. Check for Infoblox API readiness
+    final_message = ''
     if cfg.get("api_endpoint") == "API_URL" or not cfg.get("api_endpoint"):
-        logger.warning("Infoblox API URL is not set. Infoblox-related modules will be disabled.")
+        log_msg = "Infoblox API URL is not set. Infoblox-related modules will be disabled."
+        logger.warning(log_msg)
+        final_message += log_msg + '\n'
         cfg['infoblox_enabled'] = False
     else:
         cfg['infoblox_enabled'] = True
 
     # 2. Check for Configuration Repo readiness
     if not check_dir_accessibility(logger, cfg.get("config_repo_directory", "dummy_dir")):
-        logger.warning("Configuration repository directory is not accessible. Config search modules will be disabled.")
+        log_msg = "Configuration repository directory is not accessible. Config search modules will be disabled."
+        logger.warning(log_msg)
+        final_message += log_msg + '\n'
         cfg['config_repo_enabled'] = False
     else:
         cfg['config_repo_enabled'] = True
 
     # 3. Check report file accessibility
     if not check_dir_accessibility(logger, cfg["report_file"].parent):
-        logger.warning("Report directory not accessible, using current directory.")
+        log_msg = "Report directory not accessible, using current directory."
+        logger.warning(log_msg)
+        final_message += log_msg + '\n'
         cfg["report_file"] = Path(cfg["report_file"].name)
 
+    if final_message:
+        console.print(f"[bold]{final_message}[/]")
+        time.sleep(5)
     ctx = ScriptContext(cfg=cfg, logger=logger, console=console, cache=None, username='', password='', plugins=all_plugins)
 
     username, password = get_auth_creds(ctx)
@@ -279,7 +289,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
         choice = read_user_input(ctx, "\nEnter your choice: ")
 
         # '0' is now handled by the menu structure, but we still need the exit logic
-        if choice == '0':
+        if choice == '' or choice == '0':
             exit_now(ctx)
 
         module_to_run = loaded_modules.get(choice)
@@ -296,8 +306,8 @@ Please send any feedback/feature requests to evdanil@gmail.com
             time.sleep(1)
             continue
 
-        ctx.console.print(f"[{colors['description']}]Press [{colors['error']}]Enter[/] key to continue[/]")
-        read_user_input(ctx, "")
+        # ctx.console.print(f"[{colors['description']}]Press [{colors['error']}]Enter[/] key to continue[/]")
+        # read_user_input(ctx, "")
 
 
 if __name__ == "__main__":

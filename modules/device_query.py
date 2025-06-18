@@ -7,7 +7,7 @@ from rich.table import Table
 from rich.panel import Panel
 
 from core.base import BaseModule, ScriptContext
-from utils.user_input import read_user_input
+from utils.user_input import press_any_key, read_user_input
 from utils.display import (
     get_global_color_scheme, print_multi_table_panel,
     create_device_error_table, create_show_version_table,
@@ -95,6 +95,8 @@ class DeviceQueryModule(BaseModule):
                 console.print(f"[{colors['error']}]Input must be a valid IP address or FQDN.[/]")
 
         if not devices:
+            console.print(f"[{colors['error']}]No devices provided[/]")
+            press_any_key(ctx)
             return
 
         unique_devices = list(dict.fromkeys(devices))
@@ -198,3 +200,5 @@ class DeviceQueryModule(BaseModule):
                     # to a potentially existing file from a previous run.
                     force_header=True
                 )
+
+        press_any_key(ctx)

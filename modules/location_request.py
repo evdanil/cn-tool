@@ -2,7 +2,7 @@ import re
 from typing import Dict, Optional
 
 from core.base import BaseModule, ScriptContext
-from utils.user_input import read_user_input
+from utils.user_input import press_any_key, read_user_input
 from utils.display import console, get_global_color_scheme, print_table_data
 from utils.api import fetch_network_data
 from utils.file_io import queue_save
@@ -60,6 +60,7 @@ class LocationRequestModule(BaseModule):
         if not raw_input:
             logger.info("User input - Empty input")
             console.print(f"[{colors['error']}]No input provided.[/]")
+            press_any_key(ctx)
             return
 
         # --- Input Parsing and Validation ---
@@ -75,14 +76,18 @@ class LocationRequestModule(BaseModule):
             if not re.match(r"^[a-zA-Z0-9_-]*$", search_term):
                 logger.info(f"User input - Invalid keyword {search_term}")
                 console.print(f"[{colors['error']}]Keyword contains invalid characters.[/]")
+                press_any_key(ctx)
                 return
+            
             logger.info(f"User input - Keyword search for '{search_term}'")
         else:
             search_term = raw_input
             if not is_valid_site(search_term):
                 logger.info(f"User input - Incorrect site code {search_term}")
                 console.print(f"[{colors['error']}]Incorrect site code format.[/]")
+                press_any_key(ctx)
                 return
+            
             prefix = {"location": search_term.upper()}
             suffix = {"location": "Subnets"}
             logger.info(f"User input - Sitecode search for '{search_term}'")
@@ -96,6 +101,7 @@ class LocationRequestModule(BaseModule):
         if not processed_data.get("location"):
             logger.info("Request Type - Location/Keyword Search - No information received")
             console.print(f"[{colors['error']}]No information received for '{search_term}'.[/]")
+            press_any_key(ctx)
             return
 
         # --- Display and Save Results ---
@@ -119,3 +125,5 @@ class LocationRequestModule(BaseModule):
                 save_data_list_of_lists = [[row.get(col, '') for col in final_columns] for row in final_save_data]
 
                 queue_save(ctx, final_columns, save_data_list_of_lists, sheet_name="Subnet Lookup", index=False, force_header=True)
+
+        press_any_key(ctx)
