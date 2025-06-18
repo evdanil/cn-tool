@@ -2,7 +2,8 @@
 
 import ipaddress
 from time import perf_counter
-from typing import Any, Union
+import time
+from typing import Any, Optional, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 
@@ -33,11 +34,22 @@ class SubnetRequestModule(BaseModule):
     def menu_title(self) -> str:
         return "Subnet Information"
 
+    @property
+    def visibility_config_key(self) -> Optional[str]:
+        # This module will only appear in the menu if 'infoblox_enabled' is True in the config.
+        return "infoblox_enabled"
+
     def run(self, ctx: ScriptContext) -> None:
         """
         Main execution flow for the module.
         Orchestrates user input, data fetching, processing, and display.
         """
+        # It's also good practice to check at the start of the run method.
+        if not ctx.cfg.get("infoblox_enabled"):
+            ctx.console.print("[red]Infoblox feature is disabled. Please configure the API endpoint.[/red]")
+            time.sleep(1)
+            return
+
         self.execute_hook('pre_run', ctx, None)
         try:
             logger = ctx.logger

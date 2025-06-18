@@ -1,6 +1,6 @@
 # modules/bulk_ping.py
 import ipaddress
-from typing import Dict, List
+from typing import Dict, List, Optional
 from subprocess import Popen, DEVNULL, STDOUT
 
 from core.base import BaseModule, ScriptContext
@@ -22,6 +22,10 @@ class BulkPingModule(BaseModule):
     @property
     def menu_title(self) -> str:
         return "Bulk PING"
+
+    @property
+    def visibility_config_key(self) -> Optional[str]:
+        return None
 
     def run(self, ctx: ScriptContext) -> None:
         """
