@@ -41,6 +41,10 @@ class ConfigSearchModule(BaseModule):
     def menu_title(self) -> str:
         return "Configuration Lookup (by subnet or keyword)"
 
+    @property
+    def visibility_config_key(self) -> Optional[str]:
+        return "config_repo_enabled"
+
     def _show_help(self, ctx: ScriptContext):
         """Private helper to display help if the config repo is missing."""
         colors = get_global_color_scheme(ctx.cfg)

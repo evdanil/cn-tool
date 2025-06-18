@@ -41,14 +41,14 @@ from utils.app_lifecycle import exit_now
 from utils.auth import get_auth_creds
 from utils.config import BASE_CONFIG_SCHEMA, read_config, setup_from_args
 from utils.display import console, get_global_color_scheme, set_global_color_scheme
-from utils.file_io import start_worker, clear_report, check_dir_accessibility
+from utils.file_io import start_worker, check_dir_accessibility
 from utils.logging import configure_logging
 from utils.user_input import read_user_input
 from core.background import start_background_tasks
 
 
 # --- Global Constants ---
-VERSION = '0.2.19 hash 5a81d27'
+VERSION = '0.2.20 hash 1fc2b55'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -190,6 +190,25 @@ Please send any feedback/feature requests to evdanil@gmail.com
     # Add non-user-configurable values to the config dict
     cfg["version"] = VERSION
 
+# 1. Check for Infoblox API readiness
+    if cfg.get("api_endpoint") == "API_URL" or not cfg.get("api_endpoint"):
+        logger.warning("Infoblox API URL is not set. Infoblox-related modules will be disabled.")
+        cfg['infoblox_enabled'] = False
+    else:
+        cfg['infoblox_enabled'] = True
+
+    # 2. Check for Configuration Repo readiness
+    if not check_dir_accessibility(logger, cfg.get("config_repo_directory", "dummy_dir")):
+        logger.warning("Configuration repository directory is not accessible. Config search modules will be disabled.")
+        cfg['config_repo_enabled'] = False
+    else:
+        cfg['config_repo_enabled'] = True
+
+    # 3. Check report file accessibility
+    if not check_dir_accessibility(logger, cfg["report_file"].parent):
+        logger.warning("Report directory not accessible, using current directory.")
+        cfg["report_file"] = Path(cfg["report_file"].name)
+
     ctx = ScriptContext(cfg=cfg, logger=logger, console=console, cache=None, username='', password='', plugins=all_plugins)
 
     username, password = get_auth_creds(ctx)
@@ -206,51 +225,78 @@ Please send any feedback/feature requests to evdanil@gmail.com
     set_global_color_scheme(ctx)
     signal.signal(signal.SIGINT, lambda s, f: exit_now(ctx, 1, "Interrupted... Exiting..."))
 
-    if not check_dir_accessibility(logger, cfg["report_file"].parent):
-        ctx.logger.warning("Report directory not accessible, using current directory.")
-        cfg["report_file"] = Path(cfg["report_file"].name)
-
-    if cfg["api_endpoint"] == "API_URL":
-        exit_now(ctx, exit_code=1, message='Infoblox API URL is not set in configuration.')
-
     start_background_tasks(ctx)
     start_worker()
 
     colors = get_global_color_scheme(cfg)
     menu_header = """  """
-    menu_lines = [menu_header, f"    [{colors['error']} {colors['bold']}]MENU[/]"]
-    menu_lines.append(f"    [{colors['cyan']}]")
+    # Define the structure and order of your menu
+    menu_layout = {
+        "--- Tasks ---": ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'b'],
+        "--- Info ---": ['a'],
+        "--- Reporting ---": ['e', 'd'],
+        "--- Application ---": ['s', '0']
+    }
 
-    for module in sorted(loaded_modules.values(), key=lambda m: m.menu_key):
-        visibility_key = module.visibility_config_key
-        if visibility_key and not cfg.get(visibility_key, False):
-            continue  # Skip this module if its required config is not True
-        menu_lines.append(f"    {module.menu_key}. {module.menu_title}")
+    menu_lines = [menu_header, f"    [{colors['error']} {colors['title']}]MENU[/][{colors['code']}]"]
 
-    menu_lines.append("    d. Delete Report[/]")
-    menu_lines.append(f"    [{colors['warning']} {colors['bold']}]")
-    menu_lines.append("    0. Exit[/]")
+    for header, keys in menu_layout.items():
+        # A flag to track if we should print the header for this section
+        header_printed = False
+        section_lines = []
+
+        for key in keys:
+            # Handle the static 'Exit' case
+            if key == '0':
+                section_lines.append(f"    [{colors['warning']} {colors['bold']}]0. Exit[/]")
+                continue
+
+            module = loaded_modules.get(key)
+            if not module:
+                continue
+
+            # Check visibility based on the module's declared dependency
+            visibility_key = module.visibility_config_key
+
+            if visibility_key and not cfg.get(visibility_key, False):
+                continue  # Skip this module if its dependency is not met
+
+            # If we are here, the module is visible, so add it to the list
+            section_lines.append(f"    {module.menu_key}. {module.menu_title}")
+
+            # If we found any visible items in this section, print the header and the items
+        if section_lines:
+            if not header_printed:
+                menu_lines.append(f"\n    [{colors['header']}]{header}[/]")
+                header_printed = True
+            menu_lines.extend(section_lines)
+
     menu = "\n".join(menu_lines)
 
     while True:
-        console.clear()
-        console.print(menu)
-        choice = read_user_input(ctx, "Enter your choice: ")
+        ctx.console.clear()
+        ctx.console.print(menu)
+        choice = read_user_input(ctx, "\nEnter your choice: ")
+
+        # '0' is now handled by the menu structure, but we still need the exit logic
+        if choice == '0':
+            exit_now(ctx)
 
         module_to_run = loaded_modules.get(choice)
-
         if module_to_run:
-            module_to_run.run(ctx)
-        elif choice == 'd':
-            clear_report(ctx)
-        elif choice == '0':
-            exit_now(ctx)
+            # Check visibility again before running, as a safety measure
+            visibility_key = module_to_run.visibility_config_key
+            if visibility_key and not ctx.cfg.get(visibility_key, False):
+                ctx.console.print(f"[{colors['error']}]This feature is currently disabled.[/]")
+                time.sleep(2)
+            else:
+                module_to_run.run(ctx)
         else:
-            console.print(f"[{colors['error']}]Invalid choice. Please try again.[/]")
+            ctx.console.print(f"[{colors['error']}]Invalid choice. Please try again.[/]")
             time.sleep(1)
             continue
 
-        console.print(f"\n[{colors['description']}]Press [{colors['error']}]Enter[/] key to continue[/]")
+        ctx.console.print(f"[{colors['description']}]Press [{colors['error']}]Enter[/] key to continue[/]")
         read_user_input(ctx, "")
 
 

@@ -1,5 +1,5 @@
 import re
-from typing import Dict
+from typing import Dict, Optional
 
 from core.base import BaseModule, ScriptContext
 from utils.user_input import read_user_input
@@ -21,6 +21,11 @@ class LocationRequestModule(BaseModule):
     @property
     def menu_title(self) -> str:
         return "Subnet Lookup (by site code or keyword)"
+
+    @property
+    def visibility_config_key(self) -> Optional[str]:
+        # This module will only appear in the menu if 'infoblox_enabled' is True in the config.
+        return "infoblox_enabled"
 
     def run(self, ctx: ScriptContext) -> None:
         """
