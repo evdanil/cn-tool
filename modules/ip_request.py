@@ -4,7 +4,7 @@ from typing import Dict, Any, List, Optional, Set
 from concurrent.futures import ThreadPoolExecutor
 
 from core.base import BaseModule, ScriptContext
-from utils.user_input import read_user_input
+from utils.user_input import press_any_key, read_user_input
 from utils.display import console, get_global_color_scheme, print_table_data
 from utils.api import do_fancy_request
 from utils.file_io import queue_save
@@ -152,3 +152,5 @@ class IPRequestModule(BaseModule):
                 final_save_data = [[row.get(col, '') for col in final_columns_for_saving] for row in print_data_all]
 
                 queue_save(ctx, final_columns_for_saving, final_save_data, sheet_name="IP Data", index=False, force_header=True)
+
+        press_any_key(ctx)

@@ -3,7 +3,7 @@ import re
 from typing import Dict, Any, Optional
 
 from core.base import BaseModule, ScriptContext
-from utils.user_input import read_user_input
+from utils.user_input import press_any_key, read_user_input
 from utils.display import console, get_global_color_scheme, print_table_data
 from utils.api import do_fancy_request
 from utils.file_io import queue_save
@@ -57,12 +57,14 @@ class FQDNRequestModule(BaseModule):
         if len(fqdn) < 3:
             logger.info("User input - FQDN Search - Prefix is less than 3 chars")
             console.print(f"[{colors['error']}]Please use a longer prefix (at least 3 characters).[/]")
+            press_any_key(ctx)
             return
 
         # A simple prefix is not a valid FQDN, so we just check for invalid characters.
         if not re.match(r"^[a-zA-Z0-9.-]+$", fqdn):
             logger.info(f"User input - FQDN Search - Incorrect FQDN/prefix: {fqdn}")
             console.print(f"[{colors['error']}]Input contains invalid characters.[/]")
+            press_any_key(ctx)
             return
 
         # --- API Call and Data Processing ---
@@ -82,6 +84,7 @@ class FQDNRequestModule(BaseModule):
             logger.info("Request Type - FQDN Search - No information received")
             console.print(f"[{colors['error']}]No information received for '{fqdn}'.[/]")
             logger.debug(f"Request Type - FQDN Search - raw data: {content}")
+            press_any_key(ctx)
             return
 
         # --- Display and Save Results ---
@@ -96,3 +99,5 @@ class FQDNRequestModule(BaseModule):
                 final_columns = list(final_save_data[0].keys())
                 save_data_list_of_lists = [[row.get(col, '') for col in final_columns] for row in final_save_data]
                 queue_save(ctx, final_columns, save_data_list_of_lists, sheet_name="FQDN Data", index=False, force_header=True)
+
+        press_any_key(ctx)

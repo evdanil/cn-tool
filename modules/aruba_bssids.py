@@ -2,7 +2,7 @@
 from typing import Dict, List
 
 from core.base import BaseModule, ScriptContext
-from utils.user_input import read_user_input
+from utils.user_input import press_any_key, read_user_input
 from utils.display import console, get_global_color_scheme, print_table_data
 from utils.file_io import queue_save
 from utils.validation import validate_and_normalize_mac_address
@@ -117,3 +117,5 @@ class ArubaBSSIDModule(BaseModule):
                 save_data_lol = [[row.get(col, '') for col in final_columns] for row in final_results_data]
 
                 queue_save(ctx, final_columns, save_data_lol, sheet_name="Aruba BSSIDs", index=False, force_header=True)
+
+        press_any_key(ctx)

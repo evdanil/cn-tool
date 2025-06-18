@@ -62,7 +62,7 @@ def init_ad_link(
             user=user,
             password=password,
             auto_bind=True,
-            read_only=True
+            read_only=True,
         )
 
         # start_tls() is often used with ldap://. If you use ldaps:// (port 636),

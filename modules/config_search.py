@@ -6,7 +6,7 @@ from typing import List, Dict, Set, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 
 from core.base import BaseModule, ScriptContext
-from utils.user_input import read_user_input
+from utils.user_input import press_any_key, read_user_input
 from utils.display import console, get_global_color_scheme, print_search_config_data, print_table_data
 from utils.file_io import check_dir_accessibility, queue_save
 from utils.validation import is_valid_site
@@ -127,6 +127,7 @@ class ConfigSearchModule(BaseModule):
         if not data_to_save:
             logger.info("Configuration Repository - No matches found!")
             console.print(f"[{colors['error']}]No matches found![/]")
+            press_any_key(ctx)
             return
 
         missing_nets = list(set(networks) - matched_nets) if networks else []
@@ -141,6 +142,8 @@ class ConfigSearchModule(BaseModule):
 
         if ctx.cfg["report_auto_save"]:
             self._save_found_data(ctx, data_to_save, missing_nets, matched_nets, "Config Check")
+
+        press_any_key(ctx)
 
     def execute_demob_search(self, ctx: ScriptContext, sitecode: str):
         """
@@ -160,6 +163,7 @@ class ConfigSearchModule(BaseModule):
 
         if not processed_data.get("location"):
             console.print(f"[{colors['error']}]No [{colors['success']} {colors['bold']}]{sitecode}[/] subnets registered in Infoblox[/]")
+            press_any_key(ctx)
             return
 
         print_table_data(ctx, processed_data)
@@ -196,6 +200,7 @@ class ConfigSearchModule(BaseModule):
         if not data_to_save:
             logger.info(f"Configuration Repository - No matches for {sitecode} found!")
             console.print(f"[{colors['error']}]No matches found![/]")
+            press_any_key(ctx)
             return
 
         # Step 4: Process and display results
@@ -212,6 +217,9 @@ class ConfigSearchModule(BaseModule):
 
         if ctx.cfg["report_auto_save"]:
             self._save_found_data(ctx, data_to_save, missing_nets, matched_nets, "Demob Site Check")
+
+        # Commented because we await for any key in demob_check module itself
+        # press_any_key(ctx)
 
     def _execute_search(self, ctx: ScriptContext, networks: List, search_terms: List, search_input: str) -> Tuple[List, Set]:
         """A centralized method to run the search via cache or live scan."""

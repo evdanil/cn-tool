@@ -1,11 +1,13 @@
 import termios
 import sys
 import tty
+from typing import Optional
 from core.base import ScriptContext
 from utils.app_lifecycle import exit_now
+from utils.display import get_global_color_scheme
 
 
-def read_user_input(ctx: ScriptContext, prompt: str = " ", read_pass: bool = False) -> str:
+def read_user_input(ctx: ScriptContext, prompt: Optional[str] = " ", read_pass: bool = False) -> str:
     """
     Read user input and gracefully handle CTRL-C (KeyboardInterrupt) and
     CTRL-D (EOFError) to ensure a clean application shutdown.
@@ -66,3 +68,11 @@ def read_single_keypress(ctx: ScriptContext) -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     return ch
+
+
+def press_any_key(ctx: ScriptContext) -> None:
+    """  Prints press any key message and read single press of any key
+    """
+    colors = get_global_color_scheme(ctx.cfg)
+    ctx.console.print(f"[{colors['description']}]Press [{colors['error']}]any[/] key to continue[/]")
+    read_single_keypress(ctx)
