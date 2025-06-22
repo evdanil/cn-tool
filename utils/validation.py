@@ -15,6 +15,16 @@ str_ip_subnet_regexp = re.compile(
     r".*?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})[^\d]*(?:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|\/(\d{1,2}))"
 )
 
+# A more precise IP validation regex for internal functions that need to be sure.
+# Uses fullmatch and word boundaries to avoid matching parts of larger numbers.
+PRECISE_IP_REGEXP = re.compile(r"((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.){3}(25[0-5]|(2[0-4]|1\d|[1-9]|)\d)")
+
+# Company-specific regex for extracting a site code from a device hostname.
+# This should be customized to your environment's naming convention.
+# Example: Extracts 'SFO-R01' from 'cr01.sfo-r01.us.example.com'
+# The (?P<sitecode>...) part creates a named capture group for easy access.
+HOSTNAME_SITE_CODE_REGEX = re.compile(r'(?i)(?P<sitecode>\b(?:[A-Z0-9]{7}|[A-Z]{3}(?:-[A-Z0-9]{1,4})?|[A-Z]{3})\b)')
+
 
 def validate_and_normalize_mac_address(mac: str) -> Optional[str]:
     # Remove any whitespace and convert to lowercase
