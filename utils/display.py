@@ -280,6 +280,7 @@ def create_table(
     data: List[List[Any]],
     title_style: str = "bold yellow",
     box_style: Box = box.MINIMAL,
+    exclude_columns: Optional[List[str]] = None,
     **kwargs: Any
 ) -> Table:
     """
@@ -291,6 +292,7 @@ def create_table(
     @param    color_scheme (str, optional): The color scheme to use. Defaults to "default".
     @param    title_style (str, optional): The style for the table title. Defaults to "bold yellow".
     @param    box (box, optional): The box style for the table. Defaults to box.MINIMAL.
+    @param exclude_columns: A list of column names to hide from the console display.
 
     @return    Table: The created Rich table.
 
@@ -302,15 +304,34 @@ def create_table(
     title = title.upper()
     logger.debug(f"Table - title = {title} columns = {len(columns)} rows = {len(data)}")
 
+    # Ensure exclude_columns is a list, even if None is passed.
+    if exclude_columns is None:
+        exclude_columns = []
+
+    # Determine the indices of the columns to exclude.
+    # We use a set for efficient lookup.
+    exclude_set = set(exclude_columns)
+    indices_to_exclude = {i for i, col in enumerate(columns) if col in exclude_set}
+
+    # Filter the list of columns that will actually be displayed.
+    display_columns = [col for i, col in enumerate(columns) if i not in indices_to_exclude]
+
+    # Filter the data rows to remove the values from excluded columns.
+    display_data = []
+    for row in data:
+        display_row = [item for i, item in enumerate(row) if i not in indices_to_exclude]
+        display_data.append(display_row)
+
     color_cycle = cycle(colors.values())
 
+    # Create the table using only the columns and data we want to display.
     table = Table(title=title, title_style=colors.get("title", title_style), box=box_style, **kwargs)
-    for column in columns:
+    for column in display_columns:
         table.add_column(
             column, justify="left", style=next(color_cycle, next(color_cycle)), no_wrap=False
         )
 
-    for row in data:
+    for row in display_data:
         table.add_row(*[str(item) for item in row])
 
     return table
