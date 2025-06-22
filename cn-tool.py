@@ -48,7 +48,7 @@ from core.background import start_background_tasks
 
 
 # --- Global Constants ---
-VERSION = '0.2.21 hash e740052'
+VERSION = '0.2.22 hash fa18e5a'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -242,7 +242,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
     menu_header = """  """
     # Define the structure and order of your menu
     menu_layout = {
-        "--- Tasks ---": ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'b'],
+        "--- Tasks ---": ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'b', 't'],
         "--- Info ---": ['a'],
         "--- Reporting ---": ['e', 'd'],
         "--- Application ---": ['s', '0']

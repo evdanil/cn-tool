@@ -21,8 +21,8 @@ def read_user_input(ctx: ScriptContext, prompt: Optional[str] = " ", read_pass: 
     except EOFError:
         # User pressed CTRL-D. This should also trigger a clean exit.
         # We have access to everything we need via the context.
-        ctx.logger.info("CTRL-D (EOF) detected, initiating clean shutdown.")
-        exit_now(ctx, 0, "Exiting...")
+        ctx.logger.info("CTRL-D (EOF) detected, returning...")
+        return raw_input
 
     except KeyboardInterrupt:
         # User pressed CTRL-C. This is the main fix.
@@ -59,9 +59,8 @@ def read_single_keypress(ctx: ScriptContext) -> str:
         # Check for Ctrl+D (End of Transmission character)
         if ch == '\x04':
             # Restore terminal settings before exiting
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-            ctx.logger.info("CTRL-D (EOF) detected in single-keypress mode, initiating clean shutdown.")
-            exit_now(ctx, 0, "Exiting...")
+            # termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            ctx.logger.info("CTRL-D (EOF) detected in single-keypress mode, returning normally")
 
     finally:
         # Restore the terminal settings

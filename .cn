@@ -55,3 +55,4 @@ to = some_user@example.com
 # WARNING: Storing passwords in plaintext is a security risk.
 # For services like Gmail, this should be an "App Password".
 #password = abcd-efgh-ijkl-mnop
+

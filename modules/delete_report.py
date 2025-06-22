@@ -28,5 +28,5 @@ class DeleteReportModule(BaseModule):
         ctx.logger.info("Request Type - Delete Report")
         # The clear_report function already provides user feedback.
         clear_report(ctx)
-        
+
         press_any_key(ctx)
