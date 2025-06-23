@@ -284,7 +284,21 @@ class SubnetRequestModule(BaseModule):
             net_str = str(network)
             if net_str in all_data and all_data[net_str]:
                 console.clear()
-                print_table_data(ctx, all_data[net_str], suffix={"general": "Information"})
+                print_table_data(
+                    ctx,
+                    all_data[net_str],
+                    suffix={"general": "Information"},
+                    table_order=[
+                        'general',
+                        'DHCP range',
+                        'DHCP options',
+                        'DHCP members',
+                        'DHCP failover',
+                        'DNS records',
+                        'fixed addresses',
+
+                    ]
+                )
             else:
                 console.print(f"[{colors['success']}]Network [{colors['error']}{colors['bold']}] {net_str} [/] has no data in Infoblox[/]")
 
