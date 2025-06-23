@@ -48,7 +48,7 @@ from core.background import start_background_tasks
 
 
 # --- Global Constants ---
-VERSION = '0.2.22 hash fa18e5a'
+VERSION = '0.2.23 hash 6304bd3'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
