@@ -247,6 +247,7 @@ class ConfigSearchModule(BaseModule):
 
     def _search_folder_live(self, ctx: ScriptContext, folder: Path, nets: List, search_terms: List, search_input: str) -> Tuple[List, Set]:
         """Private helper containing the logic of the original `search_config` function."""
+        colors = get_global_color_scheme(ctx.cfg)
         data_to_save: List[Any] = []
         matched_nets: Set[ipaddress.IPv4Network] = set()
 
@@ -256,9 +257,16 @@ class ConfigSearchModule(BaseModule):
             return data_to_save, matched_nets
 
         parts = folder.parts
-        vendor = str(parts[-3]).lower() if len(parts) > 2 else ""
 
-        with ThreadPoolExecutor() as executor:
+        vendor, device_type, region = 'vendor', 'type', 'region'
+        if len(parts) < 6:
+            ctx.logger.warning('Repository has non-expected directory path(missing vendor/type/region)')
+        else:
+            vendor = str(parts[-3]).lower()
+            device_type = str(parts[-2]).upper()
+            region = str(parts[-1]).upper()
+
+        with ThreadPoolExecutor() as executor, console.status(f"[{colors['description']}]Searching through [{colors['type']}]{vendor.upper()}/{device_type}[/] configurations in [{colors['hostname']}]{region}[/] region...[/]"):
             futures = [
                 executor.submit(self._matched_lines, ctx, device, vendor, nets, search_terms, search_input)
                 for device in dir_list if device.is_file()

@@ -338,18 +338,46 @@ def create_table(
 
 
 def print_table_data(
-    ctx: ScriptContext, data: Dict[str, List[Dict[str, Any]]], prefix: Dict[str, str] = {}, suffix: Dict[str, str] = {}
+    ctx: ScriptContext, data: Dict[str, List[Dict[str, Any]]], prefix: Dict[str, str] = {}, suffix: Dict[str, str] = {}, table_order: Optional[List[str]] = None
 ) -> None:
     """
     Prints data using keys as column names, can use prefix/suffix dictionary to add additional information to title (main keys)
-    keys in data should match keys in suffix/prefix
+    keys in data should match keys in suffix/prefix.
+
+    Args:
+        ctx (ScriptContext): The script context, used for printing.
+        data (Dict[str, List[Dict[str, Any]]]): The data to display, where each key is a table title.
+        prefix (Dict[str, str], optional): Prefixes for table titles. Defaults to {}.
+        suffix (Dict[str, str], optional): Suffixes for table titles. Defaults to {}.
+        table_order (Optional[List[str]], optional): A list of keys from `data` to specify the
+            printing order. Tables with keys in this list will be printed first, in the specified
+            order. Remaining tables will be printed after, in alphabetical order.
+            If None or empty, tables are printed in default dictionary order. Defaults to None.
     """
     if not data:
         ctx.console.print("No data to display")
         return
 
+    # ctx.logger.debug(f'Dumping data {data}')
+
+    if table_order:
+        # Start with keys that are in both table_order and data, preserving the order
+        ordered_keys = [key for key in table_order if key in data]
+
+        # Get the remaining keys from data that were not in table_order
+        # Sort them alphabetically for a consistent, predictable output
+        remaining_keys = sorted([key for key in data if key not in ordered_keys])
+
+        # Combine the lists: user-specified order first, then the rest
+        sorted_keys = ordered_keys + remaining_keys
+    else:
+        # Fallback to the default order if table_order is not provided
+        sorted_keys = list(data.keys())
+
     tables: List[Union[Table, Panel]] = []
-    for key, value_list in data.items():
+
+    for key in sorted_keys:
+        value_list = data[key]
         if not value_list:
             continue
 
@@ -366,3 +394,21 @@ def print_table_data(
 
     if tables:
         print_multi_table_panel(ctx, tables, '')
+
+    # for key, value_list in data.items():
+    #     if not value_list:
+    #         continue
+
+    #     section_title = key
+    #     prefix_text = prefix.get(key, "")
+    #     suffix_text = suffix.get(key, "")
+    #     section_title = f"{prefix_text} {section_title} {suffix_text}".strip()
+    #     section_title = section_title.upper()
+
+    #     columns = list(value_list[0].keys())
+    #     table_data = [[item for item in record.values()] for record in value_list]
+
+    #     tables.append(create_table(ctx, section_title, columns, table_data, title_justify="left"))
+
+    # if tables:
+    #     print_multi_table_panel(ctx, tables, '')

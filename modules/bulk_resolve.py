@@ -147,6 +147,9 @@ class BulkResolveModule(BaseModule):
             is_ip_or_subnet = False
             try:
                 net = ipaddress.ip_network(raw_input, strict=False)
+                if isinstance(net, ipaddress.IPv6Network):
+                    ctx.console.print('IPv6 subnets are not supported')
+                    continue
                 # If this succeeds, it's a valid IP/Subnet.
                 is_ip_or_subnet = True
 
