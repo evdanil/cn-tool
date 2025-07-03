@@ -11,7 +11,7 @@ from utils.display import console, get_global_color_scheme, print_search_config_
 from utils.file_io import check_dir_accessibility, queue_save
 from utils.validation import is_valid_site
 from utils.config import make_dir_list
-from utils.data_processing import remove_duplicate_rows_sorted_by_col
+from utils.process_data import remove_duplicate_rows_sorted_by_col
 from utils.api import fetch_network_data
 from utils.cache import CacheManager
 

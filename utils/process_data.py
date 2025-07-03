@@ -211,6 +211,22 @@ def process_data(ctx: ScriptContext, type: str, content: Optional[bytes]) -> Dic
         return defaultdict(list)
 
 
+def remove_duplicate_rows_sorted_by_col(data: List[List[Any]], col: int) -> List[List[Any]]:
+    """
+    Removes duplicate rows from a list of lists, preserving order,
+    and sorts the result by a specified column index.
+    """
+    seen = set()
+    result = []
+    for sublist in data:
+        sublist_tuple = tuple(sublist)
+        if sublist_tuple not in seen:
+            seen.add(sublist_tuple)
+            result.append(sublist)
+    result.sort(key=lambda x: x[col])
+    return result
+
+
 # This dictionary acts as a registry to dispatch to the correct parser.
 DATA_PARSERS = {
     "ip": _parse_ip_data,

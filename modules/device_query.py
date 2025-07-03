@@ -21,7 +21,7 @@ from utils.validation import is_fqdn, ip_regexp
 from utils.parsers import (
     process_device_commands, process_device_data, prepare_device_data,
     parse_show_version, parse_show_license_reservation,
-    parse_show_license_summary, parse_show_license, parse_nexus_show_version, 
+    parse_show_license_summary, parse_show_license, parse_nexus_show_version,
     parse_nexus_show_license_all
 )
 
@@ -128,7 +128,7 @@ class DeviceQueryModule(BaseModule):
                 error_table = create_device_error_table(hostname, ctx.cfg.get("theme_name", "default"))
                 if error_table:
                     tables_to_print.append(error_table)
-            else:               
+            else:
                 platform = device_data.get('platform', 'iosxe')  # Default to iosxe for safety
                 cmd_list = platform_commands.get(platform, {})
                 for command_key, parsed_output in device_data.items():
