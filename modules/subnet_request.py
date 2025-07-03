@@ -156,7 +156,7 @@ class SubnetRequestModule(BaseModule):
                     except Exception as e:
                         ctx.logger.error(f"Error resolving input: {e}")
 
-        return sorted(list(resolved_nets))
+        return list(resolved_nets)
 
     def _resolve_single_input(self, ctx: ScriptContext, an_input: str) -> set[ipaddress.IPv4Network]:
         """
@@ -263,9 +263,20 @@ class SubnetRequestModule(BaseModule):
             for network in networks:
                 net_str = str(network)
                 net_info = all_data.get(net_str)
+
                 if net_info and net_info.get("general"):
                     description = net_info["general"][0].get("description", "N/A")
                     summary_net = {"Subnet": net_str, "Description": description}
+                    ext_attrs_list = net_info.get("Extensible Attributes", [])
+                    ea_map = {
+                        attr.get("Attribute"): attr.get("Value")
+                        for attr in ext_attrs_list if attr.get("Attribute")
+                    }
+                    summary_net["Location"] = ea_map.get("Location", "N/A")
+                    summary_net["Region"] = ea_map.get("Region", "N/A")
+                    summary_net["Country"] = ea_map.get("Country", "N/A")
+                    summary_net["VLAN"] = ea_map.get("VLAN", "N/A")
+
                     # Check for plugin-injected data and add it if it exists
                     ad_info = net_info.get("Active Directory", [{}])[0]
                     if ad_info:  # Only add if the plugin provided data

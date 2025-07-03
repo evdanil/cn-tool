@@ -142,7 +142,7 @@ def fetch_network_data(ctx: ScriptContext, search_term: str, keyword: bool = Fal
 
     if not keyword:
         # Build regex pattern for site code search
-        padded_search_term = rf'^[^;]+;\s*{search_term}\s*;'
+        padded_search_term = rf'^[^;]+;\s*{search_term}\s*(;|$)'
         encoded_pattern = selective_url_encode(padded_search_term)
         search_type = f"location_{search_term}"
     else:

@@ -78,7 +78,7 @@ class LocationRequestModule(BaseModule):
                 console.print(f"[{colors['error']}]Keyword contains invalid characters.[/]")
                 press_any_key(ctx)
                 return
-            
+
             logger.info(f"User input - Keyword search for '{search_term}'")
         else:
             search_term = raw_input
@@ -87,7 +87,7 @@ class LocationRequestModule(BaseModule):
                 console.print(f"[{colors['error']}]Incorrect site code format.[/]")
                 press_any_key(ctx)
                 return
-            
+
             prefix = {"location": search_term.upper()}
             suffix = {"location": "Subnets"}
             logger.info(f"User input - Sitecode search for '{search_term}'")

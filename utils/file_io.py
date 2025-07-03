@@ -8,7 +8,6 @@ from core.base import ScriptContext
 import threading
 import pandas as pd
 
-from utils.data_processing import data_to_dict
 from utils.display import get_global_color_scheme
 
 # Adding another thread to save data into xlsx in the background
@@ -158,10 +157,10 @@ def append_df_to_excel(
         """
         Helper function prepares Pandas DataFrame
         """
-        data_to_save = data_to_dict(columns, data)
-        data_frame = pd.DataFrame.from_dict(data_to_save)
-
-        return data_frame
+        # Directly create the DataFrame from the raw data and columns.
+        # This is the standard, robust way and avoids issues with
+        # single-row data when converting to a dictionary first.
+        return pd.DataFrame(data, columns=columns)
 
     df: pd.DataFrame
     #  If columns were provided need to prepare data set, otherwise we have to save data as is
@@ -248,4 +247,3 @@ def append_df_to_excel(
 
         # log success
         logger.info(f"Export - Updated {filename} successfully")
-
