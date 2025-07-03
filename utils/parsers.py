@@ -172,45 +172,22 @@ def parse_show_license(output: str) -> List[Dict[str, str]]:
 def prepare_device_data(processed_data: List[Dict[str, Any]]) -> Tuple[List[str], List[List[Any]]]:
     """
     This function prepares a flat list of dictionaries for saving to an Excel table.
-    It merges rows based on a composite key and ensures all rows have all columns.
+    It determines a master set of columns and ensures all rows conform to it.
 
     Args:
-        processed_data: A flat list of dictionaries, where each dict represents a potential row.
+        processed_data: A flat list of dictionaries, where each dict represents a final row.
     """
     if not processed_data:
         return [], []
 
+    # --- SIMPLIFIED LOGIC ---
+    # 1. Get all possible column headers from all rows.
     all_columns: Set[str] = set()
-    devices: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-
-    def merge_device_info(info1: Dict[str, Any], info2: Dict[str, Any]) -> Dict[str, Any]:
-        merged = info1.copy()
-        for key, value in info2.items():
-            if not merged.get(key) and value:
-                merged[key] = value
-        return merged
-
-    # --- THIS IS THE CORRECTED LOGIC ---
-    # The input is now a flat list, so we only need one loop.
     for row in processed_data:
-        # This check is crucial for safety
-        if not isinstance(row, dict):
-            # Log a warning or skip if an invalid item is found
-            continue
+        if isinstance(row, dict):
+            all_columns.update(row.keys())
 
-        all_columns.update(row.keys())
-        device_key = (row.get('Device Name', ''), row.get('Serial Number', ''), row.get('License Name', ''))
-
-        if device_key not in devices:
-            devices[device_key] = row.copy()
-        else:
-            devices[device_key] = merge_device_info(devices[device_key], row)
-    # --- END OF CORRECTION ---
-
-    # Create final rows from the merged devices
-    rows = list(devices.values())
-
-    # Define priority columns (this logic is correct)
+    # 2. Define priority columns to control the order in the Excel file.
     priority_columns = [
         'Device Name', 'Serial Number', 'Product ID (PID)', 'Parent Device Name',
         'Stack Role', 'Software Version', 'Software Image', 'License Name',
@@ -219,17 +196,14 @@ def prepare_device_data(processed_data: List[Dict[str, Any]]) -> Tuple[List[str]
         'License State', 'License Status', 'Uptime'
     ]
 
-    # Sort columns (this logic is correct)
+    # 3. Create the final, sorted list of column headers.
     other_columns = sorted(col for col in all_columns if col not in priority_columns)
-    final_columns = priority_columns + other_columns
+    final_columns = [col for col in priority_columns if col in all_columns] + other_columns
 
-    # Ensure all rows have all columns (this logic is correct)
-    for row in rows:
-        for col in final_columns:
-            row.setdefault(col, '')  # setdefault is slightly cleaner than if/not in
-
-    # Convert rows to list of lists (this logic is correct)
-    row_data = [[row.get(col, '') for col in final_columns] for row in rows]
+    # 4. Convert the list of dictionaries to a list of lists for saving.
+    # Use .get(col, '') to ensure that if a row is missing a column, it gets a blank value.
+    row_data = [[row.get(col, '') for col in final_columns] for row in processed_data]
+    # --- END OF SIMPLIFIED LOGIC ---
 
     return final_columns, row_data
 
@@ -243,10 +217,10 @@ def process_device_data(device_name: str, data: Dict[str, Any]) -> List[Dict[str
     version_output = data.get('show version', {})  # Both platforms use this key
     base_info: Dict[str, Any] = {
         'Device Name': device_name,
-        'Software Version': version_output.get('show_version', {}).get('Software Version', ''),
-        'Software Image': version_output.get('show_version', {}).get('Software Image', ''),
-        'Uptime': version_output.get('show_version', {}).get('Uptime', ''),
-        'Serial Number': version_output.get('show_version', {}).get('Serial Number', ''),
+        'Software Version': version_output.get('Software Version', ''),
+        'Software Image': version_output.get('Software Image', ''),
+        'Uptime': version_output.get('Uptime', ''),
+        'Serial Number': version_output.get('Serial Number', ''),
         'Product ID (PID)': '',
         'Stack Role': 'N/A',
         'Parent Device Name': None,
@@ -265,7 +239,7 @@ def process_device_data(device_name: str, data: Dict[str, Any]) -> List[Dict[str
     if platform == 'iosxe':
         # --- Handle IOS/XE data (existing logic) ---
         # Process license reservation data
-        reservation_data = data.get('show_license_reservation', {})
+        reservation_data = data.get('show license reservation', {})
         for sn, info in reservation_data.items():
             row = base_info.copy()
             row['Serial Number'] = sn
@@ -293,7 +267,7 @@ def process_device_data(device_name: str, data: Dict[str, Any]) -> List[Dict[str
                 rows.append(row)
 
         # Process license summary data
-        for license_item in data.get('show_license_summary', []):
+        for license_item in data.get('show license summary', []):
             row = base_info.copy()
             row.update({
                 'License Name': license_item.get('License', ''),
@@ -304,7 +278,7 @@ def process_device_data(device_name: str, data: Dict[str, Any]) -> List[Dict[str
             rows.append(row)
 
         # Process detailed license data
-        for license_item in data.get('show_license', []):
+        for license_item in data.get('show license', []):
             row = base_info.copy()
             row.update({
                 'License Name': license_item.get('Feature', ''),
