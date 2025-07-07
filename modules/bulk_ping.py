@@ -163,8 +163,8 @@ class BulkPingModule(BaseModule):
                     if isinstance(net, ipaddress.IPv6Network):
                         ctx.console.print('IPv6 subnets are not supported')
                         continue
-                    # For subnets, we iterate hosts, for single IPs (e.g. /32), it's just the one IP
-                    host_iterator = net.hosts() if net.num_addresses > 1 else [net.ip]
+
+                    host_iterator = net.hosts()
                     for ip in host_iterator:
                         if not (ip.is_loopback or ip.is_multicast or ip.is_reserved):
                             current_line_hosts.append(str(ip))
