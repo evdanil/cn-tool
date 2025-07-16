@@ -46,9 +46,14 @@ from utils.logging import configure_logging
 from utils.user_input import read_user_input
 from core.background import start_background_tasks
 
+# Fix MAC address emoji issue
+from rich._emoji_codes import EMOJI
+
+del EMOJI["cd"]
+
 
 # --- Global Constants ---
-VERSION = '0.2.28 hash c26bf2e'
+VERSION = '0.2.29 hash cbc3262'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
