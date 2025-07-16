@@ -336,6 +336,8 @@ def search_cache_keywords(ctx: ScriptContext, search_terms: List[str], search_in
     kw_idx = cache.kw_idx
     dev_idx = cache.dev_idx
 
+    all_cache_keywords = list(kw_idx.keys())  # Get all keys for prefix matching
+
     if not search_terms:
         return data_to_save
 
@@ -354,14 +356,15 @@ def search_cache_keywords(ctx: ScriptContext, search_terms: List[str], search_in
             continue
 
         for word in candidate_words:
-            # Keys in kw_idx should be lowercase if your indexing is correct.
-            word_entry = kw_idx.get(word)
+            # Looking up all keys which start with the search term
+            matching_keys = [key for key in all_cache_keywords if key.startswith(word.lower())]
 
-            if isinstance(word_entry, dict):
-                # word_entry is a dict like {'HOSTNAME1': [1,2], 'HOSTNAME2': [5,6]}
-                for hostname, lines in word_entry.items():
-                    # Standardize on uppercase for our internal processing
-                    candidate_lines_by_host[hostname.upper()].update(lines)
+            # Keys in kw_idx should be lowercase if your indexing is correct.
+            for key in matching_keys:
+                word_entry = kw_idx.get(key)
+                if isinstance(word_entry, dict):
+                    for hostname, lines in word_entry.items():
+                        candidate_lines_by_host[hostname.upper()].update(lines)
 
         # If no candidate lines were found for any of the words, move to the next search term.
         if not candidate_lines_by_host:
