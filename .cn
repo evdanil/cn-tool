@@ -13,10 +13,12 @@ auto_save = True
 
 [config_repo]
 directory = /opt/data/configs
+# expected repo structure:
+# vendor/device_type/region/device_config.cfg
 #vendors = cisco,aruba,f5,bluecoat,paloalto
 #vendors = cisco
 #regions = ap, eu, am
-#regions = ap
+regions = eu
 
 [gpg]
 #credentials = ~/device-apply.gpg
