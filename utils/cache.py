@@ -56,3 +56,16 @@ class CacheManager:
             f"Words: {len(self.kw_idx)}, "
             f"Rev: {len(self.rev_idx)}"
         )
+
+    def reset_cache(self):
+        """
+        Resets the entire cache, deleting all entries and indexes.
+        """
+        self.logger.info("Resetting cache...")
+        self.dc.clear()
+        self.dev_idx.clear()
+        self.ip_idx.clear()
+        self.kw_idx.clear()
+        self.rev_idx.clear()
+        self.log_stats("cache_reset")
+        self.logger.info("Cache reset complete.")

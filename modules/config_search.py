@@ -14,6 +14,7 @@ from utils.config import make_dir_list
 from utils.process_data import remove_duplicate_rows_sorted_by_col
 from utils.api import fetch_network_data
 from utils.cache import CacheManager
+from utils.cache_helpers import build_config_path
 
 # Assuming search_cache_config is a helper you'll create in a cache_helpers.py or similar
 # For now, this module will handle both live and cached logic paths.
@@ -262,11 +263,16 @@ class ConfigSearchModule(BaseModule):
         if len(parts) < 6:
             ctx.logger.warning('Repository has non-expected directory path(missing vendor/type/region)')
         else:
-            vendor = str(parts[-3]).lower()
-            device_type = str(parts[-2]).upper()
-            region = str(parts[-1]).upper()
+            regions = ctx.cfg.get("regions", False)
+            if regions and regions != '':
+                vendor = str(parts[-4]).lower()
+                device_type = str(parts[-3]).upper()
+                region = str(parts[-2]).upper()
+            else:
+                vendor = str(parts[-3]).lower()
+                device_type = str(parts[-2]).upper()            
 
-        with ThreadPoolExecutor() as executor, console.status(f"[{colors['description']}]Searching through [{colors['type']}]{vendor.upper()}/{device_type}[/] configurations in [{colors['hostname']}]{region}[/] region...[/]"):
+        with ThreadPoolExecutor() as executor, console.status(f"[{colors['description']}]Searching through [{colors['type']}]{vendor.upper()}/{device_type}[/] configurations...[/]"):
             futures = [
                 executor.submit(self._matched_lines, ctx, device, vendor, nets, search_terms, search_input)
                 for device in dir_list if device.is_file()
@@ -289,11 +295,13 @@ class ConfigSearchModule(BaseModule):
         rows_to_save: Dict[int, str] = {}
         device = filename.stem.upper()
 
+        vendor_stop_list = stop_words.get(vendor.lower(), ("NEVERMATCHED",))
+
         try:
             with open(filename, "r", encoding="utf-8", errors='ignore') as f:
                 for index, line in enumerate(f):
                     line_strip = line.strip()
-                    if line_strip.startswith(stop_words.get(vendor, ("NEVERMATCHED",))):
+                    if line_strip.startswith(vendor_stop_list):
                         continue
 
                     if ip_nets:
@@ -360,8 +368,10 @@ class ConfigSearchModule(BaseModule):
             dev_idx = ctx.cache.dev_idx
             device_names = {row[1].upper() for row in data}
             for device_name in device_names:
-                fname = dev_idx.get(device_name, {}).get("fname")
-                device_list.add((device_name, fname))
+                device_info = dev_idx.get(device_name, {})
+                fname = build_config_path(ctx, device_name, device_info.get('region', ''), device_info.get('vendor', ''), device_info.get('type', ''))
+                if fname:
+                    device_list.add((device_name, fname))
         else:
             logger.info("Saving device configs using data from direct file scan...")
             device_list = {(row[1], row[4]) for row in data}
@@ -371,13 +381,13 @@ class ConfigSearchModule(BaseModule):
             return
 
         logger.info(f"Saving full configs for {len(device_list)} devices.")
-        for device, fname_str in device_list:
-            if not fname_str:
+        for device, filename in device_list:
+            if not filename:
                 logger.error(f"{device} is missing full pathname information; unable to save.")
                 continue
             try:
-                with open(fname_str, "r", encoding="utf-8", errors='ignore') as f:
+                with open(filename, "r", encoding="utf-8", errors='ignore') as f:
                     file_content = f.readlines()
                     queue_save(ctx, columns=None, raw_data=file_content, sheet_name=device.upper(), index=False, skip_if_exists=True)
             except (IOError, OSError) as e:
-                logger.error(f"Error reading file {fname_str} for device {device}: {e}")
+                logger.error(f"Error reading file {filename} for device {device}: {e}")

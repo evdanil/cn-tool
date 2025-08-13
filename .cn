@@ -18,7 +18,7 @@ directory = /opt/data/configs
 #vendors = cisco,aruba,f5,bluecoat,paloalto
 #vendors = cisco
 #regions = ap, eu, am
-regions = eu
+regions = 
 
 [gpg]
 #credentials = ~/device-apply.gpg
@@ -26,6 +26,7 @@ regions = eu
 [cache]
 #enabled=true
 directory=~/.cn-cache
+version=4
 
 [theme]
 # Supported theme names: default,monochrome,pastel,dark
