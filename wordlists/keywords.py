@@ -1125,7 +1125,7 @@ standard_keywords: Dict[str, Tuple[str, ...]] = {
         "standby",
         "policy",
         "map",
-        "keepalice",
+        "keepalive",
         "adjust",
         "mss",
         "up",
