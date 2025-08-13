@@ -59,7 +59,7 @@ class BulkPingModule(BaseModule):
 
         # --- Pinging Logic ---
         results: List[Dict[str, str]] = []
-        batch_size = 100
+        batch_size = 25
 
         with console.status(f"[{colors['description']}]Pinging hosts...[/]", spinner="dots12"):
             for i in range(0, len(hosts_to_ping), batch_size):

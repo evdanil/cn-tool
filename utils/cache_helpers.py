@@ -2,6 +2,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 import re
+import queue
+import threading
 from time import time
 from pathlib import Path
 from time import perf_counter
@@ -15,10 +17,124 @@ from .hash import calculate_config_hash
 from .search_helpers import extract_keywords
 from .validation import ip_regexp
 
+HEX8_RE = re.compile(r"^[0-9A-F]{8}\b")
+B64ish_RE = re.compile(r"^[0-9a-zA-Z/+]{65}$")
+
+
+def build_config_path(
+    ctx: ScriptContext,
+    hostname: str,
+    region: str,
+    vendor: str,
+    device_type: str
+) -> Optional[Path]:
+    """
+    Builds the full, OS-agnostic path to a device's configuration file.
+
+    This is a highly efficient helper function that directly assembles the path
+    from the provided components without performing any cache lookups.
+
+    Args:
+        ctx: The script context, used to access the base config repository directory.
+        hostname: The hostname of the device (e.g., 'router_bne001').
+        region: The region of the device (e.g., 'bne').
+        vendor: The vendor of the device (e.g., 'cisco').
+        device_type: The type of the device (e.g., 'router').
+
+    Returns:
+        A pathlib.Path object for the configuration file, or None if the
+        base directory is not configured.
+    """
+    # Safely get the base directory from the application configuration.
+    # This is the only external data lookup needed.
+    base_dir = ctx.cfg.get('config_repo_directory')
+
+    # A check for the base directory is essential for robustness.
+    if not base_dir:
+        ctx.logger.error("Base configuration directory is not set in config_repo.directory")
+        return None
+
+    # Assume the on-disk filename is the lowercase version of the hostname.
+    config_filename = f"{hostname.lower()}.cfg"
+
+    return Path(base_dir) / vendor.lower() / device_type.lower() / region.lower() / config_filename
+
+
+def cache_writer(
+    ctx: ScriptContext,
+    write_queue: queue.Queue,
+    ip_idx: Index,
+    kw_idx: Index,
+    dev_idx: Index,
+    rev_idx: Index,
+    total_files: int
+):
+    """
+    Consumer thread function. Pulls parsed data from a queue and writes it
+    to diskcache in batches to keep memory usage low.
+    """
+    logger = ctx.logger
+    BATCH_SIZE = 500  # Tunable: process 500 files before writing to disk
+    processed_count = 0
+
+    while processed_count < total_files:
+        # 1. Collect a batch of results from the queue
+        batch_results = []
+        try:
+            # Block and wait for the first item to avoid busy-waiting
+            item = write_queue.get(timeout=1.0)
+            batch_results.append(item)
+            # Drain the queue for up to BATCH_SIZE items
+            while len(batch_results) < BATCH_SIZE:
+                batch_results.append(write_queue.get_nowait())
+        except queue.Empty:
+            # This happens when the queue is drained or at the very end
+            pass
+
+        if not batch_results:
+            continue
+
+        # 2. Aggregate data for this batch only
+        batch_dev_updates = {}
+        batch_rev_updates = {}
+        batch_ip_updates = defaultdict(lambda: defaultdict(list))
+        batch_kw_updates = defaultdict(lambda: defaultdict(list))
+
+        for dev_data, ip_data, kw_data, rev_data in batch_results:
+            batch_dev_updates.update(dev_data)
+            batch_rev_updates.update(rev_data)
+            for (ip, host), lines in ip_data.items():
+                batch_ip_updates[ip][host].extend(lines)
+            for (kw, host), lines in kw_data.items():
+                batch_kw_updates[kw][host].extend(lines)
+
+        # 3. Write this batch to diskcache using the efficient read-modify-write
+        try:
+            with ip_idx.transact(), kw_idx.transact(), dev_idx.transact(), rev_idx.transact():
+                dev_idx.update(batch_dev_updates)
+                rev_idx.update(batch_rev_updates)
+
+                for ip, new_host_dict in batch_ip_updates.items():
+                    current_ip_entry = ip_idx.get(ip, {})
+                    current_ip_entry.update(new_host_dict)
+                    ip_idx[ip] = current_ip_entry
+
+                for kw, new_host_dict in batch_kw_updates.items():
+                    current_kw_entry = kw_idx.get(kw, {})
+                    current_kw_entry.update(new_host_dict)
+                    kw_idx[kw] = current_kw_entry
+        except Exception as e:
+            logger.error(f"FATAL error during cache batch write: {e}")
+
+        processed_count += len(batch_results)
+        logger.info(f"Index Cache - {processed_count}/{total_files} files written to cache...")
+
 
 def mt_index_configurations(ctx: ScriptContext) -> None:
-    """Multithreaded version to index configuration files and store data in DiskCache."""
-
+    """
+    Multithreaded, memory-optimized version to index configuration files
+    using a producer-consumer model to prevent high RAM usage.
+    """
     logger = ctx.logger
     cache: Union[CacheManager, None] = ctx.cache
 
@@ -26,7 +142,6 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         return
 
     start = perf_counter()
-
     cache.dc.set("indexing", True, expire=120)
 
     # 1. Get the current state from disk
@@ -168,74 +283,32 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         logger.info("Cleaning complete.")
 
     # 5. Handle Additions/Updates
+    logger.info(f"Index Cache - Found {len(files_to_reindex)} new or updated files. Indexing...")
     if not files_to_reindex:
         logger.info("Index Cache - No configuration changes detected.")
         cache.dc.pop("indexing", None)
         cache.dc.set("updated", int(time()))
         return
 
-    logger.info(f"Index Cache - Found {len(files_to_reindex)} new or updated files. Indexing...")
+    # Create a thread-safe queue to hold results from worker threads
+    # Maxsize prevents producers from running too far ahead of the consumer, acting as back-pressure.
+    write_queue = queue.Queue(maxsize=1000)
 
-    final_dev_updates: Dict[str, Any] = {}
-    final_ip_updates: defaultdict = defaultdict(lambda: defaultdict(list))
-    final_kw_updates: defaultdict = defaultdict(lambda: defaultdict(list))
-    final_rev_updates: Dict[str, Dict] = {}
+    # Start the consumer thread (the cache writer)
+    writer_thread = threading.Thread(
+        target=cache_writer,
+        args=(ctx, write_queue, cache.ip_idx, cache.kw_idx, cache.dev_idx, cache.rev_idx, len(files_to_reindex))
+    )
+    writer_thread.start()
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(get_facts_helper, ctx, filename) for filename in files_to_reindex]
+    # Use the thread pool to produce data (read/parse files)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        # Submit all file processing tasks. They will put results on the queue.
+        for filename in files_to_reindex:
+            executor.submit(get_facts_helper, ctx, filename, write_queue)
 
-        for i, future in enumerate(futures):
-            # dev_data is {'hostname': {...}}
-            # ip_data is a defaultdict with keys like (ip_int, hostname)
-            # kw_data is a defaultdict with keys like (keyword, hostname)
-            # rev_data is {'hostname': {...}}
-            dev_data, ip_data, kw_data, rev_data = future.result()
-
-            # Merge device data
-            final_dev_updates.update(dev_data)
-            final_rev_updates.update(rev_data)
-
-            # Process and merge ip_data into a nested dictionary
-            for (ip, host), lines in ip_data.items():
-                final_ip_updates[ip][host].extend(lines)
-
-            # Process and merge kw_data
-            for (kw, host), lines in kw_data.items():
-                final_kw_updates[kw][host].extend(lines)
-
-            if i % 50 == 0 and i > 0:
-                logger.info(f"Index Cache - {i+1}/{len(files_to_reindex)} files processed in memory...")
-
-    logger.info("Batching complete. Applying all changes to disk cache...")
-
-    # 2. Now, apply all the batched changes to the cache.
-    # We still use the read-modify-write pattern, but on our large in-memory batch.
-    with ip_idx.transact(), kw_idx.transact(), dev_idx.transact(), rev_idx.transact():
-        # Update dev_idx using an explicit loop for reliability
-        logger.info(f"Writing {len(final_dev_updates)} entries to dev_idx...")
-        dev_idx.update(final_dev_updates)
-
-        logger.info(f"Writing {len(final_rev_updates)} entries to rev_idx...")
-        rev_idx.update(final_rev_updates)
-
-        for ip, new_host_dict in final_ip_updates.items():
-            # 1. Read the existing dictionary for this IP key.
-            current_ip_entry = ip_idx.get(ip, {})
-            # 2. Modify it by merging the new host data.
-            current_ip_entry.update(new_host_dict)
-            # 3. Write the complete, merged dictionary back.
-            ip_idx[ip] = current_ip_entry
-
-        logger.info(f"Merging {len(final_kw_updates)} keyword entries into kw_idx...")
-        for kw, new_host_dict in final_kw_updates.items():
-            # 1. Read
-            current_kw_entry = kw_idx.get(kw, {})
-            # 2. Modify
-            current_kw_entry.update(new_host_dict)
-            # 3. Write
-            kw_idx[kw] = current_kw_entry
-
-    # --- END OF HIGH-PERFORMANCE BATCHING LOGIC ---
+    # Wait for the writer thread to finish processing all items from the queue
+    writer_thread.join()
 
     logger.info("Disk cache update complete.")
 
@@ -245,52 +318,72 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         cache.dc.set("version", ctx.cfg["cache_version"])
 
     cache.dc.pop("indexing", None)
-    logger.info(f"Index Cache - Incremental update took {round(end - start, 3)} seconds")
+    logger.info(f"Index Cache - Update took {round(end - start, 3)} seconds")
 
 
-def get_facts_helper(ctx: ScriptContext, filename: Path) -> Tuple[Dict[str, Any], defaultdict, defaultdict, Dict[str, Any]]:
+def get_facts_helper(
+    ctx: ScriptContext, filename: Path, write_queue: Optional[queue.Queue] = None
+) -> Optional[Tuple[Dict[str, Any], defaultdict, defaultdict, Dict[str, Any]]]:
     """
-    Function is a helper to run get_device_facts in Multithreaded fashion
+    Function is a helper to run get_device_facts in Multithreaded fashion.
+    It can either return data or put it on a queue for batch processing.
     """
     parts = filename.parts
-    vendor = str(parts[-4]).lower()
-    device_type = str(parts[-3]).upper()
-    region = str(parts[-2]).upper()
+    region = ''
+    regions = ctx.cfg.get("regions", False)
+
+    if regions and regions != '':
+        vendor = str(parts[-4]).lower()
+        device_type = str(parts[-3]).upper()
+        region = str(parts[-2]).upper()
+    else:
+        vendor = str(parts[-3]).lower()
+        device_type = str(parts[-2]).upper()
+
     hostname = filename.stem.upper()
 
     ctx.logger.debug(f"Index Cache - Building {hostname.upper()} index data...")
-    return get_device_facts(ctx, hostname, region, vendor, device_type, filename)
+    result = get_device_facts(ctx, hostname, vendor, region, device_type, filename)
+
+    if write_queue:
+        write_queue.put(result)
+        return None  # Explicitly return None when using the queue
+    else:
+        return result
 
 
-def get_device_facts(ctx: ScriptContext, hostname: str, region: str, vendor: str, device_type: str, fname: Path) -> Tuple[Dict[str, Any], defaultdict, defaultdict, Dict[str, Any]]:
+def get_device_facts(ctx: ScriptContext, hostname: str, vendor: str, region: str, device_type: str, filename: Path) -> Tuple[Dict[str, Any], defaultdict, defaultdict, Dict[str, Any]]:
 
     logger = ctx.logger
     # Calculate the hash of the relevant content
-    content_hash = calculate_config_hash(fname)
+    content_hash = calculate_config_hash(filename)
 
-    device = {"fname": str(fname), "region": region, "type": device_type, "vendor": vendor, "updated": int(fname.stat().st_mtime), "hash": content_hash}
+    device = {"region": region, "type": device_type, "vendor": vendor, "updated": int(filename.stat().st_mtime), "hash": content_hash}
     ip_list: defaultdict = defaultdict(lambda: tuple())
     kw_list: defaultdict = defaultdict(lambda: tuple())
 
+    vendor_stop_words = stop_words.get(vendor.lower(), ())
     try:
-        with open(fname, "r", encoding="utf-8") as f:
+        with open(filename, "r", encoding="utf-8") as f:
             for index, line in enumerate(f):
                 line_strip = line.strip()
-                if line_strip.startswith(stop_words.get(vendor, ())) or re.match(r"^[0-9A-F]{8}\b", line_strip) or re.match(r"^[0-9a-zA-Z/+]{65}$", line_strip):
+                if line_strip.startswith(vendor_stop_words) or HEX8_RE.match(line_strip) or B64ish_RE.match(line_strip):
                     continue
 
-                for match in re.finditer(ip_regexp, line_strip):
+                for match in ip_regexp.finditer(line_strip):
+                    s = match.group()
                     try:
-                        ip = ipaddress.ip_address(match.group())
-                        if not (ip.is_reserved or str(ip).startswith(("255.", "0."))):
-                            ip_list[(str(int(ip)), hostname)] += (index,)
+                        ip = ipaddress.ip_address(s)
+                        if s.startswith(("255.", "0.")) or ip.is_reserved:
+                            continue
+                        ip_list[(str(int(ip)), hostname)] += (index,)
                     except ValueError:
                         pass
 
                 for word in set(extract_keywords(line_strip)) - set(standard_keywords.get(vendor, ())):
                     kw_list[(word, hostname)] += (index,)
     except (IOError, OSError) as e:
-        logger.error(f"Error reading device file {fname}: {e}")
+        logger.error(f"Error reading device file {filename}: {e}")
 
     reverse_index_data = {
             'ips': list(set(ip for ip, host in ip_list.keys())),
@@ -318,7 +411,6 @@ def search_cache_config(
     return data_to_save, matched_nets
 
 
-# Your ScriptContext and CacheManager classes are defined elsewhere
 def search_cache_keywords(ctx: ScriptContext, search_terms: List[str], search_input: str) -> List[List[Any]]:
     """
     Performs a hybrid cached search for regex terms.
@@ -377,12 +469,9 @@ def search_cache_keywords(ctx: ScriptContext, search_terms: List[str], search_in
             if not isinstance(device_info, dict):
                 continue
 
-            fname_str = device_info.get('fname')
-            if not fname_str:
-                continue
-
-            fname = Path(fname_str)
-            if not fname.exists():
+            fname = build_config_path(ctx, hostname, device_info.get('region', ''), device_info.get('vendor', ''), device_info.get('type', ''))
+            if not fname:
+                logger.warning(f"Unable to read configuration file for {hostname}. Cache entry invalid.")
                 continue
 
             try:
@@ -414,6 +503,9 @@ def search_cache_keywords(ctx: ScriptContext, search_terms: List[str], search_in
 def search_cache_subnets(
     ctx: ScriptContext, nets: Optional[List[ipaddress.IPv4Network]], search_input: str
 ) -> Tuple[List[List[Any]], Set[ipaddress.IPv4Network]]:
+
+    logger = ctx.logger
+
     matched_nets: Set[ipaddress.IPv4Network] = set()
     data_to_save: List[List[Any]] = []
 
@@ -436,10 +528,11 @@ def search_cache_subnets(
 
             if isinstance(ip_entry, dict):
                 for hostname, line_nums in ip_entry.items():
-                    fname_str = dev_idx.get(hostname.upper(), {}).get('fname', '')
-                    fname = Path(fname_str)
-                    if not fname.exists():
-                        continue
+                    device_info = dev_idx.get(hostname.upper(), {})
+                    fname = build_config_path(ctx, hostname, device_info.get('region', ''), device_info.get('vendor', ''), device_info.get('type', ''))
+                    if not fname:
+                        logger.warning(f"Unable to read configuration file for {hostname}. Cache entry invalid.")
+                        continue                    
 
                     try:
                         with open(fname, 'r', encoding='utf-8') as f:

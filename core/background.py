@@ -41,10 +41,14 @@ def _background_cache_init(ctx: ScriptContext) -> None:
         return
 
     # Check if the cache was updated recently and if versions match
-    if (int(time()) - int(updated_time)) <= 30 and cache.dc.get("version") == ctx.cfg["cache_version"]:
+    if (int(time()) - int(updated_time)) <= 30 and cache.dc.get("version") == ctx.cfg.get("cache_version", None):
         logger.info("Index Cache - State is up-to-date, skipping checks.")
         cache.log_stats("startup-check")
         return
+
+    if cache.dc.get("version") != ctx.cfg["cache_version"]:
+        logger.info(f"Index Cache - New cache version {ctx.cfg.get('cache_version', 'Unspecified')} in config.")
+        cache.reset_cache()
 
     logger.info("Index Cache - Starting cache check and potential re-indexing.")
     try:
