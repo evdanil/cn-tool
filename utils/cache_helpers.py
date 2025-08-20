@@ -532,7 +532,7 @@ def search_cache_subnets(
                     fname = build_config_path(ctx, hostname, device_info.get('region', ''), device_info.get('vendor', ''), device_info.get('type', ''))
                     if not fname:
                         logger.warning(f"Unable to read configuration file for {hostname}. Cache entry invalid.")
-                        continue                    
+                        continue
 
                     try:
                         with open(fname, 'r', encoding='utf-8') as f:
