@@ -84,28 +84,34 @@ class SubnetRequestModule(BaseModule):
             console.print(f"[{colors['description']}]Found [{colors['success']}]{len(unique_networks)}[/] unique subnets to query.[/]")
 
             subnet_data_cache: Dict[str, Dict] = {}
-            with ThreadPoolExecutor(max_workers=ctx.cfg.get("max_threads", 10)) as executor:
-                future_to_net = {
-                    executor.submit(self._fetch_and_process_subnet_data, ctx, network): network
-                    for network in unique_networks
-                }
+            with ctx.console.status(f"[{get_global_color_scheme(ctx.cfg)['description']}]Fetching subnets information...[/]"):
+                with ThreadPoolExecutor(max_workers=ctx.cfg.get("max_threads", 10)) as executor:
+                    future_to_net = {
+                        executor.submit(self._fetch_and_process_subnet_data, ctx, network): network
+                        for network in unique_networks
+                    }
 
-                for future in as_completed(future_to_net):
-                    network = future_to_net[future]
-                    net_str = str(network)
-                    console.print(f"[{colors['description']}]Processing results for [{colors['header']}]{net_str}[/]...[/]")
-                    processed_data = future.result()
-                    if processed_data:
-                        subnet_data_cache[net_str] = processed_data
+                    for future in as_completed(future_to_net):
+                        network = future_to_net[future]
+                        net_str = str(network)
+                        console.print(f"[{colors['description']}]Processing results for [{colors['header']}]{net_str}[/]...[/]")
+                        processed_data = future.result()
+                        if processed_data:
+                            subnet_data_cache[net_str] = processed_data
 
             # --- 4. Prepare data for display and saving ---
-            all_data_to_save: List[List[RowDict]] = []
+            grouped_by_network = defaultdict(list)
             for target in query_targets:
-                net_str = str(target.resolved_network)
+                grouped_by_network[target.resolved_network].append(target.original_input)
+
+            all_data_to_save: List[List[RowDict]] = []
+            for network, original_inputs in grouped_by_network.items():
+                net_str = str(network)
                 data = subnet_data_cache.get(net_str, {})
 
                 if ctx.cfg["report_auto_save"] and data:
-                    save_data = self._prepare_subnet_save_data(target.original_input, data)
+                    combined_input_str = ", ".join(original_inputs)
+                    save_data = self._prepare_subnet_save_data(combined_input_str, data)
                     save_data = self.execute_hook('pre_save', ctx, save_data)
                     if save_data:
                         all_data_to_save.append(save_data)
@@ -116,7 +122,7 @@ class SubnetRequestModule(BaseModule):
             console.print(f"\n[{colors['description']}]Search took [{colors['success']}]{duration}[/] seconds![/]\n")
 
             # --- 5. Display and Save ---
-            self._display_results(ctx, query_targets, subnet_data_cache)
+            self._display_results(ctx, query_targets, subnet_data_cache, grouped_by_network)
 
             if ctx.cfg["report_auto_save"] and all_data_to_save:
                 self._save_subnet_data(ctx, query_targets, all_data_to_save)
@@ -225,45 +231,69 @@ class SubnetRequestModule(BaseModule):
                     ctx.logger.error(f"Failed to fetch data for '{label}' in {net_str}: {e}")
         return processed_data_for_net
 
-    def _display_results(self, ctx: ScriptContext, query_targets: List[QueryTarget], subnet_data_cache: Dict[str, Dict]) -> None:
+    def _display_results(self, ctx: ScriptContext, query_targets: List[QueryTarget], subnet_data_cache: Dict[str, Dict], grouped_by_network: Dict[ipaddress.IPv4Network, List[str]]) -> None:
         """Handles the logic for displaying summary and/or detailed views in order."""
         colors = get_global_color_scheme(ctx.cfg)
         console = ctx.console
 
-        # Build the ordered list of results for display
-        ordered_results = []
-        for target in query_targets:
-            net_info = subnet_data_cache.get(str(target.resolved_network), {})
-            ordered_results.append((target, net_info))
-        if len(ordered_results) > 1:
+        if len(query_targets) > 1:
             summary_data = []
-            for target, net_info in ordered_results:
-                summary_net = {"Original Input": target.original_input, "Resolved Subnet": str(target.resolved_network)}
+            for target in query_targets:
+                # *** THIS IS THE FIX ***
+                # We fetch the corresponding network info from the cache for each target.
+                net_info = subnet_data_cache.get(str(target.resolved_network), {})
+
+                summary_net = {
+                    "Original Input": target.original_input,
+                    "Resolved Subnet": str(target.resolved_network)
+                }
+
                 if net_info and net_info.get("general"):
                     description = net_info["general"][0].get("description", "N/A")
                     summary_net["Description"] = description
                     ext_attrs_list = net_info.get("Extensible Attributes", [])
                     ea_map = {attr.get("Attribute"): attr.get("Value") for attr in ext_attrs_list if attr.get("Attribute")}
-                    summary_net.update({"Location": ea_map.get("Location", "N/A"), "Region": ea_map.get("Region", "N/A"), "Country": ea_map.get("Country", "N/A"), "VLAN": ea_map.get("VLAN", "N/A")})
+                    summary_net.update({
+                        "Location": ea_map.get("Location", "N/A"),
+                        "Region": ea_map.get("Region", "N/A"),
+                        "Country": ea_map.get("Country", "N/A"),
+                        "VLAN": ea_map.get("VLAN", "N/A")
+                    })
                     ad_info = net_info.get("Active Directory", [{}])[0]
                     if ad_info:
                         summary_net["AD Site"] = ad_info.get("AD Site", "N/A")
                 else:
                     summary_net["Description"] = "No data found"
                 summary_data.append(summary_net)
+
             print_table_data(ctx, {"Subnet Summary": summary_data})
             console.print(f"\n([{colors['success']}]Press [{colors['error']}{colors['bold']}]Q[/] to return / Any other key for details[/])")
             if read_single_keypress(ctx).lower() == "q":
                 return
-        for i, (target, data) in enumerate(ordered_results):
+
+        # Create a sorted list of unique networks for a stable display order.
+        unique_networks_for_display = sorted(list(grouped_by_network.keys()), key=lambda net: net.network_address)
+        num_unique_results = len(unique_networks_for_display)
+
+        for i, network in enumerate(unique_networks_for_display):
             console.clear()
-            console.print(f"[{colors['description']}]Details for Original Input: [{colors['header']} bold]{target.original_input}[/] (Resolved to: [{colors['header']} bold]{target.resolved_network}[/])[/]\n")
+
+            # Get all original inputs that resolved to this network
+            original_inputs = grouped_by_network[network]
+            inputs_str = ", ".join(f"'{inp}'" for inp in original_inputs)
+            data = subnet_data_cache.get(str(network), {})
+
+            # A more informative header
+            console.print(f"[{colors['description']}]Details for: [{colors['header']} bold]{network}[/][/]")
+            console.print(f"[{colors['description']}] (Resolved from input(s): {inputs_str})[/]\n")
+
             if data:
                 print_table_data(ctx, data, suffix={"general": "Information"}, table_order=['general', 'DHCP range', 'DHCP options', 'DHCP members', 'DHCP failover', 'DNS records', 'fixed addresses'])
             else:
-                console.print(f"[{colors['success']}]Network [{colors['error']}{colors['bold']}] {target.resolved_network} [/] has no data in Infoblox[/]")
-            if len(ordered_results) > 1 and i < len(ordered_results) - 1:
-                console.print(f"\n[{colors['success']}]Press [{colors['bold']}]SPACE[/] for next ({i + 2}/{len(ordered_results)}) / Any other key to exit details view[/]")
+                console.print(f"[{colors['success']}]Network [{colors['error']}{colors['bold']}] {network} [/] has no data in Infoblox[/]")
+
+            if num_unique_results > 1 and i < num_unique_results - 1:
+                console.print(f"\n[{colors['success']}]Press [{colors['bold']}]SPACE[/] for next ({i + 2}/{num_unique_results}) / Any other key to exit details view[/]")
                 if read_single_keypress(ctx) != ' ':
                     break
 

@@ -59,12 +59,17 @@ class BulkPingModule(BaseModule):
 
         # --- Pinging Logic ---
         results: List[Dict[str, str]] = []
-        batch_size = 25
+        batch_size = 200
 
-        with console.status(f"[{colors['description']}]Pinging hosts...[/]", spinner="dots12"):
-            for i in range(0, len(hosts_to_ping), batch_size):
-                batch = hosts_to_ping[i:i + batch_size]
-                # Ping the batch and get results. We re-order them to match the input order.
+        total_batches = int(len(hosts_to_ping) / batch_size) + 1
+        for i in range(0, len(hosts_to_ping), batch_size):
+            batch = hosts_to_ping[i:i + batch_size]
+            ending = '...'
+            # Ping the batch and get results. We re-order them to match the input order.
+            if total_batches > 1:
+                ending = f' batch {int( i / batch_size + 1)} out of {total_batches}'
+
+            with console.status(f"[{colors['description']}]Pinging hosts{ending}[/]", spinner="dots12"):
                 batch_results_map = {res['Host']: res['Result'] for res in self._ping_batch(batch)}
                 # Ensure the results are added in the same order as the batch was given.
                 for host in batch:
@@ -199,22 +204,16 @@ class BulkPingModule(BaseModule):
             # Using -n to prevent name resolution, -w3 for 3-sec timeout, -c3 for 3 packets
             command = ["ping", "-n", "-w3", "-c3", host]
             processes[host] = Popen(command, stdout=DEVNULL, stderr=STDOUT)
-
-        while processes:
-            finished_hosts = []
-            for host, proc in processes.items():
-                if proc.poll() is not None:
-                    if proc.returncode == 0:
-                        result_status = "OK"
-                    elif proc.returncode in [1, 2]:
-                        result_status = "NO RESPONSE"
-                    else:
-                        result_status = "ERROR"
-
-                    results.append({"Host": host, "Result": result_status})
-                    finished_hosts.append(host)
-
-            for host in finished_hosts:
-                del processes[host]
+        for host, proc in processes.items():
+            # proc.wait() blocks until the process finishes, consuming no CPU while waiting.
+            proc.wait()
+            # Determine the result based on the return code
+            if proc.returncode == 0:
+                result_status = "OK"
+            elif proc.returncode in [1, 2]:  # Common exit codes for unreachable hosts
+                result_status = "NO RESPONSE"
+            else:
+                result_status = "ERROR"
+            results.append({"Host": host, "Result": result_status})
 
         return results
