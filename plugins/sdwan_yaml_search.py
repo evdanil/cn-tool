@@ -49,13 +49,25 @@ class SDWANYamlSearchPlugin(BasePlugin):
             },
         }
 
+    @property
+    def user_configurable_settings(self) -> list[dict[str, Any]]:
+        """
+        Exposes settings that can be configured by the user via the SetupModule.
+        """
+        return [
+            {
+                "key": "sdwan_yaml_enabled",
+                "prompt": "Enable/Disable SD-WAN YAML Search"
+            }
+        ]
+
     def _load_data_in_background(self, ctx: ScriptContext) -> None:
         """The target function for the background thread to load and parse YAML files."""
         repo_path = ctx.cfg.get("sdwan_yaml_repo_path", "")
         repo = Path(repo_path)
         ctx.logger.info(f"SD-WAN YAML Search: Starting background load from {repo_path}...")
 
-        if not repo.is_dir():
+        if not repo_path or not repo.is_dir():
             ctx.logger.warning("SD-WAN YAML Search: repository path is invalid. Aborting load.")
             return
 
