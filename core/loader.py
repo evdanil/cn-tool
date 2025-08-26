@@ -2,8 +2,12 @@
 import os
 import importlib
 import inspect
+import logging
 from typing import Dict, Any
 from core.base import BaseModule, BasePlugin
+
+
+logger = logging.getLogger(__name__)
 
 
 def load_modules_and_plugins(master_schema: Dict[str, Any]) -> tuple[Dict[str, BaseModule], list[BasePlugin], Dict[str, Any]]:
@@ -48,11 +52,13 @@ def _load_modules(path: str) -> Dict[str, BaseModule]:
                 for name, obj in inspect.getmembers(module):
                     try:
                         if inspect.isclass(obj) and issubclass(obj, BaseModule) and obj is not BaseModule:
-                            loaded_modules[module_name] = obj()  # Instantiate the module
+                            instance = obj()
+                            logger.info(f"  -> Loaded module: {instance.menu_title} ({module_name})")
+                            loaded_modules[module_name] = instance  # Instantiate the module
                     except TypeError:
                         continue
             except ImportError as e:
-                print(f"Error loading module {module_path}: {e}")
+                logger.error("Error loading module %s: %s", module_path, e)
     return loaded_modules
 
 
@@ -71,12 +77,13 @@ def _load_and_register_plugins(path: str, modules: Dict[str, BaseModule], schema
                         try:
                             if issubclass(obj, BasePlugin) and obj is not BasePlugin:
                                 plugin = obj()
+                                logger.info(f"  -> Loaded plugin: {plugin.name}")
                                 plugin_list.append(plugin)
 
                                 plugin_schema = plugin.config_schema
                                 if plugin_schema:
-                                    print(f"Info: Loading config schema from plugin '{plugin.name}'")
-                                    schema.update(plugin_schema)
+                                    logger.info("Loading config schema from plugin '%s'", plugin.name)
+                                    schema = {**schema, **plugin_schema}
 
                                 target_name = plugin.target_module_name
                                 # Only attempt to register if the plugin specifies a target.
@@ -87,10 +94,10 @@ def _load_and_register_plugins(path: str, modules: Dict[str, BaseModule], schema
                                     else:
                                         # This warning will now only show for plugins that
                                         # SPECIFY a target that does not exist.
-                                        print(f"Warning: Plugin '{plugin.name}' targets non-existent module '{target_name}'")
+                                        logger.warning("Plugin '%s' targets non-existent module '%s'", plugin.name, target_name)
                                 # If target_name is empty, we do nothing. This is expected for lifecycle plugins.
                         except TypeError:
                             continue
             except ImportError as e:
-                print(f"Error loading plugin {module_path}: {e}")
+                logger.error("Error loading plugin %s: %s", module_path, e)
     return schema

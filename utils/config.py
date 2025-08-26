@@ -10,6 +10,8 @@ from utils.file_io import check_dir_accessibility
 # --- Configuration Schema ---
 BASE_CONFIG_SCHEMA = {
     "api_endpoint":          {"section": "api", "ini_key": "endpoint", "type": "str", "fallback": "API_URL"},
+    "api_verify_ssl":        {"section": "api", "ini_key": "verify_ssl", "type": "bool", "fallback": True},
+    "api_timeout":           {"section": "api", "ini_key": "timeout", "type": "int", "fallback": 10},
     "logging_file":          {"section": "logging", "ini_key": "logfile", "type": "path", "fallback": "~/cn.log"},
     "logging_level":         {"section": "logging", "ini_key": "level", "type": "str", "fallback": "INFO"},
     "report_file":           {"section": "output", "ini_key": "filename", "type": "path", "fallback": "~/report.xlsx"},

@@ -1,5 +1,7 @@
 [api]
 endpoint = API_URL
+verify_ssl = False
+timeout = 10
 
 [logging]
 logfile = ~/cn.log
@@ -59,3 +61,6 @@ to = some_user@example.com
 # For services like Gmail, this should be an "App Password".
 #password = abcd-efgh-ijkl-mnop
 
+[sdwan_yaml_search]
+enabled=True
+repository_path=/opt/data/github/idso-connectivity-csa-ops/shell/cisco/sdwan/configs/
