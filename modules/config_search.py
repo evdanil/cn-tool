@@ -123,7 +123,32 @@ class ConfigSearchModule(BaseModule):
         logger.info(f"User input - {', '.join(validated_search_input)}")
         search_input_str = "\n".join(validated_search_input)
 
+        # Allow plugins early access to parsed input
+        pre_run_data: Dict[str, Any] = {
+            "networks": networks,
+            "terms": keyword_regexps,
+            "search_input": search_input_str,
+        }
+        pre_run_result: Dict[str, Any] = self.execute_hook("pre_run", ctx, pre_run_data)
+        networks = pre_run_result.get("networks", networks)
+        keyword_regexps = pre_run_result.get("terms", keyword_regexps)
+        search_input_str = pre_run_result.get("search_input", search_input_str)
+
         data_to_save, matched_nets = self._execute_search(ctx, networks, keyword_regexps, search_input_str)
+
+        processed: Dict[str, Any] = self.execute_hook(
+            "process_data",
+            ctx,
+            {
+                "results": data_to_save,
+                "matched_nets": matched_nets,
+                "networks": networks,
+                "search_terms": keyword_regexps,
+                "search_input": search_input_str,
+            },
+        )
+        data_to_save = processed.get("results", data_to_save)
+        matched_nets = processed.get("matched_nets", matched_nets)
 
         if not data_to_save:
             logger.info("Configuration Repository - No matches found!")
@@ -131,7 +156,8 @@ class ConfigSearchModule(BaseModule):
             press_any_key(ctx)
             return
 
-        missing_nets = list(set(networks) - matched_nets) if networks else []
+        missing_nets = list(set(networks) - set(matched_nets)) if networks else []
+
         for missed_net in missing_nets:
             net_str = str(missed_net)
             if net_str.endswith("/32"):
@@ -205,7 +231,7 @@ class ConfigSearchModule(BaseModule):
             return
 
         # Step 4: Process and display results
-        missing_nets = list(set(networks) - matched_nets)
+        missing_nets = list(set(networks) - set(matched_nets))
         if missing_nets:
             for missed_net in missing_nets:
                 net_str = str(missed_net)
@@ -270,7 +296,7 @@ class ConfigSearchModule(BaseModule):
                 region = str(parts[-2]).upper()
             else:
                 vendor = str(parts[-3]).lower()
-                device_type = str(parts[-2]).upper()            
+                device_type = str(parts[-2]).upper()
 
         with ThreadPoolExecutor() as executor, console.status(f"[{colors['description']}]Searching through [{colors['type']}]{vendor.upper()}/{device_type}[/] configurations...[/]"):
             futures = [
@@ -366,12 +392,15 @@ class ConfigSearchModule(BaseModule):
                 return
 
             dev_idx = ctx.cache.dev_idx
-            device_names = {row[1].upper() for row in data}
-            for device_name in device_names:
-                device_info = dev_idx.get(device_name, {})
-                fname = build_config_path(ctx, device_name, device_info.get('region', ''), device_info.get('vendor', ''), device_info.get('type', ''))
-                if fname:
-                    device_list.add((device_name, fname))
+            device_names = {(row[1], row[4])for row in data}
+            for device_name, filename in device_names:
+                if Path(filename).exists():
+                    device_list.add((device_name, filename))
+                else:
+                    device_info = dev_idx.get(device_name, {})
+                    fname = build_config_path(ctx, device_name, device_info.get('region', ''), device_info.get('vendor', ''), device_info.get('type', ''))
+                    if fname:
+                        device_list.add((device_name, fname))
         else:
             logger.info("Saving device configs using data from direct file scan...")
             device_list = {(row[1], row[4]) for row in data}

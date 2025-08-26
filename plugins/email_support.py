@@ -91,6 +91,9 @@ class EmailReportPlugin(BasePlugin):
                 attachment_path=report_path,
                 use_tls=ctx.cfg.get("email_use_tls", False),
                 use_ssl=ctx.cfg.get("email_use_ssl", False),
+                use_auth=ctx.cfg.get("email_use_auth", False),
+                username=ctx.cfg.get("email_user", ""),
+                password=ctx.cfg.get("email_password", ""),
             )
 
         if success:

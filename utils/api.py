@@ -46,7 +46,11 @@ def make_api_call(ctx: ScriptContext, uri: str) -> requests.Response:
     logger.info(f"Performing API request - URL: {full_url}")
     response = requests.Response()
     try:
-        response = session.get(full_url, verify=False)
+        response = session.get(
+            full_url,
+            verify=ctx.cfg.get("api_verify_ssl", True),
+            timeout=ctx.cfg.get("api_timeout", 10),
+        )
         # Check for specific, non-fatal client errors first
         if response.status_code == 400:
             # This is often "not found". Log it for debugging but don't treat as a hard error.

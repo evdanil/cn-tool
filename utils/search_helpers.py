@@ -53,21 +53,3 @@ def extract_keywords(text: str, vendor: str = 'default') -> List[str]:
         keywords.append(word)
 
     return list(set(keywords))  # Return unique keywords
-
-
-# def extract_keywords(text: str) -> List[str]:
-#     keywords: List[str] = []
-#     # Remove non-alphanumeric chars
-#     text = re.sub(r"[\W_]+", " ", text)
-#     # Find both keywords and IP addresses in a single pass
-#     for match in re.finditer(r"(?:[a-zA-Z0-9]{10,13})\b|(?:\d{3,})|(?:[a-zA-Z]{3,})", text):
-#         word = match.group()
-#         if len(word) < 3:
-#             continue
-#         try:
-#             if int(word) < 1000:
-#                 continue
-#         except ValueError:
-#             pass
-#         keywords.append(word.lower())
-#     return keywords

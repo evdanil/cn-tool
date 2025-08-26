@@ -8,3 +8,4 @@ openpyxl
 diskcache
 netmiko
 ldap3
+pyyaml
