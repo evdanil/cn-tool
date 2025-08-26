@@ -12,24 +12,27 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-# cn-tool.py
-Utility allowing to receive information from Infoblox API
+# cn-tool
 
-## Features modular design with plugin system:
-- Performs IP/Subnet/DNS/Site information lookups using Infoblox API
-- Integrates with Active Directory
-- Performs bulk ping operations
-- Performs bulk FQDN/IP lookups using system resolver
-- Performs configuration checks across configuration storage (`/opt/data/configs/`) for obsolete configuration when device being removed (cleanups on BGP borders/prefixes/ACLs)
-- Obtains device information (serial number, IOS version and image, license data) in parallel
-- Saves all requested information for later information processing(by default `report.xlsx` in current directory) 
-- Supports email as delivery method for report
-- Keeps log of requests/responses(by default `cn.log` in current directory)
-- Supports several levels of logging
-- Supports ini-style configfile to set logging level/filenames/api endpoint/autosaving(default filename `.cn`)
-- Supports several color themes
+`cn-tool` is a modular network utility that queries Infoblox and performs
+common network checks.  It is built around a plugin system that allows new
+features to be added without modifying the core.
 
-# How to use
+## Features
+
+- IP/Subnet/DNS/Site lookups using the Infoblox API
+- Bulk ping, resolve and traceroute operations
+- Configuration repository searches for cleanup and validation tasks
+- Device information collection (serial number, IOS version and image,
+  license data) in parallel
+- Disk based cache for faster repeated lookups
+- Active Directory enrichment for subnet information
+- SD-WAN YAML repository search and Trace Site Mapper plugins
+- Saves results to `report.xlsx` and can email the report on exit or on demand
+- Configurable logging, color themes and `.cn` configuration file
+
+## Installation and usage
+
 1. git clone https://github.com/cn-tool
 2. cd cn-tool
 3. Install required python packages (json, rich, pandas, argparse) using command:
@@ -62,3 +65,69 @@ EOF
 ```
 cn
 ```
+# Configuration
+
+`cn-tool` looks for an ini-style configuration file named `.cn` next to the
+script and in the user's home directory.  The `-c` option can point to an
+alternative file.  A minimal example looks like:
+
+```ini
+[api]
+endpoint = https://infoblox.example.com
+verify_ssl = true
+timeout = 10
+
+[logging]
+logfile = ~/cn.log
+level = INFO
+
+[report]
+filename = ~/report.xlsx
+auto_save = true
+
+[config_repo]
+directory = /opt/data/configs
+
+[cache]
+directory = ~/.cn-cache
+enabled = true
+
+[theme]
+name = default
+```
+
+### Active Directory Plugin
+Enable enrichment of subnet data from Active Directory:
+
+```ini
+[ad]
+enabled = true
+uri = ldap://your-ad-server.com
+user = domain\user
+search_base = CN=Subnets,CN=Sites,CN=Configuration,DC=domain,DC=com
+connect_on_startup = true
+```
+
+### Email Plugin
+The tool can send reports via email using settings in the `[email]` section:
+
+| Key | Description |
+| --- | --- |
+| `enabled` | Enables the email feature. |
+| `send_on_exit` | Send the report automatically when the application exits. |
+| `to` | Recipient email address. |
+| `server` / `port` | SMTP server and port to connect to. |
+| `use_tls` / `use_ssl` | Enable TLS or SSL for the connection. |
+| `use_auth` | Authenticate to the SMTP server. |
+| `user` / `password` | Credentials used when `use_auth` is true. |
+
+### SD-WAN YAML Search Plugin
+Augments configuration search results by scanning a local repository of
+SD-WAN YAML files:
+
+| Key | Description |
+| --- | --- |
+| `enabled` | Enable YAML repository search. |
+| `repository_path` | Path to the SD-WAN YAML repository. |
+
+

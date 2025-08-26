@@ -1,7 +1,9 @@
 # modules/bulk_ping.py
 import ipaddress
+import shutil
+from logging import Logger
+from subprocess import DEVNULL, STDOUT, Popen
 from typing import Dict, List, Optional, Tuple
-from subprocess import Popen, DEVNULL, STDOUT
 
 from core.base import BaseModule, ScriptContext
 from utils.user_input import press_any_key, read_user_input
@@ -37,6 +39,10 @@ class BulkPingModule(BaseModule):
         logger = ctx.logger
         colors = get_global_color_scheme(ctx.cfg)
         logger.info("Request Type - Bulk PING")
+        if shutil.which("ping") is None:
+            logger.error("'ping' command not found. Aborting.")
+            press_any_key(ctx)
+            return
 
         console.print(
             "\n"
@@ -59,7 +65,7 @@ class BulkPingModule(BaseModule):
 
         # --- Pinging Logic ---
         results: List[Dict[str, str]] = []
-        batch_size = 200
+        batch_size = 100
 
         total_batches = int(len(hosts_to_ping) / batch_size) + 1
         for i in range(0, len(hosts_to_ping), batch_size):
@@ -70,7 +76,7 @@ class BulkPingModule(BaseModule):
                 ending = f' batch {int( i / batch_size + 1)} out of {total_batches}'
 
             with console.status(f"[{colors['description']}]Pinging hosts{ending}[/]", spinner="dots12"):
-                batch_results_map = {res['Host']: res['Result'] for res in self._ping_batch(batch)}
+                batch_results_map = {res['Host']: res['Result'] for res in self._ping_batch(batch, logger)}
                 # Ensure the results are added in the same order as the batch was given.
                 for host in batch:
                     results.append({'Host': host, 'Result': batch_results_map.get(host, "ERROR (No Result)")})
@@ -195,15 +201,20 @@ class BulkPingModule(BaseModule):
 
         return user_inputs, all_hosts
 
-    def _ping_batch(self, batch: List[str]) -> List[Dict[str, str]]:
+    def _ping_batch(self, batch: List[str], logger: Logger) -> List[Dict[str, str]]:
         """Pings a batch of hosts in parallel and returns the results."""
         processes: Dict[str, Popen] = {}
         results: List[Dict[str, str]] = []
 
         for host in batch:
-            # Using -n to prevent name resolution, -w3 for 3-sec timeout, -c3 for 3 packets
-            command = ["ping", "-n", "-w3", "-c3", host]
-            processes[host] = Popen(command, stdout=DEVNULL, stderr=STDOUT)
+            # Using -n to prevent name resolution, -w3 for 3-sec timeout, -c3 for 4 packets
+            command = ["ping", "-n", "-w3", "-c4", host]
+            try:
+                processes[host] = Popen(command, stdout=DEVNULL, stderr=STDOUT)
+            except FileNotFoundError:
+                logger.error("'ping' command not found.")
+                return []
+
         for host, proc in processes.items():
             # proc.wait() blocks until the process finishes, consuming no CPU while waiting.
             proc.wait()
