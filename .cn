@@ -62,5 +62,5 @@ to = some_user@example.com
 #password = abcd-efgh-ijkl-mnop
 
 [sdwan_yaml_search]
-enabled=True
-repository_path=/opt/data/github/idso-connectivity-csa-ops/shell/cisco/sdwan/configs/
+enabled=False
+#repository_path=yaml_repo_path

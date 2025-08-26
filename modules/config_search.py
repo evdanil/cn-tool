@@ -393,7 +393,7 @@ class ConfigSearchModule(BaseModule):
 
             dev_idx = ctx.cache.dev_idx
             device_names = {(row[1], row[4])for row in data}
-            logger.debug(f'DEBUG!!! device_names: {device_names}')
+
             for device_name, filename in device_names:
                 if filename != '' and Path(filename).exists():
                     device_list.add((device_name, filename))
