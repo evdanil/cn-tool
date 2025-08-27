@@ -207,8 +207,8 @@ class BulkPingModule(BaseModule):
         results: List[Dict[str, str]] = []
 
         for host in batch:
-            # Using -n to prevent name resolution, -w3 for 3-sec timeout, -c3 for 4 packets
-            command = ["ping", "-n", "-w3", "-c4", host]
+            # Using -n to prevent name resolution, -w3 for 3-sec timeout, -c2 for 2 packets
+            command = ["ping", "-n", "-w3", "-c2", host]
             try:
                 processes[host] = Popen(command, stdout=DEVNULL, stderr=STDOUT)
             except FileNotFoundError:
