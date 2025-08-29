@@ -123,6 +123,8 @@ class ConfigSearchModule(BaseModule):
         logger.info(f"User input - {', '.join(validated_search_input)}")
         search_input_str = "\n".join(validated_search_input)
 
+        total_start_time = perf_counter()
+
         # Allow plugins early access to parsed input
         pre_run_data: Dict[str, Any] = {
             "networks": networks,
@@ -134,7 +136,8 @@ class ConfigSearchModule(BaseModule):
         keyword_regexps = pre_run_result.get("terms", keyword_regexps)
         search_input_str = pre_run_result.get("search_input", search_input_str)
 
-        data_to_save, matched_nets = self._execute_search(ctx, networks, keyword_regexps, search_input_str)
+        data_to_save, matched_nets, core_search_time = self._execute_search(ctx, networks, keyword_regexps, search_input_str)
+        logger.info(f"Core search took {core_search_time} seconds!")
 
         processed: Dict[str, Any] = self.execute_hook(
             "process_data",
@@ -149,6 +152,11 @@ class ConfigSearchModule(BaseModule):
         )
         data_to_save = processed.get("results", data_to_save)
         matched_nets = processed.get("matched_nets", matched_nets)
+
+        total_end_time = perf_counter()
+        total_duration = round(total_end_time - total_start_time, 3)
+        logger.info(f"Total search (core + plugins) took {total_duration} seconds!")
+        console.print(f"[{get_global_color_scheme(ctx.cfg)['description']}]Search took [{get_global_color_scheme(ctx.cfg)['success']}]{total_duration}[/] seconds![/]")        
 
         if not data_to_save:
             logger.info("Configuration Repository - No matches found!")
@@ -248,7 +256,7 @@ class ConfigSearchModule(BaseModule):
         # Commented because we await for any key in demob_check module itself
         # press_any_key(ctx)
 
-    def _execute_search(self, ctx: ScriptContext, networks: List, search_terms: List, search_input: str) -> Tuple[List, Set]:
+    def _execute_search(self, ctx: ScriptContext, networks: List, search_terms: List, search_input: str) -> Tuple[List, Set, float]:
         """A centralized method to run the search via cache or live scan."""
         logger = ctx.logger
         start = perf_counter()
@@ -267,10 +275,9 @@ class ConfigSearchModule(BaseModule):
                 data_to_save, matched_nets = search_cache_config(ctx, "", networks, search_terms, search_input)
 
         end = perf_counter()
-        logger.info(f"Search took {round(end - start, 3)} seconds!")
-        console.print(f"[{get_global_color_scheme(ctx.cfg)['description']}]Search took [{get_global_color_scheme(ctx.cfg)['success']}]{round(end-start, 3)}[/] seconds![/]")
+        duration = round(end - start, 3)
 
-        return data_to_save, matched_nets
+        return data_to_save, matched_nets, duration
 
     def _search_folder_live(self, ctx: ScriptContext, folder: Path, nets: List, search_terms: List, search_input: str) -> Tuple[List, Set]:
         """Private helper containing the logic of the original `search_config` function."""

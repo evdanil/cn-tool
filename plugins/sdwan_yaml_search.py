@@ -2,7 +2,7 @@ import re
 import threading
 import ipaddress
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Tuple
 
 import yaml
 
@@ -111,122 +111,96 @@ class SDWANYamlSearchPlugin(BasePlugin):
         self._loading_thread.start()
 
     def _search_yaml_repo(self, ctx: ScriptContext, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Search through preloaded YAML data and extend results."""
-        # If loading is not yet complete, log and return immediately.
+        """
+        Search through preloaded YAML data efficiently in a single pass.
+        """
         if not self._is_ready.is_set():
-            ctx.logger.debug("SD-WAN YAML Search: Data is not ready for searching yet. Skipping.")
             return data
 
         search_terms = data.get("search_terms", [])
         search_networks = data.get("networks", [])
-
         if not search_terms and not search_networks:
             return data
 
-        matched_networks_set = data.get("matched_nets", set())
         results = data.get("results", [])
 
-        ctx.logger.debug(f"SD-WAN YAML Search: Starting search for terms: {search_terms if search_terms else None} and IPs: {search_networks if search_networks else None}")
+        matched_networks_set = data.get("matched_nets", set())
 
-        with self._lock:
-            # We lock here to prevent any theoretical race condition if a reload is implemented
-            yaml_data_snapshot = self._yaml_data
-
+        patterns = {}
         for term in search_terms:
             try:
-                pattern = re.compile(term, re.IGNORECASE)
+                patterns[term] = re.compile(term, re.IGNORECASE)
             except re.error:
-                pattern = re.compile(re.escape(term), re.IGNORECASE)
+                ctx.logger.debug(f"Invalid regex '{term}', treating as literal string.")
+                patterns[term] = re.compile(re.escape(term), re.IGNORECASE)
 
-            ctx.logger.debug(f"SD-WAN YAML Search: Processing term '{term}' with pattern '{pattern.pattern}'")
-
-            term_results_count = 0
-            for filename, yaml_content in yaml_data_snapshot.items():
-                if not yaml_content:
-                    continue
-
-                device = Path(filename).stem.upper()
-                for path, value in self._find_in_obj(yaml_content, pattern):
-                    ctx.logger.debug(f"Found match for '{term}' in '{filename}' at path '{path}' with value '{value}'")
-                    line_content = f"{path}: {str(value)}"
-                    results.append([term, device, 0, line_content, filename])
-                    # results.append([term, device, path, str(value), filename])
-
-                    term_results_count += 1
-            ctx.logger.debug(f"SD-WAN YAML Search: Found {term_results_count} results for term '{term}'.")
-
-        for network_str in search_networks:
-            net_results_count = 0
+        network_objects = {}
+        for net_str in search_networks:
             try:
-                search_net = ipaddress.ip_network(network_str, strict=False)
-                ctx.logger.debug(f"SD-WAN YAML Search: Processing network '{network_str}'")
+                network_objects[net_str] = ipaddress.ip_network(net_str, strict=False)
             except ValueError:
-                ctx.logger.warning(f"SD-WAN YAML Search: Invalid network format '{network_str}', skipping.")
+                ctx.logger.warning(f"SD-WAN YAML Search: Invalid network format '{net_str}', skipping.")
+
+        ctx.logger.debug(f"SD-WAN YAML Search: Starting single-pass search for {len(patterns)} terms and {len(network_objects)} networks.")
+
+        with self._lock:
+            yaml_data_snapshot = self._yaml_data
+
+        for filename, yaml_content in yaml_data_snapshot.items():
+            if not yaml_content:
                 continue
 
-            for filename, yaml_content in yaml_data_snapshot.items():
-                if not yaml_content:
-                    continue
+            device = Path(filename).stem.upper()
 
-                device = Path(filename).stem.upper()
-                for path, found_ip in self._find_ips_in_obj(yaml_content, search_net):
-                    line_content = f"{path}: {found_ip}"
-                    results.append([network_str, device, 0, line_content, filename])
-                    matched_networks_set.add(search_net)
+            for criterion, path, value in self._traverse_and_match(yaml_content, patterns, network_objects):
+                line_content = f"{path}: {str(value)}"
+                results.append([criterion, device, 0, line_content, filename])
 
-                    net_results_count += 1
-
-            ctx.logger.debug(f"SD-WAN YAML Search: Found {net_results_count} results for term '{str(network_str)}'.")
+                if criterion in network_objects:
+                    matched_networks_set.add(criterion)
 
         data["results"] = results
         data["matched_nets"] = matched_networks_set
         return data
 
-    def _find_ips_in_obj(self, obj: Any, network_obj: ipaddress.IPv4Network, path: str = "") -> Iterator[tuple[str, str]]:
+    def _traverse_and_match(
+        self,
+        obj: Any,
+        patterns: Dict[str, re.Pattern],
+        network_objects: Dict[str, ipaddress.IPv4Network],
+        path: str = ""
+    ) -> Iterator[Tuple[str, str, Any]]:
         """
-        Recursively search for IP addresses within a given network object.
-        Yields the path and the matched IP address string.
-        """
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                new_path = f"{path}.{k}" if path else k
-                yield from self._find_ips_in_obj(v, network_obj, new_path)
-        elif isinstance(obj, list):
-            for i, v in enumerate(obj):
-                new_path = f"{path}[{i}]"
-                yield from self._find_ips_in_obj(v, network_obj, new_path)
-        elif isinstance(obj, str):
-            # Find all potential IP-like strings in the value
-            for ip_match in self.ip_pattern.finditer(obj):
-                ip_str = ip_match.group(0)
-                try:
-                    # Validate the string is a real IP and check for membership
-                    ip_addr = ipaddress.ip_address(ip_str)
-                    if ip_addr in network_obj:
-                        yield path, ip_str
-                except ValueError:
-                    # Not a valid IP address, ignore
-                    continue
+        A unified recursive function that traverses a data structure ONCE,
+        checking each value against all keywords and all network criteria.
 
-    def _find_in_obj(
-        self, obj: Any, pattern: re.Pattern, path: str = ""
-    ) -> Iterator[tuple[str, Any]]:
-        """
-        Recursively search for a pattern in the values of a nested object.
-        Yields the path and the matched value.
+        Yields (matching_criterion, path, original_value).
         """
         if isinstance(obj, dict):
             for k, v in obj.items():
                 new_path = f"{path}.{k}" if path else k
-                yield from self._find_in_obj(v, pattern, new_path)
+                yield from self._traverse_and_match(v, patterns, network_objects, new_path)
         elif isinstance(obj, list):
             for i, v in enumerate(obj):
                 new_path = f"{path}[{i}]"
-                yield from self._find_in_obj(v, pattern, new_path)
-        # Check against the STRING representation of the value.
-        # This handles integers, booleans, floats, etc., solving the potential search miss.
-        elif pattern.search(str(obj)):
-            yield path, obj
+                yield from self._traverse_and_match(v, patterns, network_objects, new_path)
+        else:
+            str_value = str(obj)
+            # 1. Check against all keyword patterns
+            for term, pattern in patterns.items():
+                if pattern.search(str_value):
+                    yield term, path, obj
+
+            # 2. Check against all network objects (if the value is a string)
+            if isinstance(obj, str):
+                for ip_str in self.ip_pattern.findall(obj):
+                    try:
+                        ip_addr = ipaddress.ip_address(ip_str)
+                        for net_str, network in network_objects.items():
+                            if ip_addr in network:
+                                yield net_str, path, obj
+                    except ValueError:
+                        continue
 
     def register(self, module: BaseModule) -> None:
         module.register_hook("process_data", self._search_yaml_repo)
