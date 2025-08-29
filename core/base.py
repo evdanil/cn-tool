@@ -1,6 +1,7 @@
 # core/base.py
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from time import perf_counter
 import logging
 import threading
 from typing import Dict, Any, List, Callable, Optional, TYPE_CHECKING
@@ -79,8 +80,21 @@ class BaseModule(ABC):
         """Executes all registered callbacks for a hook, passing data through them."""
         modified_data = data
         for callback in self.hooks.get(hook_name, []):
+            try:
+                # Get the plugin's name from the bound method for clear logging
+                plugin_name = callback.__self__.name
+            except AttributeError:
+                plugin_name = "Unknown Plugin"
+
+            hook_start_time = perf_counter()
             # Each callback receives the context and the data, and must return the (potentially modified) data.
             modified_data = callback(ctx, modified_data)
+
+            hook_end_time = perf_counter()
+            duration = round(hook_end_time - hook_start_time, 3)
+
+            ctx.logger.info(f"Plugin '{plugin_name}' hook '{hook_name}' took {duration} seconds.")
+
         return modified_data
 
     @abstractmethod

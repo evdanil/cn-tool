@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 import logging
 import os
 from pathlib import Path
+import zipfile
 from queue import Queue
 from typing import Any, Dict, List, Optional
 from core.base import ScriptContext
@@ -18,15 +19,43 @@ worker_thread: Optional[threading.Thread] = None
 
 def worker() -> None:
     """
-    Thread waiting for data to get saved in a report file (whatever received as args,kwargs passed into append_df_to_excel)
+    Thread waiting for data to get saved in a report file.
     """
+    file_is_corrupt = False
+
     while True:
         save_task = save_queue.get()
         if save_task is None:  # Sentinel value to stop the worker
             break
-        with save_lock:
-            append_df_to_excel(*save_task['args'], **save_task['kwargs'])
-        save_queue.task_done()
+
+        if file_is_corrupt:
+            save_queue.task_done()
+            continue
+
+        ctx = None  # Initialize ctx to None
+        try:
+            if save_task['args']:
+                ctx = save_task['args'][0]
+
+            with save_lock:
+                append_df_to_excel(*save_task['args'], **save_task['kwargs'])
+
+        except zipfile.BadZipFile as e:
+            if ctx:
+                ctx.logger.error(f"Failed to write to the report file. It may be corrupt. Error: {e}")
+                ctx.console.print(
+                    "\n[bold red]Error:[/bold red] Could not update the report file. "
+                    "The file may be corrupt or unreadable. Please delete the report file.\n"
+                )
+                file_is_corrupt = True
+
+        except Exception as e:
+            if ctx:
+                ctx.logger.error(f"An unexpected error occurred during the file save operation: {e}", exc_info=True)
+                ctx.console.print(f"\n[bold red]Error:[/bold red] An unexpected error occurred while saving the file: {e}")
+
+        finally:
+            save_queue.task_done()
 
 
 def start_worker() -> None:
