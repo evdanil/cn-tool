@@ -73,7 +73,7 @@ class BulkPingModule(BaseModule):
             ending = '...'
             # Ping the batch and get results. We re-order them to match the input order.
             if total_batches > 1:
-                ending = f' batch {int( i / batch_size + 1)} out of {total_batches}'
+                ending = f' batch {int(i / batch_size + 1)} out of {total_batches}'
 
             with console.status(f"[{colors['description']}]Pinging hosts{ending}[/]", spinner="dots12"):
                 batch_results_map = {res['Host']: res['Result'] for res in self._ping_batch(batch, logger)}
