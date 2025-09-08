@@ -2,6 +2,7 @@ import time
 from core.base import BaseModule, ScriptContext
 from utils.user_input import read_user_input
 from utils.config import write_config_value
+from utils.file_io import check_dir_accessibility
 from pathlib import Path
 
 
@@ -97,10 +98,26 @@ class SetupModule(BaseModule):
                 ctx.cfg[setting_key] = new_value  # Update live context
                 ctx.console.print(f"[cyan]{selected_setting['prompt']}[/cyan] has been set to [yellow]{'Enabled' if new_value else 'Disabled'}[/yellow].")
             else:
-                # Keep the original behavior for non-booleans
-                new_value_to_write = read_user_input(ctx, f"Enter new value for [yellow]{selected_setting['prompt']}[/yellow]: ")
-                ctx.cfg[setting_key] = new_value_to_write  # Update live context
-                ctx.console.print(f"[cyan]{selected_setting['prompt']}[/cyan] has been set to [yellow]{new_value_to_write}[/yellow].")
+                # Validation-aware input for non-boolean settings
+                while True:
+                    prompt = selected_setting['prompt']
+                    choices = setting_spec.get('choices')
+                    if choices:
+                        prompt += f" (choices: {', '.join(choices)})"
+                    raw = read_user_input(ctx, f"Enter new value for [yellow]{prompt}[/yellow]: ")
+
+                    valid, normalized, err = self._validate_and_normalize_setting(ctx, setting_key, setting_spec, raw)
+                    if valid:
+                        new_value_to_write = normalized
+                        # Update live context with typed value when possible
+                        if setting_spec.get('type') == 'path':
+                            ctx.cfg[setting_key] = Path(normalized).expanduser()
+                        else:
+                            ctx.cfg[setting_key] = normalized
+                        ctx.console.print(f"[cyan]{selected_setting['prompt']}[/cyan] has been set to [yellow]{normalized}[/yellow].")
+                        break
+                    else:
+                        ctx.console.print(f"[red]Invalid value[/red]: {err}")
 
             # Write the string representation to the config file
             write_config_value(
@@ -113,3 +130,30 @@ class SetupModule(BaseModule):
 
             ctx.console.print("[green]Setting updated! It will be fully effective on the next application run.[/green]")
             time.sleep(1.5)
+    def _validate_and_normalize_setting(self, ctx: ScriptContext, key: str, spec: dict, raw: str) -> tuple[bool, str, str]:
+        """Validate user input according to the plugin's config schema.
+
+        Returns (is_valid, normalized_value, error_message).
+        """
+        raw = (raw or '').strip()
+        if not raw:
+            return False, raw, "value cannot be empty"
+
+        t = spec.get('type')
+        choices = spec.get('choices')
+        # Restrict to choice set (case-insensitive), persist canonical choice value
+        if choices and t == 'str':
+            lower = raw.lower()
+            cl = [c.lower() for c in choices]
+            if lower not in cl:
+                return False, raw, f"must be one of: {', '.join(choices)}"
+            return True, choices[cl.index(lower)], ''
+
+        if t == 'path':
+            p = Path(raw).expanduser()
+            if not check_dir_accessibility(ctx.logger, p):
+                return False, raw, f"directory not accessible: {p}"
+            return True, str(p), ''
+
+        # Accept any non-empty string for other types here
+        return True, raw, ''
