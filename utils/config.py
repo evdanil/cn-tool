@@ -24,6 +24,11 @@ BASE_CONFIG_SCHEMA = {
     "cache_enabled":         {"section": "cache", "ini_key": "enabled", "type": "bool", "fallback": True},
     "cache_version":         {"section": "cache", "ini_key": "version", "type": "int", "fallback": 2},
     "theme_name":            {"section": "theme", "ini_key": "theme", "type": "str", "fallback": "default"},
+    # Config Analyzer (external TUI) settings
+    "config_repo_history_dir":     {"section": "config_repo", "ini_key": "history_dir", "type": "str", "fallback": "history"},
+    "config_analyzer_layout":      {"section": "config_analyzer", "ini_key": "layout", "type": "str", "fallback": "right"},
+    "config_analyzer_scroll_to_end": {"section": "config_analyzer", "ini_key": "scroll_to_end", "type": "bool", "fallback": False},
+    "config_analyzer_debug":       {"section": "config_analyzer", "ini_key": "debug", "type": "bool", "fallback": False},
 }
 
 

@@ -9,3 +9,7 @@ diskcache
 netmiko
 ldap3
 pyyaml
+textual
+python-dateutil
+click
+
