@@ -15,7 +15,7 @@ limitations under the License.
 # cn-tool
 
 `cn-tool` is a modular network utility that queries Infoblox and performs
-common network checks.  It is built around a plugin system that allows new
+common network checks. It is built around a plugin system that allows new
 features to be added without modifying the core.
 
 ## Features
@@ -36,18 +36,25 @@ features to be added without modifying the core.
 1. git clone https://github.com/cn-tool
 2. cd cn-tool
 3. Install required python packages (json, rich, pandas, argparse) using command:
+
 ```
 pip install -r requirements.txt
 ```
+
 4. Set execute bit on the python script file:
+
 ```
 chmod +x main.py
 ```
+
 5. [Optional] To avoid being asked each time executing cn-tool - set up environmental variable `TACACS_PW`, if it is not set - program will request for credential(password). Script uses env['USER'] as login name for devices
+
 ```
 export TACACS_PW=secret
 ```
+
 6. [Optional] Add request to read `TACACS_PW` credential during login by adding to `.bash_profile`:
+
 ```bash
 cat >> ~/.bash_profile <<EOF
 echo -n "Enter current TACACS_PW:"
@@ -55,21 +62,26 @@ read -s TACACS_PW
 export TACACS_PW
 EOF
 ```
+
 7. [Optional] Create alias for convenience by adding line to `.bash_profile`
+
 ```bash
 cat >> ~/.bash_profile <<EOF
 alias cn=/path/to/cn-tool.py
 EOF
 ```
+
 8. Start using this tool using created alias or `cn-tool.py`
+
 ```
 cn
 ```
+
 # Configuration
 
 `cn-tool` looks for an ini-style configuration file named `.cn` next to the
-script and in the user's home directory.  The `-c` option can point to an
-alternative file.  A minimal example looks like:
+script and in the user's home directory. The `-c` option can point to an
+alternative file. A minimal example looks like:
 
 ```ini
 [api]
@@ -97,6 +109,7 @@ name = default
 ```
 
 ### Active Directory Plugin
+
 Enable enrichment of subnet data from Active Directory:
 
 ```ini
@@ -109,28 +122,28 @@ connect_on_startup = true
 ```
 
 ### Email Plugin
+
 The tool can send reports via email using settings in the `[email]` section:
 
-| Key | Description |
-| --- | --- |
-| `enabled` | Enables the email feature. |
-| `send_on_exit` | Send the report automatically when the application exits. |
-| `to` | Recipient email address. |
-| `server` / `port` | SMTP server and port to connect to. |
-| `use_tls` / `use_ssl` | Enable TLS or SSL for the connection. |
-| `use_auth` | Authenticate to the SMTP server. |
-| `user` / `password` | Credentials used when `use_auth` is true. |
+| Key                   | Description                                               |
+| --------------------- | --------------------------------------------------------- |
+| `enabled`             | Enables the email feature.                                |
+| `send_on_exit`        | Send the report automatically when the application exits. |
+| `to`                  | Recipient email address.                                  |
+| `server` / `port`     | SMTP server and port to connect to.                       |
+| `use_tls` / `use_ssl` | Enable TLS or SSL for the connection.                     |
+| `use_auth`            | Authenticate to the SMTP server.                          |
+| `user` / `password`   | Credentials used when `use_auth` is true.                 |
 
 ### SD-WAN YAML Search Plugin
+
 Augments configuration search results by scanning a local repository of
 SD-WAN YAML files:
 
-| Key | Description |
-| --- | --- |
-| `enabled` | Enable YAML repository search. |
+| Key               | Description                         |
+| ----------------- | ----------------------------------- |
+| `enabled`         | Enable YAML repository search.      |
 | `repository_path` | Path to the SD-WAN YAML repository. |
-
-
 
 ## Config Analyzer (TUI)
 
@@ -151,4 +164,3 @@ Settings (Setup -> Config Analyzer):
 - Default layout: right/left/top/bottom.
 - Scroll to end on load: whether the diff pane auto-scrolls to the bottom.
 - Debug logging: enables extra logs in the analyzer.
-
