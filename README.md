@@ -131,3 +131,24 @@ SD-WAN YAML files:
 | `repository_path` | Path to the SD-WAN YAML repository. |
 
 
+
+## Config Analyzer (TUI)
+
+The Config Analyzer provides an interactive TUI to browse the configuration repository and compare snapshots.
+
+- Quick filter: start typing to filter devices or snapshots by name/author/date; Backspace/Ctrl+H to edit, Esc to clear.
+- Enter: select in snapshot list (toggle up to two to show a diff).
+- Tab: switch focus between list and diff (aliases: Tab/Ctrl+I). Shift+Tab cycles backwards.
+- Diff actions: D toggles unified/side-by-side; H hides unchanged (only when the diff pane is focused).
+- Layout: Ctrl+L cycles right / bottom / left / top. Vertical layouts split the screen evenly.
+- Timestamps: shown in UTC (YYYY-MM-DD HH:MM TZ) for consistent comparisons.
+- Snapshot dedupe: `Current` is omitted when it's identical to the latest snapshot.
+
+Settings (Setup -> Config Analyzer):
+
+- Analyzer repo directory: overrides the global [config_repo] directory for the TUI only.
+- History folder name: subfolder to scan for device snapshots (e.g. `history`).
+- Default layout: right/left/top/bottom.
+- Scroll to end on load: whether the diff pane auto-scrolls to the bottom.
+- Debug logging: enables extra logs in the analyzer.
+
