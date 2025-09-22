@@ -614,7 +614,7 @@ stop_words: Dict[str, Tuple[str, ...]] = {
         "ip ospf network",
         "ip mtu",
         "channel-group",
-        "ip helper-address ",
+        # "ip helper-address ",
         "router ospf",
         "capability",
         "remark",
