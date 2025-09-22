@@ -43,7 +43,7 @@ def load_modules_and_plugins(master_schema: Dict[str, Any]) -> tuple[Dict[str, B
 def _load_modules(path: str) -> Dict[str, BaseModule]:
     """Loads all BaseModule subclasses from a given directory."""
     loaded_modules: Dict[str, BaseModule] = {}
-    for filename in os.listdir(path):
+    for filename in sorted(os.listdir(path)):
         if filename.endswith('.py') and not filename.startswith('__'):
             module_name = filename[:-3]
             module_path = f"modules.{module_name}"
@@ -66,7 +66,7 @@ def _load_and_register_plugins(path: str, modules: Dict[str, BaseModule], schema
     """
     Loads plugins, registers their hooks, and merges their config schemas.
     """
-    for filename in os.listdir(path):
+    for filename in sorted(os.listdir(path)):
         if filename.endswith('.py') and not filename.startswith('__'):
             module_name = filename[:-3]
             module_path = f"plugins.{module_name}"
