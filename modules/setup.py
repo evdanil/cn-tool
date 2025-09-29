@@ -121,8 +121,11 @@ class SetupModule(BaseModule):
                     valid, normalized, err = self._validate_and_normalize_setting(ctx, setting_key, setting_spec, raw)
                     if valid:
                         new_value_to_write = str(normalized)
-                        if setting_spec.get("type") == "path":
+                        setting_type = setting_spec.get("type")
+                        if setting_type == "path":
                             ctx.cfg[setting_key] = Path(normalized).expanduser()
+                        elif setting_type == "list[str]":
+                            ctx.cfg[setting_key] = [segment.strip() for segment in str(normalized).split(',') if segment.strip()]
                         else:
                             ctx.cfg[setting_key] = normalized
                         ctx.console.print(f"[cyan]{selected_setting['prompt']}[/cyan] has been set to [yellow]{normalized}[/yellow].")
@@ -184,6 +187,8 @@ class SetupModule(BaseModule):
             return "[green]Enabled[/green]" if self._coerce_bool(value) else "[red]Disabled[/red]"
         if isinstance(value, Path):
             return str(value)
+        if option_type == "list[str]" and isinstance(value, (list, tuple)):
+            return ", ".join(str(item) for item in value)
         return str(value)
 
     def _validate_and_normalize_setting(self, ctx: ScriptContext, key: str, spec: dict, raw: str) -> tuple[bool, str, str]:
@@ -206,5 +211,23 @@ class SetupModule(BaseModule):
             if not check_dir_accessibility(ctx.logger, p):
                 return False, raw, f"directory not accessible: {p}"
             return True, str(p), ''
+
+        if t == 'list[str]':
+            items = [segment.strip() for segment in raw.split(',') if segment.strip()]
+            if not items:
+                return False, raw, "must contain at least one value"
+            if spec.get('validate') == 'path':
+                normalized: list[str] = []
+                inaccessible: list[str] = []
+                for segment in items:
+                    candidate = Path(segment).expanduser()
+                    if not check_dir_accessibility(ctx.logger, candidate):
+                        inaccessible.append(segment)
+                    else:
+                        normalized.append(str(candidate))
+                if inaccessible:
+                    return False, raw, f"directories not accessible: {', '.join(inaccessible)}"
+                items = normalized
+            return True, ','.join(items), ''
 
         return True, raw, ''

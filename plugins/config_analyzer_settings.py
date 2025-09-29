@@ -24,7 +24,8 @@ class ConfigAnalyzerSettingsPlugin(BasePlugin):
     @property
     def user_configurable_settings(self) -> List[Dict[str, str]]:
         return [
-            {"key": "config_analyzer_repo_directory", "prompt": "Analyzer repo directory (path, overrides global)"},
+            {"key": "config_analyzer_repo_directories", "prompt": "Analyzer repo directories (comma-separated paths)"},
+            {"key": "config_analyzer_repo_names", "prompt": "Analyzer repo display names (comma-separated)"},
             {"key": "config_repo_history_dir", "prompt": "History folder name (e.g. 'history')"},
             {"key": "config_analyzer_layout", "prompt": "Default layout (right/left/top/bottom)"},
             {"key": "config_analyzer_scroll_to_end", "prompt": "Scroll to end on load (toggle)"},
@@ -36,7 +37,26 @@ class ConfigAnalyzerSettingsPlugin(BasePlugin):
         # Mirror utils/config.BASE_CONFIG_SCHEMA entries so Setup can persist values
         return {
             # Existing base config keys (duplicated spec for Setup writing)
-            "config_analyzer_repo_directory": {"section": "config_analyzer", "ini_key": "repo_directory", "type": "path", "fallback": "/opt/data/configs"},
+            "config_analyzer_repo_directories": {
+                "section": "config_analyzer",
+                "ini_key": "repo_directories",
+                "type": "list[str]",
+                "fallback": "/opt/data/configs",
+                "validate": "path",
+            },
+            "config_analyzer_repo_names": {
+                "section": "config_analyzer",
+                "ini_key": "repo_names",
+                "type": "list[str]",
+                "fallback": "",
+            },
+            # Legacy single-directory override remains for backward compatibility
+            "config_analyzer_repo_directory": {
+                "section": "config_analyzer",
+                "ini_key": "repo_directory",
+                "type": "path",
+                "fallback": "/opt/data/configs",
+            },
             "config_repo_history_dir": {"section": "config_repo", "ini_key": "history_dir", "type": "str", "fallback": "history"},
 
             # Analyzer UI preferences
