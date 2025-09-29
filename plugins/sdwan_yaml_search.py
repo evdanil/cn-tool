@@ -1,6 +1,7 @@
 import re
 import threading
 import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterator, Tuple
 
@@ -10,7 +11,10 @@ from core.base import BasePlugin, BaseModule, ScriptContext
 
 
 class SDWANYamlSearchPlugin(BasePlugin):
-    """Plugin that augments ConfigSearch results with SD-WAN YAML data."""
+    """Plugin that augments ConfigSearch results with SD-WAN YAML data from multiple repositories."""
+
+    # Maximum file size to load (10MB)
+    MAX_YAML_SIZE = 10 * 1024 * 1024
 
     def __init__(self) -> None:
         """Initializes the plugin and its threading components."""
@@ -19,6 +23,8 @@ class SDWANYamlSearchPlugin(BasePlugin):
         self._is_ready = threading.Event()  # An event to signal when loading is complete
         self._lock = threading.Lock()  # A lock to ensure thread-safe access to data
         self.ip_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+        self._loaded_files: Dict[str, str] = {}  # Track loaded files: {filename: filepath} for O(1) duplicate detection
+        self._stop_loading = threading.Event()  # Event to signal thread to stop
 
     @property
     def name(self) -> str:
@@ -41,6 +47,13 @@ class SDWANYamlSearchPlugin(BasePlugin):
                 "type": "bool",
                 "fallback": False,
             },
+            "sdwan_yaml_repo_paths": {
+                "section": "sdwan_yaml_search",
+                "ini_key": "repository_paths",
+                "type": "str",
+                "fallback": "",
+            },
+            # Backward compatibility
             "sdwan_yaml_repo_path": {
                 "section": "sdwan_yaml_search",
                 "ini_key": "repository_path",
@@ -58,31 +71,139 @@ class SDWANYamlSearchPlugin(BasePlugin):
             {
                 "key": "sdwan_yaml_enabled",
                 "prompt": "Enable/Disable SD-WAN YAML Search"
+            },
+            {
+                "key": "sdwan_yaml_repo_paths",
+                "prompt": "SD-WAN YAML repository paths (comma-separated, e.g., /path1,/path2,/path3)"
             }
         ]
 
-    def _load_data_in_background(self, ctx: ScriptContext) -> None:
-        """The target function for the background thread to load and parse YAML files."""
-        repo_path = ctx.cfg.get("sdwan_yaml_repo_path", "")
+    def _load_single_repository(self, repo_path: str, ctx: ScriptContext) -> Tuple[Dict[str, Any], Dict[str, Any], list]:
+        """Load YAML files from a single repository. Returns (yaml_data, stats, duplicates)."""
         repo = Path(repo_path)
-        ctx.logger.info(f"SD-WAN YAML Search: Starting background load from {repo_path}...")
+        repo_yaml_data = {}
+        repo_file_count = 0
+        repo_errors = 0
+        local_duplicates = []
 
-        if not repo_path or not repo.is_dir():
-            ctx.logger.warning("SD-WAN YAML Search: repository path is invalid. Aborting load.")
-            return
+        if not repo.is_dir():
+            ctx.logger.warning(f"SD-WAN YAML Search: Repository path '{repo_path}' is invalid or not a directory. Skipping.")
+            return {}, {"status": "invalid", "files": 0, "errors": 0}, []
 
-        temp_yaml_data = {}
-        file_count = 0
+        ctx.logger.debug(f"SD-WAN YAML Search: Processing repository: {repo_path}")
+
         for file in repo.rglob("*"):
             if file.suffix.lower() in {".yml", ".yaml"} and file.is_file():
-                try:
-                    with file.open(encoding="utf-8") as f:
-                        temp_yaml_data[str(file)] = yaml.safe_load(f)
-                        file_count += 1
-                except Exception as exc:
-                    ctx.logger.error(f"SD-WAN YAML Search: failed to load or parse {file}: {exc}")
+                file_str = str(file)
+                file_name = file.name
 
-        ctx.logger.info(f"SD-WAN YAML Search: Successfully loaded and parsed {file_count} YAML files.")
+                # Check for stop signal
+                if self._stop_loading.is_set():
+                    ctx.logger.info(f"SD-WAN YAML Search: Loading interrupted for repository {repo_path}")
+                    break
+
+                # Check file size before loading
+                try:
+                    file_size = file.stat().st_size
+                    if file_size > self.MAX_YAML_SIZE:
+                        ctx.logger.warning(f"SD-WAN YAML Search: File {file} exceeds size limit ({file_size} > {self.MAX_YAML_SIZE}), skipping")
+                        repo_errors += 1
+                        continue
+
+                    # Check for duplicates (will be verified later in main thread)
+                    with self._lock:
+                        if file_name in self._loaded_files:
+                            local_duplicates.append(file_name)
+                            ctx.logger.debug(f"SD-WAN YAML Search: Duplicate file '{file_name}' found, skipping")
+                            continue
+                        # Reserve this filename to prevent other threads from loading it
+                        self._loaded_files[file_name] = file_str
+
+                    with file.open(encoding="utf-8") as f:
+                        yaml_content = yaml.safe_load(f)
+                        repo_yaml_data[file_str] = yaml_content
+                        repo_file_count += 1
+
+                except Exception as exc:
+                    ctx.logger.error(f"SD-WAN YAML Search: Failed to load or parse {file}: {exc}")
+                    repo_errors += 1
+                    # Remove from loaded files if we failed to load it
+                    with self._lock:
+                        if file_name in self._loaded_files and self._loaded_files[file_name] == file_str:
+                            del self._loaded_files[file_name]
+
+        stats = {
+            "status": "success",
+            "files": repo_file_count,
+            "errors": repo_errors
+        }
+
+        ctx.logger.info(f"SD-WAN YAML Search: Repository '{repo_path}' - loaded {repo_file_count} files, {repo_errors} errors")
+        return repo_yaml_data, stats, local_duplicates
+
+    def _load_data_in_background(self, ctx: ScriptContext) -> None:
+        """The target function for the background thread to load and parse YAML files from multiple repositories in parallel."""
+        # Get repository paths - check new config key first, fall back to old one for backward compatibility
+        repo_paths_str = ctx.cfg.get("sdwan_yaml_repo_paths", "")
+        if not repo_paths_str:
+            # Fall back to old single path config for backward compatibility
+            repo_paths_str = ctx.cfg.get("sdwan_yaml_repo_path", "")
+
+        if not repo_paths_str:
+            ctx.logger.warning("SD-WAN YAML Search: No repository paths configured. Aborting load.")
+            return
+
+        # Parse multiple paths separated by comma
+        repo_paths = [path.strip() for path in repo_paths_str.split(",") if path.strip()]
+
+        if not repo_paths:
+            ctx.logger.warning("SD-WAN YAML Search: No valid repository paths found. Aborting load.")
+            return
+
+        ctx.logger.info(f"SD-WAN YAML Search: Starting parallel load from {len(repo_paths)} repository path(s)...")
+
+        temp_yaml_data = {}
+        repo_statistics = {}
+        all_duplicates = []
+
+        # Determine number of workers (max 4, but no more than number of repos)
+        max_workers = min(4, len(repo_paths))
+
+        # Process repositories in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all repository loading tasks
+            future_to_repo = {
+                executor.submit(self._load_single_repository, repo_path, ctx): repo_path
+                for repo_path in repo_paths
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_repo):
+                repo_path = future_to_repo[future]
+                try:
+                    repo_data, stats, duplicates = future.result(timeout=60)  # 60 second timeout per repo
+                    temp_yaml_data.update(repo_data)
+                    repo_statistics[repo_path] = stats
+                    all_duplicates.extend(duplicates)
+                except Exception as exc:
+                    ctx.logger.error(f"SD-WAN YAML Search: Exception loading repository {repo_path}: {exc}")
+                    repo_statistics[repo_path] = {"status": "error", "files": 0, "errors": 1}
+
+        # Calculate totals
+        total_file_count = sum(stats["files"] for stats in repo_statistics.values())
+
+        # Log summary
+        ctx.logger.info(f"SD-WAN YAML Search: Successfully loaded {total_file_count} YAML files from {len(repo_paths)} repositories")
+
+        if all_duplicates:
+            ctx.logger.info(f"SD-WAN YAML Search: Skipped {len(all_duplicates)} duplicate files across repositories")
+
+        # Log repository statistics
+        successful_repos = sum(1 for stats in repo_statistics.values() if stats["status"] == "success")
+        failed_repos = sum(1 for stats in repo_statistics.values() if stats["status"] in ["invalid", "error"])
+
+        if failed_repos > 0:
+            ctx.logger.warning(f"SD-WAN YAML Search: {failed_repos} repository path(s) were invalid or inaccessible")
 
         # Thread-safe update of the main data dictionary
         with self._lock:
@@ -104,7 +225,10 @@ class SDWANYamlSearchPlugin(BasePlugin):
             return
 
         self._is_ready.clear()  # Reset the event in case of a reconnect
-        self._yaml_data.clear()
+        self._stop_loading.clear()  # Clear stop signal for new load
+        with self._lock:
+            self._yaml_data.clear()
+            self._loaded_files.clear()  # Clear loaded files dictionary for fresh load
 
         # Create and start the daemon thread
         self._loading_thread = threading.Thread(target=self._load_data_in_background, args=(ctx,), daemon=True)
@@ -201,6 +325,24 @@ class SDWANYamlSearchPlugin(BasePlugin):
                                 yield net_str, path, obj
                     except ValueError:
                         continue
+
+    def disconnect(self, ctx: ScriptContext) -> None:
+        """Clean up resources on plugin disconnect or application shutdown."""
+        # Signal the loading thread to stop
+        self._stop_loading.set()
+
+        if self._loading_thread and self._loading_thread.is_alive():
+            ctx.logger.info("SD-WAN YAML Search: Waiting for background loading to complete...")
+            self._loading_thread.join(timeout=5.0)  # Wait max 5 seconds
+            if self._loading_thread.is_alive():
+                ctx.logger.warning("SD-WAN YAML Search: Background thread did not complete in time")
+
+        # Clean up data
+        with self._lock:
+            self._yaml_data.clear()
+            self._loaded_files.clear()
+
+        ctx.logger.debug("SD-WAN YAML Search: Plugin disconnected and cleaned up")
 
     def register(self, module: BaseModule) -> None:
         module.register_hook("process_data", self._search_yaml_repo)
