@@ -64,3 +64,8 @@ to = some_user@example.com
 [sdwan_yaml_search]
 enabled=False
 #repository_path=yaml_repo_path
+
+[config_analyzer]
+#repo_directories = repo_dir1,repo_dir2
+#repo_names = repo_routers,repo_switches
+#layout = bottom

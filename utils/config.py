@@ -26,6 +26,8 @@ BASE_CONFIG_SCHEMA = {
     "theme_name":            {"section": "theme", "ini_key": "theme", "type": "str", "fallback": "default"},
     # Config Analyzer (external TUI) settings
     "config_repo_history_dir":     {"section": "config_repo", "ini_key": "history_dir", "type": "str", "fallback": "history"},
+    "config_analyzer_repo_directories": {"section": "config_analyzer", "ini_key": "repo_directories", "type": "list[str]", "fallback": "/opt/data/configs"},
+    "config_analyzer_repo_names": {"section": "config_analyzer", "ini_key": "repo_names", "type": "list[str]", "fallback": ""},
     "config_analyzer_layout":      {"section": "config_analyzer", "ini_key": "layout", "type": "str", "fallback": "right"},
     "config_analyzer_scroll_to_end": {"section": "config_analyzer", "ini_key": "scroll_to_end", "type": "bool", "fallback": False},
     "config_analyzer_debug":       {"section": "config_analyzer", "ini_key": "debug", "type": "bool", "fallback": False},
