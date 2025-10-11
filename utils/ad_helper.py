@@ -17,7 +17,13 @@ from typing import Dict, List, Optional
 
 import ldap3
 from ldap3.utils.conv import escape_filter_chars
-from ldap3.core.exceptions import LDAPException
+from ldap3.core.exceptions import (
+    LDAPException,
+    LDAPResponseTimeoutError,
+    LDAPSocketOpenError,
+    LDAPSocketReceiveError,
+    LDAPSocketSendError,
+)
 
 # It's good practice to request only the attributes you need instead of '*'
 DEFAULT_ATTRS: List[str] = [
@@ -31,13 +37,22 @@ DEFAULT_ATTRS: List[str] = [
 
 # Can be overridden in config file if needed.
 DEFAULT_SEARCH_BASE: str = 'CN=Subnets,CN=Sites,CN=Configuration,DC=domain,DC=com'
+DEFAULT_OPERATION_TIMEOUT: int = 10
+
+RETRYABLE_EXCEPTIONS = (
+    LDAPSocketOpenError,
+    LDAPSocketReceiveError,
+    LDAPSocketSendError,
+    LDAPResponseTimeoutError,
+)
 
 
 def init_ad_link(
     logger: logging.Logger,
     user: str,
     password: str,
-    ldap_uri: str
+    ldap_uri: str,
+    operation_timeout: int = DEFAULT_OPERATION_TIMEOUT,
 ) -> Optional[ldap3.Connection]:
     """
     Initializes and binds a connection to an Active Directory server.
@@ -63,6 +78,7 @@ def init_ad_link(
             password=password,
             auto_bind=True,
             read_only=True,
+            receive_timeout=operation_timeout,
         )
 
         # start_tls() is often used with ldap://. If you use ldaps:// (port 636),
@@ -88,6 +104,7 @@ def get_ad_subnet_info(
     subnet: str,
     search_base: str,
     attributes: List[str] = DEFAULT_ATTRS,
+    operation_timeout: int = DEFAULT_OPERATION_TIMEOUT,
 ) -> Dict[str, str]:
     """
     Queries Active Directory for information about a specific subnet.
@@ -111,7 +128,12 @@ def get_ad_subnet_info(
     search_filter = f'(&(objectClass=subnet)(name={safe_subnet}))'
 
     try:
-        ldap_link.search(search_base, search_filter, attributes=attributes)
+        ldap_link.search(
+            search_base,
+            search_filter,
+            attributes=attributes,
+            time_limit=operation_timeout,
+        )
 
         if ldap_link.entries:
             data = ldap_link.entries[0]
@@ -137,6 +159,8 @@ def get_ad_subnet_info(
             logger.info(f"AD - No results found for subnet: {subnet}")
 
     except LDAPException as e:
+        if isinstance(e, RETRYABLE_EXCEPTIONS):
+            raise
         logger.error(f"An LDAP error occurred during search: {e}")
 
     return {}
