@@ -1,7 +1,14 @@
 import threading
+from typing import Any, Dict, Optional
+
 from core.base import BasePlugin, BaseModule, ScriptContext
-from utils.ad_helper import init_ad_link, get_ad_subnet_info, DEFAULT_SEARCH_BASE
-from typing import Dict, Any
+from utils.ad_helper import (
+    DEFAULT_OPERATION_TIMEOUT,
+    DEFAULT_SEARCH_BASE,
+    RETRYABLE_EXCEPTIONS,
+    get_ad_subnet_info,
+    init_ad_link,
+)
 
 
 class ADSubnetEnrichmentPlugin(BasePlugin):
@@ -45,8 +52,52 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
             "ad_uri":                {"section": "ad", "ini_key": "uri", "type": "str", "fallback": ""},
             "ad_user":               {"section": "ad", "ini_key": "user", "type": "str", "fallback": ""},
             "ad_search_base":        {"section": "ad", "ini_key": "search_base", "type": "str", "fallback": DEFAULT_SEARCH_BASE},
+            "ad_operation_timeout": {"section": "ad", "ini_key": "operation_timeout", "type": "int", "fallback": DEFAULT_OPERATION_TIMEOUT},
             "ad_connect_on_startup": {"section": "ad", "ini_key": "connect_on_startup", "type": "bool", "fallback": False},
         }
+
+    def _ensure_connection(self, ctx: ScriptContext) -> bool:
+        """Ensure the LDAP connection is present and healthy."""
+        if not ctx.cfg.get("ad_enabled"):
+            return False
+
+        if self.ad_lock is None:
+            self.ad_lock = threading.Lock()
+
+        reconnect_needed = False
+        if self.conn is None:
+            reconnect_needed = True
+        else:
+            bound = getattr(self.conn, "bound", False)
+            closed = getattr(self.conn, "closed", False)
+            if not bound or closed:
+                reconnect_needed = True
+
+        if not reconnect_needed:
+            return True
+
+        if self.conn is not None:
+            ctx.logger.warning("AD Plugin: LDAP connection appears stale; attempting to reconnect.")
+            try:
+                self.conn.unbind()
+            except Exception:
+                ctx.logger.debug("AD Plugin: Error while unbinding stale LDAP connection.", exc_info=True)
+            self.conn = None
+
+        timeout = ctx.cfg.get("ad_operation_timeout", DEFAULT_OPERATION_TIMEOUT)
+        self.conn = init_ad_link(
+            logger=ctx.logger,
+            user=ctx.cfg.get("ad_user", ""),
+            password=ctx.password,
+            ldap_uri=ctx.cfg.get("ad_uri", ""),
+            operation_timeout=timeout,
+        )
+
+        if not self.conn:
+            ctx.logger.error("AD Plugin: Failed to (re)establish persistent connection.")
+            return False
+
+        return True
 
     def connect(self, ctx: ScriptContext) -> None:
         """Called by main.py on startup."""
@@ -82,11 +133,13 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
         ctx.logger.info(f"AD Plugin: Initializing {mode} connection...")
 
         self.ad_lock = threading.Lock()  # Create the lock for this run
+        timeout = ctx.cfg.get("ad_operation_timeout", DEFAULT_OPERATION_TIMEOUT)
         self.conn = init_ad_link(
             logger=ctx.logger,
             user=ctx.cfg.get("ad_user", ""),
             password=ctx.password,
-            ldap_uri=ctx.cfg.get("ad_uri", "")
+            ldap_uri=ctx.cfg.get("ad_uri", ""),
+            operation_timeout=timeout,
         )
         if not self.conn:
             ctx.logger.error("AD Plugin: Failed to establish persistent connection for this run.")
@@ -95,10 +148,6 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
         """
         Hook callback for 'process_data'. Uses the existing connection to query AD.
         """
-        # If connection failed during setup, or plugin is disabled, do nothing.
-        if not self.conn or not self.ad_lock:
-            return data
-
         ctx.logger.debug("AD Plugin: Attempting to enrich data.")
 
         # Extract the subnet string from the data provided by the module
@@ -115,18 +164,54 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
         # Get AD configuration
         ad_search_base: str = ctx.cfg.get("ad_search_base", DEFAULT_SEARCH_BASE)
 
-        # Use the lock to ensure only one thread queries AD at a time
-        with self.ad_lock:
-            ad_info = get_ad_subnet_info(
-                logger=ctx.logger,
-                ldap_link=self.conn,
-                subnet=subnet_str,
-                search_base=ad_search_base
-            )
+        timeout = ctx.cfg.get("ad_operation_timeout", DEFAULT_OPERATION_TIMEOUT)
 
-        if ad_info:
-            ctx.logger.debug(f"AD Plugin: Successfully enriched data for {subnet_str} using persistent connection.")
-            data['Active Directory'] = [ad_info]
+        ad_info: Optional[Dict[str, Any]] = None
+        attempts = 0
+        max_attempts = 2
+
+        while attempts < max_attempts:
+            if not self._ensure_connection(ctx):
+                return data
+
+            try:
+                with self.ad_lock:
+                    ad_info = get_ad_subnet_info(
+                        logger=ctx.logger,
+                        ldap_link=self.conn,
+                        subnet=subnet_str,
+                        search_base=ad_search_base,
+                        operation_timeout=timeout,
+                    )
+                break
+            except RETRYABLE_EXCEPTIONS as exc:
+                attempts += 1
+                ctx.logger.warning(
+                    "AD Plugin: LDAP communication error during subnet lookup (%s). Attempt %s of %s.",
+                    exc,
+                    attempts,
+                    max_attempts,
+                )
+                if self.conn is not None:
+                    try:
+                        self.conn.unbind()
+                    except Exception:
+                        ctx.logger.debug(
+                            "AD Plugin: Error while unbinding LDAP connection after failure.",
+                            exc_info=True,
+                        )
+                self.conn = None
+
+                if attempts >= max_attempts:
+                    ctx.logger.error("AD Plugin: Giving up on AD lookup after repeated communication failures.")
+                    return data
+                continue
+
+        if not ad_info:
+            return data
+
+        ctx.logger.debug(f"AD Plugin: Successfully enriched data for {subnet_str} using persistent connection.")
+        data['Active Directory'] = [ad_info]
 
         return data
 
