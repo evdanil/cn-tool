@@ -230,7 +230,10 @@ class ConfigSearchModule(BaseModule):
         search_terms.append(pattern)
 
         # Step 3: Execute the search using the internal helper
-        data_to_save, matched_nets = self._execute_search(ctx, networks, search_terms, sitecode)
+        data_to_save, matched_nets, core_search_time = self._execute_search(
+            ctx, networks, search_terms, sitecode
+        )
+        logger.info(f"Demob core search took {core_search_time} seconds!")
 
         if not data_to_save:
             logger.info(f"Configuration Repository - No matches for {sitecode} found!")

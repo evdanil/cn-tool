@@ -271,11 +271,11 @@ class SubnetRequestModule(BaseModule):
             if read_single_keypress(ctx).lower() == "q":
                 return
 
-        # Create a sorted list of unique networks for a stable display order.
-        unique_networks_for_display = sorted(list(grouped_by_network.keys()), key=lambda net: net.network_address)
+        # Preserve insertion order so summary and details use the user-provided sequence.
+        unique_networks_for_display = list(grouped_by_network.keys())
         num_unique_results = len(unique_networks_for_display)
 
-        for i, network in enumerate(unique_networks_for_display):
+        for index, network in enumerate(unique_networks_for_display, start=1):
             console.clear()
 
             # Get all original inputs that resolved to this network
@@ -292,8 +292,8 @@ class SubnetRequestModule(BaseModule):
             else:
                 console.print(f"[{colors['success']}]Network [{colors['error']}{colors['bold']}] {network} [/] has no data in Infoblox[/]")
 
-            if num_unique_results > 1 and i < num_unique_results - 1:
-                console.print(f"\n[{colors['success']}]Press [{colors['bold']}]SPACE[/] for next ({i + 2}/{num_unique_results}) / Any other key to exit details view[/]")
+            if num_unique_results > 1 and index < num_unique_results:
+                console.print(f"\n[{colors['success']}]Press [{colors['bold']}]SPACE[/] for next ({index + 1}/{num_unique_results}) / Any other key to exit details view[/]")
                 if read_single_keypress(ctx) != ' ':
                     break
 
