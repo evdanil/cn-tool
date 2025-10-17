@@ -28,7 +28,7 @@ regions =
 [cache]
 #enabled=true
 directory=~/.cn-cache
-version=4
+version=5
 
 [theme]
 # Supported theme names: default,monochrome,pastel,dark

@@ -1,3 +1,4 @@
+import ipaddress
 import re
 from typing import List
 
@@ -7,9 +8,10 @@ from typing import List
 # Assuming keywords.py is at the root level for now
 # If you move it, adjust the import path.
 from wordlists.keywords import standard_keywords
+from utils.validation import ip_regexp
 
 
-def extract_keywords(text: str, vendor: str = 'default') -> List[str]:
+def extract_keywords(text: str, vendor: str = 'default', preserve_stopwords: bool = False) -> List[str]:
     """
     Extracts meaningful keywords from a line of text, ignoring common stopwords.
 
@@ -33,7 +35,7 @@ def extract_keywords(text: str, vendor: str = 'default') -> List[str]:
     cleaned_text = re.sub(r"[\W_]+", " ", text_lower)
 
     # Use a set for efficient stopword checking
-    vendor_stopwords = set(standard_keywords.get(vendor, ()))
+    vendor_stopwords = set(standard_keywords.get(vendor, ())) if not preserve_stopwords else set()
 
     # Find potential keywords. This regex is simplified for clarity, but you can use your original.
     # The key is to iterate through words.
@@ -53,3 +55,26 @@ def extract_keywords(text: str, vendor: str = 'default') -> List[str]:
         keywords.append(word)
 
     return list(set(keywords))  # Return unique keywords
+
+
+def extract_literal_ips(text: str) -> List[str]:
+    """
+    Extract literal IP addresses from a text snippet.
+
+    Args:
+        text: Arbitrary user-provided text (regex, keywords, etc.)
+
+    Returns:
+        A list of string representations for each IP address found.
+    """
+    matches: List[str] = []
+    for match in ip_regexp.finditer(text):
+        candidate = match.group()
+        try:
+            # Validate and normalise; ipaddress handles both IPv4 and IPv6.
+            ip_obj = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        matches.append(str(ip_obj))
+
+    return matches
