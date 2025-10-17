@@ -14,7 +14,7 @@ from core.base import ScriptContext
 from .cache import CacheManager
 from .config import make_dir_list
 from .hash import calculate_config_hash
-from .search_helpers import extract_keywords
+from .search_helpers import extract_keywords, extract_literal_ips
 from .validation import ip_regexp
 
 HEX8_RE = re.compile(r"^[0-9A-F]{8}\b")
@@ -380,7 +380,7 @@ def get_device_facts(ctx: ScriptContext, hostname: str, vendor: str, region: str
                     except ValueError:
                         pass
 
-                for word in set(extract_keywords(line_strip)) - set(standard_keywords.get(vendor, ())):
+                for word in set(extract_keywords(line_strip, vendor=vendor)) - set(standard_keywords.get(vendor, ())):
                     kw_list[(word, hostname)] += (index,)
     except (IOError, OSError) as e:
         logger.error(f"Error reading device file {filename}: {e}")
@@ -405,99 +405,253 @@ def search_cache_config(
     data, matched_nets = search_cache_subnets(ctx, nets, search_input)
     data_to_save.extend(data)
 
-    data = search_cache_keywords(ctx, search_terms, search_input)
-    data_to_save.extend(data)
+    kw_data, kw_matched_nets = search_cache_keywords(ctx, search_terms, search_input)
+    data_to_save.extend(kw_data)
+    matched_nets.update(kw_matched_nets)
 
     return data_to_save, matched_nets
 
 
-def search_cache_keywords(ctx: ScriptContext, search_terms: List[str], search_input: str) -> List[List[Any]]:
+def search_cache_keywords(ctx: ScriptContext, search_terms: List[str], search_input: str) -> Tuple[List[List[Any]], Set[ipaddress.IPv4Network]]:
     """
     Performs a hybrid cached search for regex terms.
     1. Uses the keyword index (kw_idx) for a fast pre-selection of candidate lines.
     2. Performs the full, expensive regex match only on the small set of candidate lines.
+    3. Falls back to IP index hints and, if needed, a bounded on-disk scan to guarantee parity with live searches.
     """
     logger = ctx.logger
     data_to_save: List[List[Any]] = []
+    matched_nets: Set[ipaddress.IPv4Network] = set()
 
     # Ensure cache is available
-    if not isinstance(ctx.cache, CacheManager):
-        return data_to_save
+    if not isinstance(ctx.cache, CacheManager) or not search_terms:
+        return data_to_save, matched_nets
 
     cache = ctx.cache
     kw_idx = cache.kw_idx
     dev_idx = cache.dev_idx
 
     all_cache_keywords = list(kw_idx.keys())  # Get all keys for prefix matching
+    seen_rows: Set[Tuple[str, int, str]] = set()
+    missing_terms: List[str] = []
+    aggregated_ip_hints: Set[str] = set()
 
-    if not search_terms:
-        return data_to_save
+    compiled_patterns: Dict[str, Optional[re.Pattern]] = {}
+
+    def get_compiled(term: str) -> Optional[re.Pattern]:
+        if term not in compiled_patterns:
+            try:
+                compiled_patterns[term] = re.compile(term, re.IGNORECASE)
+            except re.error as exc:
+                logger.warning(f"Skipping invalid regex '{term}': {exc}")
+                compiled_patterns[term] = None
+        return compiled_patterns[term]
 
     for term in search_terms:
-        # Step 1: Find candidate lines using the keyword index.
-        # Extract simple, indexable words from the user's regex term.
-        candidate_words = extract_keywords(term)
-
-        # This will hold all potential lines to check, keyed by hostname (UPPERCASE).
-        # Using a set for line numbers prevents duplicate checks.
+        candidate_words = extract_keywords(term, preserve_stopwords=True)
         candidate_lines_by_host: Dict[str, Set[int]] = defaultdict(set)
-
-        # If the regex has no simple words (e.g., "^\s*$"), we can't use the index.
-        if not candidate_words:
-            logger.warning(f"Regex '{term}' contains no indexable keywords. A full scan would be needed (cached search skipped for this term).")
+        pattern = get_compiled(term)
+        if pattern is None:
             continue
 
         for word in candidate_words:
-            # Looking up all keys which start with the search term
             matching_keys = [key for key in all_cache_keywords if key.startswith(word.lower())]
 
-            # Keys in kw_idx should be lowercase if your indexing is correct.
             for key in matching_keys:
                 word_entry = kw_idx.get(key)
                 if isinstance(word_entry, dict):
                     for hostname, lines in word_entry.items():
                         candidate_lines_by_host[hostname.upper()].update(lines)
 
-        # If no candidate lines were found for any of the words, move to the next search term.
-        if not candidate_lines_by_host:
-            continue
+        term_has_results = False
 
-        # Step 2: Perform the full regex search only on the candidate lines.
-        for hostname, line_numbers in candidate_lines_by_host.items():
+        if candidate_lines_by_host:
+            for hostname, line_numbers in candidate_lines_by_host.items():
+                device_info = dev_idx.get(hostname.upper())
+                if not isinstance(device_info, dict):
+                    continue
 
-            device_info = dev_idx.get(hostname.upper())  # Ensure lookup is also uppercase
-            if not isinstance(device_info, dict):
-                continue
+                fname = build_config_path(
+                    ctx,
+                    hostname,
+                    device_info.get('region', ''),
+                    device_info.get('vendor', ''),
+                    device_info.get('type', ''),
+                )
+                if not fname:
+                    logger.warning(f"Unable to read configuration file for {hostname}. Cache entry invalid.")
+                    continue
 
-            fname = build_config_path(ctx, hostname, device_info.get('region', ''), device_info.get('vendor', ''), device_info.get('type', ''))
-            if not fname:
-                logger.warning(f"Unable to read configuration file for {hostname}. Cache entry invalid.")
-                continue
+                try:
+                    with open(fname, "r", encoding="utf-8") as f:
+                        full_config_lines = f.readlines()
+                except (IOError, OSError) as e:
+                    logger.error(f"Could not read config for {hostname}: {e}")
+                    continue
 
-            try:
-                # Read the entire file into memory once per file.
-                with open(fname, "r", encoding="utf-8") as f:
-                    full_config_lines = f.readlines()
-
-                # Check only the specific lines we found in the index.
                 for line_num in sorted(list(line_numbers)):
                     if 0 <= line_num < len(full_config_lines):
                         line_content = full_config_lines[line_num]
-
-                        # THE CRITICAL STEP: The expensive regex search is performed here.
-                        if re.search(term, line_content, re.IGNORECASE):
-                            # It's a true match, so add it to the results.
+                        if pattern.search(line_content):
+                            row_key = (hostname.upper(), line_num, line_content.strip())
+                            if row_key in seen_rows:
+                                continue
                             data_to_save.append([
                                 search_input,
                                 hostname.upper(),
                                 line_num,
                                 line_content.strip(),
-                                ''  # Placeholder for filename consistency
+                                str(fname),
                             ])
-            except (IOError, OSError) as e:
-                logger.error(f"Could not read config for {hostname}: {e}")
+                            seen_rows.add(row_key)
+                            term_has_results = True
 
-    return data_to_save
+        # Collect IP hints to reuse subnet index later.
+        literal_ips = extract_literal_ips(term)
+        if literal_ips:
+            aggregated_ip_hints.update(literal_ips)
+
+        if not term_has_results:
+            missing_terms.append(term)
+
+    # Attempt IP-based fallback if keyword index was insufficient.
+    if aggregated_ip_hints:
+        ip_networks: List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]] = []
+        for ip_text in aggregated_ip_hints:
+            try:
+                ip_obj = ipaddress.ip_address(ip_text)
+            except ValueError:
+                continue
+
+            mask = 32 if isinstance(ip_obj, ipaddress.IPv4Address) else 128
+            try:
+                ip_net = ipaddress.ip_network(f"{ip_text}/{mask}", strict=False)
+            except ValueError:
+                continue
+            ip_networks.append(ip_net)
+
+        if ip_networks:
+            logger.info("Cache search fallback: consulting IP index for %d literal IPs", len(ip_networks))
+            subnet_data, subnet_matches = search_cache_subnets(ctx, ip_networks, search_input)
+            matched_nets.update(subnet_matches)
+
+            for row in subnet_data:
+                row_key = (row[1], row[2], row[3])
+                if row_key in seen_rows:
+                    continue
+
+                line_text = row[3]
+                if not any(pattern and pattern.search(line_text) for pattern in compiled_patterns.values()):
+                    continue
+
+                if not row[4]:
+                    device_info = dev_idx.get(row[1], {})
+                    fname = build_config_path(
+                        ctx,
+                        row[1],
+                        device_info.get('region', ''),
+                        device_info.get('vendor', ''),
+                        device_info.get('type', ''),
+                    )
+                    if fname:
+                        row[4] = str(fname)
+
+                data_to_save.append(row)
+                seen_rows.add(row_key)
+
+    # Remove missing terms that already found matches via IP fallback.
+    if missing_terms and data_to_save:
+        still_missing: List[str] = []
+        for term in missing_terms:
+            pattern = compiled_patterns.get(term)
+            if not pattern:
+                continue
+
+            if not any(pattern.search(row[3]) for row in data_to_save):
+                still_missing.append(term)
+
+        missing_terms = still_missing
+
+    # Final slow-path fallback: direct regex scan over cached files.
+    if missing_terms:
+        logger.info("Cache search fallback: running bounded regex scan for %d terms", len(missing_terms))
+        slow_rows = _slow_regex_scan(ctx, search_input, missing_terms, seen_rows)
+        data_to_save.extend(slow_rows)
+
+    return data_to_save, matched_nets
+
+
+def _slow_regex_scan(
+    ctx: ScriptContext,
+    search_input: str,
+    terms: List[str],
+    seen_rows: Set[Tuple[str, int, str]],
+) -> List[List[Any]]:
+    """
+    Last-resort fallback for cached searches: iterate configs on disk and evaluate
+    the regex terms directly. This path should be rare and is intentionally verbose in logging.
+    """
+    logger = ctx.logger
+    cache = ctx.cache
+
+    if not isinstance(cache, CacheManager):
+        return []
+
+    compiled_terms: List[Tuple[str, re.Pattern]] = []
+    for term in terms:
+        try:
+            compiled_terms.append((term, re.compile(term, re.IGNORECASE)))
+        except re.error as exc:
+            logger.warning(f"Skipping invalid regex '{term}' in slow fallback: {exc}")
+
+    if not compiled_terms:
+        return []
+
+    results: List[List[Any]] = []
+    dev_idx = cache.dev_idx
+
+    for hostname, device_info in dev_idx.items():
+        if not isinstance(device_info, dict):
+            continue
+
+        fname = build_config_path(
+            ctx,
+            hostname,
+            device_info.get('region', ''),
+            device_info.get('vendor', ''),
+            device_info.get('type', ''),
+        )
+        if not fname:
+            continue
+
+        vendor = str(device_info.get('vendor', '')).lower()
+        vendor_stopwords = stop_words.get(vendor, ())
+
+        try:
+            with open(fname, "r", encoding="utf-8", errors="ignore") as f:
+                for line_num, line in enumerate(f):
+                    line_strip = line.strip()
+                    if vendor_stopwords and line_strip.startswith(vendor_stopwords):
+                        continue
+
+                    for term, pattern in compiled_terms:
+                        if pattern.search(line):
+                            row_key = (hostname.upper(), line_num, line_strip)
+                            if row_key in seen_rows:
+                                break
+                            results.append([
+                                search_input,
+                                hostname.upper(),
+                                line_num,
+                                line_strip,
+                                str(fname),
+                            ])
+                            seen_rows.add(row_key)
+                            break
+        except (IOError, OSError) as exc:
+            logger.error(f"Slow fallback failed for {hostname}: {exc}")
+
+    return results
 
 
 def search_cache_subnets(
@@ -518,7 +672,7 @@ def search_cache_subnets(
     if not nets or not ip_idx or not dev_idx:
         return data_to_save, matched_nets
 
-    rows_to_save: Dict[str, Dict[int, str]] = defaultdict(dict)
+    rows_to_save: Dict[str, Dict[int, Tuple[str, str]]] = defaultdict(dict)
 
     for net in nets:
         for ip_obj in net:
@@ -542,7 +696,7 @@ def search_cache_subnets(
                                     try:
                                         idx = int(line_num)
                                         if 0 <= idx < len(all_lines):
-                                            rows_to_save[hostname.upper()][line_num] = all_lines[line_num].strip()
+                                            rows_to_save[hostname.upper()][line_num] = (all_lines[line_num].strip(), str(fname))
                                     except (ValueError, IndexError):
                                         # Log bad line number from cache if needed
                                         pass
@@ -552,7 +706,7 @@ def search_cache_subnets(
                 matched_nets.add(net)
 
     for hostname, indices in sorted(rows_to_save.items()):
-        for index, line in sorted(indices.items()):
-            data_to_save.append([search_input, hostname.upper(), index, line, ""])
+        for index, (line, path) in sorted(indices.items()):
+            data_to_save.append([search_input, hostname.upper(), index, line, path])
 
     return data_to_save, matched_nets
