@@ -74,8 +74,10 @@ def cache_writer(
     to diskcache in batches to keep memory usage low.
     """
     logger = ctx.logger
-    BATCH_SIZE = 500  # Tunable: process 500 files before writing to disk
+    BATCH_SIZE = 400  # Tunable: smoother progress with moderate overhead
     processed_count = 0
+    last_update_ts = time()
+    fatal_error = False
 
     while processed_count < total_files:
         # 1. Collect a batch of results from the queue
@@ -109,25 +111,53 @@ def cache_writer(
                 batch_kw_updates[kw][host].extend(lines)
 
         # 3. Write this batch to diskcache using the efficient read-modify-write
-        try:
-            with ip_idx.transact(), kw_idx.transact(), dev_idx.transact(), rev_idx.transact():
-                dev_idx.update(batch_dev_updates)
-                rev_idx.update(batch_rev_updates)
+        if not fatal_error:
+            try:
+                with ip_idx.transact(), kw_idx.transact(), dev_idx.transact(), rev_idx.transact():
+                    dev_idx.update(batch_dev_updates)
+                    rev_idx.update(batch_rev_updates)
 
-                for ip, new_host_dict in batch_ip_updates.items():
-                    current_ip_entry = ip_idx.get(ip, {})
-                    current_ip_entry.update(new_host_dict)
-                    ip_idx[ip] = current_ip_entry
+                    for ip, new_host_dict in batch_ip_updates.items():
+                        current_ip_entry = ip_idx.get(ip, {})
+                        current_ip_entry.update(new_host_dict)
+                        ip_idx[ip] = current_ip_entry
 
-                for kw, new_host_dict in batch_kw_updates.items():
-                    current_kw_entry = kw_idx.get(kw, {})
-                    current_kw_entry.update(new_host_dict)
-                    kw_idx[kw] = current_kw_entry
-        except Exception as e:
-            logger.error(f"FATAL error during cache batch write: {e}")
+                    for kw, new_host_dict in batch_kw_updates.items():
+                        current_kw_entry = kw_idx.get(kw, {})
+                        current_kw_entry.update(new_host_dict)
+                        kw_idx[kw] = current_kw_entry
+            except Exception as e:
+                fatal_error = True
+                logger.error(f"FATAL error during cache batch write: {e}")
+                # Signal the error to the UI via cache (and cfg as fallback)
+                try:
+                    msg = str(e)
+                    err = "disk_full" if 'No space left' in msg or 'ENOSPC' in msg else "io_error"
+                    ctx.cache.dc.set("indexing_error", f"{err}: {msg}")
+                    ctx.cache.dc.set("indexing_error_time", int(time()))
+                    ctx.cache.dc.set("indexing_phase", "error")
+                except Exception:
+                    try:
+                        ctx.cfg["indexing_error"] = f"io_error: {e}"
+                    except Exception:
+                        pass
 
         processed_count += len(batch_results)
         logger.info(f"Index Cache - {processed_count}/{total_files} files written to cache...")
+
+        # Publish progress so the main menu can show live status
+        try:
+            if ctx.cache and ctx.cache.dc:
+                if not fatal_error:
+                    ctx.cache.dc.set("indexing_phase", "indexing")
+                ctx.cache.dc.set("indexing_total", int(total_files))
+                ctx.cache.dc.set("indexing_done", int(processed_count))
+                now = time()
+                ctx.cache.dc.set("indexing_last_update", int(now))
+                last_update_ts = now
+        except Exception:
+            # Never allow telemetry to break indexing
+            pass
 
 
 def mt_index_configurations(ctx: ScriptContext) -> None:
@@ -143,6 +173,18 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
 
     start = perf_counter()
     cache.dc.set("indexing", True, expire=120)
+    try:
+        cache.dc.set("indexing_started", int(time()))
+        cache.dc.set("indexing_phase", "checking")
+        cache.dc.pop("checking_total", None)
+        cache.dc.pop("checking_done", None)
+        cache.dc.pop("cleaning_total", None)
+        cache.dc.pop("cleaning_done", None)
+        cache.dc.pop("indexing_total", None)
+        cache.dc.pop("indexing_done", None)
+        cache.dc.pop("indexing_last_update", None)
+    except Exception:
+        pass
 
     # 1. Get the current state from disk
     all_disk_files: Dict[str, Path] = {}
@@ -176,8 +218,14 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
 
     logger.info("Checking existing files for content changes...")
     files_reindexed_count = 0
+    try:
+        cache.dc.set("checking_total", int(len(potentially_updated_files)))
+        cache.dc.set("checking_done", 0)
+        cache.dc.set("indexing_last_update", int(time()))
+    except Exception:
+        pass
 
-    for hostname in potentially_updated_files:
+    for idx, hostname in enumerate(potentially_updated_files, start=1):
         file_path = all_disk_files[hostname]
         cached_device_info = dev_idx.get(hostname)  # Use .get()
 
@@ -208,7 +256,19 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
                 files_to_reindex.append(file_path)
                 files_reindexed_count += 1
 
+        if idx % 500 == 0:
+            try:
+                cache.dc.set("checking_done", int(idx))
+                cache.dc.set("indexing_last_update", int(time()))
+            except Exception:
+                pass
+
     logger.info(f"Finished checking files. Found {files_reindexed_count} files that need re-indexing.")
+    try:
+        cache.dc.set("checking_done", int(len(potentially_updated_files)))
+        cache.dc.set("indexing_last_update", int(time()))
+    except Exception:
+        pass
 
     # We need a unified list of all hosts whose entries need to be cleaned
     hosts_to_clean = set(deleted_files)
@@ -219,6 +279,13 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     # 4. Clean all obsolete entries using the reverse index
     if hosts_to_clean:
         logger.info(f"Cleaning {len(hosts_to_clean)} obsolete/updated host entries from indexes...")
+        try:
+            cache.dc.set("indexing_phase", "cleaning")
+            cache.dc.set("cleaning_total", int(len(hosts_to_clean)))
+            cache.dc.set("cleaning_done", 0)
+            cache.dc.set("indexing_last_update", int(time()))
+        except Exception:
+            pass
 
         # Step 1: Identify all IP/Keyword keys we need to modify.
         ips_to_modify = set()
@@ -281,13 +348,29 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
                     kw_idx[kw_key] = modified_entry
 
         logger.info("Cleaning complete.")
+        try:
+            cache.dc.set("cleaning_done", int(len(hosts_to_clean)))
+            cache.dc.set("indexing_last_update", int(time()))
+        except Exception:
+            pass
 
     # 5. Handle Additions/Updates
     logger.info(f"Index Cache - Found {len(files_to_reindex)} new or updated files. Indexing...")
     if not files_to_reindex:
         logger.info("Index Cache - No configuration changes detected.")
-        cache.dc.pop("indexing", None)
-        cache.dc.set("updated", int(time()))
+        try:
+            cache.dc.pop("indexing", None)
+            cache.dc.pop("indexing_phase", None)
+            cache.dc.pop("checking_total", None)
+            cache.dc.pop("checking_done", None)
+            cache.dc.pop("cleaning_total", None)
+            cache.dc.pop("cleaning_done", None)
+            cache.dc.pop("indexing_total", None)
+            cache.dc.pop("indexing_done", None)
+            cache.dc.pop("indexing_last_update", None)
+            cache.dc.set("updated", int(time()))
+        except Exception:
+            pass
         return
 
     # Create a thread-safe queue to hold results from worker threads
@@ -295,6 +378,14 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     write_queue = queue.Queue(maxsize=1000)
 
     # Start the consumer thread (the cache writer)
+    try:
+        cache.dc.set("indexing_phase", "indexing")
+        cache.dc.set("indexing_total", int(len(files_to_reindex)))
+        cache.dc.set("indexing_done", 0)
+        cache.dc.set("indexing_last_update", int(time()))
+    except Exception:
+        pass
+
     writer_thread = threading.Thread(
         target=cache_writer,
         args=(ctx, write_queue, cache.ip_idx, cache.kw_idx, cache.dev_idx, cache.rev_idx, len(files_to_reindex))
@@ -310,14 +401,36 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     # Wait for the writer thread to finish processing all items from the queue
     writer_thread.join()
 
+    # If a fatal error occurred, mark indexing as finished with error and avoid marking cache updated
+    fatal = False
+    try:
+        fatal = bool(cache.dc.get("indexing_error"))
+    except Exception:
+        fatal = bool(ctx.cfg.get("indexing_error", False))
+
     logger.info("Disk cache update complete.")
 
     end = perf_counter()
-    cache.dc.set("updated", int(time()))
-    if cache.dc.get("version", 0) != ctx.cfg["cache_version"]:
-        cache.dc.set("version", ctx.cfg["cache_version"])
+    if not fatal:
+        cache.dc.set("updated", int(time()))
+        if cache.dc.get("version", 0) != ctx.cfg["cache_version"]:
+            cache.dc.set("version", ctx.cfg["cache_version"])
 
-    cache.dc.pop("indexing", None)
+    try:
+        cache.dc.pop("indexing", None)
+        if not fatal:
+            cache.dc.pop("indexing_phase", None)
+        cache.dc.pop("checking_total", None)
+        cache.dc.pop("checking_done", None)
+        cache.dc.pop("cleaning_total", None)
+        cache.dc.pop("cleaning_done", None)
+        cache.dc.pop("indexing_total", None)
+        cache.dc.pop("indexing_done", None)
+        cache.dc.pop("indexing_last_update", None)
+        if fatal:
+            cache.dc.set("indexing_phase", "error")
+    except Exception:
+        pass
     logger.info(f"Index Cache - Update took {round(end - start, 3)} seconds")
 
 

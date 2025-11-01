@@ -43,7 +43,8 @@ from utils.config import BASE_CONFIG_SCHEMA, read_config, setup_from_args
 from utils.display import console, get_global_color_scheme, set_global_color_scheme
 from utils.file_io import start_worker, check_dir_accessibility
 from utils.logging import configure_logging
-from utils.user_input import read_user_input
+from utils.user_input import read_user_input, read_user_input_live
+from utils.cache_status import build_cache_status_line
 from core.background import start_background_tasks
 
 # Fix MAC address emoji issue
@@ -53,7 +54,7 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.48 hash c67304e'
+VERSION = '0.2.49 hash 8207f82'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -287,12 +288,17 @@ Please send any feedback/feature requests to evdanil@gmail.com
                 header_printed = True
             menu_lines.extend(section_lines)
 
-    menu = "\n".join(menu_lines)
+    base_menu = "\n".join(menu_lines)
 
     while True:
+        # Live-rendered menu with dynamic cache status and non-blocking input
+        # Ensure clean screen before first Live render in each loop iteration
         ctx.console.clear()
-        ctx.console.print(menu)
-        choice = read_user_input(ctx, "\nEnter your choice: ")
+        def _render_menu() -> str:
+            status_line = build_cache_status_line(ctx)
+            return f"{status_line}\n\n{base_menu}"
+
+        choice = read_user_input_live(ctx, _render_menu, interval=1.0).strip()
 
         # '0' is now handled by the menu structure, but we still need the exit logic
         if choice == '' or choice == '0':
@@ -306,6 +312,17 @@ Please send any feedback/feature requests to evdanil@gmail.com
                 ctx.console.print(f"[{colors['error']}]This feature is currently disabled.[/]")
                 time.sleep(2)
             else:
+                # Warn if a config-repo-dependent module runs while indexing
+                requires_repo = getattr(module_to_run, 'requires_config_repo', False)
+                try:
+                    indexing_active = bool(ctx.cache and ctx.cache.dc and ctx.cache.dc.get("indexing", False))
+                except Exception:
+                    indexing_active = False
+                if requires_repo and indexing_active:
+                    ctx.console.print(f"[{colors['warning']}]Configuration repository is being indexed. Live search is available but slower.[/]")
+                    proceed = read_user_input(ctx, f"[{colors['warning']}]Proceed anyway? (y/N): [/] ").strip().lower()
+                    if proceed != 'y':
+                        continue
                 module_to_run.run(ctx)
         else:
             ctx.console.print(f"[{colors['error']}]Invalid choice. Please try again.[/]")

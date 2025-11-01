@@ -13,6 +13,9 @@ def exit_now(ctx: ScriptContext, exit_code: int = 0, message: str = '') -> None:
     logger = ctx.logger
     cache = ctx.cache
 
+    # Mark exiting early so any final UI render indicates graceful shutdown
+    ctx.cfg["exiting"] = True
+
     if worker_thread and worker_thread.is_alive():
         logger.info("Waiting for background save operations to complete...")
         if exit_code == 0:

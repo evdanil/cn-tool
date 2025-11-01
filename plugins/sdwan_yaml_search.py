@@ -346,3 +346,18 @@ class SDWANYamlSearchPlugin(BasePlugin):
 
     def register(self, module: BaseModule) -> None:
         module.register_hook("process_data", self._search_yaml_repo)
+
+    # ---- Introspection helpers for status line ----
+    @property
+    def device_count(self) -> int:
+        """Approximate number of devices represented by loaded YAML files (unique stems)."""
+        with self._lock:
+            try:
+                from pathlib import Path as _Path
+                return len({ _Path(fn).stem.upper() for fn in self._yaml_data.keys() })
+            except Exception:
+                return len(self._yaml_data)
+
+    @property
+    def is_ready(self) -> bool:
+        return self._is_ready.is_set()
