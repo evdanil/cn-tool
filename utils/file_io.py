@@ -26,6 +26,8 @@ def worker() -> None:
     while True:
         save_task = save_queue.get()
         if save_task is None:  # Sentinel value to stop the worker
+            # Mark this task as done to keep queue counters consistent
+            save_queue.task_done()
             break
 
         if file_is_corrupt:
@@ -66,6 +68,23 @@ def start_worker() -> None:
     if worker_thread is None or not worker_thread.is_alive():
         worker_thread = threading.Thread(target=worker, daemon=True)
         worker_thread.start()
+
+
+def stop_worker() -> None:
+    """
+    Stop the file saving thread (if running) and wait briefly for it to exit.
+    A fresh worker will be started automatically on the next queue_save() call.
+    """
+    global worker_thread
+    if worker_thread is not None and worker_thread.is_alive():
+        try:
+            # Enqueue sentinel to stop the worker after it drains pending tasks
+            save_queue.put(None)
+            worker_thread.join(timeout=2.0)
+        except Exception:
+            pass
+        finally:
+            worker_thread = None
 
 
 def queue_save(*args: Any, **kwargs: Any) -> None:
@@ -129,6 +148,9 @@ def clear_report(ctx: ScriptContext) -> None:
             filename.unlink()
             ctx.console.print(f"[{colors['info']}]Report {filename} deleted[/]")
             ctx.logger.info(f"Clear report - Deleted {filename}")
+            # Reset the background writer state so future saves resume normally
+            stop_worker()
+            start_worker()
         except OSError as e:
             ctx.console.print(f"[{colors['error']}]Error deleting report {filename}: {e}[/]")
             ctx.logger.error(f"Error deleting report {filename}: {e}")
