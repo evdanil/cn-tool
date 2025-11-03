@@ -54,7 +54,7 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.51 hash e0fdecc'
+VERSION = '0.2.52 hash d57dffa'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -298,8 +298,14 @@ Please send any feedback/feature requests to evdanil@gmail.com
             status_line = build_cache_status_line(ctx)
             return f"{status_line}\n\n{base_menu}"
 
-        # Refresh status every 1s regardless of cache state; input poll is 100ms
-        choice = read_user_input_live(ctx, _render_menu, interval=1.0).strip()
+        # Check if cache indexing is currently active
+        try:
+            indexing_active = bool(ctx.cache and ctx.cache.dc and ctx.cache.dc.get("indexing", False))
+        except Exception:
+            indexing_active = False
+
+        # Adaptive interval: 2.5s during indexing, 60s when idle (handled in read_user_input_live)
+        choice = read_user_input_live(ctx, _render_menu, indexing_active=indexing_active).strip()
 
         # '0' is now handled by the menu structure, but we still need the exit logic
         if choice == '' or choice == '0':
