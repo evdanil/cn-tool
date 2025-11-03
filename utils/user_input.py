@@ -90,7 +90,7 @@ def press_any_key(ctx: ScriptContext) -> None:
 def read_user_input_live(
     ctx: ScriptContext,
     render: Callable[[], str],
-    interval: float = 1.0,
+    interval: float = 10.0,
 ) -> str:
     """
     Live-updating menu with a keystroke-buffered prompt inside the Live area.
@@ -242,3 +242,4 @@ def read_user_input_live(
         exit_now(ctx, 1, "Interrupted by user... Exiting...")
         return ""
     return buffer.strip()
+
