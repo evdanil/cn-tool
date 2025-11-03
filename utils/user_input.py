@@ -90,20 +90,23 @@ def press_any_key(ctx: ScriptContext) -> None:
 def read_user_input_live(
     ctx: ScriptContext,
     render: Callable[[], str],
-    interval: float = 10.0,
+    indexing_active: bool = False,
 ) -> str:
     """
     Live-updating menu with a keystroke-buffered prompt inside the Live area.
     - Shows typed characters as you enter them.
     - Supports Backspace, Enter, and Esc to clear.
     - Keeps the status/menu refreshing until you press Enter.
-    """
-    def _compose_frame(header: str, buf: str) -> str:
-        colors = get_global_color_scheme(ctx.cfg)
-        status_menu = header
-        prompt_line = f"\n\n[{colors['description']}]Enter your choice:[/] {buf}"
-        return status_menu + prompt_line
 
+    Optimized to minimize CPU usage:
+    - Caches parsed Rich objects (avoids markup reparsing)
+    - Tracks state to detect real changes
+    - Uses minute-boundary detection for timestamp updates
+    - Adaptive refresh intervals (2.5s during indexing, 60s when idle)
+    """
+    from datetime import datetime
+
+    colors = get_global_color_scheme(ctx.cfg)
     buffer: str = ""
     is_windows = os.name == 'nt' or (sys.platform.startswith('win'))
 
@@ -125,31 +128,81 @@ def read_user_input_live(
     live_console = Console(theme=getattr(ctx.console, 'theme', None), force_terminal=True)
     got_kbint = False
     try:
-        # Initialize header and schedule next status refresh
+        # Initialize state tracking
         status_header = render().rstrip()
-        next_status_at = time.monotonic() + max(0.5, interval)
+        current_minute = datetime.now().minute
+
+        # State dict to track what changed
+        state = {
+            'status_header': status_header,
+            'buffer': buffer,
+            'minute': current_minute,
+            'was_indexing': indexing_active,  # Track indexing state changes
+        }
+
+        # Parse components once (cached Rich objects)
+        status_text = Text.from_markup(status_header)
+        prompt_text = Text.from_markup(f"\n\n[{colors['description']}]Enter your choice:[/] ")
+
+        # Compose initial frame from cached objects
+        initial_group = Group(status_text, prompt_text)
+
+        # Initial interval based on current indexing state
+        status_refresh_interval = 2.5 if indexing_active else 60.0
+        next_status_at = time.monotonic() + max(0.5, status_refresh_interval)
+
         # Base polling windows (used mainly on Windows path)
         poll_active = 0.10  # when user is actively typing (last 2s)
         poll_idle = 0.30    # relaxed polling when idle
         last_key_time: float = 0.0  # 0 => no recent typing
 
-        initial_frame = _compose_frame(status_header, buffer)
-        with Live(Text.from_markup(initial_frame), console=live_console, screen=True, refresh_per_second=1) as live:
-            last_frame = initial_frame
+        with Live(initial_group, console=live_console, screen=True, refresh_per_second=1) as live:
             while True:
-                # Periodically refresh the status/menu header
-                now = time.monotonic()
-                if now >= next_status_at:
-                    new_header = render().rstrip()
-                    if new_header != status_header:
-                        status_header = new_header
-                    next_status_at = now + max(0.5, interval)
+                # Check current indexing state dynamically (it can change mid-loop!)
+                try:
+                    current_indexing = bool(ctx.cache and ctx.cache.dc and ctx.cache.dc.get("indexing", False))
+                except Exception:
+                    current_indexing = False
 
-                # Build current frame and update only on change to avoid flicker
-                current_frame = _compose_frame(status_header, buffer)
-                if current_frame != last_frame:
-                    live.update(Text.from_markup(current_frame), refresh=True)
-                    last_frame = current_frame
+                # Recalculate interval based on CURRENT state
+                status_refresh_interval = 2.5 if current_indexing else 60.0
+
+                # Detect indexing state transition
+                if current_indexing != state.get('was_indexing', False):
+                    # State changed! Adjust next wakeup immediately
+                    state['was_indexing'] = current_indexing
+                    if current_indexing:
+                        # Just started indexing - wake up sooner
+                        next_status_at = time.monotonic() + 0.1  # Wake almost immediately
+                    else:
+                        # Indexing stopped - can relax
+                        next_status_at = time.monotonic() + status_refresh_interval
+
+                now = time.monotonic()
+                now_dt = datetime.now()
+                current_minute = now_dt.minute
+
+                # Check if we need to refresh status (interval elapsed OR minute changed)
+                status_needs_refresh = (now >= next_status_at) or (current_minute != state['minute'])
+
+                if status_needs_refresh:
+                    new_header = render().rstrip()
+                    if new_header != state['status_header']:
+                        state['status_header'] = new_header
+                        status_text = Text.from_markup(new_header)
+                    state['minute'] = current_minute
+                    # Use current dynamic interval
+                    next_status_at = now + max(0.5, status_refresh_interval)
+
+                # Check if buffer changed
+                buffer_changed = buffer != state['buffer']
+                if buffer_changed:
+                    state['buffer'] = buffer
+                    prompt_text = Text.from_markup(f"\n\n[{colors['description']}]Enter your choice:[/] {buffer}")
+
+                # Only update Live display if something actually changed
+                if status_needs_refresh or buffer_changed:
+                    live.update(Group(status_text, prompt_text), refresh=True)
 
                 try:
                     if is_windows and msvcrt:
@@ -174,17 +227,37 @@ def read_user_input_live(
                             buffer += ch
                             last_key_time = time.monotonic()
                         else:
-                            # Sleep until next status update, but cap to poll_interval to keep input responsive
+                            # Calculate optimal sleep: either next status update or next minute boundary
                             now2 = time.monotonic()
                             sleep_for = max(0.0, next_status_at - now2)
+
+                            # Also consider minute boundary for timestamp updates
+                            now_dt = datetime.now()
+                            seconds_until_next_minute = 60 - now_dt.second
+                            sleep_for = min(sleep_for, seconds_until_next_minute)
+
+                            # Cap at 2.5s max to detect indexing state changes within reasonable time
+                            sleep_for = min(sleep_for, 2.5)
+
                             # Adaptive polling based on recent typing activity (2s window)
                             typing_active = (last_key_time > 0.0) and ((now2 - last_key_time) < 2.0)
                             current_poll = poll_active if typing_active else poll_idle
                             time.sleep(min(current_poll, sleep_for))
                     else:
                         # POSIX: select on stdin
-                        # Block until either input arrives or it's time to refresh status
-                        timeout = max(0.0, next_status_at - time.monotonic())
+                        # Block until either input arrives, next status update, or next minute boundary
+                        now_mono = time.monotonic()
+                        timeout_status = max(0.0, next_status_at - now_mono)
+
+                        # Calculate seconds until next minute boundary for timestamp updates
+                        now_dt = datetime.now()
+                        seconds_until_next_minute = 60 - now_dt.second
+                        timeout = min(timeout_status, seconds_until_next_minute)
+
+                        # Cap at 2.5s max to detect indexing state changes within reasonable time
+                        # This ensures we loop back and check current_indexing at least every 2.5s
+                        timeout = min(timeout, 2.5)
+
                         r, _, _ = select.select([sys.stdin], [], [], timeout)
                         if r:
                             ch = sys.stdin.read(1)
