@@ -87,7 +87,11 @@ def press_any_key(ctx: ScriptContext) -> None:
     read_single_keypress(ctx)
 
 
-def read_user_input_live(ctx: ScriptContext, render: Callable[[], str], interval: float = 1.0) -> str:
+def read_user_input_live(
+    ctx: ScriptContext,
+    render: Callable[[], str],
+    interval: float = 1.0,
+) -> str:
     """
     Live-updating menu with a keystroke-buffered prompt inside the Live area.
     - Shows typed characters as you enter them.
@@ -124,10 +128,13 @@ def read_user_input_live(ctx: ScriptContext, render: Callable[[], str], interval
         # Initialize header and schedule next status refresh
         status_header = render().rstrip()
         next_status_at = time.monotonic() + max(0.5, interval)
-        poll_interval = 0.05
+        # Base polling windows (used mainly on Windows path)
+        poll_active = 0.10  # when user is actively typing (last 2s)
+        poll_idle = 0.30    # relaxed polling when idle
+        last_key_time: float = 0.0  # 0 => no recent typing
 
         initial_frame = _compose_frame(status_header, buffer)
-        with Live(Text.from_markup(initial_frame), console=live_console, screen=True, refresh_per_second=8) as live:
+        with Live(Text.from_markup(initial_frame), console=live_console, screen=True, refresh_per_second=1) as live:
             last_frame = initial_frame
             while True:
                 # Periodically refresh the status/menu header
@@ -157,23 +164,35 @@ def read_user_input_live(ctx: ScriptContext, render: Callable[[], str], interval
                                 return buffer.strip()
                             if ch == '\x08':  # Backspace
                                 buffer = buffer[:-1]
+                                last_key_time = time.monotonic()
                                 continue
                             if ch == '\x1b':  # ESC clears buffer
                                 buffer = ""
+                                last_key_time = time.monotonic()
                                 continue
                             # Printable char
                             buffer += ch
+                            last_key_time = time.monotonic()
                         else:
-                            time.sleep(poll_interval)
+                            # Sleep until next status update, but cap to poll_interval to keep input responsive
+                            now2 = time.monotonic()
+                            sleep_for = max(0.0, next_status_at - now2)
+                            # Adaptive polling based on recent typing activity (2s window)
+                            typing_active = (last_key_time > 0.0) and ((now2 - last_key_time) < 2.0)
+                            current_poll = poll_active if typing_active else poll_idle
+                            time.sleep(min(current_poll, sleep_for))
                     else:
                         # POSIX: select on stdin
-                        r, _, _ = select.select([sys.stdin], [], [], poll_interval)
+                        # Block until either input arrives or it's time to refresh status
+                        timeout = max(0.0, next_status_at - time.monotonic())
+                        r, _, _ = select.select([sys.stdin], [], [], timeout)
                         if r:
                             ch = sys.stdin.read(1)
                             if ch in ('\r', '\n'):
                                 return buffer.strip()
                             if ch in ('\x7f', '\b', '\x08'):  # Backspace variants
                                 buffer = buffer[:-1]
+                                last_key_time = time.monotonic()
                                 continue
                             if ch == '\x1b':
                                 # Try to consume the rest of an escape sequence non-blocking
@@ -183,13 +202,13 @@ def read_user_input_live(ctx: ScriptContext, render: Callable[[], str], interval
                                     _ = sys.stdin.read(2)  # likely '[' + code
                                 else:
                                     buffer = ""  # lone ESC clears
+                                last_key_time = time.monotonic()
                                 continue
                             # Otherwise append printable characters
                             if ch.isprintable():
                                 buffer += ch
-                        else:
-                            # No input; small sleep to throttle loop
-                            time.sleep(poll_interval)
+                                last_key_time = time.monotonic()
+                        # else: timeout reached; loop will refresh status on next iteration
                 except EOFError:
                     # CTRL-D or similar: treat as empty submit
                     return buffer.strip()

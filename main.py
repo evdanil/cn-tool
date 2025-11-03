@@ -54,7 +54,7 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.49 hash 8207f82'
+VERSION = '0.2.50 hash d1cdfc7'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -298,6 +298,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
             status_line = build_cache_status_line(ctx)
             return f"{status_line}\n\n{base_menu}"
 
+        # Refresh status every 1s regardless of cache state; input poll is 100ms
         choice = read_user_input_live(ctx, _render_menu, interval=1.0).strip()
 
         # '0' is now handled by the menu structure, but we still need the exit logic

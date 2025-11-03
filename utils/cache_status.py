@@ -168,3 +168,4 @@ def build_cache_status_line(ctx: ScriptContext) -> str:
         f"[{colors['success']}]Ready[/] "
         f"Total Devices: [{colors['success']}]{total_devices}[/]" + suffix
     )
+    
