@@ -78,6 +78,7 @@ def cache_writer(
     processed_count = 0
     last_update_ts = time()
     fatal_error = False
+    event_bus = getattr(ctx, "event_bus", None)
 
     while processed_count < total_files:
         # 1. Collect a batch of results from the queue
@@ -141,6 +142,15 @@ def cache_writer(
                         ctx.cfg["indexing_error"] = f"io_error: {e}"
                     except Exception:
                         pass
+                if event_bus:
+                    event_bus.publish(
+                        "status:update",
+                        {
+                            "component": "cache",
+                            "state": "error",
+                            "error": str(e),
+                        },
+                    )
 
         processed_count += len(batch_results)
         logger.info(f"Index Cache - {processed_count}/{total_files} files written to cache...")
@@ -155,6 +165,17 @@ def cache_writer(
                 now = time()
                 ctx.cache.dc.set("indexing_last_update", int(now))
                 last_update_ts = now
+                if event_bus and not fatal_error:
+                    event_bus.publish(
+                        "status:update",
+                        {
+                            "component": "cache",
+                            "state": "indexing",
+                            "phase": ctx.cache.dc.get("indexing_phase", "indexing") if ctx.cache else "indexing",
+                            "done": processed_count,
+                            "total": total_files,
+                        },
+                    )
         except Exception:
             # Never allow telemetry to break indexing
             pass
@@ -167,6 +188,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     """
     logger = ctx.logger
     cache: Union[CacheManager, None] = ctx.cache
+    event_bus = getattr(ctx, "event_bus", None)
 
     if not cache:
         return
@@ -185,6 +207,11 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         cache.dc.pop("indexing_last_update", None)
     except Exception:
         pass
+    if event_bus:
+        event_bus.publish(
+            "status:update",
+            {"component": "cache", "state": "indexing", "phase": "checking"},
+        )
 
     # 1. Get the current state from disk
     all_disk_files: Dict[str, Path] = {}
@@ -286,6 +313,16 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             cache.dc.set("indexing_last_update", int(time()))
         except Exception:
             pass
+        if event_bus:
+            event_bus.publish(
+                "status:update",
+                {
+                    "component": "cache",
+                    "state": "indexing",
+                    "phase": "cleaning",
+                    "total": len(hosts_to_clean),
+                },
+            )
 
         # Step 1: Identify all IP/Keyword keys we need to modify.
         ips_to_modify = set()
@@ -353,6 +390,17 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             cache.dc.set("indexing_last_update", int(time()))
         except Exception:
             pass
+        if event_bus:
+            event_bus.publish(
+                "status:update",
+                {
+                    "component": "cache",
+                    "state": "indexing",
+                    "phase": "cleaning",
+                    "done": len(hosts_to_clean),
+                    "total": len(hosts_to_clean),
+                },
+            )
 
     # 5. Handle Additions/Updates
     logger.info(f"Index Cache - Found {len(files_to_reindex)} new or updated files. Indexing...")
@@ -371,6 +419,11 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             cache.dc.set("updated", int(time()))
         except Exception:
             pass
+        if event_bus:
+            event_bus.publish(
+                "status:update",
+                {"component": "cache", "state": "ready"},
+            )
         return
 
     # Create a thread-safe queue to hold results from worker threads
@@ -431,6 +484,17 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             cache.dc.set("indexing_phase", "error")
     except Exception:
         pass
+    if event_bus:
+        if fatal:
+            event_bus.publish(
+                "status:update",
+                {"component": "cache", "state": "error"},
+            )
+        else:
+            event_bus.publish(
+                "status:update",
+                {"component": "cache", "state": "ready"},
+            )
     logger.info(f"Index Cache - Update took {round(end - start, 3)} seconds")
 
 

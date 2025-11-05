@@ -2,6 +2,7 @@ import termios
 import sys
 import tty
 from typing import Optional, Callable
+import threading
 from core.base import ScriptContext
 from utils.app_lifecycle import exit_now
 from utils.display import get_global_color_scheme
@@ -91,6 +92,7 @@ def read_user_input_live(
     ctx: ScriptContext,
     render: Callable[[], str],
     indexing_active: bool = False,
+    refresh_signal: Optional[threading.Event] = None,
 ) -> str:
     """
     Live-updating menu with a keystroke-buffered prompt inside the Live area.
@@ -103,6 +105,9 @@ def read_user_input_live(
     - Tracks state to detect real changes
     - Uses minute-boundary detection for timestamp updates
     - Adaptive refresh intervals (2.5s during indexing, 60s when idle)
+
+    refresh_signal allows external events to trigger an immediate refresh
+    without waiting for the next scheduled interval.
     """
     from datetime import datetime
 
@@ -182,8 +187,13 @@ def read_user_input_live(
                 now_dt = datetime.now()
                 current_minute = now_dt.minute
 
+                forced_refresh = False
+                if refresh_signal is not None and refresh_signal.is_set():
+                    forced_refresh = True
+                    refresh_signal.clear()
+
                 # Check if we need to refresh status (interval elapsed OR minute changed)
-                status_needs_refresh = (now >= next_status_at) or (current_minute != state['minute'])
+                status_needs_refresh = forced_refresh or (now >= next_status_at) or (current_minute != state['minute'])
 
                 if status_needs_refresh:
                     new_header = render().rstrip()
