@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from core.base import ScriptContext
 import threading
 import pandas as pd
+import time
 
 from utils.display import get_global_color_scheme
 
@@ -16,11 +17,65 @@ save_queue: Queue[Dict[str, Any]] = Queue()
 save_lock = threading.Lock()
 worker_thread: Optional[threading.Thread] = None
 
+# Track how many save operations are currently pending so UI can
+# reflect "Generating" until the queue is drained.
+_pending_lock = threading.Lock()
+_pending_saves: int = 0
+
+
+def _lock_path_for(report_path: Path) -> Path:
+    """Return a filesystem lock path for the given report file."""
+    # Put lock next to the report to keep scope intuitive
+    return report_path.with_suffix(report_path.suffix + ".lock")
+
+
+def _acquire_report_lock(report_path: Path, *, timeout: float = 15.0, poll: float = 0.1, logger: Optional[logging.Logger] = None) -> tuple[Optional[int], Optional[Path]]:
+    """Attempt to acquire a cross-process lock for the report file.
+
+    Uses atomic lock-file creation. Returns (fd, lock_path) on success, (None, None) on timeout.
+    Caller must ensure release via _release_report_lock.
+    """
+    lock_path = _lock_path_for(report_path)
+    start = time.monotonic()
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+            # Optionally write PID for debug/ops visibility
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            except Exception:
+                pass
+            return fd, lock_path
+        except FileExistsError:
+            if time.monotonic() - start >= timeout:
+                if logger:
+                    logger.warning(f"Report lock timeout: unable to acquire lock {lock_path}")
+                return None, None
+            time.sleep(poll)
+        except Exception:
+            # On unexpected errors, do not spin forever
+            return None, None
+
+
+def _release_report_lock(fd: Optional[int], lock_path: Optional[Path]) -> None:
+    """Release cross-process lock by closing and removing the lock file."""
+    try:
+        if fd is not None:
+            os.close(fd)
+    except Exception:
+        pass
+    try:
+        if lock_path is not None:
+            os.unlink(str(lock_path))
+    except Exception:
+        pass
+
 
 def worker() -> None:
     """
     Thread waiting for data to get saved in a report file.
     """
+    global _pending_saves
     file_is_corrupt = False
 
     while True:
@@ -31,24 +86,76 @@ def worker() -> None:
             break
 
         if file_is_corrupt:
-            save_queue.task_done()
-            continue
+            # Even if file is corrupt, we must account for the queued task
+            # so the pending counter can drain and UI won't get stuck.
+            try:
+                ctx = None
+                if isinstance(save_task, dict) and save_task.get('args'):
+                    ctx = save_task['args'][0]
+            except Exception:
+                ctx = None
+            finally:
+                with _pending_lock:
+                    _pending_saves = max(0, _pending_saves - 1)
+                save_queue.task_done()
+                continue
 
         ctx = None  # Initialize ctx to None
+        lock_fd: Optional[int] = None
+        lock_fp: Optional[Path] = None
         try:
             if save_task['args']:
                 ctx = save_task['args'][0]
+
+            # Acquire cross-process report lock to guard Excel writes
+            report_path = None
+            if ctx and isinstance(ctx, ScriptContext):
+                report_path = ctx.cfg.get("report_file")
+                if isinstance(report_path, (str, Path)):
+                    report_path = Path(report_path).expanduser()
+            if isinstance(report_path, Path):
+                lock_fd, lock_fp = _acquire_report_lock(report_path, timeout=30.0, logger=getattr(ctx, "logger", None))
 
             with save_lock:
                 append_df_to_excel(*save_task['args'], **save_task['kwargs'])
 
         except zipfile.BadZipFile as e:
+            # Try to auto-repair by deleting the corrupted report and retrying once
+            repaired = False
             if ctx:
-                ctx.logger.error(f"Failed to write to the report file. It may be corrupt. Error: {e}")
-                ctx.console.print(
-                    "\n[bold red]Error:[/bold red] Could not update the report file. "
-                    "The file may be corrupt or unreadable. Please delete the report file.\n"
-                )
+                ctx.logger.error(f"Failed to write to the report file (likely corrupt): {e}")
+                # Ensure we have the same report_path and hold the lock
+                report_path = ctx.cfg.get("report_file") if ctx else None
+                if isinstance(report_path, (str, Path)):
+                    report_path = Path(report_path).expanduser()
+                if isinstance(report_path, Path):
+                    # If lock wasn't acquired before, try now (short wait)
+                    if lock_fd is None or lock_fp is None:
+                        lock_fd, lock_fp = _acquire_report_lock(report_path, timeout=10.0, logger=ctx.logger)
+                    try:
+                        if report_path.exists():
+                            ctx.logger.warning(f"Auto-repair: deleting corrupted report at {report_path}")
+                            os.unlink(str(report_path))
+                        # Retry write once after deletion
+                        with save_lock:
+                            append_df_to_excel(*save_task['args'], **save_task['kwargs'])
+                        repaired = True
+                        ctx.console.print("[yellow]Report file was corrupted and has been recreated automatically.[/yellow]")
+                        ctx.logger.info("Auto-repair successful: report recreated")
+                    except Exception as e2:
+                        ctx.logger.error(f"Auto-repair failed: {e2}")
+
+            if not repaired:
+                if ctx:
+                    ctx.console.print(
+                        "\n[bold red]Error:[/bold red] Could not update the report file. "
+                        "The file may be corrupt or unreadable. Please delete the report file.\n"
+                    )
+                    if getattr(ctx, "event_bus", None):
+                        ctx.event_bus.publish(
+                            "status:update",
+                            {"component": "report", "state": "error", "error": str(e)},
+                        )
                 file_is_corrupt = True
 
         except Exception as e:
@@ -57,7 +164,23 @@ def worker() -> None:
                 ctx.console.print(f"\n[bold red]Error:[/bold red] An unexpected error occurred while saving the file: {e}")
 
         finally:
-            save_queue.task_done()
+            # Decrement pending saves count and, if it drains to zero,
+            # announce completion (unless file is corrupt).
+            try:
+                with _pending_lock:
+                    _pending_saves = max(0, _pending_saves - 1)
+                    pending_now = _pending_saves
+            finally:
+                save_queue.task_done()
+                # Always release cross-process lock
+                _release_report_lock(lock_fd, lock_fp)
+            if pending_now == 0 and not file_is_corrupt and ctx and getattr(ctx, "event_bus", None):
+                report_path = ctx.cfg.get("report_file")
+                if report_path:
+                    ctx.event_bus.publish(
+                        "status:report_done",
+                        {"path": str(Path(report_path).expanduser())},
+                    )
 
 
 def start_worker() -> None:
@@ -91,7 +214,17 @@ def queue_save(*args: Any, **kwargs: Any) -> None:
     """
     Queing received data for saving thread to process
     """
+    global _pending_saves
     start_worker()
+    ctx = args[0] if args else None
+    first_pending = False
+    with _pending_lock:
+        first_pending = (_pending_saves == 0)
+        _pending_saves += 1
+    if first_pending and isinstance(ctx, ScriptContext) and getattr(ctx, "event_bus", None):
+        report_path = ctx.cfg.get("report_file")
+        payload = {"path": str(Path(report_path).expanduser())} if report_path else None
+        ctx.event_bus.publish("status:report_generating", payload)
     save_task = {
         'args': args,
         'kwargs': kwargs
@@ -104,6 +237,12 @@ def wait_for_all_saves() -> None:
     Waiting for all saving tasks to finish here
     """
     save_queue.join()
+
+
+def saves_in_progress() -> bool:
+    """Return True if there are report save operations still pending."""
+    with _pending_lock:
+        return _pending_saves > 0
 
 
 def check_file_accessibility(logger: logging.Logger, file_path: Path) -> bool:
@@ -145,17 +284,32 @@ def clear_report(ctx: ScriptContext) -> None:
     filename: Path = ctx.cfg["report_file"]
     if filename.exists():
         try:
-            filename.unlink()
+            # Acquire cross-process lock to safely delete
+            fd, lp = _acquire_report_lock(filename, timeout=10.0, logger=ctx.logger)
+            try:
+                filename.unlink()
+            finally:
+                _release_report_lock(fd, lp)
             ctx.console.print(f"[{colors['info']}]Report {filename} deleted[/]")
             ctx.logger.info(f"Clear report - Deleted {filename}")
             # Reset the background writer state so future saves resume normally
             stop_worker()
             start_worker()
+            if getattr(ctx, "event_bus", None):
+                ctx.event_bus.publish(
+                    "status:update",
+                    {"component": "report", "state": "deleted", "path": str(filename)},
+                )
         except OSError as e:
             ctx.console.print(f"[{colors['error']}]Error deleting report {filename}: {e}[/]")
             ctx.logger.error(f"Error deleting report {filename}: {e}")
     else:
         ctx.console.print(f"[{colors['info']}]Report {filename} does not exist.[/]")
+        if getattr(ctx, "event_bus", None):
+            ctx.event_bus.publish(
+                "status:update",
+                {"component": "report", "state": "deleted", "path": str(filename)},
+            )
 
 
 def append_df_to_excel(

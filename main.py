@@ -17,10 +17,13 @@ import configparser
 import logging
 import signal
 import argparse
+import threading
 import time
 import sys
+from datetime import datetime
 from pathlib import Path
 import warnings
+from typing import Any, Optional
 
 # This suppresses the specific CryptographyDeprecationWarning from paramiko
 # which can be noisy on some systems.
@@ -33,6 +36,7 @@ except ImportError:
 
 # --- Core Application Imports ---
 from core.base import ScriptContext
+from core.event_bus import EventBus
 from core.loader import load_modules_and_plugins
 
 # --- Utility Imports ---
@@ -54,7 +58,7 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.52 hash d57dffa'
+VERSION = '0.2.53 hash 0e17ae8'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -225,7 +229,17 @@ Please send any feedback/feature requests to evdanil@gmail.com
     if final_message:
         console.print(f"[bold]{final_message}[/]")
         time.sleep(5)
-    ctx = ScriptContext(cfg=cfg, logger=logger, console=console, cache=None, username='', password='', plugins=all_plugins)
+    event_bus = EventBus(logger)
+    ctx = ScriptContext(
+        cfg=cfg,
+        logger=logger,
+        console=console,
+        cache=None,
+        event_bus=event_bus,
+        username='',
+        password='',
+        plugins=all_plugins,
+    )
 
     username, password = get_auth_creds(ctx)
     if username and password:
@@ -290,54 +304,140 @@ Please send any feedback/feature requests to evdanil@gmail.com
 
     base_menu = "\n".join(menu_lines)
 
-    while True:
-        # Live-rendered menu with dynamic cache status and non-blocking input
-        # Ensure clean screen before first Live render in each loop iteration
-        ctx.console.clear()
-        def _render_menu() -> str:
-            status_line = build_cache_status_line(ctx)
-            return f"{status_line}\n\n{base_menu}"
+    status_refresh_event = threading.Event()
+    status_state_lock = threading.Lock()
+    status_state = {
+        "report_state": None,
+        "report_path": Path(ctx.cfg.get("report_file", "report.xlsx")),
+    }
+    # Initialize report status based on existing file, so the status shows on first render
+    try:
+        initial_report = status_state["report_path"].expanduser()
+        if initial_report.exists():
+            status_state["report_state"] = "completed"
+    except Exception:
+        pass
 
-        # Check if cache indexing is currently active
-        try:
-            indexing_active = bool(ctx.cache and ctx.cache.dc and ctx.cache.dc.get("indexing", False))
-        except Exception:
-            indexing_active = False
+    def _handle_status_update(payload: Optional[dict[str, Any]]) -> None:
+        if isinstance(payload, dict) and payload.get("component") == "report":
+            with status_state_lock:
+                if payload.get("state") == "deleted":
+                    status_state["report_state"] = None
+                elif payload.get("state") == "error":
+                    status_state["report_state"] = "error"
+        status_refresh_event.set()
 
-        # Adaptive interval: 2.5s during indexing, 60s when idle (handled in read_user_input_live)
-        choice = read_user_input_live(ctx, _render_menu, indexing_active=indexing_active).strip()
+    def _handle_report_generating(payload: Optional[dict[str, Any]]) -> None:
+        with status_state_lock:
+            status_state["report_state"] = "generating"
+            if isinstance(payload, dict) and payload.get("path"):
+                status_state["report_path"] = Path(payload["path"]).expanduser()
+        status_refresh_event.set()
 
-        # '0' is now handled by the menu structure, but we still need the exit logic
-        if choice == '' or choice == '0':
-            exit_now(ctx)
+    def _handle_report_done(payload: Optional[dict[str, Any]]) -> None:
+        with status_state_lock:
+            status_state["report_state"] = "completed"
+            if isinstance(payload, dict) and payload.get("path"):
+                status_state["report_path"] = Path(payload["path"]).expanduser()
+        status_refresh_event.set()
 
-        module_to_run = loaded_modules.get(choice)
-        if module_to_run:
-            # Check visibility again before running, as a safety measure
-            visibility_key = module_to_run.visibility_config_key
-            if visibility_key and not ctx.cfg.get(visibility_key, False):
-                ctx.console.print(f"[{colors['error']}]This feature is currently disabled.[/]")
-                time.sleep(2)
+    subscriptions = [
+        ctx.event_bus.subscribe("status:update", _handle_status_update),
+        ctx.event_bus.subscribe("status:report_generating", _handle_report_generating),
+        ctx.event_bus.subscribe("status:report_done", _handle_report_done),
+    ]
+
+    timer_stop_event = threading.Event()
+
+    def _minute_tick() -> None:
+        while not timer_stop_event.is_set():
+            now = datetime.now()
+            seconds_until_next_minute = 60 - now.second
+            if seconds_until_next_minute <= 0:
+                seconds_until_next_minute = 60
+            if timer_stop_event.wait(seconds_until_next_minute):
+                break
+            ctx.event_bus.publish("status:update", {"component": "timer", "state": "tick"})
+
+    threading.Thread(target=_minute_tick, name="status-minute-tick", daemon=True).start()
+
+    try:
+        while True:
+            # Live-rendered menu with dynamic cache status and non-blocking input
+            # Ensure clean screen before first Live render in each loop iteration
+
+            ctx.console.clear()
+            def _render_menu() -> str:
+                status_line = build_cache_status_line(ctx)
+                report_suffix = ""
+                with status_state_lock:
+                    report_state = status_state.get("report_state")
+                    report_path = status_state.get("report_path")
+                if report_path:
+                    candidate = report_path if isinstance(report_path, Path) else Path(report_path)
+                    candidate = candidate.expanduser()
+                    exists = candidate.exists()
+                    # Show meaningful status even if the file is being created (may not exist yet)
+                    if report_state == "generating":
+                        report_suffix = f"  • Report: [{colors['warning']}]Generating[/]"
+                    elif report_state == "error":
+                        report_suffix = f"  • Report: [{colors['error']}]Error[/]"
+                    elif report_state == "completed" and exists:
+                        report_suffix = f"  • Report: [{colors['success']}]Completed[/]"
+                    elif not report_state and exists:
+                        # If a report already exists at startup (no events yet), show it as completed
+                        report_suffix = f"  • Report: [{colors['success']}]Completed[/]"
+                return f"{status_line}{report_suffix}\n\n{base_menu}"
+
+            # Check if cache indexing is currently active
+            try:
+                indexing_active = bool(ctx.cache and ctx.cache.dc and ctx.cache.dc.get("indexing", False))
+            except Exception:
+                indexing_active = False
+
+            # Adaptive interval: 2.5s during indexing, 60s when idle (handled in read_user_input_live)
+            choice = read_user_input_live(
+                ctx,
+                _render_menu,
+                indexing_active=indexing_active,
+                refresh_signal=status_refresh_event,
+            ).strip()
+
+            # '0' is now handled by the menu structure, but we still need the exit logic
+            if choice == '' or choice == '0':
+                timer_stop_event.set()
+                for token in subscriptions:
+                    ctx.event_bus.unsubscribe(token)
+                exit_now(ctx)
+
+            module_to_run = loaded_modules.get(choice)
+            if module_to_run:
+                # Check visibility again before running, as a safety measure
+                visibility_key = module_to_run.visibility_config_key
+                if visibility_key and not ctx.cfg.get(visibility_key, False):
+                    ctx.console.print(f"[{colors['error']}]This feature is currently disabled.[/]")
+                    time.sleep(2)
+                else:
+                    # Warn if a config-repo-dependent module runs while indexing
+                    requires_repo = getattr(module_to_run, 'requires_config_repo', False)
+                    try:
+                        indexing_active = bool(ctx.cache and ctx.cache.dc and ctx.cache.dc.get("indexing", False))
+                    except Exception:
+                        indexing_active = False
+                    if requires_repo and indexing_active:
+                        ctx.console.print(f"[{colors['warning']}]Configuration repository is being indexed. Live search is available but slower.[/]")
+                        proceed = read_user_input(ctx, f"[{colors['warning']}]Proceed anyway? (y/N): [/] ").strip().lower()
+                        if proceed != 'y':
+                            continue
+                    module_to_run.run(ctx)
             else:
-                # Warn if a config-repo-dependent module runs while indexing
-                requires_repo = getattr(module_to_run, 'requires_config_repo', False)
-                try:
-                    indexing_active = bool(ctx.cache and ctx.cache.dc and ctx.cache.dc.get("indexing", False))
-                except Exception:
-                    indexing_active = False
-                if requires_repo and indexing_active:
-                    ctx.console.print(f"[{colors['warning']}]Configuration repository is being indexed. Live search is available but slower.[/]")
-                    proceed = read_user_input(ctx, f"[{colors['warning']}]Proceed anyway? (y/N): [/] ").strip().lower()
-                    if proceed != 'y':
-                        continue
-                module_to_run.run(ctx)
-        else:
-            ctx.console.print(f"[{colors['error']}]Invalid choice. Please try again.[/]")
-            time.sleep(1)
-            continue
-
-        # ctx.console.print(f"[{colors['description']}]Press [{colors['error']}]Enter[/] key to continue[/]")
-        # read_user_input(ctx, "")
+                ctx.console.print(f"[{colors['error']}]Invalid choice. Please try again.[/]")
+                time.sleep(1)
+                continue
+    finally:
+        timer_stop_event.set()
+        for token in subscriptions:
+            ctx.event_bus.unsubscribe(token)
 
 
 if __name__ == "__main__":
