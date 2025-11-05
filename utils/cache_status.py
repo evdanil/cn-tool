@@ -1,5 +1,3 @@
-from typing import Any, Dict, Optional
-from time import time
 from datetime import datetime
 
 from core.base import ScriptContext

@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from time import perf_counter
 import logging
 import threading
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Callable, Optional, TYPE_CHECKING
+
+from .event_bus import EventBus
 
 
 class ThreadSafeFileHandler(logging.FileHandler):
@@ -29,6 +33,7 @@ class ScriptContext:
     logger: logging.Logger
     console: "ThemedConsole"  # Use quotes for forward reference
     cache: Optional["CacheManager"]  # Use quotes for forward reference
+    event_bus: EventBus
     username: str
     password: str
     plugins: List["BasePlugin"]

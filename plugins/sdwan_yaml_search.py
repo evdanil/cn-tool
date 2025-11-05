@@ -19,6 +19,7 @@ class SDWANYamlSearchPlugin(BasePlugin):
     def __init__(self) -> None:
         """Initializes the plugin and its threading components."""
         self._yaml_data: Dict[str, Any] = {}
+        self._yaml_lines: Dict[str, list[str]] = {}
         self._loading_thread: threading.Thread | None = None
         self._is_ready = threading.Event()  # An event to signal when loading is complete
         self._lock = threading.Lock()  # A lock to ensure thread-safe access to data
@@ -120,9 +121,12 @@ class SDWANYamlSearchPlugin(BasePlugin):
                         self._loaded_files[file_name] = file_str
 
                     with file.open(encoding="utf-8") as f:
-                        yaml_content = yaml.safe_load(f)
-                        repo_yaml_data[file_str] = yaml_content
-                        repo_file_count += 1
+                        raw_text = f.read()
+                    yaml_content = yaml.safe_load(raw_text)
+                    repo_yaml_data[file_str] = yaml_content
+                    repo_file_count += 1
+                    with self._lock:
+                        self._yaml_lines[file_str] = raw_text.splitlines()
 
                 except Exception as exc:
                     ctx.logger.error(f"SD-WAN YAML Search: Failed to load or parse {file}: {exc}")
@@ -151,6 +155,7 @@ class SDWANYamlSearchPlugin(BasePlugin):
 
         if not repo_paths_str:
             ctx.logger.warning("SD-WAN YAML Search: No repository paths configured. Aborting load.")
+            self._is_ready.set()
             return
 
         # Parse multiple paths separated by comma
@@ -158,6 +163,7 @@ class SDWANYamlSearchPlugin(BasePlugin):
 
         if not repo_paths:
             ctx.logger.warning("SD-WAN YAML Search: No valid repository paths found. Aborting load.")
+            self._is_ready.set()
             return
 
         ctx.logger.info(f"SD-WAN YAML Search: Starting parallel load from {len(repo_paths)} repository path(s)...")
@@ -212,6 +218,21 @@ class SDWANYamlSearchPlugin(BasePlugin):
         # Signal that the data is ready for searching
         self._is_ready.set()
         ctx.logger.info("SD-WAN YAML Search: Data is now ready for searching.")
+        # Notify UI to refresh status line (YAML device count)
+        try:
+            if getattr(ctx, "event_bus", None):
+                # Compute approximate device count under lock
+                count = 0
+                try:
+                    count = self.device_count
+                except Exception:
+                    pass
+                ctx.event_bus.publish(
+                    "status:update",
+                    {"component": "yaml", "state": "ready", "count": count},
+                )
+        except Exception:
+            pass
 
     def connect(self, ctx: ScriptContext) -> None:
         """Starts the background thread to load YAML files."""
@@ -228,11 +249,14 @@ class SDWANYamlSearchPlugin(BasePlugin):
         self._stop_loading.clear()  # Clear stop signal for new load
         with self._lock:
             self._yaml_data.clear()
+            self._yaml_lines.clear()
             self._loaded_files.clear()  # Clear loaded files dictionary for fresh load
 
         # Create and start the daemon thread
         self._loading_thread = threading.Thread(target=self._load_data_in_background, args=(ctx,), daemon=True)
         self._loading_thread.start()
+        # Block until the initial load completes so results are immediately available for queries/tests
+        self._is_ready.wait(timeout=5.0)
 
     def _search_yaml_repo(self, ctx: ScriptContext, data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -268,17 +292,24 @@ class SDWANYamlSearchPlugin(BasePlugin):
         ctx.logger.debug(f"SD-WAN YAML Search: Starting single-pass search for {len(patterns)} terms and {len(network_objects)} networks.")
 
         with self._lock:
-            yaml_data_snapshot = self._yaml_data
+            yaml_data_snapshot = dict(self._yaml_data)
+            yaml_lines_snapshot = dict(self._yaml_lines)
 
         for filename, yaml_content in yaml_data_snapshot.items():
             if not yaml_content:
                 continue
 
             device = Path(filename).stem.upper()
+            raw_lines = list(yaml_lines_snapshot.get(filename, []))
 
             for criterion, path, value in self._traverse_and_match(yaml_content, patterns, network_objects):
                 line_content = f"{path}: {str(value)}"
-                results.append([criterion, device, 0, line_content, filename])
+                line_index = 0
+                for idx, raw_line in enumerate(raw_lines):
+                    if raw_line.strip() == line_content:
+                        line_index = idx
+                        break
+                results.append([criterion, device, line_index, line_content, filename])
 
                 if criterion in network_objects:
                     matched_networks_set.add(criterion)
@@ -340,6 +371,7 @@ class SDWANYamlSearchPlugin(BasePlugin):
         # Clean up data
         with self._lock:
             self._yaml_data.clear()
+            self._yaml_lines.clear()
             self._loaded_files.clear()
 
         ctx.logger.debug("SD-WAN YAML Search: Plugin disconnected and cleaned up")
