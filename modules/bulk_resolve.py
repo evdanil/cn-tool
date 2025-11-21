@@ -36,20 +36,30 @@ class BulkResolveModule(BaseModule):
         logger.info("Request Type - Bulk DNS Lookup")
 
         # --- Nested Helper Functions ---
-        def resolve_ip(ip: str) -> Tuple[str, Optional[Tuple[str, List[str], List[str]]]]:
+        def lookup_ip(ip: str) -> Optional[Tuple[str, List[str], List[str]]]:
             try:
-                # Returns (hostname, aliaslist, ipaddrlist)
-                return (ip, socket.gethostbyaddr(ip))
+                return socket.gethostbyaddr(ip)
             except (socket.gaierror, socket.herror, socket.timeout):
-                return (ip, None)
+                return None
 
-        def resolve_name(name: str) -> Tuple[str, Optional[List[str]]]:
+        def resolve_ip(ip: str) -> Tuple[str, Optional[Tuple[str, List[str], List[str]]]]:
+            return (ip, lookup_ip(ip))
+
+        def lookup_name(name: str) -> Optional[List[str]]:
             try:
                 addrinfo = socket.getaddrinfo(name, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
                 # Use dict.fromkeys to get unique IPs, then convert back to a list
-                return (name, list(dict.fromkeys([str(addr[4][0]) for addr in addrinfo])))
+                return list(dict.fromkeys([str(addr[4][0]) for addr in addrinfo]))
             except (socket.gaierror, socket.herror, socket.timeout):
-                return (name, None)
+                return None
+
+        def resolve_name(name: str) -> Tuple[str, Optional[List[str]]]:
+            return (name, lookup_name(name))
+
+        def format_joined(values: Optional[List[str]]) -> str:
+            if not values:
+                return "Not Resolved"
+            return ", ".join(values)
 
         # --- User Input and Target Parsing ---
         console.print(
@@ -82,20 +92,47 @@ class BulkResolveModule(BaseModule):
                 original_ip, data = future.result()
                 if data:
                     hostname, aliases, _ = data
-                    ip_results_map[original_ip].append({"IP": original_ip, "Name": hostname})
-                    for alias in aliases:
-                        ip_results_map[original_ip].append({"IP": original_ip, "Name": alias})
+                    resolved_names = [hostname] + aliases
+                    for resolved_name in resolved_names:
+                        reverse_ips = lookup_name(resolved_name)
+                        ip_results_map[original_ip].append(
+                            {
+                                "IP": original_ip,
+                                "Resolved Name": resolved_name,
+                                "Reverse Result": format_joined(reverse_ips),
+                            }
+                        )
                 else:
-                    ip_results_map[original_ip].append({"IP": original_ip, "Name": "Not Resolved"})
+                    ip_results_map[original_ip].append(
+                        {
+                            "IP": original_ip,
+                            "Resolved Name": "Not Resolved",
+                            "Reverse Result": "Not Resolved",
+                        }
+                    )
 
             # Process Name results as they complete
             for future in as_completed(name_futures):
                 original_name, ip_list = future.result()
                 if ip_list:
                     for ip_addr in ip_list:
-                        name_results_map[original_name].append({"Name": original_name, "IP": ip_addr})
+                        reverse_lookup = lookup_ip(ip_addr)
+                        reverse_name = reverse_lookup[0] if reverse_lookup else "Not Resolved"
+                        name_results_map[original_name].append(
+                            {
+                                "Name": original_name,
+                                "Resolved IP": ip_addr,
+                                "Reverse Result": reverse_name,
+                            }
+                        )
                 else:
-                    name_results_map[original_name].append({"Name": original_name, "IP": "Not Resolved"})
+                    name_results_map[original_name].append(
+                        {
+                            "Name": original_name,
+                            "Resolved IP": "Not Resolved",
+                            "Reverse Result": "Not Resolved",
+                        }
+                    )
 
         # --- Display and Save (logic is now much simpler) ---
         # Assemble final results in the original user-provided order.
@@ -121,12 +158,27 @@ class BulkResolveModule(BaseModule):
             save_data: List[Tuple[str, str]] = []
             # Extract data from the final (potentially modified) results for saving
             for item in final_results_for_display.get("Name to IP Lookup", []):
-                save_data.append((item.get("Name", ""), item.get("IP", "")))
+                save_data.append((
+                    item.get("Name", ""),
+                    item.get("Resolved IP", ""),
+                    item.get("Reverse Result", ""),
+                ))
             for item in final_results_for_display.get("IP to Name Lookup", []):
-                save_data.append((item.get("IP", ""), item.get("Name", "")))
+                save_data.append((
+                    item.get("IP", ""),
+                    item.get("Resolved Name", ""),
+                    item.get("Reverse Result", ""),
+                ))
             if save_data:
                 final_save_data = self.execute_hook('pre_save', ctx, save_data)
-                queue_save(ctx, ["Query", "Result"], final_save_data, sheet_name="Bulk DNS Lookup", index=False, force_header=True)
+                queue_save(
+                    ctx,
+                    ["Query", "Result", "Reverse Result"],
+                    final_save_data,
+                    sheet_name="Bulk DNS Lookup",
+                    index=False,
+                    force_header=True,
+                )
 
         press_any_key(ctx)
 
