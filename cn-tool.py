@@ -58,7 +58,7 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.54 hash d67e58d'
+VERSION = '0.2.55 hash 4489fcd'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -262,7 +262,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
     menu_header = """  """
     # Define the structure and order of your menu
     menu_layout = {
-        "--- Tasks ---": ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'b', 't'],
+        "--- Tasks ---": ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'b', 'o', 't'],
         # Keep 'a' for your existing module and add 'c' for Config Analyzer
         "--- Info ---": ['a', 'c'],
         "--- Reporting ---": ['e', 'd'],
