@@ -98,7 +98,6 @@ def worker() -> None:
                 with _pending_lock:
                     _pending_saves = max(0, _pending_saves - 1)
                 save_queue.task_done()
-                continue
 
         ctx = None  # Initialize ctx to None
         lock_fd: Optional[int] = None
