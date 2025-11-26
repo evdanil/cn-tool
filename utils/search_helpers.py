@@ -10,6 +10,10 @@ from typing import List
 from wordlists.keywords import standard_keywords
 from utils.validation import ip_regexp
 
+# P3 Optimization: Module-level compiled regex for word cleanup
+# Compiled once at module load instead of per-call
+WORD_CLEANUP_PATTERN: re.Pattern = re.compile(r"[\W_]+")
+
 
 def extract_keywords(text: str, vendor: str = 'default', preserve_stopwords: bool = False) -> List[str]:
     """
@@ -32,7 +36,8 @@ def extract_keywords(text: str, vendor: str = 'default', preserve_stopwords: boo
 
     # Remove non-alphanumeric chars that are not part of a word (like standalone punctuation)
     # This keeps things like "word-with-hyphen" but cleans up ",.;"
-    cleaned_text = re.sub(r"[\W_]+", " ", text_lower)
+    # P3 Optimization: Use precompiled regex pattern
+    cleaned_text = WORD_CLEANUP_PATTERN.sub(" ", text_lower)
 
     # Use a set for efficient stopword checking
     vendor_stopwords = set(standard_keywords.get(vendor, ())) if not preserve_stopwords else set()

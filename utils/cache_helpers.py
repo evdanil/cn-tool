@@ -1,5 +1,6 @@
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import ipaddress
 import re
 import queue
@@ -12,6 +13,12 @@ from diskcache import Index
 from wordlists.keywords import stop_words, standard_keywords
 from core.base import ScriptContext
 from .cache import CacheManager
+from .cache_optimized import (
+    SortedKeyIndex,
+    IPRangeIndex,
+    get_config_lines_cached,
+    clear_config_cache,
+)
 from .config import make_dir_list
 from .hash import calculate_config_hash
 from .search_helpers import extract_keywords, extract_literal_ips
@@ -19,6 +26,64 @@ from .validation import ip_regexp
 
 HEX8_RE = re.compile(r"^[0-9A-F]{8}\b")
 B64ish_RE = re.compile(r"^[0-9a-zA-Z/+]{65}$")
+
+# =============================================================================
+# P3 Optimization: Precompiled Stop Word Patterns
+# =============================================================================
+# Instead of using tuple.startswith() which iterates O(n) prefixes,
+# compile all stop words for each vendor into a single regex pattern.
+
+
+def _build_stopword_regex(prefixes: Tuple[str, ...]) -> Optional[re.Pattern]:
+    """
+    Build a single compiled regex from a tuple of stop word prefixes.
+
+    Args:
+        prefixes: Tuple of string prefixes to match at line start.
+
+    Returns:
+        Compiled regex pattern, or None if prefixes is empty.
+    """
+    if not prefixes:
+        return None
+
+    # Escape special regex characters and join with |
+    escaped = [re.escape(prefix) for prefix in prefixes]
+    # Sort by length descending to match longer prefixes first
+    escaped.sort(key=len, reverse=True)
+    pattern = f"^({'|'.join(escaped)})"
+    return re.compile(pattern)
+
+
+# Precompiled stop word patterns per vendor (built once at module load)
+STOPWORD_PATTERNS: Dict[str, Optional[re.Pattern]] = {
+    vendor: _build_stopword_regex(prefixes)
+    for vendor, prefixes in stop_words.items()
+}
+
+# Volatile config line prefixes for hash computation (skip these lines)
+HASH_SKIP_PREFIXES: Tuple[str, ...] = (
+    '!', '---', 'Building configuration...', 'Current configuration', '#'
+)
+
+
+def matches_stopword(line: str, vendor: str) -> bool:
+    """
+    Check if a line starts with any stop word for the given vendor.
+
+    Uses precompiled regex for O(1) matching instead of O(n) tuple iteration.
+
+    Args:
+        line: The line to check (should be stripped).
+        vendor: The vendor name (lowercase).
+
+    Returns:
+        True if line starts with a stop word, False otherwise.
+    """
+    pattern = STOPWORD_PATTERNS.get(vendor)
+    if pattern is None:
+        return False
+    return pattern.match(line) is not None
 
 
 def build_config_path(
@@ -463,6 +528,9 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
 
     logger.info("Disk cache update complete.")
 
+    # Clear in-memory file content LRU cache after indexing to ensure fresh reads
+    clear_config_cache()
+
     end = perf_counter()
     if not fatal:
         cache.dc.set("updated", int(time()))
@@ -530,23 +598,43 @@ def get_facts_helper(
 
 
 def get_device_facts(ctx: ScriptContext, hostname: str, vendor: str, region: str, device_type: str, filename: Path) -> Tuple[Dict[str, Any], defaultdict, defaultdict, Dict[str, Any]]:
+    """
+    Extract device metadata, IPs, and keywords from a config file.
 
+    P2 Optimization: Computes content hash in the same pass as index extraction,
+    eliminating duplicate file reads.
+
+    P3 Optimization: Uses precompiled regex patterns for stop word matching.
+    """
     logger = ctx.logger
-    # Calculate the hash of the relevant content
-    content_hash = calculate_config_hash(filename)
 
-    device = {"region": region, "type": device_type, "vendor": vendor, "updated": int(filename.stat().st_mtime), "hash": content_hash}
+    # P2 Optimization: Single-pass hash + index extraction
+    # Open in binary mode for accurate hash computation, decode for processing
+    hasher = hashlib.sha256()
     ip_list: defaultdict = defaultdict(lambda: tuple())
     kw_list: defaultdict = defaultdict(lambda: tuple())
 
-    vendor_stop_words = stop_words.get(vendor.lower(), ())
+    vendor_lower = vendor.lower()
+    content_hash = "error-generating-hash"  # Default in case of error
+
     try:
-        with open(filename, "r", encoding="utf-8") as f:
-            for index, line in enumerate(f):
-                line_strip = line.strip()
-                if line_strip.startswith(vendor_stop_words) or HEX8_RE.match(line_strip) or B64ish_RE.match(line_strip):
+        with open(filename, "rb") as f:
+            for index, line_bytes in enumerate(f):
+                # Decode for processing
+                line_str = line_bytes.decode('utf-8', errors='ignore')
+                line_strip = line_str.strip()
+
+                # Hash computation: skip volatile lines (same logic as hash.py)
+                # P3 Optimization: Use module-level HASH_SKIP_PREFIXES tuple
+                if line_strip and not line_strip.startswith(HASH_SKIP_PREFIXES):
+                    hasher.update(line_bytes)
+
+                # Index extraction: skip stop words and noise patterns
+                # P3 Optimization: Use precompiled regex via matches_stopword()
+                if matches_stopword(line_strip, vendor_lower) or HEX8_RE.match(line_strip) or B64ish_RE.match(line_strip):
                     continue
 
+                # Extract IPs
                 for match in ip_regexp.finditer(line_strip):
                     s = match.group()
                     try:
@@ -557,10 +645,23 @@ def get_device_facts(ctx: ScriptContext, hostname: str, vendor: str, region: str
                     except ValueError:
                         pass
 
+                # Extract keywords
                 for word in set(extract_keywords(line_strip, vendor=vendor)) - set(standard_keywords.get(vendor, ())):
                     kw_list[(word, hostname)] += (index,)
+
+        content_hash = hasher.hexdigest()
+
     except (IOError, OSError) as e:
         logger.error(f"Error reading device file {filename}: {e}")
+
+    # Build device metadata with computed hash
+    device = {
+        "region": region,
+        "type": device_type,
+        "vendor": vendor,
+        "updated": int(filename.stat().st_mtime),
+        "hash": content_hash
+    }
 
     reverse_index_data = {
             'ips': list(set(ip for ip, host in ip_list.keys())),
@@ -595,6 +696,8 @@ def search_cache_keywords(ctx: ScriptContext, search_terms: List[str], search_in
     1. Uses the keyword index (kw_idx) for a fast pre-selection of candidate lines.
     2. Performs the full, expensive regex match only on the small set of candidate lines.
     3. Falls back to IP index hints and, if needed, a bounded on-disk scan to guarantee parity with live searches.
+
+    Optimized to use O(log n) prefix search via SortedKeyIndex and LRU file caching.
     """
     logger = ctx.logger
     data_to_save: List[List[Any]] = []
@@ -608,7 +711,9 @@ def search_cache_keywords(ctx: ScriptContext, search_terms: List[str], search_in
     kw_idx = cache.kw_idx
     dev_idx = cache.dev_idx
 
-    all_cache_keywords = list(kw_idx.keys())  # Get all keys for prefix matching
+    # P1 Optimization: Use SortedKeyIndex for O(log n) prefix search
+    sorted_kw_idx = SortedKeyIndex(kw_idx)
+
     seen_rows: Set[Tuple[str, int, str]] = set()
     missing_terms: List[str] = []
     aggregated_ip_hints: Set[str] = set()
@@ -632,7 +737,8 @@ def search_cache_keywords(ctx: ScriptContext, search_terms: List[str], search_in
             continue
 
         for word in candidate_words:
-            matching_keys = [key for key in all_cache_keywords if key.startswith(word.lower())]
+            # P1 Optimization: O(log n) prefix search instead of O(n) linear scan
+            matching_keys = sorted_kw_idx.prefix_search(word.lower())
 
             for key in matching_keys:
                 word_entry = kw_idx.get(key)
@@ -659,9 +765,9 @@ def search_cache_keywords(ctx: ScriptContext, search_terms: List[str], search_in
                     logger.warning(f"Unable to read configuration file for {hostname}. Cache entry invalid.")
                     continue
 
+                # P2 Optimization: Use LRU cached file reads
                 try:
-                    with open(fname, "r", encoding="utf-8") as f:
-                        full_config_lines = f.readlines()
+                    full_config_lines = get_config_lines_cached(str(fname))
                 except (IOError, OSError) as e:
                     logger.error(f"Could not read config for {hostname}: {e}")
                     continue
@@ -802,13 +908,13 @@ def _slow_regex_scan(
             continue
 
         vendor = str(device_info.get('vendor', '')).lower()
-        vendor_stopwords = stop_words.get(vendor, ())
 
         try:
             with open(fname, "r", encoding="utf-8", errors="ignore") as f:
                 for line_num, line in enumerate(f):
                     line_strip = line.strip()
-                    if vendor_stopwords and line_strip.startswith(vendor_stopwords):
+                    # P3 Optimization: Use precompiled regex via matches_stopword()
+                    if matches_stopword(line_strip, vendor):
                         continue
 
                     for term, pattern in compiled_terms:
@@ -834,7 +940,11 @@ def _slow_regex_scan(
 def search_cache_subnets(
     ctx: ScriptContext, nets: Optional[List[ipaddress.IPv4Network]], search_input: str
 ) -> Tuple[List[List[Any]], Set[ipaddress.IPv4Network]]:
+    """
+    Search for IPs within given subnets using the IP index.
 
+    Optimized to use O(log n) range queries via IPRangeIndex and LRU file caching.
+    """
     logger = ctx.logger
 
     matched_nets: Set[ipaddress.IPv4Network] = set()
@@ -849,14 +959,19 @@ def search_cache_subnets(
     if not nets or not ip_idx or not dev_idx:
         return data_to_save, matched_nets
 
+    # P1 Optimization: Use IPRangeIndex for O(log n) range queries
+    ip_range_idx = IPRangeIndex(ip_idx)
+
     rows_to_save: Dict[str, Dict[int, Tuple[str, str]]] = defaultdict(dict)
 
     for net in nets:
-        for ip_obj in net:
-            ip_key = str(int(ip_obj))
+        # P1 Optimization: O(log n + k) search instead of O(subnet_size) iteration
+        matching_ips = ip_range_idx.search_subnet(net)
 
-            ip_entry = ip_idx.get(ip_key)
+        if matching_ips:
+            matched_nets.add(net)
 
+        for ip_int, ip_entry in matching_ips:
             if isinstance(ip_entry, dict):
                 for hostname, line_nums in ip_entry.items():
                     device_info = dev_idx.get(hostname.upper(), {})
@@ -865,22 +980,21 @@ def search_cache_subnets(
                         logger.warning(f"Unable to read configuration file for {hostname}. Cache entry invalid.")
                         continue
 
+                    # P2 Optimization: Use LRU cached file reads
                     try:
-                        with open(fname, 'r', encoding='utf-8') as f:
-                            all_lines = f.readlines()
-                            if isinstance(line_nums, (list, tuple)):
-                                for line_num in line_nums:
-                                    try:
-                                        idx = int(line_num)
-                                        if 0 <= idx < len(all_lines):
-                                            rows_to_save[hostname.upper()][line_num] = (all_lines[line_num].strip(), str(fname))
-                                    except (ValueError, IndexError):
-                                        # Log bad line number from cache if needed
-                                        pass
+                        all_lines = get_config_lines_cached(str(fname))
+                        if isinstance(line_nums, (list, tuple)):
+                            for line_num in line_nums:
+                                try:
+                                    idx = int(line_num)
+                                    if 0 <= idx < len(all_lines):
+                                        rows_to_save[hostname.upper()][line_num] = (all_lines[idx].strip(), str(fname))
+                                except (ValueError, IndexError):
+                                    # Log bad line number from cache if needed
+                                    pass
                     except IOError:
                         # Log file reading error if needed
                         pass
-                matched_nets.add(net)
 
     for hostname, indices in sorted(rows_to_save.items()):
         for index, (line, path) in sorted(indices.items()):
