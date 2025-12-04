@@ -56,6 +56,13 @@ def configure_logging(logfile_location: str, log_level_str: str) -> logging.Logg
     # Add the file handler to the logger
     logger.addHandler(file_handler)
 
+    # Ensure Netmiko uses the same handler instead of creating its own netmiko.log
+    netmiko_logger = logging.getLogger("netmiko")
+    netmiko_logger.setLevel(log_level_numeric)
+    netmiko_logger.propagate = False
+    netmiko_logger.handlers.clear()
+    netmiko_logger.addHandler(file_handler)
+
     # Log the successful configuration
     # logger.debug(f"Logger '{logger.name}' configured with level {log_level_str} ({log_level_numeric}) writing to {logfile_location}")
 
