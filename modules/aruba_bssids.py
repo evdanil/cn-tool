@@ -30,8 +30,8 @@ def _wired_mac_to_bssids(wired_mac: str, bssid: str) -> List[str]:
     binary_r0_nic = z + binary_nic[4:]
     binary_bssid = format(int(bssid, 10), "020b").zfill(len(binary_r0_nic))
     binary_r1_nic = bin(int(binary_r0_nic, 2) + int(binary_bssid, 2))[2:]
-    r0_nic = hex(int(binary_r0_nic, 2))[2:]
-    r1_nic = hex(int(binary_r1_nic, 2))[2:]
+    r0_nic = hex(int(binary_r0_nic, 2))[2:].zfill(6)
+    r1_nic = hex(int(binary_r1_nic, 2))[2:].zfill(6)
     r0_mac = clean_mac[0:6] + r0_nic
     r1_mac = clean_mac[0:6] + r1_nic
     r0_mac = (':'.join(r0_mac[i:i+2] for i in range(0, len(r0_mac), 2))).upper()
