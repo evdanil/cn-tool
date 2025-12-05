@@ -1,3 +1,4 @@
+from pathlib import Path
 from socket import gethostbyaddr
 from typing import Optional, List, Dict, Any, Set, Tuple
 from netmiko import ConnLogOnly, SSHDetect, BaseConnection
@@ -318,7 +319,7 @@ def process_device_data(device_name: str, data: Dict[str, Any]) -> List[Dict[str
     return rows
 
 
-def process_device_commands(logger: logging.Logger, device: str, platform_commands: Dict[str, Dict[str, Tuple]], username: Optional[str], password: Optional[str], type: str = 'cisco_ios') -> Dict[str, Any]:
+def process_device_commands(logger: logging.Logger, device: str, platform_commands: Dict[str, Dict[str, Tuple]], username: Optional[str], password: Optional[str], type: str = 'cisco_ios', log_file: Optional[str] = None) -> Dict[str, Any]:
     # interrogate device and get serial/mac/license data
     # check for reverse DNS entry
 
@@ -364,7 +365,10 @@ def process_device_commands(logger: logging.Logger, device: str, platform_comman
 
         # Add the detected device_type for the actual connection
         dev["device_type"] = detected_type
-        conn = ConnLogOnly(**dev)
+        # Pass log_file to avoid writing netmiko.log in current directory
+        # Default to home directory if not specified
+        netmiko_log = log_file or str(Path.home() / "netmiko.log")
+        conn = ConnLogOnly(log_file=netmiko_log, **dev)
         if not conn:
             logger.info(f'{device} - Unable to create device connection!')
             return {device: 'Unable to create device connection'}

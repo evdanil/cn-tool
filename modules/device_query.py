@@ -1,5 +1,6 @@
 import ipaddress
 import re
+from pathlib import Path
 from typing import Dict, Any, List, Tuple, Callable, Union
 from concurrent.futures import ThreadPoolExecutor
 
@@ -104,10 +105,13 @@ class DeviceQueryModule(BaseModule):
 
         # --- Device Interaction ---
         results: Dict[str, Dict[str, Any]] = {}
+        # Get log file path from config to avoid netmiko writing to current directory
+        log_file = str(ctx.cfg.get("logging_file", Path.home() / "cn.log"))
+
         with console.status(f"[{colors['description']}]Connecting to devices and running commands...[/]", spinner="dots12"):
             with ThreadPoolExecutor(max_workers=10) as executor:  # Increased workers for network-bound tasks
                 future_to_device = {
-                    executor.submit(process_device_commands, logger, device, platform_commands, ctx.username, ctx.password): device
+                    executor.submit(process_device_commands, logger, device, platform_commands, ctx.username, ctx.password, log_file=log_file): device
                     for device in unique_devices
                 }
                 for future in future_to_device:
