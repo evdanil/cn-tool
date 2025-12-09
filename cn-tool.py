@@ -58,7 +58,7 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.59 hash aee56c9'
+VERSION = '0.2.60 hash 33608c1'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -383,10 +383,10 @@ Please send any feedback/feature requests to evdanil@gmail.com
                     elif report_state == "error":
                         report_suffix = f"  • Report: [{colors['error']}]Error[/]"
                     elif report_state == "completed" and exists:
-                        report_suffix = f"  • Report: [{colors['success']}]Completed[/]"
+                        report_suffix = f"  • Report: [{colors['success']}]Ready[/]"
                     elif not report_state and exists:
-                        # If a report already exists at startup (no events yet), show it as completed
-                        report_suffix = f"  • Report: [{colors['success']}]Completed[/]"
+                        # If a report already exists at startup (no events yet), show it as ready
+                        report_suffix = f"  • Report: [{colors['success']}]Ready[/]"
                 return f"{status_line}{report_suffix}\n\n{base_menu}"
 
             # Check if cache indexing is currently active

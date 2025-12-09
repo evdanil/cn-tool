@@ -36,7 +36,7 @@ class ThemedConsole:
         theme_styles["bold"] = Style(bold=True)
 
         self.theme = Theme(theme_styles)
-        self.console = Console(theme=self.theme)
+        self.console = Console(theme=self.theme, emoji=False)
 
     def print(self, *objects: Any, sep: str = " ", end: str = "\n", style: Optional[Union[str, Style]] = None, **kwargs: Any) -> None:
         if isinstance(style, str):
