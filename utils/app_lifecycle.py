@@ -34,7 +34,7 @@ def exit_now(ctx: ScriptContext, exit_code: int = 0, message: str = '') -> None:
     if exit_code == 0:
         # Normal exit requested by user (e.g., pressing '0')
         logger.info("Terminating by user request - Have a nice day!")
-        console.print(f"[{colors['success']}]Have a nice day![/] :smiley:")
+        console.print(f"[{colors['success']}]Have a nice day![/]")
     elif exit_code == 1 and "Interrupted" in message:
         # Specific case for CTRL+C
         logger.warning(f"Abnormal termination: {message}")
