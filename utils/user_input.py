@@ -125,6 +125,8 @@ def read_user_input_live(
         # Enter a cbreak-like mode: disable canonical input and echo, keep output processing intact
         new_settings = termios.tcgetattr(fd)
         new_settings[3] = new_settings[3] & ~(termios.ICANON | termios.ECHO)
+        # Disable software flow control so we can handle CTRL-S/CTRL-Q ourselves
+        new_settings[0] = new_settings[0] & ~(termios.IXON | termios.IXOFF)
         new_settings[6][termios.VMIN] = 1
         new_settings[6][termios.VTIME] = 0
         termios.tcsetattr(fd, termios.TCSANOW, new_settings)
@@ -162,6 +164,7 @@ def read_user_input_live(
         last_key_time: float = 0.0  # 0 => no recent typing
 
         with Live(initial_group, console=live_console, screen=True, refresh_per_second=1) as live:
+            updates_paused = False
             while True:
                 # Check current indexing state dynamically (it can change mid-loop!)
                 try:
@@ -193,7 +196,9 @@ def read_user_input_live(
                     refresh_signal.clear()
 
                 # Check if we need to refresh status (interval elapsed OR minute changed)
-                status_needs_refresh = forced_refresh or (now >= next_status_at) or (current_minute != state['minute'])
+                status_needs_refresh = (not updates_paused) and (
+                    forced_refresh or (now >= next_status_at) or (current_minute != state['minute'])
+                )
 
                 if status_needs_refresh:
                     new_header = render().rstrip()
@@ -211,7 +216,7 @@ def read_user_input_live(
                     prompt_text = Text.from_markup(f"\n\n[{colors['description']}]Enter your choice:[/] {buffer}")
 
                 # Only update Live display if something actually changed
-                if status_needs_refresh or buffer_changed:
+                if (status_needs_refresh or buffer_changed) and not updates_paused:
                     live.update(Group(status_text, prompt_text), refresh=True)
 
                 try:
@@ -222,6 +227,27 @@ def read_user_input_live(
                             # Handle special keys (arrows etc.) which come as \xe0 or \x00 prefix
                             if ch in ('\x00', '\xe0'):
                                 _ = msvcrt.getwch()  # consume the next char
+                                continue
+                            if ch == '\x13':  # CTRL-S pauses refresh
+                                if not updates_paused:
+                                    updates_paused = True
+                                    live.stop(refresh=False)
+                                    ctx.console.print(Group(status_text, prompt_text))
+                                    ctx.console.print(f"\n[{colors['description']}]Menu updates paused. Press CTRL-Q to resume.[/]")
+                                continue
+                            if ch == '\x11':  # CTRL-Q resumes refresh
+                                if updates_paused:
+                                    updates_paused = False
+                                    ctx.console.clear()
+                                    # Refresh menu when coming back
+                                    refreshed_header = render().rstrip()
+                                    status_text = Text.from_markup(refreshed_header)
+                                    state['status_header'] = refreshed_header
+                                    state['minute'] = datetime.now().minute
+                                    prompt_text = Text.from_markup(f"\n\n[{colors['description']}]Enter your choice:[/] {buffer}")
+                                    live.start()
+                                    live.update(Group(status_text, prompt_text), refresh=True)
+                                    next_status_at = time.monotonic() + max(0.5, status_refresh_interval)
                                 continue
                             if ch in ('\r', '\n'):
                                 return buffer.strip()
@@ -271,6 +297,26 @@ def read_user_input_live(
                         r, _, _ = select.select([sys.stdin], [], [], timeout)
                         if r:
                             ch = sys.stdin.read(1)
+                            if ch == '\x13':  # CTRL-S pauses refresh
+                                if not updates_paused:
+                                    updates_paused = True
+                                    live.stop(refresh=False)
+                                    ctx.console.print(Group(status_text, prompt_text))
+                                    ctx.console.print(f"\n[{colors['description']}]Menu updates paused. Press CTRL-Q to resume.[/]")
+                                continue
+                            if ch == '\x11':  # CTRL-Q resumes refresh
+                                if updates_paused:
+                                    updates_paused = False
+                                    ctx.console.clear()
+                                    refreshed_header = render().rstrip()
+                                    status_text = Text.from_markup(refreshed_header)
+                                    state['status_header'] = refreshed_header
+                                    state['minute'] = datetime.now().minute
+                                    prompt_text = Text.from_markup(f"\n\n[{colors['description']}]Enter your choice:[/] {buffer}")
+                                    live.start()
+                                    live.update(Group(status_text, prompt_text), refresh=True)
+                                    next_status_at = time.monotonic() + max(0.5, status_refresh_interval)
+                                continue
                             if ch in ('\r', '\n'):
                                 return buffer.strip()
                             if ch in ('\x7f', '\b', '\x08'):  # Backspace variants
