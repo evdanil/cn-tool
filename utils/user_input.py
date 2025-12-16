@@ -231,7 +231,7 @@ def read_user_input_live(
                             if ch == '\x13':  # CTRL-S pauses refresh
                                 if not updates_paused:
                                     updates_paused = True
-                                    live.stop(refresh=False)
+                                    live.stop()
                                     ctx.console.print(Group(status_text, prompt_text))
                                     ctx.console.print(f"\n[{colors['description']}]Menu updates paused. Press CTRL-Q to resume.[/]")
                                 continue
@@ -300,7 +300,7 @@ def read_user_input_live(
                             if ch == '\x13':  # CTRL-S pauses refresh
                                 if not updates_paused:
                                     updates_paused = True
-                                    live.stop(refresh=False)
+                                    live.stop()
                                     ctx.console.print(Group(status_text, prompt_text))
                                     ctx.console.print(f"\n[{colors['description']}]Menu updates paused. Press CTRL-Q to resume.[/]")
                                 continue
@@ -371,4 +371,5 @@ def read_user_input_live(
         exit_now(ctx, 1, "Interrupted by user... Exiting...")
         return ""
     return buffer.strip()
+
 
