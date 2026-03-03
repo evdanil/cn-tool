@@ -1,5 +1,5 @@
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import hashlib
 import ipaddress
 import re
@@ -9,8 +9,9 @@ from time import time
 from pathlib import Path
 from time import perf_counter
 from typing import Dict, List, Optional, Set, Tuple, Union, Any
+from types import SimpleNamespace
 from diskcache import Index
-from wordlists.keywords import stop_words, standard_keywords
+from wordlists.keywords import stop_words
 from core.base import ScriptContext
 from .cache import CacheManager
 from .cache_optimized import (
@@ -25,7 +26,9 @@ from .search_helpers import extract_keywords, extract_literal_ips
 from .validation import ip_regexp
 
 HEX8_RE = re.compile(r"^[0-9A-F]{8}\b")
-B64ish_RE = re.compile(r"^[0-9a-zA-Z/+]{65}$")
+LONG_HEX_RE = re.compile(r"^[0-9A-Fa-f]{24,}$")
+B64ish_RE = re.compile(r"^[0-9A-Za-z+/=]{64,}$")
+MAX_INDEXABLE_LINE_LENGTH = 4096
 
 # =============================================================================
 # P3 Optimization: Precompiled Stop Word Patterns
@@ -125,6 +128,123 @@ def build_config_path(
     return Path(base_dir) / vendor.lower() / device_type.lower() / region.lower() / config_filename
 
 
+def _excluded_dir_names(ctx: ScriptContext) -> Set[str]:
+    excluded = {
+        str(item).strip().lower()
+        for item in ctx.cfg.get("config_repo_excluded_dirs", [])
+        if str(item).strip()
+    }
+    history_dir = str(ctx.cfg.get("config_repo_history_dir", "history")).strip().lower()
+    if history_dir:
+        excluded.add(history_dir)
+    return excluded
+
+
+def _cfg_vendor_set(ctx: ScriptContext, key: str) -> Set[str]:
+    values = ctx.cfg.get(key, [])
+    if isinstance(values, str):
+        values = [item.strip() for item in values.split(",") if item.strip()]
+    return {str(item).strip().lower() for item in values if str(item).strip()}
+
+
+def _parse_repo_metadata(ctx: ScriptContext, filename: Path) -> Optional[Tuple[str, str, str]]:
+    """
+    Parse vendor/type/region from config-repo relative path in a layout-safe way.
+
+    Expected shapes:
+    - no-region mode: vendor/device_type/device.cfg
+    - region mode:   vendor/device_type/region/device.cfg
+    """
+    base_dir = ctx.cfg.get("config_repo_directory")
+    if not base_dir:
+        return None
+
+    try:
+        rel_path = filename.relative_to(base_dir)
+    except ValueError:
+        return None
+
+    parts = rel_path.parts
+    has_regions = bool(ctx.cfg.get("config_repo_regions", []))
+    expected_depth = 4 if has_regions else 3
+    if len(parts) != expected_depth:
+        return None
+
+    excluded = _excluded_dir_names(ctx)
+    if any(str(part).lower() in excluded for part in parts[:-1]):
+        return None
+
+    vendor = str(parts[0]).lower()
+    device_type = str(parts[1]).upper()
+    region = str(parts[2]).upper() if has_regions else ''
+    return vendor, device_type, region
+
+
+class _NoopLogger:
+    """Minimal logger for process workers where full logger objects are not picklable."""
+
+    def error(self, *_args: Any, **_kwargs: Any) -> None:
+        return
+
+
+def _index_worker_cfg_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a small picklable cfg subset required by get_device_facts()."""
+
+    def _to_list(key: str) -> List[str]:
+        raw = cfg.get(key, [])
+        if isinstance(raw, str):
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        return [str(item).strip() for item in raw if str(item).strip()]
+
+    return {
+        "cache_index_skip_vendors": _to_list("cache_index_skip_vendors"),
+        "cache_index_skip_keyword_vendors": _to_list("cache_index_skip_keyword_vendors"),
+        "cache_index_skip_ip_vendors": _to_list("cache_index_skip_ip_vendors"),
+        "cache_index_max_positions_per_key": int(cfg.get("cache_index_max_positions_per_key", 64) or 64),
+    }
+
+
+def _check_file_change_worker(task: Tuple[str, str, int, str]) -> Tuple[str, str, int, int, str, str, bool]:
+    """
+    Worker for parallel change detection.
+    Returns: (hostname, path, cached_mtime, current_mtime, old_hash, new_hash, changed)
+    """
+    hostname, path_str, cached_mtime, old_hash = task
+    file_path = Path(path_str)
+
+    try:
+        current_mtime = int(file_path.stat().st_mtime)
+    except OSError:
+        # Force reindex when file metadata can't be read.
+        return hostname, path_str, cached_mtime, cached_mtime, old_hash, "stat-error", True
+
+    if (current_mtime - cached_mtime) <= 1:
+        return hostname, path_str, cached_mtime, current_mtime, old_hash, old_hash, False
+
+    new_hash = calculate_config_hash(file_path)
+    return hostname, path_str, cached_mtime, current_mtime, old_hash, new_hash, new_hash != old_hash
+
+
+def _index_file_worker_process(
+    task: Tuple[str, str, str, str, str, Dict[str, Any]]
+) -> Tuple[Dict[str, Any], Dict[Tuple[str, str], Tuple[int, ...]], Dict[Tuple[str, str], Tuple[int, ...]], Dict[str, Any]]:
+    """
+    Process-safe indexing worker.
+    task: (hostname, vendor, region, device_type, filename_str, worker_cfg)
+    """
+    hostname, vendor, region, device_type, filename_str, worker_cfg = task
+    proc_ctx = SimpleNamespace(cfg=worker_cfg, logger=_NoopLogger())
+    return get_device_facts(proc_ctx, hostname, vendor, region, device_type, Path(filename_str))
+
+
+def _list_cfg_files(folder: Path) -> List[Path]:
+    """List .cfg files for a folder, swallowing transient filesystem errors."""
+    try:
+        return [path for path in folder.glob("*.cfg") if path.is_file()]
+    except OSError:
+        return []
+
+
 def cache_writer(
     ctx: ScriptContext,
     write_queue: queue.Queue,
@@ -132,18 +252,23 @@ def cache_writer(
     kw_idx: Index,
     dev_idx: Index,
     rev_idx: Index,
-    total_files: int
+    total_files: int,
+    batch_size: int,
 ):
     """
     Consumer thread function. Pulls parsed data from a queue and writes it
     to diskcache in batches to keep memory usage low.
     """
     logger = ctx.logger
-    BATCH_SIZE = 400  # Tunable: smoother progress with moderate overhead
+    # Keep batches configurable to balance throughput and memory.
+    BATCH_SIZE = max(1, int(batch_size))
     processed_count = 0
     last_update_ts = time()
     fatal_error = False
     event_bus = getattr(ctx, "event_bus", None)
+    writer_started = perf_counter()
+    aggregate_seconds = 0.0
+    write_seconds = 0.0
 
     while processed_count < total_files:
         # 1. Collect a batch of results from the queue
@@ -163,6 +288,7 @@ def cache_writer(
             continue
 
         # 2. Aggregate data for this batch only
+        aggregate_started = perf_counter()
         batch_dev_updates = {}
         batch_rev_updates = {}
         batch_ip_updates = defaultdict(lambda: defaultdict(list))
@@ -175,23 +301,32 @@ def cache_writer(
                 batch_ip_updates[ip][host].extend(lines)
             for (kw, host), lines in kw_data.items():
                 batch_kw_updates[kw][host].extend(lines)
+        aggregate_seconds += perf_counter() - aggregate_started
 
         # 3. Write this batch to diskcache using the efficient read-modify-write
         if not fatal_error:
             try:
+                write_started = perf_counter()
                 with ip_idx.transact(), kw_idx.transact(), dev_idx.transact(), rev_idx.transact():
                     dev_idx.update(batch_dev_updates)
                     rev_idx.update(batch_rev_updates)
 
                     for ip, new_host_dict in batch_ip_updates.items():
                         current_ip_entry = ip_idx.get(ip, {})
+                        for host, lines in list(new_host_dict.items()):
+                            if isinstance(lines, list):
+                                new_host_dict[host] = tuple(lines)
                         current_ip_entry.update(new_host_dict)
                         ip_idx[ip] = current_ip_entry
 
                     for kw, new_host_dict in batch_kw_updates.items():
                         current_kw_entry = kw_idx.get(kw, {})
+                        for host, lines in list(new_host_dict.items()):
+                            if isinstance(lines, list):
+                                new_host_dict[host] = tuple(lines)
                         current_kw_entry.update(new_host_dict)
                         kw_idx[kw] = current_kw_entry
+                write_seconds += perf_counter() - write_started
             except Exception as e:
                 fatal_error = True
                 logger.error(f"FATAL error during cache batch write: {e}")
@@ -218,7 +353,16 @@ def cache_writer(
                     )
 
         processed_count += len(batch_results)
-        logger.info(f"Index Cache - {processed_count}/{total_files} files written to cache...")
+        elapsed = max(perf_counter() - writer_started, 0.001)
+        rate = processed_count / elapsed
+        try:
+            q_depth = write_queue.qsize()
+        except Exception:
+            q_depth = -1
+        logger.info(
+            f"Index Cache - {processed_count}/{total_files} files written to cache "
+            f"({rate:.1f} files/s, q={q_depth}, batch={BATCH_SIZE})..."
+        )
 
         # Publish progress so the main menu can show live status
         try:
@@ -245,6 +389,15 @@ def cache_writer(
             # Never allow telemetry to break indexing
             pass
 
+    total_elapsed = max(perf_counter() - writer_started, 0.001)
+    logger.info(
+        "Index Cache writer breakdown: total=%.2fs aggregate=%.2fs write=%.2fs other=%.2fs",
+        total_elapsed,
+        aggregate_seconds,
+        write_seconds,
+        max(total_elapsed - aggregate_seconds - write_seconds, 0.0),
+    )
+
 
 def mt_index_configurations(ctx: ScriptContext) -> None:
     """
@@ -254,12 +407,14 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     logger = ctx.logger
     cache: Union[CacheManager, None] = ctx.cache
     event_bus = getattr(ctx, "event_bus", None)
+    index_workers = max(1, min(32, int(ctx.cfg.get("cache_index_workers", 4) or 4)))
 
     if not cache:
         return
 
     start = perf_counter()
-    cache.dc.set("indexing", True, expire=120)
+    # Keep indexing marker persistent for long runs; liveness is tracked via indexing_last_update.
+    cache.dc.set("indexing", True)
     try:
         cache.dc.set("indexing_started", int(time()))
         cache.dc.set("indexing_phase", "checking")
@@ -280,16 +435,54 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
 
     # 1. Get the current state from disk
     all_disk_files: Dict[str, Path] = {}
-    for folder in make_dir_list(ctx):
-        for file_path in folder.glob("*.cfg"):
-            # All keys should be upper case to match cache keys
-            all_disk_files[file_path.stem.upper()] = file_path
+    discovery_folders = make_dir_list(ctx)
+    discovery_workers = max(1, min(16, index_workers))
+    with ThreadPoolExecutor(max_workers=discovery_workers) as executor:
+        future_to_folder = {
+            executor.submit(_list_cfg_files, folder): folder
+            for folder in discovery_folders
+        }
+        for future in as_completed(future_to_folder):
+            folder = future_to_folder[future]
+            try:
+                folder_files = future.result()
+            except Exception as exc:
+                logger.error(f"Failed to enumerate configs in {folder}: {exc}")
+                continue
+            for file_path in folder_files:
+                if _parse_repo_metadata(ctx, file_path) is None:
+                    logger.debug(f"Skipping non-canonical config path: {file_path}")
+                    continue
+                # All keys should be upper case to match cache keys
+                all_disk_files[file_path.stem.upper()] = file_path
+    total_bytes = 0
+    for path in all_disk_files.values():
+        try:
+            total_bytes += int(path.stat().st_size)
+        except OSError:
+            continue
 
     # 2. Get the last known state from cache
     dev_idx = cache.dev_idx
     rev_idx = cache.rev_idx
     ip_idx = cache.ip_idx
     kw_idx = cache.kw_idx
+
+    cfg_cache_version = int(ctx.cfg.get("cache_version", 0))
+    current_cache_version = int(cache.dc.get("version", 0) or 0)
+    if current_cache_version != cfg_cache_version:
+        logger.warning(
+            "Cache version mismatch detected (cache=%s, config=%s). Resetting all cache indexes.",
+            current_cache_version,
+            cfg_cache_version,
+        )
+        with ip_idx.transact(), kw_idx.transact(), dev_idx.transact(), rev_idx.transact():
+            ip_idx.clear()
+            kw_idx.clear()
+            dev_idx.clear()
+            rev_idx.clear()
+        cache.dc.set("version", cfg_cache_version)
+
     # All keys in cache already uppercased
     cached_hostnames = set(dev_idx.keys())
     disk_hostnames = set(all_disk_files.keys())
@@ -307,9 +500,13 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     logger.info(f"New files:{len(new_files)}")
     logger.info(f"Potentially updated files:{len(potentially_updated_files)}")
     logger.info(f"Files to re-index:{len(files_to_reindex)}")
+    logger.info(f"Approx input size:{round(total_bytes / (1024 * 1024), 1)} MiB")
 
     logger.info("Checking existing files for content changes...")
     files_reindexed_count = 0
+    last_checking_heartbeat = time()
+    check_workers_default = max(2, min(16, index_workers))
+    check_workers = max(1, min(64, int(ctx.cfg.get("cache_check_workers", check_workers_default) or check_workers_default)))
     try:
         cache.dc.set("checking_total", int(len(potentially_updated_files)))
         cache.dc.set("checking_done", 0)
@@ -317,7 +514,9 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     except Exception:
         pass
 
-    for idx, hostname in enumerate(potentially_updated_files, start=1):
+    check_tasks: List[Tuple[str, str, int, str]] = []
+    prechecked_count = 0
+    for hostname in potentially_updated_files:
         file_path = all_disk_files[hostname]
         cached_device_info = dev_idx.get(hostname)  # Use .get()
 
@@ -325,35 +524,53 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         if not isinstance(cached_device_info, dict):
             logger.error(f"FATAL: Cached info for '{hostname}' is not a dictionary! Got: {type(cached_device_info)}. Re-indexing.")
             files_to_reindex.append(file_path)
+            prechecked_count += 1
             continue
         # --- END CRITICAL DEBUGGING ---
 
         # Get values with defaults for safety
-        cached_mtime = cached_device_info.get("updated", 0)
-        old_hash = cached_device_info.get("hash", "no-hash-in-cache")
+        cached_mtime = int(cached_device_info.get("updated", 0) or 0)
+        old_hash = str(cached_device_info.get("hash", "no-hash-in-cache"))
+        check_tasks.append((hostname, str(file_path), cached_mtime, old_hash))
 
-        # Get current file properties
-        current_mtime = int(file_path.stat().st_mtime)
+    logger.info(f"Checking phase runtime settings: workers={check_workers}")
+    if check_tasks:
+        with ThreadPoolExecutor(max_workers=check_workers) as executor:
+            future_to_task = {
+                executor.submit(_check_file_change_worker, task): task
+                for task in check_tasks
+            }
+            for idx, future in enumerate(as_completed(future_to_task), start=1):
+                fallback_task = future_to_task[future]
+                try:
+                    hostname, path_str, cached_mtime, current_mtime, old_hash, new_hash, changed = future.result()
+                except Exception as exc:
+                    hostname, path_str, cached_mtime, old_hash = fallback_task
+                    logger.error(
+                        f"Checking worker failed for {hostname} ({path_str}): {exc}. Scheduling re-index.",
+                        exc_info=True,
+                    )
+                    files_to_reindex.append(Path(path_str))
+                    changed = False
+                else:
+                    if changed:
+                        logger.info(f"Content changed for {hostname} (mtime and hash mismatch), scheduling for re-index.")
+                        logger.debug(f"  - Details for {hostname}:")
+                        logger.debug(f"  - Cached MTime: {cached_mtime}, Current MTime: {current_mtime}")
+                        logger.debug(f"  - Cached Hash:  {old_hash}")
+                        logger.debug(f"  - New Hash:     {new_hash}")
+                        files_to_reindex.append(Path(path_str))
+                        files_reindexed_count += 1
 
-        # Compare. Let's add a tiny tolerance to the mtime comparison.
-        if (current_mtime - cached_mtime) > 1:
-            # The file is definitely newer. Now check the hash.
-            new_hash = calculate_config_hash(file_path)
-            if new_hash != old_hash:
-                logger.info(f"Content changed for {hostname} (mtime and hash mismatch), scheduling for re-index.")
-                logger.debug(f"  - Details for {hostname}:")
-                logger.debug(f"  - Cached MTime: {cached_mtime}, Current MTime: {current_mtime}")
-                logger.debug(f"  - Cached Hash:  {old_hash}")
-                logger.debug(f"  - New Hash:     {new_hash}")
-                files_to_reindex.append(file_path)
-                files_reindexed_count += 1
-
-        if idx % 500 == 0:
-            try:
-                cache.dc.set("checking_done", int(idx))
-                cache.dc.set("indexing_last_update", int(time()))
-            except Exception:
-                pass
+                done_count = prechecked_count + idx
+                now = time()
+                if idx % 100 == 0 or (now - last_checking_heartbeat) >= 5:
+                    try:
+                        cache.dc.set("checking_done", int(done_count))
+                        cache.dc.set("indexing_last_update", int(now))
+                        last_checking_heartbeat = now
+                    except Exception:
+                        pass
 
     logger.info(f"Finished checking files. Found {files_reindexed_count} files that need re-indexing.")
     try:
@@ -392,10 +609,19 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         # Step 1: Identify all IP/Keyword keys we need to modify.
         ips_to_modify = set()
         kws_to_modify = set()
+        last_cleaning_heartbeat = time()
         for hostname in hosts_to_clean:
             old_rev_data = rev_idx.get(hostname, {})
             ips_to_modify.update(old_rev_data.get('ips', []))
             kws_to_modify.update(old_rev_data.get('kws', []))
+            # Keep background stale-check from clearing a healthy long-running clean phase.
+            now = time()
+            if (now - last_cleaning_heartbeat) >= 5:
+                try:
+                    cache.dc.set("indexing_last_update", int(now))
+                    last_cleaning_heartbeat = now
+                except Exception:
+                    pass
 
         logger.info(f"Identified {len(ips_to_modify)} IP keys and {len(kws_to_modify)} keyword keys to modify.")
 
@@ -408,7 +634,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
 
         # Step 3: Perform all cleanup operations on the fast in-memory dicts.
         logger.info("Performing cleanup operations in memory...")
-        for hostname in hosts_to_clean:
+        for clean_idx, hostname in enumerate(hosts_to_clean, start=1):
             old_rev_data = rev_idx.get(hostname, {})  # Still need this to know what to clean
 
             # Clean the in-memory ip_idx
@@ -420,6 +646,14 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             for keyword in old_rev_data.get('kws', []):
                 if keyword in in_memory_kw_idx and hostname in in_memory_kw_idx[keyword]:
                     del in_memory_kw_idx[keyword][hostname]
+            now = time()
+            if clean_idx % 100 == 0 or (now - last_cleaning_heartbeat) >= 5:
+                try:
+                    cache.dc.set("cleaning_done", int(clean_idx))
+                    cache.dc.set("indexing_last_update", int(now))
+                    last_cleaning_heartbeat = now
+                except Exception:
+                    pass
         logger.info("In-memory cleanup complete.")
 
         # Step 4: Write all changes back to diskcache in a single transaction.
@@ -468,8 +702,19 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             )
 
     # 5. Handle Additions/Updates
-    logger.info(f"Index Cache - Found {len(files_to_reindex)} new or updated files. Indexing...")
-    if not files_to_reindex:
+    index_inputs_by_host: Dict[str, Tuple[str, str, str, str, Path]] = {}
+    for file_path in files_to_reindex:
+        parsed = _parse_repo_metadata(ctx, file_path)
+        if parsed is None:
+            logger.debug(f"Skipping file with unsupported path layout before indexing: {file_path}")
+            continue
+        vendor, device_type, region = parsed
+        hostname = file_path.stem.upper()
+        index_inputs_by_host[hostname] = (hostname, vendor, region, device_type, file_path)
+    index_inputs = list(index_inputs_by_host.values())
+
+    logger.info(f"Index Cache - Found {len(index_inputs)} new or updated files. Indexing...")
+    if not index_inputs:
         logger.info("Index Cache - No configuration changes detected.")
         try:
             cache.dc.pop("indexing", None)
@@ -491,14 +736,27 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             )
         return
 
-    # Create a thread-safe queue to hold results from worker threads
+    # Create a thread-safe queue to hold results from worker threads/processes.
     # Maxsize prevents producers from running too far ahead of the consumer, acting as back-pressure.
-    write_queue = queue.Queue(maxsize=1000)
+    queue_size = max(8, int(ctx.cfg.get("cache_index_queue_size", 64) or 64))
+    batch_size = max(1, int(ctx.cfg.get("cache_index_batch_size", 100) or 100))
+    executor_mode = str(ctx.cfg.get("cache_index_executor", "thread") or "thread").strip().lower()
+    if executor_mode not in {"thread", "process"}:
+        logger.warning(f"Unsupported cache index executor '{executor_mode}', falling back to 'thread'.")
+        executor_mode = "thread"
+    logger.info(
+        "Index runtime settings: workers=%s queue_size=%s batch_size=%s mode=%s",
+        index_workers,
+        queue_size,
+        batch_size,
+        executor_mode,
+    )
+    write_queue = queue.Queue(maxsize=queue_size)
 
     # Start the consumer thread (the cache writer)
     try:
         cache.dc.set("indexing_phase", "indexing")
-        cache.dc.set("indexing_total", int(len(files_to_reindex)))
+        cache.dc.set("indexing_total", int(len(index_inputs)))
         cache.dc.set("indexing_done", 0)
         cache.dc.set("indexing_last_update", int(time()))
     except Exception:
@@ -506,15 +764,48 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
 
     writer_thread = threading.Thread(
         target=cache_writer,
-        args=(ctx, write_queue, cache.ip_idx, cache.kw_idx, cache.dev_idx, cache.rev_idx, len(files_to_reindex))
+        args=(
+            ctx,
+            write_queue,
+            cache.ip_idx,
+            cache.kw_idx,
+            cache.dev_idx,
+            cache.rev_idx,
+            len(index_inputs),
+            batch_size,
+        ),
     )
     writer_thread.start()
 
-    # Use the thread pool to produce data (read/parse files)
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        # Submit all file processing tasks. They will put results on the queue.
-        for filename in files_to_reindex:
-            executor.submit(get_facts_helper, ctx, filename, write_queue)
+    # Produce data (read/parse files) via threads or processes.
+    if executor_mode == "process":
+        worker_cfg = _index_worker_cfg_from_cfg(ctx.cfg)
+        with ProcessPoolExecutor(max_workers=index_workers) as executor:
+            future_to_hostname = {
+                executor.submit(
+                    _index_file_worker_process,
+                    (hostname, vendor, region, device_type, str(filename), worker_cfg),
+                ): hostname
+                for hostname, vendor, region, device_type, filename in index_inputs
+            }
+            for idx, future in enumerate(as_completed(future_to_hostname), start=1):
+                hostname = future_to_hostname[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    logger.error(f"Index worker failed for {hostname}: {exc}", exc_info=True)
+                    result = ({}, {}, {}, {})
+                write_queue.put(result)
+                if idx % 100 == 0:
+                    try:
+                        cache.dc.set("indexing_last_update", int(time()))
+                    except Exception:
+                        pass
+    else:
+        with ThreadPoolExecutor(max_workers=index_workers) as executor:
+            # Submit all file processing tasks. They will put results on the queue.
+            for item in index_inputs:
+                executor.submit(_index_file_worker_thread, ctx, item, write_queue)
 
     # Wait for the writer thread to finish processing all items from the queue
     writer_thread.join()
@@ -566,6 +857,27 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     logger.info(f"Index Cache - Update took {round(end - start, 3)} seconds")
 
 
+def _index_file_worker_thread(
+    ctx: ScriptContext,
+    item: Tuple[str, str, str, str, Path],
+    write_queue: Optional[queue.Queue] = None,
+) -> Optional[Tuple[Dict[str, Any], Dict[Tuple[str, str], Tuple[int, ...]], Dict[Tuple[str, str], Tuple[int, ...]], Dict[str, Any]]]:
+    """
+    Thread worker that indexes one file using pre-parsed metadata.
+    item: (hostname, vendor, region, device_type, filename)
+    """
+    hostname, vendor, region, device_type, filename = item
+    try:
+        result = get_device_facts(ctx, hostname, vendor, region, device_type, filename)
+    except Exception as exc:
+        ctx.logger.error(f"Index worker failed for {hostname} ({filename}): {exc}", exc_info=True)
+        result = ({}, {}, {}, {})
+    if write_queue:
+        write_queue.put(result)
+        return None
+    return result
+
+
 def get_facts_helper(
     ctx: ScriptContext, filename: Path, write_queue: Optional[queue.Queue] = None
 ) -> Optional[Tuple[Dict[str, Any], defaultdict, defaultdict, Dict[str, Any]]]:
@@ -573,19 +885,17 @@ def get_facts_helper(
     Function is a helper to run get_device_facts in Multithreaded fashion.
     It can either return data or put it on a queue for batch processing.
     """
-    parts = filename.parts
-    region = ''
-    regions = ctx.cfg.get("regions", False)
-
-    if regions and regions != '':
-        vendor = str(parts[-4]).lower()
-        device_type = str(parts[-3]).upper()
-        region = str(parts[-2]).upper()
-    else:
-        vendor = str(parts[-3]).lower()
-        device_type = str(parts[-2]).upper()
-
     hostname = filename.stem.upper()
+    parsed = _parse_repo_metadata(ctx, filename)
+    if parsed is None:
+        ctx.logger.debug(f"Skipping file with unsupported path layout: {filename}")
+        result = ({}, {}, {}, {})
+        if write_queue:
+            write_queue.put(result)
+            return None
+        return result
+
+    vendor, device_type, region = parsed
 
     ctx.logger.debug(f"Index Cache - Building {hostname.upper()} index data...")
     result = get_device_facts(ctx, hostname, vendor, region, device_type, filename)
@@ -611,10 +921,17 @@ def get_device_facts(ctx: ScriptContext, hostname: str, vendor: str, region: str
     # P2 Optimization: Single-pass hash + index extraction
     # Open in binary mode for accurate hash computation, decode for processing
     hasher = hashlib.sha256()
-    ip_list: defaultdict = defaultdict(lambda: tuple())
-    kw_list: defaultdict = defaultdict(lambda: tuple())
+    # Use lists for line number accumulation: append is O(1), tuple concat is O(n).
+    ip_list: defaultdict = defaultdict(list)
+    kw_list: defaultdict = defaultdict(list)
 
     vendor_lower = vendor.lower()
+    skip_vendors = _cfg_vendor_set(ctx, "cache_index_skip_vendors")
+    skip_kw_vendors = skip_vendors.union(_cfg_vendor_set(ctx, "cache_index_skip_keyword_vendors"))
+    skip_ip_vendors = skip_vendors.union(_cfg_vendor_set(ctx, "cache_index_skip_ip_vendors"))
+    skip_keywords = vendor_lower in skip_kw_vendors
+    skip_ips = vendor_lower in skip_ip_vendors
+    max_positions = max(1, int(ctx.cfg.get("cache_index_max_positions_per_key", 64) or 64))
     content_hash = "error-generating-hash"  # Default in case of error
 
     try:
@@ -629,25 +946,41 @@ def get_device_facts(ctx: ScriptContext, hostname: str, vendor: str, region: str
                 if line_strip and not line_strip.startswith(HASH_SKIP_PREFIXES):
                     hasher.update(line_bytes)
 
+                if not line_strip:
+                    continue
+                if len(line_strip) > MAX_INDEXABLE_LINE_LENGTH:
+                    continue
+
                 # Index extraction: skip stop words and noise patterns
                 # P3 Optimization: Use precompiled regex via matches_stopword()
-                if matches_stopword(line_strip, vendor_lower) or HEX8_RE.match(line_strip) or B64ish_RE.match(line_strip):
+                if (
+                    matches_stopword(line_strip, vendor_lower)
+                    or HEX8_RE.match(line_strip)
+                    or LONG_HEX_RE.match(line_strip)
+                    or B64ish_RE.match(line_strip)
+                ):
                     continue
 
                 # Extract IPs
-                for match in ip_regexp.finditer(line_strip):
-                    s = match.group()
-                    try:
-                        ip = ipaddress.ip_address(s)
-                        if s.startswith(("255.", "0.")) or ip.is_reserved:
-                            continue
-                        ip_list[(str(int(ip)), hostname)] += (index,)
-                    except ValueError:
-                        pass
+                if not skip_ips:
+                    for match in ip_regexp.finditer(line_strip):
+                        s = match.group()
+                        try:
+                            ip = ipaddress.ip_address(s)
+                            if s.startswith(("255.", "0.")) or ip.is_reserved:
+                                continue
+                            line_numbers = ip_list[(str(int(ip)), hostname)]
+                            if len(line_numbers) < max_positions:
+                                line_numbers.append(index)
+                        except ValueError:
+                            pass
 
                 # Extract keywords
-                for word in set(extract_keywords(line_strip, vendor=vendor)) - set(standard_keywords.get(vendor, ())):
-                    kw_list[(word, hostname)] += (index,)
+                if not skip_keywords:
+                    for word in extract_keywords(line_strip, vendor=vendor_lower):
+                        line_numbers = kw_list[(word, hostname)]
+                        if len(line_numbers) < max_positions:
+                            line_numbers.append(index)
 
         content_hash = hasher.hexdigest()
 
@@ -663,12 +996,16 @@ def get_device_facts(ctx: ScriptContext, hostname: str, vendor: str, region: str
         "hash": content_hash
     }
 
+    # Convert to tuples once (linear cost) to keep queue/cache payloads compact.
+    ip_data = {key: tuple(lines) for key, lines in ip_list.items()}
+    kw_data = {key: tuple(lines) for key, lines in kw_list.items()}
+
     reverse_index_data = {
-            'ips': list(set(ip for ip, host in ip_list.keys())),
-            'kws': list(set(kw for kw, host in kw_list.keys()))
+            'ips': list(set(ip for ip, host in ip_data.keys())),
+            'kws': list(set(kw for kw, host in kw_data.keys()))
         }
 
-    return ({hostname: device}, ip_list, kw_list, {hostname: reverse_index_data})
+    return ({hostname: device}, ip_data, kw_data, {hostname: reverse_index_data})
 
 
 def search_cache_config(

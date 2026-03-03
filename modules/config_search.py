@@ -299,8 +299,8 @@ class ConfigSearchModule(BaseModule):
         if len(parts) < 6:
             ctx.logger.warning('Repository has non-expected directory path(missing vendor/type/region)')
         else:
-            regions = ctx.cfg.get("regions", False)
-            if regions and regions != '':
+            regions = ctx.cfg.get("config_repo_regions", [])
+            if regions:
                 vendor = str(parts[-4]).lower()
                 device_type = str(parts[-3]).upper()
                 region = str(parts[-2]).upper()
@@ -420,13 +420,35 @@ class ConfigSearchModule(BaseModule):
             logger.info(f"Too many devices ({len(device_list)}) have matches, skipping full config report update.")
             return
 
+        max_config_tab_kb = int(ctx.cfg.get("report_max_config_tab_kb", 512) or 512)
+        max_config_tab_bytes = max(1, max_config_tab_kb) * 1024
+
         logger.info(f"Saving full configs for {len(device_list)} devices.")
         for device, filename in device_list:
             if not filename:
                 logger.error(f"{device} is missing full pathname information; unable to save.")
                 continue
+            file_path = Path(filename)
             try:
-                with open(filename, "r", encoding="utf-8", errors='ignore') as f:
+                file_size = file_path.stat().st_size
+                if file_size > max_config_tab_bytes:
+                    message = (
+                        f"Config omitted: size {round(file_size / 1024, 1)} KB exceeds "
+                        f"limit {max_config_tab_kb} KB. Adjust [report] max_config_tab_kb to include."
+                    )
+                    logger.info(f"{device}: {message}")
+                    queue_save(
+                        ctx,
+                        columns=["Notice"],
+                        raw_data=[[message]],
+                        sheet_name=device.upper(),
+                        index=False,
+                        skip_if_exists=True,
+                        force_header=True,
+                    )
+                    continue
+
+                with open(file_path, "r", encoding="utf-8", errors='ignore') as f:
                     file_content = f.readlines()
                     queue_save(ctx, columns=None, raw_data=file_content, sheet_name=device.upper(), index=False, skip_if_exists=True)
             except (IOError, OSError) as e:

@@ -12,6 +12,10 @@ logfile = ~/cn.log
 [report]
 filename = ~/report.xlsx
 auto_save = True
+# Cross-process report lock timeout in seconds
+#lock_timeout = 120
+# Max device config size (KB) to include as full tab in report
+#max_config_tab_kb = 512
 
 [config_repo]
 directory = /opt/data/configs
@@ -21,6 +25,8 @@ directory = /opt/data/configs
 #vendors = cisco
 #regions = ap, eu, am
 regions = 
+# Optional: skip specific subdirectories under each vendor (e.g. old collectors/history trees)
+#excluded_dirs = mobilerouter,old,history
 
 [gpg]
 #credentials = ~/device-apply.gpg
@@ -29,6 +35,17 @@ regions =
 #enabled=true
 directory=~/.cn-cache
 version=5
+# Indexing throughput/memory tuning:
+# check_workers = 4
+# index_workers = 4
+# index_executor = thread   # thread|process
+index_queue_size = 128
+index_batch_size = 256
+# index_max_positions_per_key = 64
+# Optional vendor-level index controls for heavy XML vendors:
+# index_skip_vendors = paloalto
+index_skip_keyword_vendors = paloalto
+# index_skip_ip_vendors = paloalto
 
 [theme]
 # Supported theme names: default,monochrome,pastel,dark

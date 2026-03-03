@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 import logging
 import os
 from pathlib import Path
+import re
 import zipfile
 from queue import Queue
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,41 @@ worker_thread: Optional[threading.Thread] = None
 _pending_lock = threading.Lock()
 _pending_saves: int = 0
 
+# openpyxl rejects these control chars in cell text:
+# 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
+_ILLEGAL_XLSX_CHARS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
+
+
+def _sanitize_excel_value(value: Any) -> tuple[Any, int]:
+    """Return value safe for Excel cells and count removed illegal chars."""
+    if isinstance(value, str):
+        return _ILLEGAL_XLSX_CHARS_RE.subn("", value)
+    return value, 0
+
+
+def _sanitize_dataframe_for_excel(df: pd.DataFrame) -> int:
+    """Sanitize DataFrame values/headers for openpyxl and return replacement count."""
+    replacements = 0
+
+    # Sanitize cell values.
+    for col in df.columns:
+        cleaned_values: List[Any] = []
+        for value in df[col].tolist():
+            cleaned, n = _sanitize_excel_value(value)
+            replacements += n
+            cleaned_values.append(cleaned)
+        df[col] = cleaned_values
+
+    # Sanitize string column headers as well.
+    cleaned_columns: List[Any] = []
+    for col in list(df.columns):
+        cleaned, n = _sanitize_excel_value(col)
+        replacements += n
+        cleaned_columns.append(cleaned)
+    df.columns = cleaned_columns
+
+    return replacements
+
 
 def _lock_path_for(report_path: Path) -> Path:
     """Return a filesystem lock path for the given report file."""
@@ -29,7 +65,74 @@ def _lock_path_for(report_path: Path) -> Path:
     return report_path.with_suffix(report_path.suffix + ".lock")
 
 
-def _acquire_report_lock(report_path: Path, *, timeout: float = 15.0, poll: float = 0.1, logger: Optional[logging.Logger] = None) -> tuple[Optional[int], Optional[Path]]:
+def _read_lock_pid(lock_path: Path) -> Optional[int]:
+    """Best-effort read of PID from lock file contents."""
+    try:
+        text = lock_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if not text:
+            return None
+        token = text.splitlines()[0].strip()
+        return int(token) if token.isdigit() else None
+    except Exception:
+        return None
+
+
+def _pid_exists(pid: int) -> bool:
+    """Cross-platform-ish PID existence check without external dependencies."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we may not have permission to signal it.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _try_break_stale_report_lock(lock_path: Path, *, stale_after: float, logger: Optional[logging.Logger] = None) -> bool:
+    """
+    Try to remove stale lock file.
+    Returns True if a lock was removed, False otherwise.
+    """
+    try:
+        st = lock_path.stat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+    age = max(0.0, time.time() - float(st.st_mtime))
+    pid = _read_lock_pid(lock_path)
+    pid_alive = _pid_exists(pid) if isinstance(pid, int) else None
+
+    stale = False
+    if isinstance(pid_alive, bool) and not pid_alive:
+        stale = True
+    elif age >= stale_after and pid_alive is not True:
+        stale = True
+
+    if not stale:
+        return False
+
+    try:
+        os.unlink(str(lock_path))
+        if logger:
+            logger.warning(
+                "Removed stale report lock %s (pid=%s age=%.1fs)",
+                lock_path,
+                pid,
+                age,
+            )
+        return True
+    except Exception:
+        return False
+
+
+def _acquire_report_lock(report_path: Path, *, timeout: float = 15.0, poll: float = 0.1, stale_after: float = 600.0, logger: Optional[logging.Logger] = None) -> tuple[Optional[int], Optional[Path]]:
     """Attempt to acquire a cross-process lock for the report file.
 
     Uses atomic lock-file creation. Returns (fd, lock_path) on success, (None, None) on timeout.
@@ -47,6 +150,9 @@ def _acquire_report_lock(report_path: Path, *, timeout: float = 15.0, poll: floa
                 pass
             return fd, lock_path
         except FileExistsError:
+            # Attempt stale-lock recovery before waiting.
+            if _try_break_stale_report_lock(lock_path, stale_after=stale_after, logger=logger):
+                continue
             if time.monotonic() - start >= timeout:
                 if logger:
                     logger.warning(f"Report lock timeout: unable to acquire lock {lock_path}")
@@ -108,12 +214,27 @@ def worker() -> None:
 
             # Acquire cross-process report lock to guard Excel writes
             report_path = None
+            lock_timeout = 120.0
             if ctx and isinstance(ctx, ScriptContext):
                 report_path = ctx.cfg.get("report_file")
+                try:
+                    lock_timeout = float(ctx.cfg.get("report_lock_timeout", 120) or 120)
+                except Exception:
+                    lock_timeout = 120.0
+                lock_timeout = max(5.0, min(600.0, lock_timeout))
                 if isinstance(report_path, (str, Path)):
                     report_path = Path(report_path).expanduser()
             if isinstance(report_path, Path):
-                lock_fd, lock_fp = _acquire_report_lock(report_path, timeout=30.0, logger=getattr(ctx, "logger", None))
+                lock_fd, lock_fp = _acquire_report_lock(
+                    report_path,
+                    timeout=lock_timeout,
+                    stale_after=max(300.0, lock_timeout * 2.0),
+                    logger=getattr(ctx, "logger", None),
+                )
+                if lock_fd is None or lock_fp is None:
+                    raise TimeoutError(
+                        f"Unable to acquire report lock within {int(lock_timeout)}s: {report_path}"
+                    )
 
             with save_lock:
                 append_df_to_excel(*save_task['args'], **save_task['kwargs'])
@@ -130,7 +251,12 @@ def worker() -> None:
                 if isinstance(report_path, Path):
                     # If lock wasn't acquired before, try now (short wait)
                     if lock_fd is None or lock_fp is None:
-                        lock_fd, lock_fp = _acquire_report_lock(report_path, timeout=10.0, logger=ctx.logger)
+                        lock_fd, lock_fp = _acquire_report_lock(
+                            report_path,
+                            timeout=min(30.0, lock_timeout),
+                            stale_after=max(300.0, lock_timeout * 2.0),
+                            logger=ctx.logger,
+                        )
                     try:
                         if report_path.exists():
                             ctx.logger.warning(f"Auto-repair: deleting corrupted report at {report_path}")
@@ -156,6 +282,18 @@ def worker() -> None:
                             {"component": "report", "state": "error", "error": str(e)},
                         )
                 file_is_corrupt = True
+
+        except TimeoutError as e:
+            if ctx:
+                ctx.logger.error(f"Report save skipped due to lock timeout: {e}")
+                ctx.console.print(
+                    f"\n[bold yellow]Warning:[/bold yellow] Report is busy and could not be locked in time: {e}"
+                )
+                if getattr(ctx, "event_bus", None):
+                    ctx.event_bus.publish(
+                        "status:update",
+                        {"component": "report", "state": "warning", "error": str(e)},
+                    )
 
         except Exception as e:
             if ctx:
@@ -372,6 +510,13 @@ def append_df_to_excel(
         df = prepare_df(columns, raw_data)
     else:
         df = pd.DataFrame(raw_data)
+
+    cleaned_count = _sanitize_dataframe_for_excel(df)
+    if cleaned_count:
+        logger.warning(
+            "Report export sanitized %s illegal control characters for Excel compatibility",
+            cleaned_count,
+        )
 
     # Excel file doesn't exist - saving and exiting
     if not check_file_accessibility(logger, Path(filename)):
