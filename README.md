@@ -108,6 +108,60 @@ enabled = true
 name = default
 ```
 
+### Additional Options (Large Repos / Large Configs)
+
+These options were added to handle bigger repositories, heavy vendor configs
+(for example large XML configs), and report write contention.
+
+Note: primary section is `[report]`. For compatibility, `[output]` is also accepted.
+
+#### Report output options
+
+| Section / Key                   | Default | Explanation |
+| ------------------------------ | ------- | ----------- |
+| `[report] lock_timeout`        | `120`   | Max time (seconds) to wait for report file lock before failing with lock timeout. Increase when multiple tasks/processes write to the same report. |
+| `[report] max_config_tab_kb`   | `512`   | Max config size (KB) to include as a full per-device tab in Excel. If exceeded, tool creates a tab with a notice instead of embedding full config text. |
+
+#### Config repository options
+
+| Section / Key                        | Default   | Explanation |
+| ----------------------------------- | --------- | ----------- |
+| `[config_repo] excluded_dirs`       | *(empty)* | Comma-separated directory names to skip during discovery/indexing (case-insensitive), e.g. `old,history,mobilerouter`. Useful to avoid indexing legacy trees. |
+| `[config_repo] history_dir`         | `history` | Folder name treated as snapshot-history path for analyzer workflows and excluded from live config indexing by default. |
+
+#### Cache indexing tuning options
+
+| Section / Key                                  | Default  | Explanation |
+| --------------------------------------------- | -------- | ----------- |
+| `[cache] check_workers`                        | `4`      | Worker count for "did file change?" checks (mtime/hash). Higher improves pre-check speed but uses more CPU. |
+| `[cache] index_workers`                        | `4`      | Worker count used to parse/index configs. Increase gradually; too high can increase contention and memory. |
+| `[cache] index_executor`                       | `thread` | Index worker model: `thread` or `process`. Use `process` when GIL is a bottleneck on CPU-heavy parsing. |
+| `[cache] index_queue_size`                     | `64`     | Max queued indexing results waiting for cache writer. Larger queue can improve throughput but uses more RAM. |
+| `[cache] index_batch_size`                     | `100`    | Number of indexed hosts written per cache transaction. Larger batches reduce write overhead; smaller batches reduce peak memory. |
+| `[cache] index_max_positions_per_key`          | `64`     | Cap on stored line positions per indexed key (IP/keyword) per host. Lower value shrinks cache size; higher value improves hit precision. |
+| `[cache] index_skip_vendors`                   | *(empty)* | Comma-separated vendors to skip from both keyword and IP indexing (device metadata still tracked). Useful for very large config formats. |
+| `[cache] index_skip_keyword_vendors`           | *(empty)* | Vendors to skip only keyword index generation for. |
+| `[cache] index_skip_ip_vendors`                | *(empty)* | Vendors to skip only IP index generation for. |
+
+Example tuning snippet:
+
+```ini
+[config_repo]
+excluded_dirs = old,history,mobilerouter
+
+[cache]
+check_workers = 8
+index_workers = 6
+index_executor = process
+index_batch_size = 50
+index_max_positions_per_key = 32
+index_skip_vendors = paloalto
+
+[report]
+lock_timeout = 180
+max_config_tab_kb = 512
+```
+
 ### Active Directory Plugin
 
 Enable enrichment of subnet data from Active Directory:
