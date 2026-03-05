@@ -28,6 +28,12 @@ def exit_now(ctx: ScriptContext, exit_code: int = 0, message: str = '') -> None:
 
     if cache and isinstance(cache, CacheManager):
         logger.info("Closing disk cache...")
+        # Close Index connections (FanoutCache.close() misses these)
+        for idx in (cache.dev_idx, cache.ip_idx, cache.kw_idx, cache.rev_idx):
+            try:
+                idx._cache.close()
+            except Exception:
+                pass
         cache.dc.close()
         logger.info("Disk cache closed.")
 
