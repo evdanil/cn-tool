@@ -1,6 +1,7 @@
 import configparser
 import argparse
 import logging
+import math
 from pathlib import Path
 from typing import Dict, Any, List
 
@@ -35,6 +36,8 @@ BASE_CONFIG_SCHEMA = {
     "cache_index_skip_vendors": {"section": "cache", "ini_key": "index_skip_vendors", "type": "list[str]", "fallback": ""},
     "cache_index_skip_keyword_vendors": {"section": "cache", "ini_key": "index_skip_keyword_vendors", "type": "list[str]", "fallback": ""},
     "cache_index_skip_ip_vendors": {"section": "cache", "ini_key": "index_skip_ip_vendors", "type": "list[str]", "fallback": ""},
+    "cache_sqlite_cache_size": {"section": "cache", "ini_key": "sqlite_cache_size", "type": "str", "fallback": "16M"},
+    "cache_sqlite_mmap_size":  {"section": "cache", "ini_key": "sqlite_mmap_size", "type": "str", "fallback": "32M"},
     "theme_name":            {"section": "theme", "ini_key": "theme", "type": "str", "fallback": "default"},
     # Config Analyzer (external TUI) settings
     "config_repo_history_dir":     {"section": "config_repo", "ini_key": "history_dir", "type": "str", "fallback": "history"},
@@ -51,6 +54,43 @@ SECTION_ALIASES: Dict[str, List[str]] = {
     "report": ["output"],
     "output": ["report"],
 }
+
+
+def parse_size(value) -> int:
+    """Parse a size value with optional K/M/G suffix to bytes.
+    Examples: '32M' -> 33554432, '512K' -> 524288, '1G' -> 1073741824
+    Returns 0 for empty or non-positive values.
+    """
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    s = str(value).strip().upper()
+    if not s:
+        return 0
+    multipliers = {'K': 1024, 'M': 1024**2, 'G': 1024**3}
+    if s[-1] in multipliers:
+        result = int(float(s[:-1]) * multipliers[s[-1]])
+    else:
+        result = int(s)
+    return max(0, result)
+
+
+def parse_cache_pages(value, page_size: int = 4096) -> int:
+    """Parse a cache size value to SQLite pages.
+    Accepts plain page count (e.g. '4096') or human-readable bytes (e.g. '16M').
+    When K/M/G suffix is detected, converts bytes to pages and rounds to nearest power of 2.
+    Returns at least 1 page.
+    """
+    s = str(value).strip().upper()
+    if not s:
+        return 1
+    has_suffix = s[-1] in ('K', 'M', 'G')
+    if has_suffix:
+        size_bytes = parse_size(value)
+        pages = size_bytes / page_size
+        if pages < 1:
+            return 1
+        return 1 << round(math.log2(pages))
+    return max(1, int(s))
 
 
 def _apply_types(cfg: Dict[str, Any], schema: Dict[str, Any], logger: logging.Logger) -> Dict[str, Any]:

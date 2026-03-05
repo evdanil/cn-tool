@@ -21,12 +21,12 @@ auto_save = True
 directory = /opt/data/configs
 # expected repo structure:
 # vendor/device_type/region/device_config.cfg
-#vendors = cisco,aruba,f5,bluecoat,paloalto
+vendors = cisco,aruba,f5,bluecoat,viptela
 #vendors = cisco
 #regions = ap, eu, am
 regions = 
 # Optional: skip specific subdirectories under each vendor (e.g. old collectors/history trees)
-#excluded_dirs = mobilerouter,old,history
+excluded_dirs = mobilerouter,old,history
 
 [gpg]
 #credentials = ~/device-apply.gpg
@@ -46,6 +46,9 @@ index_batch_size = 256
 # index_skip_vendors = paloalto
 index_skip_keyword_vendors = paloalto
 # index_skip_ip_vendors = paloalto
+# SQLite memory tuning (per database, 8 databases total):
+# sqlite_cache_size = 16M
+# sqlite_mmap_size = 32M
 
 [theme]
 # Supported theme names: default,monochrome,pastel,dark

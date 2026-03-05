@@ -13,7 +13,8 @@ def start_background_tasks(ctx: ScriptContext) -> None:
         # Initialize the CacheManager instance and attach it to the context
         ctx.cache = CacheManager.get_instance(
             directory=ctx.cfg["cache_directory"],
-            logger=ctx.logger
+            logger=ctx.logger,
+            cfg=ctx.cfg,
         )
         # Start the cache indexing in a separate thread
         threading.Thread(target=_background_cache_init, args=[ctx], daemon=True).start()

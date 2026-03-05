@@ -2,6 +2,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import hashlib
 import ipaddress
+import logging
 import re
 import queue
 import threading
@@ -585,6 +586,9 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     for file_path in files_to_reindex:
         hosts_to_clean.add(file_path.stem.upper())
 
+    # Release discovery-phase structures no longer needed
+    del all_disk_files, cached_hostnames, disk_hostnames, potentially_updated_files
+
     # 4. Clean all obsolete entries using the reverse index
     if hosts_to_clean:
         logger.info(f"Cleaning {len(hosts_to_clean)} obsolete/updated host entries from indexes...")
@@ -700,6 +704,10 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
                     "total": len(hosts_to_clean),
                 },
             )
+
+        # Release cleaning-phase structures before indexing phase
+        del in_memory_ip_idx, in_memory_kw_idx
+        del ips_to_modify, kws_to_modify
 
     # 5. Handle Additions/Updates
     index_inputs_by_host: Dict[str, Tuple[str, str, str, str, Path]] = {}
@@ -822,6 +830,9 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     # Clear in-memory file content LRU cache after indexing to ensure fresh reads
     clear_config_cache()
 
+    # Release memory held by Python allocator and SQLite after indexing
+    _release_post_indexing_memory(cache, logger)
+
     end = perf_counter()
     if not fatal:
         cache.dc.set("updated", int(time()))
@@ -855,6 +866,31 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
                 {"component": "cache", "state": "ready"},
             )
     logger.info(f"Index Cache - Update took {round(end - start, 3)} seconds")
+
+
+def _release_post_indexing_memory(cache: CacheManager, logger: logging.Logger) -> None:
+    """Release memory held by Python allocator and SQLite after indexing."""
+    import gc
+    gc.collect()
+
+    # Shrink SQLite page caches across all connections
+    try:
+        for shard in cache.dc._shards:
+            shard._sql('PRAGMA shrink_memory').fetchall()
+        for idx_obj in cache.dc._indexes.values():
+            idx_obj._cache._sql('PRAGMA shrink_memory').fetchall()
+        logger.debug("Post-indexing: SQLite shrink_memory completed.")
+    except Exception as exc:
+        logger.warning("Post-indexing: SQLite shrink_memory failed (diskcache internals may have changed): %s", exc)
+
+    # Return freed pages to OS (Linux only)
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+        logger.debug("Post-indexing: malloc_trim completed.")
+    except Exception:
+        pass
 
 
 def _index_file_worker_thread(

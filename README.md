@@ -142,6 +142,8 @@ Note: primary section is `[report]`. For compatibility, `[output]` is also accep
 | `[cache] index_skip_vendors`                   | *(empty)* | Comma-separated vendors to skip from both keyword and IP indexing (device metadata still tracked). Useful for very large config formats. |
 | `[cache] index_skip_keyword_vendors`           | *(empty)* | Vendors to skip only keyword index generation for. |
 | `[cache] index_skip_ip_vendors`                | *(empty)* | Vendors to skip only IP index generation for. |
+| `[cache] sqlite_cache_size`                    | `16M`    | SQLite page cache per database. Supports K/M/G suffixes (converted to pages, rounded to power of 2) or plain page count. 8 databases total. |
+| `[cache] sqlite_mmap_size`                     | `32M`    | SQLite mmap size per database. Supports K/M/G suffixes. Total across 8 databases: 8 × this value. |
 
 Example tuning snippet:
 
@@ -156,6 +158,8 @@ index_executor = process
 index_batch_size = 50
 index_max_positions_per_key = 32
 index_skip_vendors = paloalto
+sqlite_cache_size = 16M
+sqlite_mmap_size = 32M
 
 [report]
 lock_timeout = 180
