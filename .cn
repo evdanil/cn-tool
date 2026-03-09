@@ -89,3 +89,13 @@ enabled=False
 #repo_directories = repo_dir1,repo_dir2
 #repo_names = repo_routers,repo_switches
 #layout = bottom
+
+[route_baseline]
+#output_directory = ~/cn-route-runs
+#workers = 20
+#per_device_sessions = 3
+#dns = false
+#timeout = 120
+#infoblox_enrich = false
+#ospf_lsdb = false
+#omp_tlocs = false
