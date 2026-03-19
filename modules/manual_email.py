@@ -4,22 +4,10 @@ from core.base import BaseModule, ScriptContext
 from utils.email_helper import (
     interpret_bool,
     send_configured_report,
-    send_report_email as _email_send_report,
+    send_report_email,
 )
 from utils.user_input import press_any_key
 from utils.file_io import wait_for_all_saves, saves_in_progress
-
-
-def send_report_email(**kwargs):
-    """Compatibility shim for tests to intercept report email calls."""
-    return _email_send_report(**kwargs)
-
-
-def _dispatch_send_report_email(**kwargs):
-    return send_report_email(**kwargs)
-
-
-send_configured_report.__globals__["send_report_email"] = _dispatch_send_report_email
 
 
 class EmailReportModule(BaseModule):
@@ -59,6 +47,7 @@ class EmailReportModule(BaseModule):
             prefix="EMAIL (manual)",
             success_message=f"[green]Report has been sent successfully to {receiver}.[/green]" if receiver else None,
             failure_message="[red]Failed to send the report. Please check the logs for details.[/red]",
+            send_email_fn=send_report_email,
         )
 
         if success is False:

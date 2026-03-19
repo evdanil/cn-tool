@@ -1,101 +1,72 @@
 [api]
-endpoint = API_URL
-verify_ssl = False
+endpoint = https://infoblox.example.com
+verify_ssl = true
 timeout = 10
 
 [logging]
 logfile = ~/cn.log
-# Levels supported DEBUG,INFO,WARNING,ERROR
-# Defaults to INFO
-#level = INFO
+# Supported levels: DEBUG, INFO, WARNING, ERROR
+# level = INFO
 
 [report]
 filename = ~/report.xlsx
-auto_save = True
-# Cross-process report lock timeout in seconds
-#lock_timeout = 120
-# Max device config size (KB) to include as full tab in report
-#max_config_tab_kb = 512
+auto_save = true
+# lock_timeout = 120
+# max_config_tab_kb = 512
 
 [config_repo]
 directory = /opt/data/configs
-# expected repo structure:
-# vendor/device_type/region/device_config.cfg
 vendors = cisco,aruba,f5,bluecoat,viptela
-#vendors = cisco
-#regions = ap, eu, am
-regions = 
-# Optional: skip specific subdirectories under each vendor (e.g. old collectors/history trees)
-excluded_dirs = mobilerouter,old,history
+regions =
+excluded_dirs = old,history
+history_dir = history
 
 [gpg]
-#credentials = ~/device-apply.gpg
+# credentials = ~/device-apply.gpg
 
 [cache]
-#enabled=true
-directory=~/.cn-cache
-version=5
-# Indexing throughput/memory tuning:
+enabled = true
+directory = ~/.cn-cache
+version = 5
 # check_workers = 4
 # index_workers = 4
-# index_executor = thread   # thread|process
-index_queue_size = 128
-index_batch_size = 256
-# index_max_positions_per_key = 64
-# Optional vendor-level index controls for heavy XML vendors:
-# index_skip_vendors = paloalto
-index_skip_keyword_vendors = paloalto
-# index_skip_ip_vendors = paloalto
-# SQLite memory tuning (per database, 8 databases total):
-# sqlite_cache_size = 16M
-# sqlite_mmap_size = 32M
+# index_executor = thread
+# index_queue_size = 128
+# index_batch_size = 256
+# index_skip_keyword_vendors = paloalto
 
 [theme]
-# Supported theme names: default,monochrome,pastel,dark
-#name=default
+# theme = default
 
-# Only works if subnet AD enrichment plugin present
 [ad]
-# Default is false
-#enabled = true
-uri = ldap://your-ad-server.com
-user = your-user@yourdomain.com or domain\login
-# Optional: Override the default search base if needed
-search_base = CN=Subnets,CN=Sites,CN=Configuration,DC=domain,DC=com
-# Default false, allows to connect to AD as soon as script started(saves time if performing multiple subnet(opt 2) requests)
-#connect_on_startup = true
+# enabled = true
+uri = ldap://your-ad-server.example.com
+user = your-user@example.com or domain\login
+search_base = CN=Subnets,CN=Sites,CN=Configuration,DC=example,DC=com
+# operation_timeout = 15
+# connect_on_startup = false
 
 [email]
-# change send_on_exit to true to receive report once cn-tool terminates
+# enabled = true
 send_on_exit = false
 to = some_user@example.com
-#from = cn-tool@localhost
-#subject = CN-Tool Execution Report
-#server = smtp.gmail.com
-#port = 587
-#use_tls = true
-#use_ssl = false
-#use_auth = true
-#user = my_account@gmail.com
-# WARNING: Storing passwords in plaintext is a security risk.
-# For services like Gmail, this should be an "App Password".
-#password = abcd-efgh-ijkl-mnop
+# from = cn-tool@localhost
+# subject = CN-Tool Execution Report
+# server = smtp.example.com
+# port = 587
+# use_tls = true
+# use_ssl = false
+# use_auth = true
+# user = my_account@example.com
+# password = app-password-or-service-password
 
 [sdwan_yaml_search]
-enabled=False
-#repository_path=yaml_repo_path
+enabled = false
+# repository_paths = /path/to/repo1,/path/to/repo2
 
 [config_analyzer]
-#repo_directories = repo_dir1,repo_dir2
-#repo_names = repo_routers,repo_switches
-#layout = bottom
-
-[route_baseline]
-#output_directory = ~/cn-route-runs
-#workers = 20
-#per_device_sessions = 3
-#dns = false
-#timeout = 120
-#infoblox_enrich = false
-#ospf_lsdb = false
-#omp_tlocs = false
+# repo_directories = /path/to/repoA,/path/to/repoB
+# repo_names = repoA,repoB
+# layout = right
+# scroll_to_end = false
+# debug = false

@@ -100,4 +100,14 @@ class FQDNRequestModule(BaseModule):
                 save_data_list_of_lists = [[row.get(col, '') for col in final_columns] for row in final_save_data]
                 queue_save(ctx, final_columns, save_data_list_of_lists, sheet_name="FQDN Data", index=False, force_header=True)
 
+        ctx.event_bus.publish(
+            "stats:module_detail",
+            {
+                "unit_count": 1,
+                "query_count": 1,
+                "result_count": len(processed_data.get("fqdn", [])),
+                "success_count": 1,
+            },
+        )
+
         press_any_key(ctx)

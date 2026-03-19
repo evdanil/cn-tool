@@ -4,20 +4,8 @@ from core.base import BaseModule, BasePlugin, ScriptContext
 from utils.email_helper import (
     interpret_bool,
     send_configured_report,
-    send_report_email as _email_send_report,
+    send_report_email,
 )
-
-
-def send_report_email(**kwargs):
-    """Compatibility shim so tests can patch the email helper."""
-    return _email_send_report(**kwargs)
-
-
-def _dispatch_send_report_email(**kwargs):
-    return send_report_email(**kwargs)
-
-
-send_configured_report.__globals__["send_report_email"] = _dispatch_send_report_email
 
 
 class EmailReportPlugin(BasePlugin):
@@ -82,4 +70,5 @@ class EmailReportPlugin(BasePlugin):
                 prefix="EMAIL",
                 success_message="[green]Report has been sent successfully via email.[/green]",
                 failure_message="[red]Failed to send report via email. Please check the logs.[/red]",
+                send_email_fn=send_report_email,
             )

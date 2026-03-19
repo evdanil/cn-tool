@@ -126,4 +126,15 @@ class LocationRequestModule(BaseModule):
 
                 queue_save(ctx, final_columns, save_data_list_of_lists, sheet_name="Subnet Lookup", index=False, force_header=True)
 
+        ctx.event_bus.publish(
+            "stats:module_detail",
+            {
+                "unit_count": 1,
+                "query_count": 1,
+                "result_count": len(processed_data.get("location", [])),
+                "success_count": 1,
+                "search_mode": "keyword" if is_keyword_search else "sitecode",
+            },
+        )
+
         press_any_key(ctx)

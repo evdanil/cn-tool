@@ -31,7 +31,11 @@ _ILLEGAL_XLSX_CHARS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 def _sanitize_excel_value(value: Any) -> tuple[Any, int]:
     """Return value safe for Excel cells and count removed illegal chars."""
     if isinstance(value, str):
-        return _ILLEGAL_XLSX_CHARS_RE.subn("", value)
+        cleaned, replacements = _ILLEGAL_XLSX_CHARS_RE.subn("", value)
+        if cleaned and cleaned[0] in ("=", "+", "-", "@") and not cleaned.startswith("'"):
+            cleaned = f"'{cleaned}"
+            replacements += 1
+        return cleaned, replacements
     return value, 0
 
 
@@ -216,7 +220,7 @@ def worker() -> None:
             report_path = None
             lock_timeout = 120.0
             if ctx and isinstance(ctx, ScriptContext):
-                report_path = ctx.cfg.get("report_file")
+                report_path = save_task.get("kwargs", {}).get("report_path") or ctx.cfg.get("report_file")
                 try:
                     lock_timeout = float(ctx.cfg.get("report_lock_timeout", 120) or 120)
                 except Exception:
@@ -458,6 +462,7 @@ def append_df_to_excel(
     truncate_sheet: bool = False,
     skip_if_exists: bool = False,
     force_header: bool = False,
+    report_path: Optional[Path] = None,
     **to_excel_kwargs: Any,
 ) -> None:
     """
@@ -493,7 +498,7 @@ def append_df_to_excel(
     """
 
     logger = ctx.logger
-    filename = ctx.cfg["report_file"]
+    filename = Path(report_path).expanduser() if report_path else Path(ctx.cfg["report_file"]).expanduser()
 
     def prepare_df(columns: List[str], data: List[List[Any]]) -> pd.DataFrame:
         """
@@ -519,7 +524,7 @@ def append_df_to_excel(
         )
 
     # Excel file doesn't exist - saving and exiting
-    if not check_file_accessibility(logger, Path(filename)):
+    if not check_file_accessibility(logger, filename):
         # Log report creation
         logger.info(f"Export - Report {filename} doesn't exist - creating...")
         df.to_excel(
@@ -571,14 +576,17 @@ def append_df_to_excel(
         startrow = 0
 
     with pd.ExcelWriter(
-        filename, engine="openpyxl", if_sheet_exists="overlay", mode="a"
+        filename,
+        engine="openpyxl",
+        if_sheet_exists="replace" if truncate_sheet else "overlay",
+        mode="a",
     ) as writer:
 
         header: bool
         # if force_header is set we always write header, otherwise
         # if filled_rows = 0 then we need header, otherwise header is already in the sheet
         # in no columns provided we dont need a header
-        if columns and force_header:
+        if columns and (force_header or truncate_sheet):
             header = True
         elif columns:
             header = not bool(filled_rows)
@@ -596,3 +604,50 @@ def append_df_to_excel(
 
         # log success
         logger.info(f"Export - Updated {filename} successfully")
+
+
+def write_excel_sheets(
+    ctx: ScriptContext,
+    report_path: Path,
+    sheets: List[Dict[str, Any]],
+) -> None:
+    """Write multiple sheets to one workbook under a single lock."""
+    lock_fd: Optional[int] = None
+    lock_fp: Optional[Path] = None
+    report_path = Path(report_path).expanduser()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        lock_timeout = float(ctx.cfg.get("report_lock_timeout", 120) or 120)
+    except Exception:
+        lock_timeout = 120.0
+    lock_timeout = max(5.0, min(600.0, lock_timeout))
+
+    lock_fd, lock_fp = _acquire_report_lock(
+        report_path,
+        timeout=lock_timeout,
+        stale_after=max(300.0, lock_timeout * 2.0),
+        logger=ctx.logger,
+    )
+    if lock_fd is None or lock_fp is None:
+        raise TimeoutError(
+            f"Unable to acquire report lock within {int(lock_timeout)}s: {report_path}"
+        )
+
+    try:
+        with save_lock:
+            for sheet in sheets:
+                append_df_to_excel(
+                    ctx,
+                    sheet.get("columns"),
+                    sheet.get("raw_data", []),
+                    sheet_name=sheet.get("sheet_name", "Sheet1"),
+                    startrow=sheet.get("startrow", 0),
+                    truncate_sheet=sheet.get("truncate_sheet", False),
+                    skip_if_exists=sheet.get("skip_if_exists", False),
+                    force_header=sheet.get("force_header", False),
+                    report_path=report_path,
+                    **sheet.get("to_excel_kwargs", {}),
+                )
+    finally:
+        _release_report_lock(lock_fd, lock_fp)

@@ -6,7 +6,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from core.base import ScriptContext
 
@@ -111,10 +111,12 @@ def send_configured_report(
     prefix: str = "EMAIL",
     success_message: Optional[str] = None,
     failure_message: Optional[str] = None,
+    send_email_fn: Optional[Callable[..., bool]] = None,
 ) -> bool:
     """Send the configured report and perform optional post-send cleanup."""
     logger = ctx.logger
     console = getattr(ctx, "console", None)
+    send_email = send_email_fn or send_report_email
 
     def _console_print(message: str) -> None:
         if console:
@@ -132,7 +134,7 @@ def send_configured_report(
         _console_print(f"[red]Error: Report file not found at '{report_path}'. Please generate a report first.[/red]")
         return False
 
-    success = send_report_email(
+    success = send_email(
         logger=logger,
         smtp_server=ctx.cfg.get("email_server", ""),
         smtp_port=int(ctx.cfg.get("email_port", 25)),
@@ -169,4 +171,3 @@ def send_configured_report(
             _console_print(failure_message)
 
     return success
-
