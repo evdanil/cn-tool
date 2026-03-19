@@ -153,4 +153,16 @@ class IPRequestModule(BaseModule):
 
                 queue_save(ctx, final_columns_for_saving, final_save_data, sheet_name="IP Data", index=False, force_header=True)
 
+        ctx.event_bus.publish(
+            "stats:module_detail",
+            {
+                "unit_count": len(ip_addresses),
+                "input_count": len(ip_addresses_input),
+                "unique_count": len(ip_addresses),
+                "success_count": len(successful_ips),
+                "miss_count": max(0, len(ip_addresses) - len(successful_ips)),
+                "result_count": len(print_data_all),
+            },
+        )
+
         press_any_key(ctx)

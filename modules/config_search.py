@@ -178,6 +178,20 @@ class ConfigSearchModule(BaseModule):
         if ctx.cfg["report_auto_save"]:
             self._save_found_data(ctx, data_to_save, missing_nets, matched_nets, "Config Check")
 
+        ctx.event_bus.publish(
+            "stats:module_detail",
+            {
+                "unit_count": max(1, len(validated_search_input)),
+                "query_count": len(validated_search_input),
+                "network_count": len(networks),
+                "term_count": len(keyword_regexps),
+                "match_count": len(sorted_data),
+                "matched_subnet_count": len(matched_nets),
+                "miss_count": len(missing_nets),
+                "search_mode": "generic",
+            },
+        )
+
         press_any_key(ctx)
 
     def execute_demob_search(self, ctx: ScriptContext, sitecode: str):
@@ -255,6 +269,19 @@ class ConfigSearchModule(BaseModule):
 
         if ctx.cfg["report_auto_save"]:
             self._save_found_data(ctx, data_to_save, missing_nets, matched_nets, "Demob Site Check")
+
+        ctx.event_bus.publish(
+            "stats:module_detail",
+            {
+                "unit_count": 1,
+                "query_count": 1,
+                "network_count": len(networks),
+                "match_count": len(sorted_data),
+                "matched_subnet_count": len(matched_nets),
+                "miss_count": len(missing_nets),
+                "search_mode": "demob",
+            },
+        )
 
         # Commented because we await for any key in demob_check module itself
         # press_any_key(ctx)
