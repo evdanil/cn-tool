@@ -126,6 +126,18 @@ class SubnetRequestModule(BaseModule):
 
             if ctx.cfg["report_auto_save"] and all_data_to_save:
                 self._save_subnet_data(ctx, query_targets, all_data_to_save)
+
+            ctx.event_bus.publish(
+                "stats:module_detail",
+                {
+                    "unit_count": len(unique_networks),
+                    "input_count": len(user_inputs),
+                    "unique_count": len(unique_networks),
+                    "resolved_target_count": len(query_targets),
+                    "success_count": len(subnet_data_cache),
+                    "miss_count": max(0, len(unique_networks) - len(subnet_data_cache)),
+                },
+            )
         finally:
             self.execute_hook('post_run', ctx, None)
 

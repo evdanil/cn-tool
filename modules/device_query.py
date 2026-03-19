@@ -126,6 +126,7 @@ class DeviceQueryModule(BaseModule):
         final_results = self.execute_hook('process_data', ctx, results)
 
         # --- Display Results ---
+        successful_device_count = 0
         for hostname, device_data in final_results.items():
             tables_to_print: List[Union[Table, Panel]] = []
             if device_data.get(hostname) == 'Failed to process':
@@ -133,6 +134,7 @@ class DeviceQueryModule(BaseModule):
                 if error_table:
                     tables_to_print.append(error_table)
             else:
+                successful_device_count += 1
                 platform = device_data.get('platform', 'iosxe')  # Default to iosxe for safety
                 cmd_list = platform_commands.get(platform, {})
                 for command_key, parsed_output in device_data.items():
@@ -204,5 +206,15 @@ class DeviceQueryModule(BaseModule):
                     # to a potentially existing file from a previous run.
                     force_header=True
                 )
+
+        ctx.event_bus.publish(
+            "stats:module_detail",
+            {
+                "unit_count": len(unique_devices),
+                "query_count": len(unique_devices),
+                "success_count": successful_device_count,
+                "miss_count": max(0, len(unique_devices) - successful_device_count),
+            },
+        )
 
         press_any_key(ctx)

@@ -12,9 +12,20 @@ def exit_now(ctx: ScriptContext, exit_code: int = 0, message: str = '') -> None:
     colors = get_global_color_scheme(ctx.cfg)
     logger = ctx.logger
     cache = ctx.cache
+    stats = getattr(ctx, "stats", None)
+
+    if exit_code == 0:
+        final_status = "completed"
+    elif exit_code == 1 and "Interrupted" in message:
+        final_status = "interrupted"
+    else:
+        final_status = "failed"
 
     # Mark exiting early so any final UI render indicates graceful shutdown
     ctx.cfg["exiting"] = True
+
+    if stats:
+        stats.prepare_for_shutdown(final_status)
 
     if worker_thread and worker_thread.is_alive():
         logger.info("Waiting for background save operations to complete...")
@@ -56,5 +67,9 @@ def exit_now(ctx: ScriptContext, exit_code: int = 0, message: str = '') -> None:
         if plugin.manages_global_connection:
             ctx.logger.info(f"Disconnecting plugin: {plugin.name}")
             plugin.disconnect(ctx)
+
+    if stats:
+        stats.finalize_session(final_status)
+        stats.close()
 
     sys.exit(exit_code)

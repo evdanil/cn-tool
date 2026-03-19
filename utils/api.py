@@ -1,7 +1,7 @@
 # Define session object to handle all https requests
 # Handle rate-limit and server errors
 from typing import Any, Dict, List, Optional, Set
-from requests.exceptions import HTTPError, Timeout, RequestException
+from requests.exceptions import ConnectionError as RequestsConnectionError, HTTPError, Timeout, RequestException
 from requests.adapters import HTTPAdapter
 import urllib3
 from urllib3.util.retry import Retry
@@ -37,7 +37,7 @@ def make_api_call(ctx: ScriptContext, uri: str) -> requests.Response:
     - Treats 400 errors as non-fatal (e.g., "not found").
     - Treats 401 as a fatal authentication error.
     - Retries on 5xx server errors.
-    - Exits on connection errors.
+    - Returns a non-OK response on connection/timeout errors.
     """
     logger = ctx.logger
     endpoint = ctx.cfg["api_endpoint"]
@@ -45,6 +45,8 @@ def make_api_call(ctx: ScriptContext, uri: str) -> requests.Response:
 
     logger.info(f"Performing API request - URL: {full_url}")
     response = requests.Response()
+    response.status_code = 500  # sentinel: ensures .ok is False if returned from exception handler
+    response._content = b""  # requests.Response.content should stay bytes-like, even on sentinel responses
     try:
         response = session.get(
             full_url,
@@ -71,10 +73,20 @@ def make_api_call(ctx: ScriptContext, uri: str) -> requests.Response:
         # For all other 4xx and 5xx errors, raise an exception to be caught below.
         response.raise_for_status()
 
-    except (Timeout, ConnectionError) as e:
+    except (Timeout, RequestsConnectionError) as e:
         logger.error(f"API Connection Error for URL {full_url}: {e}")
-        # Connection errors are usually fatal for a CLI tool, as the endpoint is unavailable.
-        exit_now(ctx, exit_code=1, message=f"API Connection Error - unable to reach {endpoint}")
+        colors = get_global_color_scheme(ctx.cfg)
+        if isinstance(e, Timeout):
+            ctx.console.print(
+                f"[{colors['error']}]API request timed out - request is taking too long ({endpoint})[/]"
+            )
+            response.status_code = 504
+        else:
+            ctx.console.print(
+                f"[{colors['error']}]API connection error - unable to reach {endpoint}[/]"
+            )
+            response.status_code = 503
+        return response
 
     except HTTPError as e:
         # This will now only catch the errors we didn't handle above (e.g., 403, 500, 503).

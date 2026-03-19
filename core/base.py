@@ -1,29 +1,17 @@
 # core/base.py
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from time import perf_counter
 import logging
-import threading
-from dataclasses import dataclass
-from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Callable, Optional, TYPE_CHECKING
+from time import perf_counter
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from .event_bus import EventBus
-
-
-class ThreadSafeFileHandler(logging.FileHandler):
-    def __init__(self, filename: str, mode: str = 'a', encoding: Optional[str] = None, delay: bool = False):
-        super().__init__(filename, mode, encoding, delay)
-        self._lock = threading.Lock()
-
-    def emit(self, record: logging.LogRecord) -> None:
-        with self._lock:
-            super().emit(record)
 
 
 if TYPE_CHECKING:
     from utils.display import ThemedConsole
     from utils.cache import CacheManager
+    from utils.stats import StatsManager
 
 
 @dataclass
@@ -37,6 +25,7 @@ class ScriptContext:
     username: str
     password: str
     plugins: List["BasePlugin"]
+    stats: Optional["StatsManager"] = None
 
 
 class BaseModule(ABC):
@@ -61,6 +50,11 @@ class BaseModule(ABC):
         e.g., return 'email_enabled'
         """
         return None
+
+    @property
+    def track_in_stats(self) -> bool:
+        """Whether this module should contribute to shared usage statistics."""
+        return True
 
     @property
     @abstractmethod

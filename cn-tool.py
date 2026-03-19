@@ -58,7 +58,7 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.71 hash 092b55d'
+VERSION = '0.2.72 hash 8f4a456'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -140,7 +140,7 @@ Features:
 
 Useful tips:
 
-Request for credential can be skipped if environmental variable `TACACS_PW` is set or device-apply.gpg file with credentials present in user directory.
+Prefer a fresh `device-apply.gpg` credentials file when possible. As a convenience fallback, the credential prompt can be skipped if the `TACACS_PW` environment variable is set.
 
 - for environmental variable set up - copy lines below(including EOF) and paste in the terminal window:
 
@@ -150,7 +150,7 @@ read -s TACACS_PW
 export TACACS_PW
 EOF
 
-It will update .bash_profile with the request to read `TACACS_PW` credential during login time. Re-login to the terminal to see it in action.
+It will update .bash_profile with the request to read `TACACS_PW` credential during login time. Re-login to the terminal to see it in action. Note that environment variables are inherited by child processes in the same session.
 
 - for device-apply.gpg file creation use commands below, if file is older than 24 hours it won't be used:
 
@@ -265,7 +265,7 @@ Please send any feedback/feature requests to evdanil@gmail.com
         "--- Tasks ---": ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'b', 'o', 't'],
         # Keep 'a' for your existing module and add 'c' for Config Analyzer
         "--- Info ---": ['a', 'c'],
-        "--- Reporting ---": ['e', 'd'],
+        "--- Reporting ---": ['e', 'd', 'u'],
         "--- Application ---": ['s', '0']
     }
 
@@ -429,11 +429,32 @@ Please send any feedback/feature requests to evdanil@gmail.com
                         proceed = read_user_input(ctx, f"[{colors['warning']}]Proceed anyway? (y/N): [/] ").strip().lower()
                         if proceed != 'y':
                             continue
-                    module_to_run.run(ctx)
+                    stats = getattr(ctx, "stats", None)
+                    if stats and getattr(module_to_run, "track_in_stats", True):
+                        stats.start_module_run(module_to_run)
+                    try:
+                        module_to_run.run(ctx)
+                    except SystemExit:
+                        raise
+                    except KeyboardInterrupt:
+                        if stats and getattr(module_to_run, "track_in_stats", True):
+                            stats.prepare_for_shutdown("interrupted")
+                        raise
+                    except Exception:
+                        ctx.logger.exception("Unhandled exception while running module '%s'", module_to_run.menu_title)
+                        if stats and getattr(module_to_run, "track_in_stats", True):
+                            stats.prepare_for_shutdown("failed")
+                        raise
+                    else:
+                        if stats and getattr(module_to_run, "track_in_stats", True):
+                            stats.finish_module_run("completed")
             else:
                 ctx.console.print(f"[{colors['error']}]Invalid choice. Please try again.[/]")
                 time.sleep(1)
                 continue
+    except Exception:
+        logger.exception("Unhandled exception in main loop")
+        exit_now(ctx, 1, "Unexpected error. Check logs.")
     finally:
         timer_stop_event.set()
         for token in subscriptions:
