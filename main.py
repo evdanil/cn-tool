@@ -58,7 +58,7 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.72 hash 8f4a456'
+VERSION = '0.2.73 hash 9eedcee'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -140,7 +140,7 @@ Features:
 
 Useful tips:
 
-Prefer a fresh `device-apply.gpg` credentials file when possible. As a convenience fallback, the credential prompt can be skipped if the `TACACS_PW` environment variable is set.
+A GPG-encrypted credentials file can be used to avoid interactive prompts. As a convenience fallback, the credential prompt can be skipped if the `TACACS_PW` environment variable is set.
 
 - for environmental variable set up - copy lines below(including EOF) and paste in the terminal window:
 
@@ -152,10 +152,8 @@ EOF
 
 It will update .bash_profile with the request to read `TACACS_PW` credential during login time. Re-login to the terminal to see it in action. Note that environment variables are inherited by child processes in the same session.
 
-- for device-apply.gpg file creation use commands below, if file is older than 24 hours it won't be used:
+- for a GPG-backed credentials file, create an encrypted file with lines in the form `User = ...` and `Password = ...`, then point `-g/--gpg-file` or `[gpg] credentials` to it. Files older than 24 hours will be ignored:
 
-device-apply --make-key
-device-apply --make-credentials --overwrite
 
 Create an alias for convenience by adding line to `.bash_profile`:
 
