@@ -75,6 +75,39 @@ theme = default
 
 ## Optional Integrations
 
+### GPG Credentials File
+
+To avoid interactive password prompts, you can store credentials in a
+GPG-encrypted file and point `[gpg] credentials` or `-g/--gpg-file` at it.
+
+The decrypted file must contain exactly these fields:
+
+```text
+User = your-username
+Password = your-password
+```
+
+One way to create it is:
+
+```bash
+cat > /tmp/cn-tool-credentials.txt <<'EOF'
+User = your-username
+Password = your-password
+EOF
+
+gpg --encrypt --recipient YOUR_KEY_ID \
+  --output ~/cn-tool.gpg \
+  /tmp/cn-tool-credentials.txt
+
+rm -f /tmp/cn-tool-credentials.txt
+```
+
+Notes:
+
+- `cn-tool` will ignore credential files older than 24 hours.
+- The file must be decryptable by `gpg` in the environment where `cn-tool` runs.
+- If you do not want to use GPG, set `TACACS_PW` or enter the credential interactively.
+
 ### Active Directory
 
 ```ini
