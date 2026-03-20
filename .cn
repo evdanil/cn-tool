@@ -22,7 +22,7 @@ excluded_dirs = old,history
 history_dir = history
 
 [gpg]
-# credentials = ~/device-apply.gpg
+# credentials = ~/cn-tool.gpg
 
 [cache]
 enabled = true
