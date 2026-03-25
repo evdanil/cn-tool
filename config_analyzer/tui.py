@@ -16,8 +16,6 @@ from .keymap import snapshot_bindings
 from .tips import snapshot_tips
 from rich.syntax import Syntax
 from .formatting import format_timestamp
-from io import StringIO
-from rich.console import Console
 from rich.text import Text
 from .search import SearchController
 from .widgets import SearchableTextPane
@@ -36,7 +34,6 @@ class DiffViewPane(SearchableTextPane):
         Binding("d", "toggle_diff_mode", "Toggle Diff View"),
         Binding("h", "toggle_hide_unchanged", "Hide Unchanged"),
         Binding("tab", "focus_next_panel", "Switch Panel", show=False),
-        Binding("ctrl+f", "start_find", "Find"),
         Binding("ctrl+d", "dump_debug", "", show=False),
     ]
 
@@ -202,6 +199,17 @@ class SelectionDataTable(DataTable):
                 pass
             return
         try:
+            from .utils import handle_search_key
+
+            if bool(getattr(self.app, "_search_active", False)) and handle_search_key(self.app, event, "diff"):
+                try:
+                    event.stop()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+        try:
             handler = getattr(self.app, "process_filter_key", None)
             if handler and handler(event, require_table_focus=False):
                 try:
@@ -250,12 +258,11 @@ class CommitSelectorApp(FilterMixin, App):
     """
 
     show_hide_diff_key = reactive(False, layout=True)
-    show_focus_next_key = reactive(False, layout=True)
     # Dynamic footer hint visibility
     show_select_key = reactive(True)
     show_diff_controls_key = reactive(False)
 
-    BINDINGS = snapshot_bindings(show_hide_diff_key, show_focus_next_key, show_select_key, show_diff_controls_key)
+    BINDINGS = snapshot_bindings(show_hide_diff_key, show_select_key, show_diff_controls_key)
     # Add App-level nav bindings to route to the diff pane when it has focus
     BINDINGS += [
         Binding("up", "pane_up", "", show=False),
@@ -289,6 +296,8 @@ class CommitSelectorApp(FilterMixin, App):
         self._diff_has_content: bool = False
         self._pending_diff_scroll: Optional[int] = None
         self._pending_diff_focus: bool = False
+        self._diff_maximized: bool = False
+        self._current_diff_document_id: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -362,13 +371,15 @@ class CommitSelectorApp(FilterMixin, App):
         self.table = SelectionDataTable(id="commit_table")
         self.table_container = Container(self.table, id="table-container")
 
-        # Orientation
-        if self.layout in ("right", "left"):
-            ordered = (self.diff_view, self.table_container) if self.layout == "left" else (self.table_container, self.diff_view)
-            container = Horizontal(*ordered, classes=f"layout-{self.layout}")
+        if self._diff_maximized and self.show_hide_diff_key:
+            container = Container(self.diff_view, id="diff-maximized")
         else:
-            ordered = (self.diff_view, self.table_container) if self.layout == "top" else (self.table_container, self.diff_view)
-            container = Vertical(*ordered, classes=f"layout-{self.layout}")
+            if self.layout in ("right", "left"):
+                ordered = (self.diff_view, self.table_container) if self.layout == "left" else (self.table_container, self.diff_view)
+                container = Horizontal(*ordered, classes=f"layout-{self.layout}")
+            else:
+                ordered = (self.diff_view, self.table_container) if self.layout == "top" else (self.table_container, self.diff_view)
+                container = Vertical(*ordered, classes=f"layout-{self.layout}")
         self.main_panel.mount(container)
 
         # Populate table and reapply state
@@ -395,7 +406,7 @@ class CommitSelectorApp(FilterMixin, App):
                 focused_diff = True
             except Exception:
                 focused_diff = False
-        if not focused_diff:
+        if not focused_diff and not self._diff_maximized:
             try:
                 self.table.focus()
             except Exception:
@@ -450,6 +461,12 @@ class CommitSelectorApp(FilterMixin, App):
         # D/H hints when diff visible and focused
         self.show_diff_controls_key = bool(diff_visible and getattr(self.diff_view, "has_focus", False))
 
+    def _activate_diff_document(self, document_id: str) -> str:
+        if document_id != self._current_diff_document_id:
+            self._search.reset()
+            self._current_diff_document_id = document_id
+        return document_id
+
     def _render_rows(self) -> None:
         table = self.table
         try:
@@ -487,6 +504,8 @@ class CommitSelectorApp(FilterMixin, App):
         self._update_tips()
 
     def on_key(self, event: events.Key) -> None:  # type: ignore
+        from .utils import handle_search_key
+
         # Delegate to mixin; consume if handled (only when table focused)
         if self._debug_keys:
             try:
@@ -499,6 +518,15 @@ class CommitSelectorApp(FilterMixin, App):
                 )
             except Exception:
                 pass
+        if self._search_active and handle_search_key(self, event, "diff"):
+            return
+        if self._diff_maximized and not self._search_active and event.key == "escape":
+            self.action_toggle_maximize_pane()
+            try:
+                event.stop()
+            except Exception:
+                pass
+            return
         if self.process_filter_key(event, require_table_focus=True):
             try:
                 event.stop()
@@ -512,7 +540,6 @@ class CommitSelectorApp(FilterMixin, App):
 
     def show_diff(self) -> None:
         self.show_hide_diff_key = True
-        self.show_focus_next_key = True
 
         restore_scroll = self._pending_diff_scroll
         self._pending_diff_scroll = None
@@ -529,36 +556,25 @@ class CommitSelectorApp(FilterMixin, App):
         if snapshot1.timestamp > snapshot2.timestamp:
             snapshot1, snapshot2 = snapshot2, snapshot1
 
-        # Clear and set the raw text for search
-        self.diff_view.clear()
-
-        # Use actual terminal width for rendering, with a reasonable maximum
-        # The diff_view widget width is more accurate than app width for side-by-side layout
         terminal_width = self.diff_view.size.width if self.diff_view.size.width > 0 else self.size.width
-        # Use a reasonable maximum width to prevent excessive memory usage
-        # 250 is a good upper bound for most wide terminals
-        console_width = min(terminal_width, 250) if terminal_width > 0 else 250
 
         if self.diff_mode == "side-by-side":
-            # Try using the original Table approach again
-            renderable = get_diff_side_by_side(snapshot1, snapshot2, hide_unchanged=self.hide_unchanged_sbs)
+            renderable = get_diff_side_by_side(
+                snapshot1,
+                snapshot2,
+                hide_unchanged=self.hide_unchanged_sbs,
+                total_width=max(terminal_width, 80),
+            )
+            document_id = self._activate_diff_document(
+                f"diff:side-by-side:{int(self.hide_unchanged_sbs)}:{snapshot1.path}:{snapshot2.path}"
+            )
         else:
             renderable = get_diff(snapshot1, snapshot2)
+            document_id = self._activate_diff_document(
+                f"diff:unified:{snapshot1.path}:{snapshot2.path}"
+            )
 
-        # Extract plain text for search (without colors)
-        raw_buf = StringIO()
-        Console(file=raw_buf, force_terminal=False, color_system=None, width=console_width).print(renderable)
-        raw_text = raw_buf.getvalue()
-        self.diff_view._lines = raw_text.splitlines()
-        if self.diff_view.search:
-            self.diff_view.search.set_lines(self.diff_view._lines)
-
-        # Set the renderable directly
-        self.diff_view._renderable = renderable
-        self.diff_view._base_text = None
-
-        # Apply search or just write the content
-        self.diff_view.apply_search()
+        self.diff_view.set_renderable(renderable, document_id=document_id)
 
         self._diff_has_content = True
 
@@ -584,8 +600,9 @@ class CommitSelectorApp(FilterMixin, App):
         self.diff_view.styles.visibility = "hidden"
         self.diff_view.can_focus = False
         self.show_hide_diff_key = False
-        self.show_focus_next_key = False
+        self._diff_maximized = False
         self._diff_has_content = False
+        self._current_diff_document_id = ""
         if self._search_active:
             self._search_active = False
             self._search.reset()
@@ -733,20 +750,9 @@ class CommitSelectorApp(FilterMixin, App):
             except Exception:
                 prev_scroll = 0
 
-        # Clear and set the raw text for search
-        self.diff_view.clear()
-        self.diff_view._lines = snap.content_body.splitlines()
-        if self.diff_view.search:
-            self.diff_view.search.set_lines(self.diff_view._lines)
-
-        # Create syntax highlighted renderable
-        from rich.syntax import Syntax
         renderable = Syntax(snap.content_body, "ini", word_wrap=False, line_numbers=False)
-        self.diff_view._renderable = renderable
-        self.diff_view._base_text = None
-
-        # Apply search or just write the content
-        self.diff_view.apply_search()
+        document_id = self._activate_diff_document(f"single:{snap.path}")
+        self.diff_view.set_renderable(renderable, document_id=document_id)
 
         self._diff_has_content = True
         self.diff_view.styles.visibility = "visible"
@@ -783,6 +789,19 @@ class CommitSelectorApp(FilterMixin, App):
         except ValueError:
             idx = 0
         self.layout = order[(idx + 1) % len(order)]
+
+        def _remount() -> None:
+            self._apply_layout()
+
+        try:
+            self.call_after_refresh(_remount)
+        except Exception:
+            _remount()
+
+    def action_toggle_maximize_pane(self) -> None:
+        if not self._diff_has_content:
+            return
+        self._diff_maximized = not self._diff_maximized
 
         def _remount() -> None:
             self._apply_layout()

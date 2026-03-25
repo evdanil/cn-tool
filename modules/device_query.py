@@ -8,6 +8,7 @@ from rich.table import Table
 from rich.panel import Panel
 
 from core.base import BaseModule, ScriptContext
+from utils.auth import ensure_device_auth
 from utils.user_input import press_any_key, read_user_input
 from utils.display import (
     get_global_color_scheme, print_multi_table_panel,
@@ -83,7 +84,7 @@ class DeviceQueryModule(BaseModule):
             if "/" not in search_input and re.match(ip_regexp, search_input):
                 try:
                     ip = ipaddress.ip_address(search_input)
-                    if ip.is_unspecified or ip.is_reserved or ip.is_link_local:
+                    if ip.is_unspecified or ip.is_reserved or ip.is_link_local or ip.is_loopback:
                         console.print(f"[{colors['error']}]Invalid IP: Broadcast, reserved, and loopback IPs are excluded.[/]")
                     else:
                         devices.append(search_input)
@@ -107,11 +108,21 @@ class DeviceQueryModule(BaseModule):
         results: Dict[str, Dict[str, Any]] = {}
         # Get log file path from config to avoid netmiko writing to current directory
         log_file = str(ctx.cfg.get("logging_file", Path.home() / "cn.log"))
+        ensure_device_auth(ctx)
 
         with console.status(f"[{colors['description']}]Connecting to devices and running commands...[/]", spinner="dots12"):
             with ThreadPoolExecutor(max_workers=10) as executor:  # Increased workers for network-bound tasks
                 future_to_device = {
-                    executor.submit(process_device_commands, logger, device, platform_commands, ctx.username, ctx.password, log_file=log_file): device
+                    executor.submit(
+                        process_device_commands,
+                        logger,
+                        device,
+                        platform_commands,
+                        ctx.username,
+                        ctx.password,
+                        log_file=log_file,
+                        cfg=ctx.cfg,
+                    ): device
                     for device in unique_devices
                 }
                 for future in future_to_device:

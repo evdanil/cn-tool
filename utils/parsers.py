@@ -5,6 +5,8 @@ from netmiko import ConnLogOnly, SSHDetect, BaseConnection
 import logging
 import re
 
+from utils.ssh import build_netmiko_device, describe_ssh_error, get_ssh_config_file
+
 
 def parse_show_version(output: str) -> Dict[str, Any]:
     # This function parses 'show version' output
@@ -319,7 +321,16 @@ def process_device_data(device_name: str, data: Dict[str, Any]) -> List[Dict[str
     return rows
 
 
-def process_device_commands(logger: logging.Logger, device: str, platform_commands: Dict[str, Dict[str, Tuple]], username: Optional[str], password: Optional[str], type: str = 'cisco_ios', log_file: Optional[str] = None) -> Dict[str, Any]:
+def process_device_commands(
+    logger: logging.Logger,
+    device: str,
+    platform_commands: Dict[str, Dict[str, Tuple]],
+    username: Optional[str],
+    password: Optional[str],
+    type: str = 'cisco_ios',
+    log_file: Optional[str] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     # interrogate device and get serial/mac/license data
     # check for reverse DNS entry
 
@@ -334,13 +345,15 @@ def process_device_commands(logger: logging.Logger, device: str, platform_comman
 
     output: Dict[str, Any] = {}
 
-    dev: Dict[str, Any] = {
-        "device_type": "autodetect",
-        "host": device,
-        "username": username,
-        "password": password,
-        "secret": ''
-        }
+    ssh_config_file = get_ssh_config_file(cfg or {}, logger)
+    dev = build_netmiko_device(
+        host=device,
+        device_type="autodetect",
+        username=username,
+        password=password,
+        secret="",
+        ssh_config_file=ssh_config_file,
+    )
 
     conn: Optional[BaseConnection] = None
     try:
@@ -393,8 +406,9 @@ def process_device_commands(logger: logging.Logger, device: str, platform_comman
                 output[command] = {}
 
     except Exception as e:
-        logger.info(f'{device} - Unable to connect or execute command! Error: {e}')
-        return {device: f'Connection/Command error: {e}'}
+        error_message = describe_ssh_error(e)
+        logger.info(f'{device} - Unable to connect or execute command! Error: {error_message}')
+        return {device: f'Connection/Command error: {error_message}'}
     finally:
         if conn:
             conn.disconnect()

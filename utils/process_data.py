@@ -9,6 +9,7 @@ import json
 from typing import Dict, List, Any, Optional
 
 from core.base import ScriptContext
+from utils.infoblox_safety import infoblox_debug_payloads_enabled
 
 
 def _parse_ip_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -175,7 +176,10 @@ def process_data(ctx: ScriptContext, type: str, content: Optional[bytes]) -> Dic
     """
     logger = ctx.logger
     logger.info(f"Processing data - {type.upper()}")
-    logger.debug(f"Processing data {type.upper()} content: {content}")
+    payload_size = len(content or b"")
+    logger.debug(f"Processing data {type.upper()} payload size: {payload_size} bytes")
+    if infoblox_debug_payloads_enabled(ctx):
+        logger.debug(f"Processing data {type.upper()} content: {content}")
 
     if not content:
         return defaultdict(list)

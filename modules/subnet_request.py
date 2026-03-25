@@ -8,11 +8,12 @@ from typing import Any, Dict, List, Optional, Set, Union
 
 # Assuming these are your project's utility modules
 from core.base import BaseModule, ScriptContext
-from utils.api import do_fancy_request, make_api_call
+from utils.api import bound_infoblox_workers, describe_infoblox_failure, request_result
 from utils.display import get_global_color_scheme, print_table_data
 from utils.file_io import queue_save
+from utils.infoblox_ux import format_no_match_message, format_partial_results_message
 from utils.process_data import process_data
-from utils.user_input import press_any_key, read_single_keypress, read_user_input
+from utils.user_input import press_any_key, read_user_input
 
 # Type alias for clarity
 NetworkObject = Union[ipaddress.IPv4Network, ipaddress.IPv4Address]
@@ -24,6 +25,24 @@ class QueryTarget:
     """Represents a single query, linking an original input to a resolved network."""
     original_input: str
     resolved_network: ipaddress.IPv4Network
+
+
+@dataclass(frozen=True)
+class InputResolutionResult:
+    networks: Set[ipaddress.IPv4Network]
+    failure_message: str = ""
+
+
+@dataclass(frozen=True)
+class SubnetFetchOutcome:
+    data: Dict[str, Any]
+    warnings: List[str]
+
+
+@dataclass(frozen=True)
+class SubnetSummaryState:
+    status: str
+    description: str
 
 
 class SubnetRequestModule(BaseModule):
@@ -71,7 +90,9 @@ class SubnetRequestModule(BaseModule):
             start = perf_counter()
 
             # --- 2. Resolve all inputs into an ordered list of query targets ---
-            query_targets = self._resolve_inputs_to_targets(ctx, user_inputs)
+            query_targets, resolution_errors = self._resolve_inputs_to_targets(ctx, user_inputs)
+            for original_input, message in resolution_errors.items():
+                console.print(f"[{colors['warning']}]{original_input}[/] - [{colors['error']}]{message}[/]")
             if not query_targets:
                 console.print(f"[{colors['error']}]Could not resolve any of the provided inputs to a valid subnet.[{colors['error']}]")
                 press_any_key(ctx)
@@ -84,8 +105,9 @@ class SubnetRequestModule(BaseModule):
             console.print(f"[{colors['description']}]Found [{colors['success']}]{len(unique_networks)}[/] unique subnets to query.[/]")
 
             subnet_data_cache: Dict[str, Dict] = {}
+            subnet_warning_cache: Dict[str, List[str]] = {}
             with ctx.console.status(f"[{get_global_color_scheme(ctx.cfg)['description']}]Fetching subnets information...[/]"):
-                with ThreadPoolExecutor(max_workers=ctx.cfg.get("max_threads", 10)) as executor:
+                with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(unique_networks))) as executor:
                     future_to_net = {
                         executor.submit(self._fetch_and_process_subnet_data, ctx, network): network
                         for network in unique_networks
@@ -95,9 +117,11 @@ class SubnetRequestModule(BaseModule):
                         network = future_to_net[future]
                         net_str = str(network)
                         console.print(f"[{colors['description']}]Processing results for [{colors['header']}]{net_str}[/]...[/]")
-                        processed_data = future.result()
-                        if processed_data:
-                            subnet_data_cache[net_str] = processed_data
+                        outcome = future.result()
+                        if outcome.data:
+                            subnet_data_cache[net_str] = outcome.data
+                        if outcome.warnings:
+                            subnet_warning_cache[net_str] = outcome.warnings
 
             # --- 4. Prepare data for display and saving ---
             grouped_by_network = defaultdict(list)
@@ -122,7 +146,7 @@ class SubnetRequestModule(BaseModule):
             console.print(f"\n[{colors['description']}]Search took [{colors['success']}]{duration}[/] seconds![/]\n")
 
             # --- 5. Display and Save ---
-            self._display_results(ctx, query_targets, subnet_data_cache, grouped_by_network)
+            self._display_results(ctx, query_targets, subnet_data_cache, grouped_by_network, subnet_warning_cache)
 
             if ctx.cfg["report_auto_save"] and all_data_to_save:
                 self._save_subnet_data(ctx, query_targets, all_data_to_save)
@@ -161,26 +185,32 @@ class SubnetRequestModule(BaseModule):
             inputs.append(search_input)
         return list(dict.fromkeys(inputs))
 
-    def _resolve_inputs_to_targets(self, ctx: ScriptContext, inputs: List[str]) -> List[QueryTarget]:
+    def _resolve_inputs_to_targets(self, ctx: ScriptContext, inputs: List[str]) -> tuple[List[QueryTarget], Dict[str, str]]:
         """
         Takes raw user input strings and resolves them into an ordered list of QueryTarget objects.
         This preserves the original input and its order.
         """
         all_targets: List[QueryTarget] = []
+        errors: Dict[str, str] = {}
         with ctx.console.status(f"[{get_global_color_scheme(ctx.cfg)['description']}]Resolving inputs and finding subnets...[/]"):
             # Using executor.map preserves the order of the inputs
-            with ThreadPoolExecutor() as executor:
-                results_generator = executor.map(lambda item: self._resolve_single_input(ctx, item), inputs)
-                for original_input, resolved_nets_set in zip(inputs, results_generator):
-                    if not resolved_nets_set:
+            with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(inputs))) as executor:
+                results_generator = executor.map(lambda item: self._resolve_single_input_detailed(ctx, item), inputs)
+                for original_input, resolution in zip(inputs, results_generator):
+                    if resolution.failure_message:
+                        errors[original_input] = resolution.failure_message
+                    if not resolution.networks:
                         ctx.logger.warning(f"Could not resolve '{original_input}' to any subnet.")
                         continue
                     # Sort to ensure consistent order for supernets
-                    for net in sorted(list(resolved_nets_set), key=lambda ip: ip.network_address):
+                    for net in sorted(list(resolution.networks), key=lambda ip: ip.network_address):
                         all_targets.append(QueryTarget(original_input=original_input, resolved_network=net))
-        return all_targets
+        return all_targets, errors
 
     def _resolve_single_input(self, ctx: ScriptContext, an_input: str) -> Set[ipaddress.IPv4Network]:
+        return self._resolve_single_input_detailed(ctx, an_input).networks
+
+    def _resolve_single_input_detailed(self, ctx: ScriptContext, an_input: str) -> InputResolutionResult:
         """
         Worker function to resolve a single input string into one or more network objects.
         """
@@ -189,125 +219,267 @@ class SubnetRequestModule(BaseModule):
             if not isinstance(net, ipaddress.IPv4Network):
                 raise ValueError("Only IPv4 is supported.")
             if net.prefixlen == 32:
-                response = make_api_call(ctx, f'network?contains_address={net.network_address}')
-                if response and response.ok:
-                    content = response.json()
-                    if content and 'network' in content[0]:
-                        return {ipaddress.IPv4Network(content[0]['network'])}
-                return set()
+                result = request_result(ctx, f'network?contains_address={net.network_address}')
+                if result.ok and result.has_items and 'network' in result.items[0]:
+                    return InputResolutionResult(networks={ipaddress.IPv4Network(result.items[0]['network'])})
+                if result.failed:
+                    return InputResolutionResult(networks=set(), failure_message=describe_infoblox_failure(result))
+                return InputResolutionResult(networks=set())
             elif net.prefixlen < 30:
-                response = make_api_call(ctx, f'network?network_container={net.compressed}')
-                if response and response.ok:
-                    supernet_data = process_data(ctx, type='supernet', content=response.content)
+                result = request_result(ctx, f'network?network_container={net.compressed}')
+                if result.ok:
+                    supernet_data = process_data(ctx, type='supernet', content=result.content)
                     found_subnets = {ipaddress.IPv4Network(sub["network"]) for sub in supernet_data.get("subnets", [])}
                     if found_subnets:
-                        return found_subnets
-            return {net}
+                        return InputResolutionResult(networks=found_subnets)
+                elif result.failed:
+                    return InputResolutionResult(networks=set(), failure_message=describe_infoblox_failure(result))
+            return InputResolutionResult(networks={net})
         except ValueError:
             ctx.logger.warning(f"Invalid IP/Subnet format for input: '{an_input}'")
-            return set()
+            return InputResolutionResult(networks=set())
         except Exception as e:
             ctx.logger.error(f"Error resolving input '{an_input}': {e}")
-            return set()
+            return InputResolutionResult(networks=set(), failure_message="Subnet resolution failed.")
 
-    def _fetch_and_process_subnet_data(self, ctx: ScriptContext, network: ipaddress.IPv4Network) -> Dict:
+    def _fetch_and_process_subnet_data(self, ctx: ScriptContext, network: ipaddress.IPv4Network) -> SubnetFetchOutcome:
         """
         Fetches all data for a single subnet, processes it, and prepares it for display.
         This function is designed to be run in a thread pool for a *unique* network.
         """
-        processed_data = self._fetch_all_data_for_subnet(ctx, network)
-        processed_data = self.execute_hook('process_data', ctx, processed_data)
-        return processed_data
+        outcome = self._fetch_all_data_for_subnet(ctx, network)
+        processed_data = self.execute_hook('process_data', ctx, outcome.data)
+        return SubnetFetchOutcome(data=processed_data, warnings=outcome.warnings)
 
-    def _fetch_all_data_for_subnet(self, ctx: ScriptContext, network: NetworkObject) -> Dict[str, Any]:
+    def _fetch_all_data_for_subnet(self, ctx: ScriptContext, network: NetworkObject) -> SubnetFetchOutcome:
         """Fetches all related data points for a single subnet in parallel."""
         net_str = str(network)
-        req_urls = {
-            "general": f"network?network={net_str}&_return_fields=network,comment,extattrs",
-            "DNS records": f"ipv4address?network={net_str}&usage=DNS&_return_fields=ip_address,names",
-            "network options": f"network?network={net_str}&_return_fields=options,members",
-            "DHCP range": f"range?network={net_str}",
-            "DHCP failover": f"range?network={net_str}&_return_fields=member,failover_association",
-            "fixed addresses": f"fixedaddress?network={net_str}&_return_fields=ipv4addr,mac,name",
+        request_specs = {
+            "network bundle": {
+                "uri": f"network?network={net_str}&_return_fields=network,comment,extattrs,options,members",
+                "parser_types": ("general", "network options"),
+                "warning_labels": ("general", "network options"),
+            },
+            "DNS records": {
+                "uri": f"ipv4address?network={net_str}&usage=DNS&_return_fields=ip_address,names",
+                "parser_types": ("DNS records",),
+                "warning_labels": ("DNS records",),
+            },
+            "range bundle": {
+                "uri": f"range?network={net_str}&_return_fields=network,start_addr,end_addr,member,failover_association",
+                "parser_types": ("DHCP range", "DHCP failover"),
+                "warning_labels": ("DHCP range", "DHCP failover"),
+            },
+            "fixed addresses": {
+                "uri": f"fixedaddress?network={net_str}&_return_fields=ipv4addr,mac,name",
+                "parser_types": ("fixed addresses",),
+                "warning_labels": ("fixed addresses",),
+            },
         }
         processed_data_for_net: Dict[str, Any] = defaultdict(list)
-        with ThreadPoolExecutor() as executor:
-            future_to_label = {executor.submit(do_fancy_request, ctx, "", uri, spinner=None): label for label, uri in req_urls.items()}
+        warnings: List[str] = []
+        with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(request_specs))) as executor:
+            future_to_label = {
+                executor.submit(request_result, ctx, spec["uri"]): label
+                for label, spec in request_specs.items()
+            }
             for future in as_completed(future_to_label):
                 label = future_to_label[future]
+                spec = request_specs[label]
                 try:
-                    response_content = future.result()
-                    if response_content:
-                        processed_data_for_net.update(process_data(ctx, type=label, content=response_content))
+                    result = future.result()
+                    if result.ok:
+                        for parser_type in spec["parser_types"]:
+                            processed_data_for_net.update(process_data(ctx, type=parser_type, content=result.content))
+                    elif result.failed:
+                        message = describe_infoblox_failure(result)
+                        for warning_label in spec["warning_labels"]:
+                            warnings.append(f"{warning_label}: {message}")
                 except Exception as e:
                     ctx.logger.error(f"Failed to fetch data for '{label}' in {net_str}: {e}")
-        return processed_data_for_net
+                    for warning_label in spec["warning_labels"]:
+                        warnings.append(f"{warning_label}: request processing failed.")
+        return SubnetFetchOutcome(data=processed_data_for_net, warnings=warnings)
 
-    def _display_results(self, ctx: ScriptContext, query_targets: List[QueryTarget], subnet_data_cache: Dict[str, Dict], grouped_by_network: Dict[ipaddress.IPv4Network, List[str]]) -> None:
+    def _display_results(self, ctx: ScriptContext, query_targets: List[QueryTarget], subnet_data_cache: Dict[str, Dict], grouped_by_network: Dict[ipaddress.IPv4Network, List[str]], subnet_warning_cache: Optional[Dict[str, List[str]]] = None) -> None:
         """Handles the logic for displaying summary and/or detailed views in order."""
         colors = get_global_color_scheme(ctx.cfg)
         console = ctx.console
-
-        if len(query_targets) > 1:
-            summary_data = []
-            for target in query_targets:
-                # *** THIS IS THE FIX ***
-                # We fetch the corresponding network info from the cache for each target.
-                net_info = subnet_data_cache.get(str(target.resolved_network), {})
-
-                summary_net = {
-                    "Original Input": target.original_input,
-                    "Resolved Subnet": str(target.resolved_network)
-                }
-
-                if net_info and net_info.get("general"):
-                    description = net_info["general"][0].get("description", "N/A")
-                    summary_net["Description"] = description
-                    ext_attrs_list = net_info.get("Extensible Attributes", [])
-                    ea_map = {attr.get("Attribute"): attr.get("Value") for attr in ext_attrs_list if attr.get("Attribute")}
-                    summary_net.update({
-                        "Location": ea_map.get("Location", "N/A"),
-                        "Region": ea_map.get("Region", "N/A"),
-                        "Country": ea_map.get("Country", "N/A"),
-                        "VLAN": ea_map.get("VLAN", "N/A")
-                    })
-                    ad_info = net_info.get("Active Directory", [{}])[0]
-                    if ad_info:
-                        summary_net["AD Site"] = ad_info.get("AD Site", "N/A")
-                else:
-                    summary_net["Description"] = "No data found"
-                summary_data.append(summary_net)
-
-            print_table_data(ctx, {"Subnet Summary": summary_data})
-            console.print(f"\n([{colors['success']}]Press [{colors['error']}{colors['bold']}]Q[/] to return / Any other key for details[/])")
-            if read_single_keypress(ctx).lower() == "q":
-                return
+        subnet_warning_cache = subnet_warning_cache or {}
 
         # Preserve insertion order so summary and details use the user-provided sequence.
         unique_networks_for_display = list(grouped_by_network.keys())
-        num_unique_results = len(unique_networks_for_display)
+        if len(unique_networks_for_display) > 1:
+            while True:
+                selected_networks, return_to_summary = self._prompt_for_detail_selection(
+                    ctx,
+                    unique_networks_for_display,
+                    grouped_by_network,
+                    subnet_data_cache,
+                    subnet_warning_cache,
+                )
+                if not selected_networks:
+                    return
+                self._print_selected_subnet_details(
+                    ctx,
+                    selected_networks,
+                    grouped_by_network,
+                    subnet_data_cache,
+                    subnet_warning_cache,
+                )
+                if not return_to_summary:
+                    return
+        else:
+            self._print_selected_subnet_details(
+                ctx,
+                unique_networks_for_display,
+                grouped_by_network,
+                subnet_data_cache,
+                subnet_warning_cache,
+            )
 
-        for index, network in enumerate(unique_networks_for_display, start=1):
-            console.clear()
+    def _prompt_for_detail_selection(
+        self,
+        ctx: ScriptContext,
+        networks: List[ipaddress.IPv4Network],
+        grouped_by_network: Dict[ipaddress.IPv4Network, List[str]],
+        subnet_data_cache: Dict[str, Dict],
+        subnet_warning_cache: Dict[str, List[str]],
+    ) -> tuple[List[ipaddress.IPv4Network], bool]:
+        colors = get_global_color_scheme(ctx.cfg)
+        summary_data: List[Dict[str, str]] = []
+        for index, network in enumerate(networks, start=1):
+            net_info = subnet_data_cache.get(str(network), {})
+            warnings = subnet_warning_cache.get(str(network), [])
+            summary_state = self._build_summary_state(net_info, warnings)
+            summary_net: Dict[str, str] = {
+                "#": str(index),
+                "Original Input(s)": ", ".join(grouped_by_network[network]),
+                "Resolved Subnet": str(network),
+                "Status": summary_state.status,
+            }
 
-            # Get all original inputs that resolved to this network
-            original_inputs = grouped_by_network[network]
-            inputs_str = ", ".join(f"'{inp}'" for inp in original_inputs)
-            data = subnet_data_cache.get(str(network), {})
-
-            # A more informative header
-            console.print(f"[{colors['description']}]Details for: [{colors['header']} bold]{network}[/][/]")
-            console.print(f"[{colors['description']}] (Resolved from input(s): {inputs_str})[/]\n")
-
-            if data:
-                print_table_data(ctx, data, suffix={"general": "Information"}, table_order=['general', 'DHCP range', 'DHCP options', 'DHCP members', 'DHCP failover', 'DNS records', 'fixed addresses'])
+            if net_info and net_info.get("general"):
+                description = net_info["general"][0].get("description", "N/A")
+                summary_net["Description"] = description
+                ext_attrs_list = net_info.get("Extensible Attributes", [])
+                ea_map = {attr.get("Attribute"): attr.get("Value") for attr in ext_attrs_list if attr.get("Attribute")}
+                summary_net.update({
+                    "Location": ea_map.get("Location", "N/A"),
+                    "Region": ea_map.get("Region", "N/A"),
+                    "Country": ea_map.get("Country", "N/A"),
+                    "VLAN": ea_map.get("VLAN", "N/A"),
+                })
+                ad_info = net_info.get("Active Directory", [{}])[0]
+                if ad_info:
+                    summary_net["AD Site"] = ad_info.get("AD Site", "N/A")
             else:
-                console.print(f"[{colors['success']}]Network [{colors['error']}{colors['bold']}] {network} [/] has no data in Infoblox[/]")
+                summary_net["Description"] = summary_state.description
 
-            if num_unique_results > 1 and index < num_unique_results:
-                console.print(f"\n[{colors['success']}]Press [{colors['bold']}]SPACE[/] for next ({index + 1}/{num_unique_results}) / Any other key to exit details view[/]")
-                if read_single_keypress(ctx) != ' ':
-                    break
+            summary_data.append(summary_net)
+
+        print_table_data(ctx, {"Subnet Summary": summary_data})
+
+        while True:
+            console = ctx.console
+            console.print(
+                f"\n[{colors['description']}]Detail view: "
+                f"[{colors['success']}][Enter][/]/[{colors['success']}]A[/]=all, "
+                f"[{colors['success']}]1-{len(networks)}[/]=one subnet, "
+                f"[{colors['error']}][{colors['bold']}]Q[/]=return[/]"
+            )
+            choice = read_user_input(ctx, "Selection: ").strip().lower()
+            if choice in ("", "a", "all"):
+                return networks, False
+            if choice == "q":
+                return [], False
+            if choice.isdigit():
+                index = int(choice)
+                if 1 <= index <= len(networks):
+                    return [networks[index - 1]], True
+            console.print(f"[{colors['error']}]Invalid selection. Use Enter, A, a result number, or Q.[/]")
+
+    def _print_selected_subnet_details(
+        self,
+        ctx: ScriptContext,
+        selected_networks: List[ipaddress.IPv4Network],
+        grouped_by_network: Dict[ipaddress.IPv4Network, List[str]],
+        subnet_data_cache: Dict[str, Dict],
+        subnet_warning_cache: Dict[str, List[str]],
+    ) -> None:
+        colors = get_global_color_scheme(ctx.cfg)
+        console = ctx.console
+        total_selected = len(selected_networks)
+        for index, network in enumerate(selected_networks, start=1):
+            if total_selected > 1:
+                console.print(f"\n[{colors['description']}]{'-' * 72}[/]")
+            self._print_subnet_details(
+                ctx,
+                network,
+                grouped_by_network[network],
+                subnet_data_cache.get(str(network), {}),
+                subnet_warning_cache.get(str(network), []),
+                index=index,
+                total=total_selected,
+            )
+
+    def _print_subnet_details(
+        self,
+        ctx: ScriptContext,
+        network: ipaddress.IPv4Network,
+        original_inputs: List[str],
+        data: Dict[str, Any],
+        warnings: List[str],
+        *,
+        index: int,
+        total: int,
+    ) -> None:
+        colors = get_global_color_scheme(ctx.cfg)
+        console = ctx.console
+        inputs_str = ", ".join(f"'{inp}'" for inp in original_inputs)
+
+        if total > 1:
+            console.print(f"[{colors['description']}]Details [{index}/{total}] for: [{colors['header']} bold]{network}[/][/]")
+        else:
+            console.print(f"[{colors['description']}]Details for: [{colors['header']} bold]{network}[/][/]")
+        console.print(f"[{colors['description']}] (Resolved from input(s): {inputs_str})[/]\n")
+
+        if warnings:
+            console.print(f"[{colors['warning']}]{format_partial_results_message(f'{len(warnings)} lookup issue(s) for {network}.')}[/]")
+            for warning in warnings:
+                console.print(f"[{colors['warning']}]Warning:[/] [{colors['error']}]{warning}[/]")
+
+        if data:
+            print_table_data(
+                ctx,
+                data,
+                suffix={"general": "Information"},
+                table_order=['general', 'DHCP range', 'DHCP options', 'DHCP members', 'DHCP failover', 'DNS records', 'fixed addresses'],
+            )
+            return
+
+        if warnings:
+            console.print(f"[{colors['warning']}]No subnet details available because one or more Infoblox lookups failed.[/]")
+            return
+
+        console.print(f"[{colors['error']}]{format_no_match_message('subnet records', str(network))}[/]")
+
+    def _build_summary_state(self, data: Dict[str, Any], warnings: List[str]) -> SubnetSummaryState:
+        has_primary_details = bool(data.get("general"))
+        has_secondary_details = bool(data) and not has_primary_details
+        has_warnings = bool(warnings)
+
+        if has_primary_details and has_warnings:
+            return SubnetSummaryState(status="Data with warnings", description="General subnet data with lookup warnings")
+        if has_primary_details:
+            return SubnetSummaryState(status="Data found", description="Subnet data available")
+        if has_secondary_details and has_warnings:
+            return SubnetSummaryState(status="Partial data with warnings", description="Partial subnet detail without general metadata")
+        if has_secondary_details:
+            return SubnetSummaryState(status="Partial data", description="Partial subnet detail without general metadata")
+        if has_warnings:
+            return SubnetSummaryState(status="Warnings only", description=warnings[0])
+        return SubnetSummaryState(status="No data", description="No matching subnet records found")
 
     def _prepare_subnet_save_data(self, original_input: str, processed_data: Dict[str, Any]) -> List[RowDict]:
         """

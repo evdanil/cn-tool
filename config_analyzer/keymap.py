@@ -8,6 +8,9 @@ from textual.binding import Binding
 def browser_bindings() -> list[Binding]:
     return [
         Binding("ctrl+q", "quit", "Quit"),
+        Binding("ctrl+f", "start_find", "Find"),
+        Binding("alt+f", "start_find", "", show=False),
+        Binding("z", "toggle_maximize_pane", "Maximize"),
         Binding("enter", "enter_selected", "Enter/Open"),
         Binding("right", "enter_selected", "Enter/Open"),
         Binding("left", "go_up", "Up"),
@@ -19,13 +22,16 @@ def browser_bindings() -> list[Binding]:
     ]
 
 
-def snapshot_bindings(show_hide_diff_key, show_focus_next_key, show_select_key, show_diff_controls_key) -> list[Binding]:
+def snapshot_bindings(show_hide_diff_key, show_select_key, show_diff_controls_key) -> list[Binding]:
     """Build bindings for the snapshot selector view.
 
     Accepts reactive flags from the app for dynamic visibility.
     """
     return [
         Binding("ctrl+q", "quit", "Quit"),
+        Binding("ctrl+f", "start_find", "Find"),
+        Binding("alt+f", "start_find", "", show=False),
+        Binding("z", "toggle_maximize_pane", "Maximize", show=show_hide_diff_key),
         Binding("enter", "toggle_row", "Toggle Select", show=show_select_key),
         Binding("tab", "focus_next", "Switch Panel"),
         Binding("escape", "hide_diff", "Back / Hide Diff", show=show_hide_diff_key),

@@ -1,10 +1,11 @@
 import os
 from typing import Optional, Tuple
+
 from core.base import ScriptContext
+from utils.app_lifecycle import exit_now
+from utils.display import console, get_global_color_scheme
 from utils.gpg import get_gpg_credentials
 from utils.user_input import read_user_input
-from utils.display import console, get_global_color_scheme
-from utils.app_lifecycle import exit_now
 
 
 def get_auth_creds(ctx: ScriptContext) -> Tuple[Optional[str], Optional[str]]:
@@ -45,3 +46,46 @@ def get_auth_creds(ctx: ScriptContext) -> Tuple[Optional[str], Optional[str]]:
         ctx.password = str(password)
 
     return (username, password)
+
+
+def install_context_credentials(ctx: ScriptContext, username: str, password: str) -> None:
+    """
+    Store credentials on the shared context without touching any transport session.
+    """
+    ctx.username = str(username)
+    ctx.password = str(password)
+
+
+def ensure_device_auth(ctx: ScriptContext) -> Tuple[str, str]:
+    """
+    Lazily ensure shared TACACS/GPG credentials exist on the context.
+    """
+    if ctx.username and ctx.password:
+        return (ctx.username, ctx.password)
+
+    username, password = get_auth_creds(ctx)
+    if not username or not password:
+        ctx.logger.error("Auth - credentials are required but incomplete")
+        exit_now(ctx, 1, "Authentication error - verify credentials.")
+
+    install_context_credentials(ctx, str(username), str(password))
+    return (ctx.username, ctx.password)
+
+
+def install_infoblox_auth(ctx: ScriptContext, username: str, password: str) -> None:
+    """
+    Stores credentials on the shared context and applies them to the shared HTTP session.
+    """
+    from utils.api import session
+
+    install_context_credentials(ctx, username, password)
+    session.auth = (ctx.username, ctx.password)
+
+
+def ensure_infoblox_auth(ctx: ScriptContext) -> Tuple[str, str]:
+    """
+    Lazily ensure Infoblox credentials are available on the context and session.
+    """
+    username, password = ensure_device_auth(ctx)
+    install_infoblox_auth(ctx, username, password)
+    return (ctx.username, ctx.password)

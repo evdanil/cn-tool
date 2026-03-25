@@ -1,15 +1,13 @@
 import os
-from typing import Dict, List, Optional, Tuple, Sequence, Union, Set
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, DataTable, Static
 from textual.containers import Horizontal, Vertical, Container
 from textual.binding import Binding
 from textual import events
-import os
 from textual.timer import Timer
-from rich.console import Console, Group, RenderableType
-from io import StringIO
+from rich.console import Group, RenderableType
 
 from .parser import parse_snapshot, parse_snapshot_meta
 from .formatting import format_timestamp
@@ -84,6 +82,17 @@ class BrowserDataTable(DataTable):
         since Textual delivers keys to the focused widget first.
         """
         try:
+            from .utils import handle_search_key
+
+            if getattr(self.app, "_search_target", "") == "preview" and handle_search_key(self.app, event, "preview"):
+                try:
+                    event.stop()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+        try:
             handler = getattr(self.app, "process_filter_key", None)
             if handler and handler(event, require_table_focus=False):
                 try:
@@ -124,7 +133,6 @@ class PreviewPane(SearchableTextPane):
     """Preview pane backed by :class:`SearchableTextPane` with key handling tweaks."""
 
     BINDINGS = [
-        Binding("ctrl+f", "start_find", "Find"),
         Binding("up", "scroll_up", "Scroll Up", show=False),
         Binding("down", "scroll_down", "Scroll Down", show=False),
         Binding("pageup", "page_up", "Page Up", show=False),
@@ -169,12 +177,19 @@ class PreviewPane(SearchableTextPane):
         except Exception:
             _scroll()
 
-    def set_renderable(self, renderable: RenderableType, *, base_text: Optional["Text"] = None, raw_text: Optional[str] = None) -> None:  # type: ignore[override]
-        super().set_renderable(renderable, base_text=base_text, raw_text=raw_text)
+    def set_renderable(
+        self,
+        renderable: RenderableType,
+        *,
+        base_text: Optional["Text"] = None,
+        raw_text: Optional[str] = None,
+        document_id: str = "",
+    ) -> None:  # type: ignore[override]
+        super().set_renderable(renderable, base_text=base_text, raw_text=raw_text, document_id=document_id)
         self._auto_scroll_if_needed()
 
-    def set_text(self, text: str) -> None:  # type: ignore[override]
-        super().set_text(text)
+    def set_text(self, text: str, *, document_id: str = "") -> None:  # type: ignore[override]
+        super().set_text(text, document_id=document_id)
         self._auto_scroll_if_needed()
 
     def on_key(self, event: events.Key) -> None:  # type: ignore[override]
@@ -292,6 +307,7 @@ class RepoBrowserApp(FilterMixin, App):
         self._filter_apply_timer: Optional[Timer] = None
         self.preview_fullscreen: bool = False
         self._last_preview_key: Optional[str] = None
+        self._current_preview_document_id: str = ""
         # Find-in-preview state
         self._search_target: str = ""  # 'preview' or ''
         self._preview_search: SearchController = SearchController()
@@ -641,24 +657,23 @@ class RepoBrowserApp(FilterMixin, App):
         self._start_highlight_file = None
         self._highlight_dir_name = None
 
-    def _syntax_to_text(self, content: str, lang: str) -> "Text":
-        from rich.syntax import Syntax
-        from rich.text import Text
-        # Render Syntax to ANSI, then parse to Text to keep styles
-        buf = StringIO()
-        console = Console(file=buf, force_terminal=True, color_system="truecolor", width=10_000)
-        console.print(Syntax(content, lang, word_wrap=False, line_numbers=False))
-        return Text.from_ansi(buf.getvalue())
-
     def _update_preview(self, key: str) -> None:
         """Populate the right pane for a given key (file or directory)."""
         self._last_preview_key = key
         self.preview.clear()
 
+        def _activate_document(document_id: str) -> str:
+            if document_id != self._current_preview_document_id:
+                self._preview_search.reset()
+                self._current_preview_document_id = document_id
+            return document_id
+
         # Directory previews render informational text only
         if key == "..":
+            document_id = _activate_document("preview:up")
             self.preview.set_text(
-                f"Path: {self._current_directory_label()}\nEnter to navigate. Press Q to quit."
+                f"Path: {self._current_directory_label()}\nEnter to navigate. Press Q to quit.",
+                document_id=document_id,
             )
             self._update_tips()
             return
@@ -669,7 +684,7 @@ class RepoBrowserApp(FilterMixin, App):
                 msg = f"Path: {key}\nRepository: {repo_label}\nEnter to navigate. Press Q to quit."
             else:
                 msg = f"Path: {key}\nEnter to navigate. Press Q to quit."
-            self.preview.set_text(msg)
+            self.preview.set_text(msg, document_id=_activate_document(f"preview:{key}"))
             self._update_tips()
             return
 
@@ -685,21 +700,10 @@ class RepoBrowserApp(FilterMixin, App):
             base_lang = "yaml" if key.lower().endswith((".yml", ".yaml")) else "ini"
             renderable: RenderableType = Syntax(content, base_lang, word_wrap=False, line_numbers=False)
 
-            # Clear the preview and set lines for search
-            self.preview.clear()
-            self.preview._lines = content.splitlines()
-            if self.preview.search:
-                self.preview.search.set_lines(self.preview._lines)
-
             if note:
                 note_text = Text(note, style="italic dim")
                 renderable = Group(renderable, note_text)
-                # Note is not searchable
-
-            # Set the renderable and apply search
-            self.preview._renderable = renderable
-            self.preview._base_text = None
-            self.preview.apply_search()
+            self.preview.set_renderable(renderable, document_id=_activate_document(f"preview:{key}"))
 
         if fsize and fsize > self.MAX_PREVIEW_BYTES:
             try:
@@ -710,7 +714,10 @@ class RepoBrowserApp(FilterMixin, App):
                 _render_syntax(content, note=note)
                 self._update_tips()
             except Exception as exc:
-                self.preview.set_text(f"Error reading file: {exc}")
+                self.preview.set_text(
+                    f"Error reading file: {exc}",
+                    document_id=_activate_document(f"preview:error:{key}"),
+                )
                 self._update_tips()
             return
 
@@ -726,7 +733,10 @@ class RepoBrowserApp(FilterMixin, App):
             _render_syntax(content)
             self._update_tips()
         except OSError as exc:
-            self.preview.set_text(f"Error reading file: {exc}")
+            self.preview.set_text(
+                f"Error reading file: {exc}",
+                document_id=_activate_document(f"preview:error:{key}"),
+            )
             self._update_tips()
 
     def _selected_row_key(self) -> Optional[str]:
@@ -750,6 +760,9 @@ class RepoBrowserApp(FilterMixin, App):
         self.tips.update(browser_tips(filter_hint, search_hint, preview_focused))
 
     # ---- Find in preview ----
+    def action_start_find(self) -> None:
+        self.action_start_find_preview()
+
     def action_start_find_preview(self) -> None:
         self._search_target = 'preview'
         self._preview_search.reset()
@@ -1025,6 +1038,8 @@ class RepoBrowserApp(FilterMixin, App):
         return False
 
     def on_key(self, event: events.Key) -> None:  # type: ignore
+        from .utils import handle_search_key
+
         if self._debug_keys:
             try:
                 self.logr.debug(
@@ -1036,6 +1051,8 @@ class RepoBrowserApp(FilterMixin, App):
                 )
             except Exception:
                 pass
+        if self._search_target == "preview" and handle_search_key(self, event, "preview"):
+            return
         # When in preview fullscreen, Escape should exit fullscreen
         if getattr(self, "preview_fullscreen", False) and event.key == "escape":
             self.preview_fullscreen = False
@@ -1045,7 +1062,7 @@ class RepoBrowserApp(FilterMixin, App):
             self._apply_layout()
             self._render_entries()
             try:
-                self.table.focus()
+                self.preview.focus()
             except Exception:
                 pass
             try:
@@ -1206,10 +1223,6 @@ class RepoBrowserApp(FilterMixin, App):
                 self.selected_repo_root = self._entry_repo.get(key) or self._determine_repo_root(key) or self.current_root
                 self.exit()
             elif lower.endswith((".yml", ".yaml")):
-                # Fullscreen preview for YAML files
-                self.preview_fullscreen = True
-                self._apply_layout()
-                self._update_preview(key)
                 try:
                     self.preview.focus()
                 except Exception:
@@ -1270,6 +1283,26 @@ class RepoBrowserApp(FilterMixin, App):
             rc = self.table.row_count
             if rc:
                 self.table.cursor_coordinate = (rc - 1, 0)
+        except Exception:
+            pass
+
+    def action_toggle_maximize_pane(self) -> None:
+        target_key = self._last_preview_key or self._selected_row_key()
+        if not target_key:
+            return
+
+        if self.preview_fullscreen:
+            self.preview_fullscreen = False
+            self._pending_cursor_key = self._last_preview_key
+            self._apply_layout()
+            self._render_entries()
+        else:
+            self.preview_fullscreen = True
+            self._apply_layout()
+            self._update_preview(target_key)
+
+        try:
+            self.preview.focus()
         except Exception:
             pass
 

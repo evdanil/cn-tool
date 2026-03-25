@@ -4,11 +4,11 @@ from typing import Dict, Any, List, Optional, Set
 from concurrent.futures import ThreadPoolExecutor
 
 from core.base import BaseModule, ScriptContext
-from utils.user_input import press_any_key, read_user_input
+from utils.api import bound_infoblox_workers, describe_infoblox_failure, request_result
 from utils.display import console, get_global_color_scheme, print_table_data
-from utils.api import do_fancy_request
 from utils.file_io import queue_save
 from utils.process_data import process_data
+from utils.user_input import press_any_key, read_user_input
 
 
 class IPRequestModule(BaseModule):
@@ -21,7 +21,7 @@ class IPRequestModule(BaseModule):
 
     @property
     def menu_title(self) -> str:
-        return "IP Information"
+        return "IP Information (IPv4)"
 
     @property
     def visibility_config_key(self) -> Optional[str]:
@@ -30,17 +30,17 @@ class IPRequestModule(BaseModule):
 
     def run(self, ctx: ScriptContext) -> None:
         """
-        Requests user to provide IP address(es), validates the input, calls the API,
+        Requests user to provide IPv4 address(es), validates the input, calls the API,
         processes the data, and then prints and/or saves it.
         """
         logger = ctx.logger
         colors = get_global_color_scheme(ctx.cfg)
-        logger.info("Request Type - IP Information")
+        logger.info("Request Type - IP Information (IPv4)")
 
         console.print(
             "\n"
-            f"[{colors['description']}]Please provide an IP address or a list of IP addresses, one per line.[/]\n"
-            f"[{colors['description']}]The tool will request detailed information, such as hostname, location, and network configuration.[/]\n"
+            f"[{colors['description']}]Please provide an IPv4 address or a list of IPv4 addresses, one per line.[/]\n"
+            f"[{colors['description']}]This module is IPv4-only and will request hostname, location, and network configuration details.[/]\n"
             f"[{colors['description']}]Empty input line starts the process.[/]\n"
             f"[{colors['header']}]Example:[/]\n"
             f"[{colors['success']} {colors['bold']}]134.162.104.110[/]\n"
@@ -57,10 +57,12 @@ class IPRequestModule(BaseModule):
                 ip = ipaddress.ip_address(search_input)
                 if ip.is_unspecified or ip.is_reserved or ip.is_link_local:
                     console.print(f"[{colors['error']}]Invalid IP: Broadcast, unspecified, and reserved IPs are excluded.[/]")
+                elif ip.version != 4:
+                    console.print(f"[{colors['error']}]IPv6 lookups are not supported in this module yet. Please enter an IPv4 address.[/]")
                 else:
                     ip_addresses_input.append(search_input)
             except ValueError:
-                console.print(f"[{colors['error']}]Invalid IP format. Please enter a valid IPv4 or IPv6 address.[/]")
+                console.print(f"[{colors['error']}]Invalid IP format. Please enter a valid IPv4 address.[/]")
 
         if not ip_addresses_input:
             return
@@ -74,16 +76,16 @@ class IPRequestModule(BaseModule):
         start = perf_counter()
         req_urls = {ip: f"ipv4address?ip_address={ip}&_return_fields=network,names,status,types,lease_state,mac_address" for ip in ip_addresses}
 
-        with ThreadPoolExecutor() as executor, console.status(f"[{colors['description']}]Fetching IP information...[/]"):
-            future_to_ip = {executor.submit(do_fancy_request, ctx, "", uri, spinner=None): ip for ip, uri in req_urls.items()}
+        with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(req_urls))) as executor, console.status(f"[{colors['description']}]Fetching IP information...[/]"):
+            future_to_ip = {executor.submit(request_result, ctx, uri): ip for ip, uri in req_urls.items()}
             results = {future_to_ip[future]: future.result() for future in future_to_ip}
 
         processed_data_by_ip: Dict[str, Dict[str, Any]] = {}
         successful_ips: Set[str] = set()
+        failed_ips: Dict[str, str] = {}
         for ip, response in results.items():
-            if response:
-                # Initial processing
-                data = process_data(ctx, type="ip", content=response)
+            if response.ok:
+                data = process_data(ctx, type="ip", content=response.content)
 
                 # --- HOOK: Allows plugins to modify the processed data ---
                 data = self.execute_hook('process_data', ctx, data)
@@ -91,15 +93,19 @@ class IPRequestModule(BaseModule):
                 if data and data.get("general"):
                     processed_data_by_ip[ip] = data
                     successful_ips.add(ip)
+            elif response.failed:
+                failed_ips[ip] = describe_infoblox_failure(response)
 
         end = perf_counter()
         logger.info(f"IP Information search took {round(end - start, 3)} seconds!")
-        console.print(f"[{colors['description']}]Request Type - IP Information - Search took [{colors['success']}]{round(end-start, 3)}[/] seconds![/]")
+        console.print(f"[{colors['description']}]Request Type - IP Information (IPv4) - Search took [{colors['success']}]{round(end-start, 3)}[/] seconds![/]")
 
         # --- Display and Save Results ---
         for ip in ip_addresses:
-            if ip not in successful_ips:
-                console.print(f"[{colors['success']} {colors['bold']}]{ip}[/] - [{colors['error']}]No data received[/]")
+            if ip in failed_ips:
+                console.print(f"[{colors['success']} {colors['bold']}]{ip}[/] - [{colors['error']}]{failed_ips[ip]}[/]")
+            elif ip not in successful_ips:
+                console.print(f"[{colors['success']} {colors['bold']}]{ip}[/] - [{colors['error']}]No matching IPv4 record found[/]")
 
         # Prepare data for both printing and saving
         save_data_all: List[List[Any]] = []

@@ -9,6 +9,7 @@ from core.base import BaseModule, ScriptContext
 from utils.user_input import press_any_key, read_user_input
 from utils.display import console, get_global_color_scheme, print_search_config_data, print_table_data
 from utils.file_io import check_dir_accessibility, queue_save
+from utils.infoblox_ux import format_no_match_message, format_partial_results_message
 from utils.validation import is_valid_site
 from utils.config import make_dir_list
 from utils.process_data import remove_duplicate_rows_sorted_by_col
@@ -204,21 +205,44 @@ class ConfigSearchModule(BaseModule):
             sitecode: The validated site code to search for.
         """
         logger = ctx.logger
+        console = ctx.console
         colors = get_global_color_scheme(ctx.cfg)
+        normalized_sitecode = str(sitecode or "").strip().upper()
+        if not is_valid_site(normalized_sitecode):
+            logger.info(f"Executing demobilization search rejected invalid sitecode: {sitecode}")
+            console.print(f"[{colors['error']}]Invalid site code format.[/]")
+            press_any_key(ctx)
+            return
+
+        sitecode = normalized_sitecode
         logger.info(f"Executing demobilization search for sitecode: {sitecode}")
 
         # Step 1: Fetch network data from Infoblox
-        processed_data = fetch_network_data(ctx, sitecode)
+        lookup_result = fetch_network_data(ctx, sitecode)
+        processed_data = lookup_result.data
+
+        if lookup_result.status == "error" and not lookup_result.has_data:
+            console.print(f"[{colors['error']}]{lookup_result.message}[/]")
+            press_any_key(ctx)
+            return
+
+        if lookup_result.status == "partial_error":
+            console.print(f"[{colors['warning']}]{format_partial_results_message(lookup_result.message)}[/]")
 
         if not processed_data.get("location"):
-            console.print(f"[{colors['error']}]No [{colors['success']} {colors['bold']}]{sitecode}[/] subnets registered in Infoblox[/]")
+            console.print(f"[{colors['error']}]{format_no_match_message('subnet records', sitecode)}[/]")
             press_any_key(ctx)
             return
 
         print_table_data(ctx, processed_data)
         console.print(f'[{colors["description"]}]Received {len(processed_data["location"])} subnet records for [{colors["success"]} {colors["bold"]}]{sitecode}[/]')
 
-        if read_user_input(ctx, f"[{colors['warning']}]Would you like to proceed searching configuration files (Y/N)? [/]").lower() != "y":
+        if read_user_input(ctx, f"[{colors['warning']}]Proceed with configuration search for this site code (Y/N)? [/]").lower() != "y":
+            return
+
+        if not check_dir_accessibility(ctx.logger, ctx.cfg.get("config_repo_directory", '')):
+            self._show_help(ctx)
+            press_any_key(ctx)
             return
 
         # Step 2: Prepare search terms from the fetched network data
@@ -251,7 +275,7 @@ class ConfigSearchModule(BaseModule):
 
         if not data_to_save:
             logger.info(f"Configuration Repository - No matches for {sitecode} found!")
-            console.print(f"[{colors['error']}]No matches found![/]")
+            console.print(f"[{colors['error']}]No matching configuration entries found for site code [{colors['success']} {colors['bold']}]{sitecode}[/].[/]")
             press_any_key(ctx)
             return
 
@@ -262,7 +286,7 @@ class ConfigSearchModule(BaseModule):
                 net_str = str(missed_net)
                 if net_str.endswith("/32"):
                     net_str = net_str[:-3]
-                console.print(f"[{colors['description']}]Subnet [{colors['success']} {colors['bold']}]{net_str}[/] - [{colors['error']}]No matches found[/]")
+                console.print(f"[{colors['description']}]Subnet [{colors['success']} {colors['bold']}]{net_str}[/] - [{colors['error']}]No configuration matches found[/]")
 
         sorted_data = remove_duplicate_rows_sorted_by_col(data_to_save, 2)
         print_search_config_data(ctx, sorted_data)
@@ -283,8 +307,7 @@ class ConfigSearchModule(BaseModule):
             },
         )
 
-        # Commented because we await for any key in demob_check module itself
-        # press_any_key(ctx)
+        press_any_key(ctx)
 
     def _execute_search(self, ctx: ScriptContext, networks: List, search_terms: List, search_input: str) -> Tuple[List, Set, float]:
         """A centralized method to run the search via cache or live scan."""
