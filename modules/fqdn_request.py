@@ -3,11 +3,12 @@ import re
 from typing import Dict, Any, Optional
 
 from core.base import BaseModule, ScriptContext
-from utils.user_input import press_any_key, read_user_input
+from utils.api import describe_infoblox_failure, request_result
 from utils.display import console, get_global_color_scheme, print_table_data
-from utils.api import do_fancy_request
 from utils.file_io import queue_save
+from utils.infoblox_ux import format_no_match_message
 from utils.process_data import process_data
+from utils.user_input import press_any_key, read_user_input
 
 
 class FQDNRequestModule(BaseModule):
@@ -69,21 +70,23 @@ class FQDNRequestModule(BaseModule):
 
         # --- API Call and Data Processing ---
         uri = f"search?fqdn~={fqdn}&_return_fields=ipv4addr,ipv6addr,name&_max_results=1000"
-        content = do_fancy_request(
-            ctx,
-            message=f"[{colors['description']}]Fetching data for [{colors['header']}]{fqdn}[/]...[/]",
-            uri=uri,
-        )
+        with ctx.console.status(f"[{colors['description']}]Fetching data for [{colors['header']}]{fqdn}[/]...[/]"):
+            result = request_result(ctx, uri)
 
         processed_data: Dict[str, Any] = {}
-        if content:
-            processed_data = process_data(ctx, type="fqdn", content=content)
+        if result.ok:
+            processed_data = process_data(ctx, type="fqdn", content=result.content)
             processed_data = self.execute_hook('process_data', ctx, processed_data)
+        elif result.failed:
+            logger.info("Request Type - FQDN Search - Request failed")
+            console.print(f"[{colors['error']}]{describe_infoblox_failure(result)}[/]")
+            press_any_key(ctx)
+            return
 
         if not processed_data or not processed_data.get("fqdn"):
-            logger.info("Request Type - FQDN Search - No information received")
-            console.print(f"[{colors['error']}]No information received for '{fqdn}'.[/]")
-            logger.debug(f"Request Type - FQDN Search - raw data: {content}")
+            logger.info("Request Type - FQDN Search - No matching records found")
+            console.print(f"[{colors['error']}]{format_no_match_message('DNS records', fqdn)}[/]")
+            logger.debug(f"Request Type - FQDN Search - raw data: {result.content}")
             press_any_key(ctx)
             return
 

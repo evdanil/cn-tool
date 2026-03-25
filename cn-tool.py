@@ -40,9 +40,7 @@ from core.event_bus import EventBus
 from core.loader import load_modules_and_plugins
 
 # --- Utility Imports ---
-from utils.api import session
 from utils.app_lifecycle import exit_now
-from utils.auth import get_auth_creds
 from utils.config import BASE_CONFIG_SCHEMA, read_config, setup_from_args
 from utils.display import console, get_global_color_scheme, set_global_color_scheme
 from utils.file_io import start_worker, check_dir_accessibility
@@ -58,7 +56,7 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.74 hash d026a6c'
+VERSION = '0.2.75 hash ca6d59a'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -240,12 +238,6 @@ Please send any feedback/feature requests to evdanil@gmail.com
         password='',
         plugins=all_plugins,
     )
-
-    username, password = get_auth_creds(ctx)
-    if username and password:
-        session.auth = (username, password)
-    else:
-        ctx.logger.warning("Auth - Incomplete credentials provided; Infoblox API calls may fail.")
 
     # Connect global plugins
     for plugin in ctx.plugins:

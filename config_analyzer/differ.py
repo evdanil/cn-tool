@@ -1,31 +1,24 @@
 import difflib
 from typing import TYPE_CHECKING, List
+
+from rich.cells import cell_len, set_cell_size
 from rich.syntax import Syntax
-from rich.table import Table
 from rich.text import Text
-from rich import box
+
 from .debug import get_logger
 
-# Use a forward reference to avoid circular import
 if TYPE_CHECKING:
     from .parser import Snapshot
 
+
 _log = get_logger("diff")
+
+
 def get_diff(snapshot1: "Snapshot", snapshot2: "Snapshot") -> Syntax:
-    """
-    Generates a unified diff between the content of two snapshots and wraps it
-    in a ``rich.syntax.Syntax`` object for optional colorization.
+    """Return a unified diff renderable without line wrapping."""
 
-    Args:
-        snapshot1: The first snapshot object.
-        snapshot2: The second snapshot object.
-
-    Returns:
-        A ``Syntax`` instance containing the diff output.
-    """
     lines1 = snapshot1.content_body.splitlines(keepends=True)
     lines2 = snapshot2.content_body.splitlines(keepends=True)
-
     diff_lines = difflib.unified_diff(
         lines1,
         lines2,
@@ -33,7 +26,6 @@ def get_diff(snapshot1: "Snapshot", snapshot2: "Snapshot") -> Syntax:
         tofile=snapshot2.original_filename,
         lineterm="",
     )
-
     diff_text = "".join(diff_lines)
     _log.debug(
         "get_diff: %s vs %s, len1=%d len2=%d diff_chars=%d",
@@ -43,82 +35,89 @@ def get_diff(snapshot1: "Snapshot", snapshot2: "Snapshot") -> Syntax:
         len(lines2),
         len(diff_text),
     )
-    return Syntax(diff_text, "diff", line_numbers=True, word_wrap=True)
-    
-def get_diff_side_by_side(snapshot1: "Snapshot", snapshot2: "Snapshot", hide_unchanged: bool = False):
-    """
-    Generates a side-by-side diff table between two snapshots.
+    return Syntax(diff_text, "diff", line_numbers=True, word_wrap=False)
 
-    Left column is snapshot1, right column is snapshot2. Colors:
-    - red: deletion (only on left)
-    - green: insertion (only on right)
-    - yellow: replacement (both sides differ)
-    - default: equal
-    """
+
+def _fit_cell(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if cell_len(text) <= width:
+        return set_cell_size(text, width)
+    if width <= 3:
+        return set_cell_size(text[:width], width)
+    return set_cell_size(text[: width - 3] + "...", width)
+
+
+def get_diff_side_by_side(
+    snapshot1: "Snapshot",
+    snapshot2: "Snapshot",
+    hide_unchanged: bool = False,
+    total_width: int = 160,
+) -> Text:
+    """Return a fixed-width side-by-side diff as styled plain text."""
+
     left_lines: List[str] = snapshot1.content_body.splitlines()
     right_lines: List[str] = snapshot2.content_body.splitlines()
+    matcher = difflib.SequenceMatcher(None, left_lines, right_lines, autojunk=False)
 
-    sm = difflib.SequenceMatcher(None, left_lines, right_lines, autojunk=False)
+    divider = " | "
+    column_width = max((max(total_width, 60) - len(divider)) // 2, 20)
+
     _log.debug(
-        "get_diff_sbs: %s vs %s, hide_unchanged=%s, len1=%d len2=%d",
+        "get_diff_sbs: %s vs %s, hide_unchanged=%s, len1=%d len2=%d width=%d",
         snapshot1.original_filename,
         snapshot2.original_filename,
         hide_unchanged,
         len(left_lines),
         len(right_lines),
+        total_width,
     )
 
-    table = Table(
-        show_header=True,
-        header_style="bold",
-        expand=True,
-        pad_edge=False,
-        show_lines=False,
-        show_edge=False,
-        box=box.SIMPLE,
-    )
-    table.add_column(snapshot1.original_filename, overflow="fold", ratio=1)
-    table.add_column(snapshot2.original_filename, overflow="fold", ratio=1)
+    rendered = Text()
+    header = Text()
+    header.append(_fit_cell(snapshot1.original_filename, column_width), style="bold")
+    header.append(divider, style="dim")
+    header.append(_fit_cell(snapshot2.original_filename, column_width), style="bold")
+    rendered.append(header)
+    rendered.append("\n")
 
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    separator = Text()
+    separator.append("-" * column_width, style="dim")
+    separator.append(divider, style="dim")
+    separator.append("-" * column_width, style="dim")
+    rendered.append(separator)
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             if hide_unchanged:
                 continue
-            for a, b in zip(left_lines[i1:i2], right_lines[j1:j2]):
-                table.add_row(Text(a), Text(b))
+            pairs = zip(left_lines[i1:i2], right_lines[j1:j2])
+            style_pairs = [("", "")]
         elif tag == "replace":
             left_block = left_lines[i1:i2]
             right_block = right_lines[j1:j2]
-            max_len = max(len(left_block), len(right_block))
-            for k in range(max_len):
-                a = left_block[k] if k < len(left_block) else ""
-                b = right_block[k] if k < len(right_block) else ""
-                # Changed lines should be yellow - use markup instead of style
-                # Escape any markup characters in the content
-                a_escaped = a.replace("[", r"\[").replace("]", r"\]")
-                b_escaped = b.replace("[", r"\[").replace("]", r"\]")
-                table.add_row(
-                    Text.from_markup(f"[bright_yellow]{a_escaped}[/bright_yellow]"),
-                    Text.from_markup(f"[bright_yellow]{b_escaped}[/bright_yellow]")
+            pairs = (
+                (
+                    left_block[index] if index < len(left_block) else "",
+                    right_block[index] if index < len(right_block) else "",
                 )
-                _log.debug("Added replace row: left='%s' right='%s' with yellow markup", a[:30], b[:30])
+                for index in range(max(len(left_block), len(right_block)))
+            )
+            style_pairs = [("bright_yellow", "bright_yellow")]
         elif tag == "delete":
-            for a in left_lines[i1:i2]:
-                # Deleted lines should be red on left, empty on right - use markup
-                a_escaped = a.replace("[", r"\[").replace("]", r"\]")
-                table.add_row(
-                    Text.from_markup(f"[bright_red]{a_escaped}[/bright_red]"),
-                    Text("")
-                )
-                _log.debug("Added delete row: left='%s' with red markup", a[:30])
-        elif tag == "insert":
-            for b in right_lines[j1:j2]:
-                # Inserted lines should be empty on left, green on right - use markup
-                b_escaped = b.replace("[", r"\[").replace("]", r"\]")
-                table.add_row(
-                    Text(""),
-                    Text.from_markup(f"[bright_green]{b_escaped}[/bright_green]")
-                )
-                _log.debug("Added insert row: right='%s' with green markup", b[:30])
+            pairs = ((line, "") for line in left_lines[i1:i2])
+            style_pairs = [("bright_red", "dim")]
+        else:
+            pairs = (("", line) for line in right_lines[j1:j2])
+            style_pairs = [("dim", "bright_green")]
 
-    return table
+        left_style, right_style = style_pairs[0]
+        for left_text, right_text in pairs:
+            rendered.append("\n")
+            line = Text()
+            line.append(_fit_cell(left_text, column_width), style=left_style or None)
+            line.append(divider, style="dim")
+            line.append(_fit_cell(right_text, column_width), style=right_style or None)
+            rendered.append(line)
+
+    return rendered

@@ -3,9 +3,10 @@ from typing import Dict, Optional
 
 from core.base import BaseModule, ScriptContext
 from utils.user_input import press_any_key, read_user_input
-from utils.display import console, get_global_color_scheme, print_table_data
+from utils.display import get_global_color_scheme, print_table_data
 from utils.api import fetch_network_data
 from utils.file_io import queue_save
+from utils.infoblox_ux import format_no_match_message, format_partial_results_message
 from utils.validation import is_valid_site
 
 
@@ -33,46 +34,54 @@ class LocationRequestModule(BaseModule):
         (Original `location_request` logic)
         """
         logger = ctx.logger
+        console = ctx.console
         colors = get_global_color_scheme(ctx.cfg)
         logger.info("Request Type - Subnet Lookup by Location/Keyword")
 
         console.print(
             "\n"
-            f"[{colors['description']}]Type in a location site code to obtain a list of registered [{colors['bold']}]subnets[/].[/]\n"
+            f"[{colors['description']}]Search for registered subnets by [{colors['bold']}]site code[/] or [{colors['bold']}]keyword[/].[/]\n"
             f"[{colors['description']}]Supported site code format: [{colors['success']} {colors['bold']}]XXX, XXXXXXX, XXX-XX\\[XX][/]\n"
+            f"[{colors['description']}]Keyword searches look in the subnet description/comment field.[/]\n"
             f"[{colors['description']}]Request has a limit of [{colors['error']} {colors['bold']}]1000[/] records per search.[/]\n"
-            f"[{colors['header']} {colors['bold']}]Examples:[/]\n"
-            f"[{colors['success']} {colors['bold']}]CIC[/] -> Fetches subnets for [{colors['warning']} {colors['bold']}]Chinchilla site[/]\n"
-            f"[{colors['success']} {colors['bold']}]WND-RYD[/] -> Fetches subnets for [{colors['warning']} {colors['bold']}]Wandoan site[/]\n"
-            "\n"
-            f"[{colors['description']}]Alternatively, type '[{colors['error']} {colors['bold']}] + [/]' followed by a keyword to search in the description.[/]\n"
-            f"[{colors['header']} {colors['bold']}]Examples:[/]\n"
-            f"[{colors['error']} {colors['bold']}] +[/][{colors['success']} {colors['bold']}]PRJ18[/] -> Fetches subnets with [{colors['bold']}]PRJ18[/] in the description.[/]\n"
         )
 
-        raw_input = read_user_input(
-            ctx,
-            f"Enter [{colors['success']} {colors['bold']}]location code[/] or '[{colors['error']} {colors['bold']}] + [/]'[{colors['success']} {colors['bold']}]keyword[/]: "
-        ).strip()
+        search_mode = self._read_search_mode(ctx)
+        if not search_mode:
+            return
+
+        if search_mode == "sitecode":
+            raw_input = read_user_input(
+                ctx,
+                f"Enter [{colors['success']} {colors['bold']}]location code[/]: ",
+            ).strip()
+        else:
+            raw_input = read_user_input(
+                ctx,
+                f"Enter [{colors['success']} {colors['bold']}]keyword[/] (min 3 chars): ",
+            ).strip()
 
         logger.info(f"User input - {raw_input}")
 
         if not raw_input:
             logger.info("User input - Empty input")
-            console.print(f"[{colors['error']}]No input provided.[/]")
+            console.print(f"[{colors['error']}]No search value provided.[/]")
             press_any_key(ctx)
             return
 
         # --- Input Parsing and Validation ---
         search_term: str = ""
-        is_keyword_search = False
+        is_keyword_search = search_mode == "keyword"
         prefix: Dict[str, str] = {}
         suffix: Dict[str, str] = {}
 
-        if raw_input.startswith("+"):
-            is_keyword_search = True
-            search_term = raw_input[1:].strip()
-            # Basic validation for keyword
+        if is_keyword_search:
+            search_term = raw_input.strip()
+            if len(search_term) < 3:
+                logger.info(f"User input - Keyword too short {search_term}")
+                console.print(f"[{colors['error']}]Keyword searches require at least 3 characters.[/]")
+                press_any_key(ctx)
+                return
             if not re.match(r"^[a-zA-Z0-9_-]*$", search_term):
                 logger.info(f"User input - Invalid keyword {search_term}")
                 console.print(f"[{colors['error']}]Keyword contains invalid characters.[/]")
@@ -93,14 +102,24 @@ class LocationRequestModule(BaseModule):
             logger.info(f"User input - Sitecode search for '{search_term}'")
 
         # --- API Call and Data Processing ---
-        processed_data = fetch_network_data(ctx, search_term, keyword=is_keyword_search)
+        lookup_result = fetch_network_data(ctx, search_term, keyword=is_keyword_search)
+        processed_data = lookup_result.data
 
         # --- HOOK: Allow plugins to modify the processed data ---
         processed_data = self.execute_hook('process_data', ctx, processed_data)
 
+        if lookup_result.status == "error" and not lookup_result.has_data:
+            logger.info("Request Type - Location/Keyword Search - Request failed")
+            console.print(f"[{colors['error']}]{lookup_result.message}[/]")
+            press_any_key(ctx)
+            return
+
+        if lookup_result.status == "partial_error":
+            console.print(f"[{colors['warning']}]{format_partial_results_message(lookup_result.message)}[/]")
+
         if not processed_data.get("location"):
-            logger.info("Request Type - Location/Keyword Search - No information received")
-            console.print(f"[{colors['error']}]No information received for '{search_term}'.[/]")
+            logger.info("Request Type - Location/Keyword Search - No matching records found")
+            console.print(f"[{colors['error']}]{format_no_match_message('subnet records', search_term)}[/]")
             press_any_key(ctx)
             return
 
@@ -138,3 +157,22 @@ class LocationRequestModule(BaseModule):
         )
 
         press_any_key(ctx)
+
+    def _read_search_mode(self, ctx: ScriptContext) -> Optional[str]:
+        colors = get_global_color_scheme(ctx.cfg)
+        console = ctx.console
+        console.print(
+            f"[{colors['header']}]Search modes:[/]\n"
+            f"[{colors['success']}]1[/]. site code\n"
+            f"[{colors['success']}]2[/]. keyword (description search)"
+        )
+        mode = read_user_input(ctx, "Select search mode [1/2]: ").strip().lower()
+        if not mode:
+            return None
+        if mode in {"site", "s", "1", "sitecode", "site code"}:
+            return "sitecode"
+        if mode in {"keyword", "k", "2"}:
+            return "keyword"
+        console.print(f"[{colors['error']}]Invalid search mode. Use 1 for site code or 2 for keyword.[/]")
+        press_any_key(ctx)
+        return None

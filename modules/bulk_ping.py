@@ -1,8 +1,9 @@
 # modules/bulk_ping.py
 import ipaddress
+import re
 import shutil
 from logging import Logger
-from subprocess import DEVNULL, STDOUT, Popen
+from subprocess import PIPE, STDOUT, Popen
 from typing import Dict, List, Optional, Tuple
 
 from core.base import BaseModule, ScriptContext
@@ -10,6 +11,9 @@ from utils.user_input import press_any_key, read_user_input
 from utils.display import console, get_global_color_scheme, print_table_data
 from utils.file_io import queue_save
 from utils.validation import is_fqdn, validate_ip
+
+
+_PING_RECEIVED_RE = re.compile(r"(\d+)\s+packets transmitted,\s*(\d+)\s+(?:packets\s+)?received")
 
 
 class BulkPingModule(BaseModule):
@@ -105,8 +109,9 @@ class BulkPingModule(BaseModule):
                 # This is a large subnet. We will ONLY display the successful pings.
                 success_results = []
                 for host in hosts_in_item:
-                    if results_map.get(host) == "OK":
-                        success_results.append({'Host': host, 'Result': "OK"})
+                    result = results_map.get(host)
+                    if isinstance(result, str) and result.startswith("OK"):
+                        success_results.append({'Host': host, 'Result': result})
 
                 if success_results:
                     # If we found any successful pings, display them.
@@ -210,21 +215,44 @@ class BulkPingModule(BaseModule):
             # Using -n to prevent name resolution, -w3 for 3-sec timeout, -c2 for 2 packets
             command = ["ping", "-n", "-w3", "-c2", host]
             try:
-                processes[host] = Popen(command, stdout=DEVNULL, stderr=STDOUT)
+                processes[host] = Popen(
+                    command,
+                    stdout=PIPE,
+                    stderr=STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
             except FileNotFoundError:
                 logger.error("'ping' command not found.")
                 return []
 
         for host, proc in processes.items():
-            # proc.wait() blocks until the process finishes, consuming no CPU while waiting.
-            proc.wait()
-            # Determine the result based on the return code
-            if proc.returncode == 0:
-                result_status = "OK"
-            elif proc.returncode in [1, 2]:  # Common exit codes for unreachable hosts
-                result_status = "NO RESPONSE"
-            else:
-                result_status = "ERROR"
+            output, _ = proc.communicate()
+            result_status = self._classify_ping_result(proc.returncode, output)
             results.append({"Host": host, "Result": result_status})
 
         return results
+
+    def _classify_ping_result(self, returncode: Optional[int], output: str) -> str:
+        """Classify ping results, keeping any reply as success while reporting probe loss."""
+        counts = self._extract_ping_counts(output)
+        if counts is not None:
+            transmitted, received = counts
+            if received >= transmitted:
+                return "OK"
+            if received > 0:
+                return f"OK ({received}/{transmitted} replies)"
+            return "NO RESPONSE"
+
+        if returncode == 0:
+            return "OK"
+        if returncode in [1, 2]:
+            return "NO RESPONSE"
+        return "ERROR"
+
+    def _extract_ping_counts(self, output: str) -> Optional[tuple[int, int]]:
+        match = _PING_RECEIVED_RE.search(str(output or ""))
+        if not match:
+            return None
+        return int(match.group(1)), int(match.group(2))

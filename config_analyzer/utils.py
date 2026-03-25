@@ -39,6 +39,15 @@ def handle_search_key(app, event, search_target):
         safe_call(event.stop)
         return True
 
+    if (
+        isinstance(ch, str)
+        and ch.lower() == "z"
+        and not any(getattr(event, mod, False) for mod in ["ctrl", "alt", "meta"])
+    ):
+        safe_call(getattr(app, "action_toggle_maximize_pane", None))
+        safe_call(event.stop)
+        return True
+
     # Handle printable characters
     if (isinstance(ch, str) and len(ch) == 1 and ch.isprintable() and
         not any(getattr(event, mod, False) for mod in ["ctrl", "alt", "meta"])):
