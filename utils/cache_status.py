@@ -4,20 +4,54 @@ from core.base import ScriptContext
 from utils.display import get_global_color_scheme
 
 
-def _yaml_device_count(ctx: ScriptContext) -> int:
+def _yaml_plugin(ctx: ScriptContext):
     try:
         for plugin in ctx.plugins:
             # Prefer a dedicated property if available
             if hasattr(plugin, 'name') and getattr(plugin, 'name') == 'SD-WAN YAML Search':
-                if hasattr(plugin, 'device_count'):
-                    return int(getattr(plugin, 'device_count'))
-                # Fallback to internal map if present
-                data = getattr(plugin, '_yaml_data', None)
-                if isinstance(data, dict):
-                    return len(data)
+                return plugin
     except Exception:
         pass
-    return 0
+    return None
+
+
+def _yaml_state(ctx: ScriptContext) -> tuple[int, bool]:
+    plugin = _yaml_plugin(ctx)
+    if plugin is None:
+        return 0, False
+
+    try:
+        if hasattr(plugin, 'device_count'):
+            count = int(getattr(plugin, 'device_count'))
+        else:
+            data = getattr(plugin, '_yaml_data', None)
+            count = len(data) if isinstance(data, dict) else 0
+    except Exception:
+        count = 0
+
+    try:
+        loading = bool(getattr(plugin, 'is_loading'))
+    except Exception:
+        loading = False
+
+    return count, loading
+
+
+def _device_suffix(
+    ctx: ScriptContext,
+    colors: dict[str, str],
+    repo_count: int,
+    yaml_count: int,
+    yaml_loading: bool,
+) -> str:
+    parts = [f"Repo [{colors['success']}]{repo_count}[/]"]
+    yaml_enabled = bool(ctx.cfg.get("sdwan_yaml_enabled", False)) if isinstance(ctx.cfg, dict) else False
+    if yaml_enabled:
+        if yaml_loading:
+            parts.append(f"YAML [{colors['warning']}]Loading[/]")
+        else:
+            parts.append(f"YAML [{colors['success']}]{yaml_count}[/]")
+    return " (" + ", ".join(parts) + ")"
 
 
 def build_cache_status_line(ctx: ScriptContext) -> str:
@@ -38,26 +72,18 @@ def build_cache_status_line(ctx: ScriptContext) -> str:
             repo_count = len(ctx.cache.dev_idx)
         except Exception:
             repo_count = 0
-    yaml_count = _yaml_device_count(ctx)
+    yaml_count, yaml_loading = _yaml_state(ctx)
     total_devices = repo_count + yaml_count
 
     if ctx.cfg.get("exiting", False):
-        yaml_enabled = bool(ctx.cfg.get("sdwan_yaml_enabled", False)) if isinstance(ctx.cfg, dict) else False
-        parts = [f"Repo [{colors['success']}]{repo_count}[/]"]
-        if yaml_enabled:
-            parts.append(f"YAML [{colors['success']}]{yaml_count}[/]")
-        suffix = " (" + ", ".join(parts) + ")"
+        suffix = _device_suffix(ctx, colors, repo_count, yaml_count, yaml_loading)
         return (
             f"[{colors['description']}]{ts} Configuration Cache Status: "
             f"[{colors['warning']}]Exiting Gracefully…[/] "
             f"Total Devices: [{colors['success']}]{total_devices}[/]" + suffix
         )
     if not ctx.cfg.get("cache_enabled", False) or not getattr(ctx, "cache", None):
-        yaml_enabled = bool(ctx.cfg.get("sdwan_yaml_enabled", False)) if isinstance(ctx.cfg, dict) else False
-        parts = [f"Repo [{colors['success']}]{repo_count}[/]"]
-        if yaml_enabled:
-            parts.append(f"YAML [{colors['success']}]{yaml_count}[/]")
-        suffix = " (" + ", ".join(parts) + ")"
+        suffix = _device_suffix(ctx, colors, repo_count, yaml_count, yaml_loading)
         return (
             f"[{colors['description']}]{ts} Configuration Cache Status: "
             f"[{colors['error']}]Disabled[/] "
@@ -73,11 +99,7 @@ def build_cache_status_line(ctx: ScriptContext) -> str:
     if not err_msg:
         err_msg = ctx.cfg.get("indexing_error") if isinstance(ctx.cfg, dict) else None
     if err_msg:
-        yaml_enabled = bool(ctx.cfg.get("sdwan_yaml_enabled", False)) if isinstance(ctx.cfg, dict) else False
-        parts = [f"Repo [{colors['success']}]{repo_count}[/]"]
-        if yaml_enabled:
-            parts.append(f"YAML [{colors['success']}]{yaml_count}[/]")
-        suffix = " (" + ", ".join(parts) + ")"
+        suffix = _device_suffix(ctx, colors, repo_count, yaml_count, yaml_loading)
         return (
             f"[{colors['description']}]{ts} Configuration Cache Status: "
             f"[{colors['error']}]Error[/] - {err_msg} "
@@ -108,11 +130,7 @@ def build_cache_status_line(ctx: ScriptContext) -> str:
         percent = int((done / total * 100)) if total else 0
 
         label_cap = str(label).capitalize()
-        yaml_enabled = bool(ctx.cfg.get("sdwan_yaml_enabled", False)) if isinstance(ctx.cfg, dict) else False
-        parts = [f"Repo [{colors['success']}]{repo_count}[/]"]
-        if yaml_enabled:
-            parts.append(f"YAML [{colors['success']}]{yaml_count}[/]")
-        suffix = " (" + ", ".join(parts) + ")"
+        suffix = _device_suffix(ctx, colors, repo_count, yaml_count, yaml_loading)
         return (
             f"[{colors['description']}]{ts} Configuration Cache Status: "
             f"[{colors['warning']}]{label_cap}[/] - "
@@ -134,11 +152,7 @@ def build_cache_status_line(ctx: ScriptContext) -> str:
         updated_i = 0
 
     if started_i and updated_i < started_i:
-        yaml_enabled = bool(ctx.cfg.get("sdwan_yaml_enabled", False)) if isinstance(ctx.cfg, dict) else False
-        parts = [f"Repo [{colors['success']}]{repo_count}[/]"]
-        if yaml_enabled:
-            parts.append(f"YAML [{colors['success']}]{yaml_count}[/]")
-        suffix = " (" + ", ".join(parts) + ")"
+        suffix = _device_suffix(ctx, colors, repo_count, yaml_count, yaml_loading)
         return (
             f"[{colors['description']}]{ts} Configuration Cache Status: "
             f"[{colors['warning']}]Verifying[/] "
@@ -146,24 +160,15 @@ def build_cache_status_line(ctx: ScriptContext) -> str:
         )
     # If nothing indexed yet, reflect 'Not Indexed' instead of 'Ready'
     if repo_count == 0 and int(updated_i) == 0:
-        yaml_enabled = bool(ctx.cfg.get("sdwan_yaml_enabled", False)) if isinstance(ctx.cfg, dict) else False
-        parts = [f"Repo [{colors['success']}]{repo_count}[/]"]
-        if yaml_enabled:
-            parts.append(f"YAML [{colors['success']}]{yaml_count}[/]")
-        suffix = " (" + ", ".join(parts) + ")"
+        suffix = _device_suffix(ctx, colors, repo_count, yaml_count, yaml_loading)
         return (
             f"[{colors['description']}]{ts} Configuration Cache Status: "
             f"[{colors['warning']}]Not Indexed[/] "
             f"Total Devices: [{colors['success']}]{total_devices}[/]" + suffix
         )
-    yaml_enabled = bool(ctx.cfg.get("sdwan_yaml_enabled", False)) if isinstance(ctx.cfg, dict) else False
-    parts = [f"Repo [{colors['success']}]{repo_count}[/]"]
-    if yaml_enabled:
-        parts.append(f"YAML [{colors['success']}]{yaml_count}[/]")
-    suffix = " (" + ", ".join(parts) + ")"
+    suffix = _device_suffix(ctx, colors, repo_count, yaml_count, yaml_loading)
     return (
         f"[{colors['description']}]{ts} Configuration Cache Status: "
         f"[{colors['success']}]Ready[/] "
         f"Total Devices: [{colors['success']}]{total_devices}[/]" + suffix
     )
-    

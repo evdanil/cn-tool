@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from core.base import BaseModule, ScriptContext
 from utils.user_input import press_any_key, read_user_input
+from utils.auth import ensure_infoblox_auth
 from utils.display import console, get_global_color_scheme, print_search_config_data, print_table_data
 from utils.file_io import check_dir_accessibility, queue_save
 from utils.infoblox_ux import format_no_match_message, format_partial_results_message
@@ -195,7 +196,7 @@ class ConfigSearchModule(BaseModule):
 
         press_any_key(ctx)
 
-    def execute_demob_search(self, ctx: ScriptContext, sitecode: str):
+    def execute_demob_search(self, ctx: ScriptContext, sitecode: str, ensure_auth: bool = True):
         """
         Executes the search logic for a given sitecode.
         This is a public method designed to be called by other modules.
@@ -217,8 +218,11 @@ class ConfigSearchModule(BaseModule):
         sitecode = normalized_sitecode
         logger.info(f"Executing demobilization search for sitecode: {sitecode}")
 
+        if ensure_auth:
+            ensure_infoblox_auth(ctx)
+
         # Step 1: Fetch network data from Infoblox
-        lookup_result = fetch_network_data(ctx, sitecode)
+        lookup_result = fetch_network_data(ctx, sitecode, ensure_auth=False)
         processed_data = lookup_result.data
 
         if lookup_result.status == "error" and not lookup_result.has_data:

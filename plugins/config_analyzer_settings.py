@@ -34,35 +34,10 @@ class ConfigAnalyzerSettingsPlugin(BasePlugin):
 
     @property
     def config_schema(self) -> Dict[str, Dict[str, Any]]:
-        # Mirror utils/config.BASE_CONFIG_SCHEMA entries so Setup can persist values
+        # UI-extension fields only; section/ini_key/type/fallback come from BASE_CONFIG_SCHEMA
         return {
-            # Existing base config keys (duplicated spec for Setup writing)
-            "config_analyzer_repo_directories": {
-                "section": "config_analyzer",
-                "ini_key": "repo_directories",
-                "type": "list[str]",
-                "fallback": "/opt/data/configs",
-                "validate": "path",
-            },
-            "config_analyzer_repo_names": {
-                "section": "config_analyzer",
-                "ini_key": "repo_names",
-                "type": "list[str]",
-                "fallback": "",
-            },
-            # Legacy single-directory override remains for backward compatibility
-            "config_analyzer_repo_directory": {
-                "section": "config_analyzer",
-                "ini_key": "repo_directory",
-                "type": "path",
-                "fallback": "/opt/data/configs",
-            },
-            "config_repo_history_dir": {"section": "config_repo", "ini_key": "history_dir", "type": "str", "fallback": "history"},
-
-            # Analyzer UI preferences
-            "config_analyzer_layout": {"section": "config_analyzer", "ini_key": "layout", "type": "str", "fallback": "right", "choices": ["right", "left", "top", "bottom"]},
-            "config_analyzer_scroll_to_end": {"section": "config_analyzer", "ini_key": "scroll_to_end", "type": "bool", "fallback": False},
-            "config_analyzer_debug": {"section": "config_analyzer", "ini_key": "debug", "type": "bool", "fallback": False},
+            "config_analyzer_repo_directories": {"validate": "path"},
+            "config_analyzer_layout": {"choices": ["right", "left", "top", "bottom"]},
         }
 
     def register(self, module: BaseModule) -> None:

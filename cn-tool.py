@@ -41,7 +41,7 @@ from core.loader import load_modules_and_plugins
 
 # --- Utility Imports ---
 from utils.app_lifecycle import exit_now
-from utils.config import BASE_CONFIG_SCHEMA, read_config, setup_from_args
+from utils.config import BASE_CONFIG_SCHEMA, parse_optional_bool, read_config, setup_from_args
 from utils.display import console, get_global_color_scheme, set_global_color_scheme
 from utils.file_io import start_worker, check_dir_accessibility
 from utils.logging import configure_logging
@@ -56,7 +56,7 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.75 hash ca6d59a'
+VERSION = '0.2.76 hash eed281a'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -209,13 +209,36 @@ Please send any feedback/feature requests to evdanil@gmail.com
         cfg['infoblox_enabled'] = True
 
     # 2. Check for Configuration Repo readiness
-    if not check_dir_accessibility(logger, cfg.get("config_repo_directory", "dummy_dir")):
-        log_msg = "Configuration repository directory is not accessible. Config search modules will be disabled."
-        logger.warning(log_msg)
-        final_message += log_msg + '\n'
+    #    enabled = true/false  → explicit opt-in/out
+    #    enabled absent        → auto-detect from directory accessibility
+    #    [config_repo] absent  → disabled (no warning)
+    repo_enabled_value = cfg.get("config_repo_enabled", "")
+    repo_enabled_raw = str(repo_enabled_value).strip()
+    repo_enabled = parse_optional_bool(repo_enabled_value)
+    if repo_enabled is False:
+        logger.info("Configuration repository explicitly disabled in config.")
         cfg['config_repo_enabled'] = False
+    elif repo_enabled is True:
+        if not check_dir_accessibility(logger, cfg.get("config_repo_directory", "dummy_dir")):
+            log_msg = "Configuration repository directory is not accessible. Config search modules will be disabled."
+            logger.warning(log_msg)
+            final_message += log_msg + '\n'
+            cfg['config_repo_enabled'] = False
+        else:
+            cfg['config_repo_enabled'] = True
     else:
-        cfg['config_repo_enabled'] = True
+        if repo_enabled_raw:
+            logger.warning(
+                "Invalid value for config_repo.enabled: %r. Falling back to auto-detect.",
+                repo_enabled_raw,
+            )
+        # Not set — auto-detect: check directory only if it looks intentionally configured
+        repo_dir = cfg.get("config_repo_directory")
+        if repo_dir and check_dir_accessibility(logger, repo_dir):
+            cfg['config_repo_enabled'] = True
+        else:
+            logger.info("Configuration repository not configured or directory not accessible, skipping.")
+            cfg['config_repo_enabled'] = False
 
     # 3. Check report file accessibility
     if not check_dir_accessibility(logger, cfg["report_file"].parent):

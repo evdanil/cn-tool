@@ -10,6 +10,18 @@ from core.base import BaseModule, BasePlugin
 logger = logging.getLogger(__name__)
 
 
+def _merge_plugin_schema(schema: Dict[str, Any], plugin_schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge plugin schema entries without discarding required base metadata."""
+    merged = schema.copy()
+    for key, plugin_spec in plugin_schema.items():
+        current_spec = merged.get(key)
+        if isinstance(current_spec, dict) and isinstance(plugin_spec, dict):
+            merged[key] = {**current_spec, **plugin_spec}
+        else:
+            merged[key] = plugin_spec
+    return merged
+
+
 def load_modules_and_plugins(master_schema: Dict[str, Any]) -> tuple[Dict[str, BaseModule], list[BasePlugin], Dict[str, Any]]:
     """
     Discovers, loads, and registers all modules and plugins.
@@ -83,7 +95,7 @@ def _load_and_register_plugins(path: str, modules: Dict[str, BaseModule], schema
                                 plugin_schema = plugin.config_schema
                                 if plugin_schema:
                                     logger.info("Loading config schema from plugin '%s'", plugin.name)
-                                    schema = {**schema, **plugin_schema}
+                                    schema = _merge_plugin_schema(schema, plugin_schema)
 
                                 target_name = plugin.target_module_name
                                 # Only attempt to register if the plugin specifies a target.
