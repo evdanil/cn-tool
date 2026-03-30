@@ -98,9 +98,8 @@ def send_report_email(
 
 def interpret_bool(value: Any) -> bool:
     """Return True when a string or primitive represents a truthy value."""
-    if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "t", "y", "yes", "on"}
-    return bool(value)
+    from utils.config import coerce_bool
+    return coerce_bool(value)
 
 
 def send_configured_report(

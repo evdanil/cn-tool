@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Set, Union
 # Assuming these are your project's utility modules
 from core.base import BaseModule, ScriptContext
 from utils.api import bound_infoblox_workers, describe_infoblox_failure, request_result
+from utils.auth import ensure_infoblox_auth
 from utils.display import get_global_color_scheme, print_table_data
 from utils.file_io import queue_save
 from utils.infoblox_ux import format_no_match_message, format_partial_results_message
@@ -80,6 +81,8 @@ class SubnetRequestModule(BaseModule):
             console = ctx.console
             colors = get_global_color_scheme(ctx.cfg)
             logger.info("Request Type - Subnet Information")
+
+            ensure_infoblox_auth(ctx)
 
             # --- 1. Get User Input ---
             user_inputs = self._get_networks_from_user(ctx)
@@ -219,14 +222,14 @@ class SubnetRequestModule(BaseModule):
             if not isinstance(net, ipaddress.IPv4Network):
                 raise ValueError("Only IPv4 is supported.")
             if net.prefixlen == 32:
-                result = request_result(ctx, f'network?contains_address={net.network_address}')
+                result = request_result(ctx, f'network?contains_address={net.network_address}', ensure_auth=False)
                 if result.ok and result.has_items and 'network' in result.items[0]:
                     return InputResolutionResult(networks={ipaddress.IPv4Network(result.items[0]['network'])})
                 if result.failed:
                     return InputResolutionResult(networks=set(), failure_message=describe_infoblox_failure(result))
                 return InputResolutionResult(networks=set())
             elif net.prefixlen < 30:
-                result = request_result(ctx, f'network?network_container={net.compressed}')
+                result = request_result(ctx, f'network?network_container={net.compressed}', ensure_auth=False)
                 if result.ok:
                     supernet_data = process_data(ctx, type='supernet', content=result.content)
                     found_subnets = {ipaddress.IPv4Network(sub["network"]) for sub in supernet_data.get("subnets", [])}
@@ -280,7 +283,7 @@ class SubnetRequestModule(BaseModule):
         warnings: List[str] = []
         with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(request_specs))) as executor:
             future_to_label = {
-                executor.submit(request_result, ctx, spec["uri"]): label
+                executor.submit(request_result, ctx, spec["uri"], ensure_auth=False): label
                 for label, spec in request_specs.items()
             }
             for future in as_completed(future_to_label):

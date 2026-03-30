@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from core.base import BaseModule, ScriptContext
 from utils.api import bound_infoblox_workers, describe_infoblox_failure, request_result
+from utils.auth import ensure_infoblox_auth
 from utils.display import console, get_global_color_scheme, print_table_data
 from utils.file_io import queue_save
 from utils.process_data import process_data
@@ -36,6 +37,8 @@ class IPRequestModule(BaseModule):
         logger = ctx.logger
         colors = get_global_color_scheme(ctx.cfg)
         logger.info("Request Type - IP Information (IPv4)")
+
+        ensure_infoblox_auth(ctx)
 
         console.print(
             "\n"
@@ -77,7 +80,7 @@ class IPRequestModule(BaseModule):
         req_urls = {ip: f"ipv4address?ip_address={ip}&_return_fields=network,names,status,types,lease_state,mac_address" for ip in ip_addresses}
 
         with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(req_urls))) as executor, console.status(f"[{colors['description']}]Fetching IP information...[/]"):
-            future_to_ip = {executor.submit(request_result, ctx, uri): ip for ip, uri in req_urls.items()}
+            future_to_ip = {executor.submit(request_result, ctx, uri, ensure_auth=False): ip for ip, uri in req_urls.items()}
             results = {future_to_ip[future]: future.result() for future in future_to_ip}
 
         processed_data_by_ip: Dict[str, Dict[str, Any]] = {}

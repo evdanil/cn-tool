@@ -2,10 +2,6 @@ import os
 from typing import Optional, Tuple
 
 from core.base import ScriptContext
-from utils.app_lifecycle import exit_now
-from utils.display import console, get_global_color_scheme
-from utils.gpg import get_gpg_credentials
-from utils.user_input import read_user_input
 
 
 def get_auth_creds(ctx: ScriptContext) -> Tuple[Optional[str], Optional[str]]:
@@ -13,6 +9,10 @@ def get_auth_creds(ctx: ScriptContext) -> Tuple[Optional[str], Optional[str]]:
     Retrieves user credentials from environment variables, GPG file, or interactive prompt.
     The credentials are also stored in the context object.
     """
+    from utils.display import console, get_global_color_scheme
+    from utils.gpg import get_gpg_credentials
+    from utils.user_input import read_user_input
+
     logger = ctx.logger
     colors = get_global_color_scheme(ctx.cfg)
 
@@ -33,6 +33,8 @@ def get_auth_creds(ctx: ScriptContext) -> Tuple[Optional[str], Optional[str]]:
                 password = read_user_input(ctx, f"[{colors['header']} {colors['bold']}]Provide security credential:[/]", True)
 
     if not username:
+        from utils.app_lifecycle import exit_now
+
         logger.info("Auth - USER not set, requesting username")
         username = read_user_input(ctx, f"[{colors['header']} {colors['bold']}]Provide username:[/]")
         if not username:
@@ -60,6 +62,8 @@ def ensure_device_auth(ctx: ScriptContext) -> Tuple[str, str]:
     """
     Lazily ensure shared TACACS/GPG credentials exist on the context.
     """
+    from utils.app_lifecycle import exit_now
+
     if ctx.username and ctx.password:
         return (ctx.username, ctx.password)
 

@@ -2,6 +2,7 @@ import re
 from typing import Dict, Optional
 
 from core.base import BaseModule, ScriptContext
+from utils.auth import ensure_infoblox_auth
 from utils.user_input import press_any_key, read_user_input
 from utils.display import get_global_color_scheme, print_table_data
 from utils.api import fetch_network_data
@@ -37,6 +38,8 @@ class LocationRequestModule(BaseModule):
         console = ctx.console
         colors = get_global_color_scheme(ctx.cfg)
         logger.info("Request Type - Subnet Lookup by Location/Keyword")
+
+        ensure_infoblox_auth(ctx)
 
         console.print(
             "\n"
@@ -102,7 +105,7 @@ class LocationRequestModule(BaseModule):
             logger.info(f"User input - Sitecode search for '{search_term}'")
 
         # --- API Call and Data Processing ---
-        lookup_result = fetch_network_data(ctx, search_term, keyword=is_keyword_search)
+        lookup_result = fetch_network_data(ctx, search_term, keyword=is_keyword_search, ensure_auth=False)
         processed_data = lookup_result.data
 
         # --- HOOK: Allow plugins to modify the processed data ---

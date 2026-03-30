@@ -4,6 +4,7 @@ from typing import Dict, Any, Optional
 
 from core.base import BaseModule, ScriptContext
 from utils.api import describe_infoblox_failure, request_result
+from utils.auth import ensure_infoblox_auth
 from utils.display import console, get_global_color_scheme, print_table_data
 from utils.file_io import queue_save
 from utils.infoblox_ux import format_no_match_message
@@ -36,6 +37,8 @@ class FQDNRequestModule(BaseModule):
         logger = ctx.logger
         colors = get_global_color_scheme(ctx.cfg)
         logger.info("Request Type - FQDN Search - DNS A/AAAA records")
+
+        ensure_infoblox_auth(ctx)
 
         console.print(
             "\n"
@@ -71,7 +74,7 @@ class FQDNRequestModule(BaseModule):
         # --- API Call and Data Processing ---
         uri = f"search?fqdn~={fqdn}&_return_fields=ipv4addr,ipv6addr,name&_max_results=1000"
         with ctx.console.status(f"[{colors['description']}]Fetching data for [{colors['header']}]{fqdn}[/]...[/]"):
-            result = request_result(ctx, uri)
+            result = request_result(ctx, uri, ensure_auth=False)
 
         processed_data: Dict[str, Any] = {}
         if result.ok:

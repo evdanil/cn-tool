@@ -255,8 +255,15 @@ class SDWANYamlSearchPlugin(BasePlugin):
         # Create and start the daemon thread
         self._loading_thread = threading.Thread(target=self._load_data_in_background, args=(ctx,), daemon=True)
         self._loading_thread.start()
-        # Block until the initial load completes so results are immediately available for queries/tests
-        self._is_ready.wait(timeout=5.0)
+        # Notify the UI that YAML loading is now in progress.
+        try:
+            if getattr(ctx, "event_bus", None):
+                ctx.event_bus.publish(
+                    "status:update",
+                    {"component": "yaml", "state": "loading"},
+                )
+        except Exception:
+            pass
 
     def _search_yaml_repo(self, ctx: ScriptContext, data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -393,3 +400,8 @@ class SDWANYamlSearchPlugin(BasePlugin):
     @property
     def is_ready(self) -> bool:
         return self._is_ready.is_set()
+
+    @property
+    def is_loading(self) -> bool:
+        thread = self._loading_thread
+        return bool(thread and thread.is_alive() and not self._is_ready.is_set())

@@ -23,6 +23,7 @@ BASE_CONFIG_SCHEMA = {
     "report_lock_timeout":   {"section": "report", "ini_key": "lock_timeout", "type": "int", "fallback": 120},
     "report_max_config_tab_kb": {"section": "report", "ini_key": "max_config_tab_kb", "type": "int", "fallback": 512},
     "gpg_credentials":       {"section": "gpg", "ini_key": "credentials", "type": "path", "fallback": "~/cn-tool.gpg"},
+    "config_repo_enabled":   {"section": "config_repo", "ini_key": "enabled", "type": "str", "fallback": ""},
     "config_repo_directory": {"section": "config_repo", "ini_key": "directory", "type": "path", "fallback": "/opt/data/configs"},
     "config_repo_regions":   {"section": "config_repo", "ini_key": "regions", "type": "list[str]", "fallback": "ap,eu,am"},
     "config_repo_vendors":   {"section": "config_repo", "ini_key": "vendors", "type": "list[str]", "fallback": "cisco,aruba,f5,bluecoat,paloalto"},
@@ -96,6 +97,68 @@ def parse_cache_pages(value, page_size: int = 4096) -> int:
     return max(1, int(s))
 
 
+_TRUTHY = frozenset({"true", "1", "t", "y", "yes", "on"})
+_FALSY = frozenset({"false", "0", "f", "n", "no", "off"})
+
+
+def coerce_bool(value) -> bool:
+    """Parse a value as boolean. Accepts strings like 'true', '1', 'yes', 'on', etc."""
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUTHY
+    return bool(value)
+
+
+def parse_optional_bool(value) -> bool | None:
+    """Parse a tri-state bool, returning None for blank or unrecognized values."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value in (0, 1):
+            return bool(value)
+        return None
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    if normalized in _TRUTHY:
+        return True
+    if normalized in _FALSY:
+        return False
+    return None
+
+
+def coerce_config_value(raw: str, spec: Dict[str, Any], logger: logging.Logger = None):
+    """Convert a raw string to the typed value described by a config schema spec."""
+    if not isinstance(raw, str):
+        return raw
+
+    clean = raw.strip().strip('"\'')
+    t = spec.get("type", "str")
+
+    if t == "bool":
+        return coerce_bool(clean)
+    if t == "path":
+        return Path(clean).expanduser()
+    if t == "list[str]":
+        return [
+            item.strip().strip('"\'')
+            for item in raw.split(',')
+            if item.strip().strip('"\'')
+        ]
+    if t == "int":
+        try:
+            return int(clean)
+        except (ValueError, TypeError):
+            if logger:
+                logger.warning("CONFIG: Could not convert '%s' to int for key. Using fallback.", clean)
+            return spec.get("fallback")
+    return clean
+
+
 def _apply_types(cfg: Dict[str, Any], schema: Dict[str, Any], logger: logging.Logger) -> Dict[str, Any]:
     """
     Helper function to convert raw string values to their proper types and sanitize them.
@@ -103,37 +166,7 @@ def _apply_types(cfg: Dict[str, Any], schema: Dict[str, Any], logger: logging.Lo
     typed_cfg = cfg.copy()
     for key, spec in schema.items():
         if key in typed_cfg:
-            raw_value = typed_cfg[key]
-            option_type = spec["type"]
-
-            # This check handles the case where the value might already be a bool or int from a default.
-            if not isinstance(raw_value, str):
-                continue  # It's not a string that needs cleaning, so skip.
-
-            # Strip leading/trailing whitespace, then strip standard quote characters.
-            clean_value = raw_value.strip().strip('"\'')
-
-            if option_type == 'path':
-                typed_cfg[key] = Path(clean_value).expanduser()
-            elif option_type == 'list[str]':
-                # Split the raw string, then sanitize each individual item in the list.
-                items = raw_value.split(',')
-                typed_cfg[key] = [
-                    item.strip().strip('"\'')
-                    for item in items
-                    if item.strip().strip('"\'')
-                ]
-            elif option_type == 'bool':
-                typed_cfg[key] = clean_value.lower() in ('true', '1', 't', 'y', 'yes')
-            elif option_type == 'str':
-                typed_cfg[key] = clean_value
-            # For 'int', we let the final conversion happen in read_config, but we use the clean string.
-            elif option_type == 'int':
-                try:
-                    typed_cfg[key] = int(clean_value)
-                except (ValueError, TypeError):
-                    logger.warning(f"CONFIG: Could not convert '{clean_value}' to int for key '{key}'. Using fallback.")
-                    typed_cfg[key] = spec['fallback']
+            typed_cfg[key] = coerce_config_value(typed_cfg[key], spec, logger)
     return typed_cfg
 
 

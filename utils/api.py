@@ -142,6 +142,8 @@ def describe_infoblox_failure(result: InfobloxResult) -> str:
         return "Authentication failed against Infoblox."
     if result.status == "timeout":
         return "Infoblox request timed out."
+    if result.status == "connection_lost":
+        return "Infoblox did not respond in time. The request may have been too large or exceeded the server timeout."
     if result.status == "connection_error":
         return "Unable to reach the Infoblox API endpoint."
     if result.status == "tls_error":
@@ -290,15 +292,22 @@ class InfobloxClient:
                 error_kind="tls_error",
                 full_url_value=full_url,
             )
-        except RequestsConnectionError:
+        except RequestsConnectionError as exc:
+            exc_lower = str(exc).lower()
+            if any(kw in exc_lower for kw in ("reset", "aborted", "disconnected", "broken pipe", "eof occurred", "timed out")):
+                status = "connection_lost"
+                message = "Infoblox did not respond in time. The request may have been too large or exceeded the server timeout."
+            else:
+                status = "connection_error"
+                message = "Unable to reach the Infoblox API endpoint."
             response = _build_response(503, url=full_url)
             return build_result(
-                status="connection_error",
+                status=status,
                 status_code=503,
                 response_obj=response,
                 content=response.content,
-                message="Unable to reach the Infoblox API endpoint.",
-                error_kind="connection_error",
+                message=message,
+                error_kind=status,
                 full_url_value=full_url,
             )
         except HTTPError as exc:
@@ -436,7 +445,12 @@ def selective_url_encode(pattern: str) -> str:
     return encoded_pattern
 
 
-def fetch_network_data(ctx: ScriptContext, search_term: str, keyword: bool = False) -> NetworkSearchResult:
+def fetch_network_data(
+    ctx: ScriptContext,
+    search_term: str,
+    keyword: bool = False,
+    ensure_auth: bool = True,
+) -> NetworkSearchResult:
     """
     Fetches and processes IPv4 and IPv6 network data based on a search term.
     Merges results, removes duplicates, and returns the processed data.
@@ -464,8 +478,8 @@ def fetch_network_data(ctx: ScriptContext, search_term: str, keyword: bool = Fal
     ):
         with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, 2)) as executor:
             future_to_family = {
-                executor.submit(request_result, ctx, uri_ipv4): "ipv4",
-                executor.submit(request_result, ctx, uri_ipv6): "ipv6",
+                executor.submit(request_result, ctx, uri_ipv4, ensure_auth=ensure_auth): "ipv4",
+                executor.submit(request_result, ctx, uri_ipv6, ensure_auth=ensure_auth): "ipv6",
             }
             family_results = {future_to_family[future]: future.result() for future in future_to_family}
 
