@@ -388,7 +388,11 @@ def print_table_data(
         section_title = section_title.upper()
 
         columns = list(value_list[0].keys())
-        table_data = [[item for item in record.values()] for record in value_list]
+        for record in value_list[1:]:
+            for column in record.keys():
+                if column not in columns:
+                    columns.append(column)
+        table_data = [[record.get(column, "") for column in columns] for record in value_list]
 
         tables.append(create_table(ctx, section_title, columns, table_data, title_justify="left"))
 
