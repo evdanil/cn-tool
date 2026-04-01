@@ -31,6 +31,9 @@ _DEFAULT_INFOBLOX_MAX_WORKERS = 8
 _MAX_INFOBLOX_MAX_WORKERS = 32
 _adapter_lock = threading.Lock()
 _session_pool_size = _DEFAULT_INFOBLOX_MAX_WORKERS
+_inheritance_support_by_endpoint: Dict[str, bool] = {}
+_inheritance_support_lock = threading.Lock()
+_inheritance_support_inflight: Dict[str, threading.Event] = {}
 
 
 def _sanitize_infoblox_worker_limit(value: Any) -> int:
@@ -401,6 +404,73 @@ def get_infoblox_client() -> InfobloxClient:
 
 def request_result(ctx: ScriptContext, uri: str, *, ensure_auth: bool = True) -> InfobloxResult:
     return get_infoblox_client().request(ctx, uri, ensure_auth=ensure_auth)
+
+
+def _append_query_arg(uri: str, key: str, value: str) -> str:
+    if f"{key}=" in str(uri):
+        return uri
+    separator = "&" if "?" in str(uri) else "?"
+    return f"{uri}{separator}{key}={value}"
+
+
+def request_result_with_inheritance(ctx: ScriptContext, uri: str, *, ensure_auth: bool = True) -> InfobloxResult:
+    """
+    Request Infoblox data with `_inheritance=True` and automatically fall back
+    once per endpoint when the grid rejects the option.
+    """
+    endpoint_key = str(ctx.cfg.get("api_endpoint") or "").strip()
+    should_probe = False
+    wait_event: Optional[threading.Event] = None
+    use_plain_request = False
+
+    with _inheritance_support_lock:
+        cached_support = _inheritance_support_by_endpoint.get(endpoint_key)
+        if cached_support is False:
+            use_plain_request = True
+        if endpoint_key and cached_support is None:
+            wait_event = _inheritance_support_inflight.get(endpoint_key)
+            if wait_event is None:
+                wait_event = threading.Event()
+                _inheritance_support_inflight[endpoint_key] = wait_event
+                should_probe = True
+
+    if use_plain_request:
+        return request_result(ctx, uri, ensure_auth=ensure_auth)
+
+    if endpoint_key and wait_event is not None and not should_probe:
+        wait_event.wait()
+        use_plain_request = False
+        with _inheritance_support_lock:
+            if _inheritance_support_by_endpoint.get(endpoint_key) is False:
+                use_plain_request = True
+        if use_plain_request:
+            return request_result(ctx, uri, ensure_auth=ensure_auth)
+
+    inherited_uri = _append_query_arg(uri, "_inheritance", "True")
+
+    try:
+        result = request_result(ctx, inherited_uri, ensure_auth=ensure_auth)
+
+        if result.status_code == 400:
+            fallback_result = request_result(ctx, uri, ensure_auth=ensure_auth)
+            if fallback_result.status_code != 400:
+                if endpoint_key:
+                    with _inheritance_support_lock:
+                        _inheritance_support_by_endpoint[endpoint_key] = False
+                ctx.logger.info("Infoblox endpoint rejected _inheritance; falling back to plain subnet lookups for this session.")
+                return fallback_result
+            return result
+
+        if endpoint_key and result.status_code and result.status_code != 400:
+            with _inheritance_support_lock:
+                _inheritance_support_by_endpoint[endpoint_key] = True
+        return result
+    finally:
+        if should_probe and endpoint_key:
+            with _inheritance_support_lock:
+                event = _inheritance_support_inflight.pop(endpoint_key, None)
+                if event is not None:
+                    event.set()
 
 
 def make_api_call(ctx: ScriptContext, uri: str) -> requests.Response:
