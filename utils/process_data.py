@@ -9,6 +9,7 @@ import json
 from typing import Dict, List, Any, Optional
 
 from core.base import ScriptContext
+from utils.dhcp_options import decode_dhcp_option_value
 from utils.infoblox_safety import infoblox_debug_payloads_enabled
 
 
@@ -41,10 +42,28 @@ def _dedupe_dhcp_option_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             row_index_by_key[key] = len(deduped_rows) - 1
             continue
 
-        if row.get("Inherited"):
-            deduped_rows[existing_index]["Inherited"] = "Yes"
+        if row.get("inherited"):
+            deduped_rows[existing_index]["inherited"] = "Yes"
+        if row.get("decoded value") and not deduped_rows[existing_index].get("decoded value"):
+            deduped_rows[existing_index]["decoded value"] = row["decoded value"]
 
     return deduped_rows
+
+
+def _build_dhcp_option_row(option: Dict[str, Any], inherited: bool) -> Dict[str, Any]:
+    row = {
+        "name": option.get("name", ""),
+        "num": str(option.get("num", "")),
+        "value": option.get("value", ""),
+        "vendor class": option.get("vendor_class", ""),
+        "use option": str(option.get("use_option", "")),
+    }
+    decoded_value = decode_dhcp_option_value(option.get("num", ""), option.get("value", ""))
+    if decoded_value:
+        row["decoded value"] = decoded_value
+    if inherited:
+        row["inherited"] = "Yes"
+    return row
 
 
 def _parse_ip_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -129,18 +148,18 @@ def _parse_general_subnet_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List
 
     general_row = {"subnet": data.get("network", ""), "description": data.get("comment", "")}
     if comment_meta.get("inherited") or comment_meta.get("multisource"):
-        general_row["Inherited"] = "Description"
+        general_row["inherited"] = "Description"
     processed_data["general"] = [general_row]
 
     extattrs_rows = [
         {
             "Attribute": key,
             "Value": record.get("value", ""),
-            **({"Inherited": "Yes"} if _is_inherited_entry(extattrs_meta.get(key, {}), record) else {}),
+            **({"inherited": "Yes"} if _is_inherited_entry(extattrs_meta.get(key, {}), record) else {}),
         }
         for key, record in data.get("extattrs", {}).items()
     ]
-    processed_data["Extensible Attributes"] = _ensure_column_present(extattrs_rows, "Inherited")
+    processed_data["Extensible Attributes"] = _ensure_column_present(extattrs_rows, "inherited")
     return processed_data
 
 
@@ -169,21 +188,22 @@ def _parse_network_options_data(raw_data: List[Dict[str, Any]]) -> Dict[str, Lis
             {
                 "IP Address": mem.get("ipv4addr", ""),
                 "name": mem.get("name", ""),
-                **({"Inherited": "Yes"} if _is_inherited_entry(member_meta[idx] if idx < len(member_meta) else {}, mem) else {}),
+                **({"inherited": "Yes"} if _is_inherited_entry(member_meta[idx] if idx < len(member_meta) else {}, mem) else {}),
             }
             for idx, mem in enumerate(data.get("members", []))
         ]
-        processed_data["DHCP members"] = _ensure_column_present(member_rows, "Inherited")
+        processed_data["DHCP members"] = _ensure_column_present(member_rows, "inherited")
     if "options" in data:
         option_rows = [
-            {
-                "name": opt.get("name", ""), "num": str(opt.get("num", "")),
-                "value": opt.get("value", ""), "vendor class": opt.get("vendor_class", ""),
-                "use option": str(opt.get("use_option", "")),
-                **({"Inherited": "Yes"} if _is_inherited_entry(option_meta[idx] if idx < len(option_meta) else {}, opt) else {}),
-            } for idx, opt in enumerate(data.get("options", []))
+            _build_dhcp_option_row(
+                opt,
+                _is_inherited_entry(option_meta[idx] if idx < len(option_meta) else {}, opt),
+            )
+            for idx, opt in enumerate(data.get("options", []))
         ]
-        processed_data["DHCP options"] = _ensure_column_present(_dedupe_dhcp_option_rows(option_rows), "Inherited")
+        option_rows = _dedupe_dhcp_option_rows(option_rows)
+        option_rows = _ensure_column_present(option_rows, "decoded value")
+        processed_data["DHCP options"] = _ensure_column_present(option_rows, "inherited")
     return processed_data
 
 

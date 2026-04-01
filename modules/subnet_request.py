@@ -394,7 +394,7 @@ class SubnetRequestModule(BaseModule):
                     "VLAN": ea_map.get("VLAN", "N/A"),
                 })
                 if inherited_fields:
-                    summary_net["Inherited"] = ", ".join(inherited_fields)
+                    summary_net["inherited"] = ", ".join(inherited_fields)
                     any_inherited = True
                 ad_info = net_info.get("Active Directory", [{}])[0]
                 if ad_info:
@@ -406,7 +406,7 @@ class SubnetRequestModule(BaseModule):
 
         if any_inherited:
             for row in summary_data:
-                row.setdefault("Inherited", "")
+                row.setdefault("inherited", "")
 
         print_table_data(ctx, {"Subnet Summary": summary_data})
 
@@ -529,6 +529,7 @@ class SubnetRequestModule(BaseModule):
         ext_attrs = processed_data.get("Extensible Attributes", [])
         ad_info = processed_data.get("Active Directory", [{}])[0]
         inherited_fields = self._collect_save_inherited_fields(processed_data)
+        has_decoded_options = any(option.get("decoded value") for option in dhcp_options)
 
         is_dhcp = "Y" if dhcp_members or dhcp_ranges else "N"
         main_row = {
@@ -538,6 +539,9 @@ class SubnetRequestModule(BaseModule):
             "DHCP Scope End": dhcp_ranges[0].get("end address", "") if dhcp_ranges else "",
             "DHCP Servers": "\n".join([f"{m['name']} - {m['IP Address']}" for m in dhcp_members]),
             "DHCP Options\nOption - Value": "\n".join([f"{o['name']} - {o['value']}" for o in dhcp_options]),
+            "DHCP Options\nOption - Decoded Value": "\n".join([
+                f"{o['name']} - {o.get('decoded value', '')}" for o in dhcp_options
+            ]) if has_decoded_options else "",
             "DHCP Failover Association": dhcp_failover[0].get("dhcp failover", "") if dhcp_failover else "",
             "Notes": general_info.get("description", ""),
             "Inherited Fields": ", ".join(inherited_fields),
@@ -569,11 +573,11 @@ class SubnetRequestModule(BaseModule):
     def _collect_summary_inherited_fields(self, processed_data: Dict[str, Any]) -> List[str]:
         inherited_fields: List[str] = []
         general_info = processed_data.get("general", [{}])[0]
-        if general_info.get("Inherited"):
+        if general_info.get("inherited"):
             inherited_fields.append("Description")
 
         for attr in processed_data.get("Extensible Attributes", []):
-            if attr.get("Inherited") and attr.get("Attribute") in {"Location", "Region", "Country", "VLAN"}:
+            if attr.get("inherited") and attr.get("Attribute") in {"Location", "Region", "Country", "VLAN"}:
                 inherited_fields.append(str(attr.get("Attribute")))
 
         # Preserve display order while removing duplicates.
@@ -582,9 +586,9 @@ class SubnetRequestModule(BaseModule):
     def _collect_save_inherited_fields(self, processed_data: Dict[str, Any]) -> List[str]:
         inherited_fields = self._collect_summary_inherited_fields(processed_data)
 
-        if any(row.get("Inherited") for row in processed_data.get("DHCP options", [])):
+        if any(row.get("inherited") for row in processed_data.get("DHCP options", [])):
             inherited_fields.append("DHCP options")
-        if any(row.get("Inherited") for row in processed_data.get("DHCP members", [])):
+        if any(row.get("inherited") for row in processed_data.get("DHCP members", [])):
             inherited_fields.append("DHCP members")
 
         return list(dict.fromkeys(inherited_fields))
@@ -616,7 +620,8 @@ class SubnetRequestModule(BaseModule):
             all_row_dicts = [row for sublist in all_data_to_save for row in sublist]
             base_columns = [
                 "Original Input", "IP", "Mask", "Name", "MAC", "DHCP", "DHCP Scope Start", "DHCP Scope End",
-                "DHCP Servers", "DHCP Options\nOption - Value", "DHCP Failover Association", "Notes"
+                "DHCP Servers", "DHCP Options\nOption - Value", "DHCP Options\nOption - Decoded Value",
+                "DHCP Failover Association", "Notes"
             ]
             discovered_headers = {}
             for row in all_row_dicts:
