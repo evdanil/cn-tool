@@ -1,4 +1,5 @@
 import ipaddress
+import json
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,10 +9,11 @@ from typing import Any, Dict, List, Optional, Set, Union
 
 # Assuming these are your project's utility modules
 from core.base import BaseModule, ScriptContext
-from utils.api import bound_infoblox_workers, describe_infoblox_failure, request_result
+from utils.api import bound_infoblox_workers, describe_infoblox_failure, request_result, request_result_with_inheritance
 from utils.auth import ensure_infoblox_auth
 from utils.display import get_global_color_scheme, print_table_data
 from utils.file_io import queue_save
+from utils.infoblox_inheritance import normalize_record_fields
 from utils.infoblox_ux import format_no_match_message, format_partial_results_message
 from utils.process_data import process_data
 from utils.user_input import press_any_key, read_user_input
@@ -262,28 +264,32 @@ class SubnetRequestModule(BaseModule):
                 "uri": f"network?network={net_str}&_return_fields=network,comment,extattrs,options,members",
                 "parser_types": ("general", "network options"),
                 "warning_labels": ("general", "network options"),
+                "request_fn": request_result_with_inheritance,
             },
             "DNS records": {
                 "uri": f"ipv4address?network={net_str}&usage=DNS&_return_fields=ip_address,names",
                 "parser_types": ("DNS records",),
                 "warning_labels": ("DNS records",),
+                "request_fn": request_result,
             },
             "range bundle": {
                 "uri": f"range?network={net_str}&_return_fields=network,start_addr,end_addr,member,failover_association",
                 "parser_types": ("DHCP range", "DHCP failover"),
                 "warning_labels": ("DHCP range", "DHCP failover"),
+                "request_fn": request_result,
             },
             "fixed addresses": {
                 "uri": f"fixedaddress?network={net_str}&_return_fields=ipv4addr,mac,name",
                 "parser_types": ("fixed addresses",),
                 "warning_labels": ("fixed addresses",),
+                "request_fn": request_result,
             },
         }
         processed_data_for_net: Dict[str, Any] = defaultdict(list)
         warnings: List[str] = []
         with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(request_specs))) as executor:
             future_to_label = {
-                executor.submit(request_result, ctx, spec["uri"], ensure_auth=False): label
+                executor.submit(spec["request_fn"], ctx, spec["uri"], ensure_auth=False): label
                 for label, spec in request_specs.items()
             }
             for future in as_completed(future_to_label):
@@ -292,8 +298,20 @@ class SubnetRequestModule(BaseModule):
                 try:
                     result = future.result()
                     if result.ok:
+                        raw_data = None
+                        if label == "network bundle":
+                            raw_data = [
+                                normalize_record_fields(
+                                    item,
+                                    scalar_fields=("comment",),
+                                    extattrs_fields=("extattrs",),
+                                    list_struct_fields=("options", "members"),
+                                )
+                                for item in result.items
+                            ]
+                        payload_content = json.dumps(raw_data).encode() if raw_data is not None else result.content
                         for parser_type in spec["parser_types"]:
-                            processed_data_for_net.update(process_data(ctx, type=parser_type, content=result.content))
+                            processed_data_for_net.update(process_data(ctx, type=parser_type, content=payload_content))
                     elif result.failed:
                         message = describe_infoblox_failure(result)
                         for warning_label in spec["warning_labels"]:
@@ -351,6 +369,7 @@ class SubnetRequestModule(BaseModule):
     ) -> tuple[List[ipaddress.IPv4Network], bool]:
         colors = get_global_color_scheme(ctx.cfg)
         summary_data: List[Dict[str, str]] = []
+        any_inherited = False
         for index, network in enumerate(networks, start=1):
             net_info = subnet_data_cache.get(str(network), {})
             warnings = subnet_warning_cache.get(str(network), [])
@@ -367,12 +386,16 @@ class SubnetRequestModule(BaseModule):
                 summary_net["Description"] = description
                 ext_attrs_list = net_info.get("Extensible Attributes", [])
                 ea_map = {attr.get("Attribute"): attr.get("Value") for attr in ext_attrs_list if attr.get("Attribute")}
+                inherited_fields = self._collect_summary_inherited_fields(net_info)
                 summary_net.update({
                     "Location": ea_map.get("Location", "N/A"),
                     "Region": ea_map.get("Region", "N/A"),
                     "Country": ea_map.get("Country", "N/A"),
                     "VLAN": ea_map.get("VLAN", "N/A"),
                 })
+                if inherited_fields:
+                    summary_net["Inherited"] = ", ".join(inherited_fields)
+                    any_inherited = True
                 ad_info = net_info.get("Active Directory", [{}])[0]
                 if ad_info:
                     summary_net["AD Site"] = ad_info.get("AD Site", "N/A")
@@ -380,6 +403,10 @@ class SubnetRequestModule(BaseModule):
                 summary_net["Description"] = summary_state.description
 
             summary_data.append(summary_net)
+
+        if any_inherited:
+            for row in summary_data:
+                row.setdefault("Inherited", "")
 
         print_table_data(ctx, {"Subnet Summary": summary_data})
 
@@ -501,6 +528,7 @@ class SubnetRequestModule(BaseModule):
         fixed_addrs = processed_data.get("fixed addresses", [])
         ext_attrs = processed_data.get("Extensible Attributes", [])
         ad_info = processed_data.get("Active Directory", [{}])[0]
+        inherited_fields = self._collect_save_inherited_fields(processed_data)
 
         is_dhcp = "Y" if dhcp_members or dhcp_ranges else "N"
         main_row = {
@@ -511,7 +539,8 @@ class SubnetRequestModule(BaseModule):
             "DHCP Servers": "\n".join([f"{m['name']} - {m['IP Address']}" for m in dhcp_members]),
             "DHCP Options\nOption - Value": "\n".join([f"{o['name']} - {o['value']}" for o in dhcp_options]),
             "DHCP Failover Association": dhcp_failover[0].get("dhcp failover", "") if dhcp_failover else "",
-            "Notes": general_info.get("description", "")
+            "Notes": general_info.get("description", ""),
+            "Inherited Fields": ", ".join(inherited_fields),
         }
 
         if ad_info:
@@ -536,6 +565,29 @@ class SubnetRequestModule(BaseModule):
                 "Name": fa.get("name"), "MAC": fa.get("MAC"), "Notes": "Fixed IP"
             })
         return data_rows
+
+    def _collect_summary_inherited_fields(self, processed_data: Dict[str, Any]) -> List[str]:
+        inherited_fields: List[str] = []
+        general_info = processed_data.get("general", [{}])[0]
+        if general_info.get("Inherited"):
+            inherited_fields.append("Description")
+
+        for attr in processed_data.get("Extensible Attributes", []):
+            if attr.get("Inherited") and attr.get("Attribute") in {"Location", "Region", "Country", "VLAN"}:
+                inherited_fields.append(str(attr.get("Attribute")))
+
+        # Preserve display order while removing duplicates.
+        return list(dict.fromkeys(inherited_fields))
+
+    def _collect_save_inherited_fields(self, processed_data: Dict[str, Any]) -> List[str]:
+        inherited_fields = self._collect_summary_inherited_fields(processed_data)
+
+        if any(row.get("Inherited") for row in processed_data.get("DHCP options", [])):
+            inherited_fields.append("DHCP options")
+        if any(row.get("Inherited") for row in processed_data.get("DHCP members", [])):
+            inherited_fields.append("DHCP members")
+
+        return list(dict.fromkeys(inherited_fields))
 
     def _save_subnet_data(self, ctx: ScriptContext, query_targets: List[QueryTarget], all_data_to_save: List[List[RowDict]]) -> None:
         """

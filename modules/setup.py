@@ -269,7 +269,11 @@ class SetupModule(BaseModule):
             return
 
         try:
+            from utils.auth import ensure_device_auth
             from utils.ad_helper import init_ad_link
+
+            if not getattr(ctx, "password", ""):
+                ensure_device_auth(ctx)
 
             with ctx.console.status("[cyan]Testing AD connection...[/cyan]"):
                 conn = init_ad_link(

@@ -84,6 +84,7 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
                 ctx.logger.debug("AD Plugin: Error while unbinding stale LDAP connection.", exc_info=True)
             self.conn = None
 
+        self._ensure_shared_password(ctx)
         timeout = ctx.cfg.get("ad_operation_timeout", DEFAULT_OPERATION_TIMEOUT)
         self.conn = init_ad_link(
             logger=ctx.logger,
@@ -98,6 +99,15 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
             return False
 
         return True
+
+    def _ensure_shared_password(self, ctx: ScriptContext) -> None:
+        """Populate the shared password on demand before attempting an AD bind."""
+        if ctx.password:
+            return
+
+        from utils.auth import ensure_device_auth
+
+        ensure_device_auth(ctx)
 
     def connect(self, ctx: ScriptContext) -> None:
         """Called by main.py on startup."""
@@ -133,6 +143,7 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
         ctx.logger.info(f"AD Plugin: Initializing {mode} connection...")
 
         self.ad_lock = threading.Lock()  # Create the lock for this run
+        self._ensure_shared_password(ctx)
         timeout = ctx.cfg.get("ad_operation_timeout", DEFAULT_OPERATION_TIMEOUT)
         self.conn = init_ad_link(
             logger=ctx.logger,

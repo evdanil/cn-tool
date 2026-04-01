@@ -12,6 +12,10 @@ from core.base import ScriptContext
 from utils.infoblox_safety import infoblox_debug_payloads_enabled
 
 
+def _is_inherited_entry(meta: Dict[str, Any], row: Dict[str, Any]) -> bool:
+    return bool(meta.get("inherited") or meta.get("multisource") or row.get("inheritance_source"))
+
+
 def _parse_ip_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     """Parses data for the 'ip' type."""
     processed_data = defaultdict(list)
@@ -88,11 +92,24 @@ def _parse_general_subnet_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List
         return processed_data
 
     data = raw_data[0]
-    processed_data["general"] = [{"subnet": data.get("network", ""), "description": data.get("comment", "")}]
-    processed_data["Extensible Attributes"] = [
-        {"Attribute": key, "Value": record.get("value", "")}
+    inheritance = data.get("_inheritance", {})
+    comment_meta = inheritance.get("comment", {})
+    extattrs_meta = inheritance.get("extattrs", {})
+
+    general_row = {"subnet": data.get("network", ""), "description": data.get("comment", "")}
+    if comment_meta.get("inherited") or comment_meta.get("multisource"):
+        general_row["Inherited"] = "Description"
+    processed_data["general"] = [general_row]
+
+    extattrs_rows = [
+        {
+            "Attribute": key,
+            "Value": record.get("value", ""),
+            **({"Inherited": "Yes"} if _is_inherited_entry(extattrs_meta.get(key, {}), record) else {}),
+        }
         for key, record in data.get("extattrs", {}).items()
     ]
+    processed_data["Extensible Attributes"] = extattrs_rows
     return processed_data
 
 
@@ -113,19 +130,29 @@ def _parse_network_options_data(raw_data: List[Dict[str, Any]]) -> Dict[str, Lis
         return processed_data
 
     data = raw_data[0]
+    inheritance = data.get("_inheritance", {})
+    member_meta = inheritance.get("members", [])
+    option_meta = inheritance.get("options", [])
     if "members" in data:
-        processed_data["DHCP members"] = [
-            {"IP Address": mem.get("ipv4addr", ""), "name": mem.get("name", "")}
-            for mem in data.get("members", [])
+        member_rows = [
+            {
+                "IP Address": mem.get("ipv4addr", ""),
+                "name": mem.get("name", ""),
+                **({"Inherited": "Yes"} if _is_inherited_entry(member_meta[idx] if idx < len(member_meta) else {}, mem) else {}),
+            }
+            for idx, mem in enumerate(data.get("members", []))
         ]
+        processed_data["DHCP members"] = member_rows
     if "options" in data:
-        processed_data["DHCP options"] = [
+        option_rows = [
             {
                 "name": opt.get("name", ""), "num": str(opt.get("num", "")),
                 "value": opt.get("value", ""), "vendor class": opt.get("vendor_class", ""),
                 "use option": str(opt.get("use_option", "")),
-            } for opt in data.get("options", [])
+                **({"Inherited": "Yes"} if _is_inherited_entry(option_meta[idx] if idx < len(option_meta) else {}, opt) else {}),
+            } for idx, opt in enumerate(data.get("options", []))
         ]
+        processed_data["DHCP options"] = option_rows
     return processed_data
 
 
@@ -159,7 +186,11 @@ def _parse_fixed_addresses_data(raw_data: List[Dict[str, Any]]) -> Dict[str, Lis
     return processed_data
 
 
-def process_data(ctx: ScriptContext, type: str, content: Optional[bytes]) -> Dict[str, Any]:
+def process_data(
+    ctx: ScriptContext,
+    type: str,
+    content: Optional[bytes] = None,
+) -> Dict[str, Any]:
     """
     Process raw API data by dispatching to the appropriate parser based on the 'type'.
 
@@ -185,7 +216,7 @@ def process_data(ctx: ScriptContext, type: str, content: Optional[bytes]) -> Dic
         return defaultdict(list)
 
     try:
-        raw_data: Any = json.loads(content)
+        raw_data = json.loads(content)
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse JSON response for type '{type}': {e}")
         # It's better to return empty data than to crash the entire application
