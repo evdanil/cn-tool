@@ -66,6 +66,23 @@ def _build_dhcp_option_row(option: Dict[str, Any], inherited: bool) -> Dict[str,
     return row
 
 
+def _normalize_dhcp_option_row_order(row: Dict[str, Any]) -> Dict[str, Any]:
+    ordered_keys = (
+        "name",
+        "num",
+        "value",
+        "vendor class",
+        "use option",
+        "inherited",
+        "decoded value",
+    )
+    normalized = {key: row.get(key, "") for key in ordered_keys}
+    for key, value in row.items():
+        if key not in normalized:
+            normalized[key] = value
+    return normalized
+
+
 def _parse_ip_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     """Parses data for the 'ip' type."""
     processed_data = defaultdict(list)
@@ -203,7 +220,8 @@ def _parse_network_options_data(raw_data: List[Dict[str, Any]]) -> Dict[str, Lis
         ]
         option_rows = _dedupe_dhcp_option_rows(option_rows)
         option_rows = _ensure_column_present(option_rows, "decoded value")
-        processed_data["DHCP options"] = _ensure_column_present(option_rows, "inherited")
+        option_rows = _ensure_column_present(option_rows, "inherited")
+        processed_data["DHCP options"] = [_normalize_dhcp_option_row_order(row) for row in option_rows]
     return processed_data
 
 
