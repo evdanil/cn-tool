@@ -16,6 +16,37 @@ def _is_inherited_entry(meta: Dict[str, Any], row: Dict[str, Any]) -> bool:
     return bool(meta.get("inherited") or meta.get("multisource") or row.get("inheritance_source"))
 
 
+def _ensure_column_present(rows: List[Dict[str, Any]], column: str) -> List[Dict[str, Any]]:
+    if any(row.get(column) for row in rows):
+        for row in rows:
+            row.setdefault(column, "")
+    return rows
+
+
+def _dedupe_dhcp_option_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped_rows: List[Dict[str, Any]] = []
+    row_index_by_key: Dict[tuple[str, str, str, str, str], int] = {}
+
+    for row in rows:
+        key = (
+            str(row.get("name", "")),
+            str(row.get("num", "")),
+            str(row.get("value", "")),
+            str(row.get("vendor class", "")),
+            str(row.get("use option", "")),
+        )
+        existing_index = row_index_by_key.get(key)
+        if existing_index is None:
+            deduped_rows.append(dict(row))
+            row_index_by_key[key] = len(deduped_rows) - 1
+            continue
+
+        if row.get("Inherited"):
+            deduped_rows[existing_index]["Inherited"] = "Yes"
+
+    return deduped_rows
+
+
 def _parse_ip_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     """Parses data for the 'ip' type."""
     processed_data = defaultdict(list)
@@ -109,7 +140,7 @@ def _parse_general_subnet_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List
         }
         for key, record in data.get("extattrs", {}).items()
     ]
-    processed_data["Extensible Attributes"] = extattrs_rows
+    processed_data["Extensible Attributes"] = _ensure_column_present(extattrs_rows, "Inherited")
     return processed_data
 
 
@@ -142,7 +173,7 @@ def _parse_network_options_data(raw_data: List[Dict[str, Any]]) -> Dict[str, Lis
             }
             for idx, mem in enumerate(data.get("members", []))
         ]
-        processed_data["DHCP members"] = member_rows
+        processed_data["DHCP members"] = _ensure_column_present(member_rows, "Inherited")
     if "options" in data:
         option_rows = [
             {
@@ -152,7 +183,7 @@ def _parse_network_options_data(raw_data: List[Dict[str, Any]]) -> Dict[str, Lis
                 **({"Inherited": "Yes"} if _is_inherited_entry(option_meta[idx] if idx < len(option_meta) else {}, opt) else {}),
             } for idx, opt in enumerate(data.get("options", []))
         ]
-        processed_data["DHCP options"] = option_rows
+        processed_data["DHCP options"] = _ensure_column_present(_dedupe_dhcp_option_rows(option_rows), "Inherited")
     return processed_data
 
 
