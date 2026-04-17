@@ -1,7 +1,11 @@
 import os
+import threading
 from typing import Optional, Tuple
 
 from core.base import ScriptContext
+
+
+_auth_lock = threading.Lock()
 
 
 def get_auth_creds(ctx: ScriptContext) -> Tuple[Optional[str], Optional[str]]:
@@ -61,19 +65,26 @@ def install_context_credentials(ctx: ScriptContext, username: str, password: str
 def ensure_device_auth(ctx: ScriptContext) -> Tuple[str, str]:
     """
     Lazily ensure shared TACACS/GPG credentials exist on the context.
+
+    Serialised via a module-level lock so concurrent workers never race into
+    duplicate interactive prompts.
     """
     from utils.app_lifecycle import exit_now
 
     if ctx.username and ctx.password:
         return (ctx.username, ctx.password)
 
-    username, password = get_auth_creds(ctx)
-    if not username or not password:
-        ctx.logger.error("Auth - credentials are required but incomplete")
-        exit_now(ctx, 1, "Authentication error - verify credentials.")
+    with _auth_lock:
+        if ctx.username and ctx.password:
+            return (ctx.username, ctx.password)
 
-    install_context_credentials(ctx, str(username), str(password))
-    return (ctx.username, ctx.password)
+        username, password = get_auth_creds(ctx)
+        if not username or not password:
+            ctx.logger.error("Auth - credentials are required but incomplete")
+            exit_now(ctx, 1, "Authentication error - verify credentials.")
+
+        install_context_credentials(ctx, str(username), str(password))
+        return (ctx.username, ctx.password)
 
 
 def install_infoblox_auth(ctx: ScriptContext, username: str, password: str) -> None:
