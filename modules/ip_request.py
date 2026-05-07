@@ -115,7 +115,7 @@ class IPRequestModule(BaseModule):
         print_data_all: List[Dict[str, Any]] = []
         columns = ["Subnet", "IP", "Name", "Status", "Lease State", "Record Type", "MAC"]
 
-        for ip in successful_ips:
+        for ip in ip_addresses:
             if ip in processed_data_by_ip:
                 general_data = processed_data_by_ip[ip].get("general", [{}])[0]
                 extra_data = processed_data_by_ip[ip].get("extra", [{}])[0]
