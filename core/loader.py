@@ -22,6 +22,55 @@ def _merge_plugin_schema(schema: Dict[str, Any], plugin_schema: Dict[str, Any]) 
     return merged
 
 
+def collect_plugin_schemas(master_schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Harvest config_schema from every plugin without registering hooks.
+
+    Returns ``master_schema`` extended with each plugin's contributed keys.
+    Used by cn-lens (``cn_lens.runtime``) so it sees the same schema surface as
+    cn-tool's main entry point without pulling in module loading or hook
+    registration. Plugin files are walked in ``sorted(os.listdir(...))`` order
+    -- the same order ``_load_and_register_plugins`` uses -- so merge precedence
+    matches between the two callers.
+
+    NOTE: this instantiates each ``BasePlugin`` subclass to read its
+    ``config_schema`` property. Plugin authors must keep ``__init__`` free of
+    I/O or thread/process creation, otherwise cn-lens runtime build incurs
+    those side effects on every invocation.
+    """
+    plugins_path = os.path.join(os.path.dirname(__file__), "..", "plugins")
+    schema = master_schema.copy()
+    if not os.path.isdir(plugins_path):
+        return schema
+    for filename in sorted(os.listdir(plugins_path)):
+        if not filename.endswith(".py") or filename.startswith("__"):
+            continue
+        module_path = f"plugins.{filename[:-3]}"
+        try:
+            mod = importlib.import_module(module_path)
+        except Exception as exc:
+            logger.debug("collect_plugin_schemas: import failed %s: %s", module_path, exc)
+            continue
+        for _, obj in inspect.getmembers(mod):
+            if not inspect.isclass(obj) or obj is BasePlugin:
+                continue
+            try:
+                if not issubclass(obj, BasePlugin):
+                    continue
+            except TypeError:
+                continue
+            try:
+                plugin_schema = obj().config_schema or {}
+            except Exception as exc:
+                logger.warning(
+                    "collect_plugin_schemas: could not read schema from %s: %s",
+                    obj.__name__,
+                    exc,
+                )
+                continue
+            schema = _merge_plugin_schema(schema, plugin_schema)
+    return schema
+
+
 def load_modules_and_plugins(master_schema: Dict[str, Any]) -> tuple[Dict[str, BaseModule], list[BasePlugin], Dict[str, Any]]:
     """
     Discovers, loads, and registers all modules and plugins.

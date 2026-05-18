@@ -233,44 +233,268 @@ def _append_xlsx_row(sheet: Any, values: tuple[Any, ...]) -> None:
     sheet.append(_xlsx_safe_row(values))
 
 
+def _format_kv_block(items: Mapping[str, Any], indent: str = "    ") -> list[str]:
+    """Return indented `key: value` lines with values column-aligned.
+
+    Key followed by colon (no space before colon, matches `key: value`
+    convention). Values are right-padded by post-colon spaces so they line
+    up visually. Nested mappings/lists are pretty-printed via YAML instead
+    of dumped as JSON.
+    """
+    if not items:
+        return []
+    keys = list(items.keys())
+    width = max(len(str(k)) for k in keys)
+    lines: list[str] = []
+    for key in keys:
+        value = items[key]
+        pad = " " * (width - len(str(key)))
+        if isinstance(value, Mapping) or (
+            isinstance(value, (list, tuple)) and not isinstance(value, str)
+        ):
+            rendered = yaml.safe_dump(_plain_value(value), sort_keys=False).rstrip()
+            lines.append(f"{indent}{key}:")
+            for sub in rendered.splitlines():
+                lines.append(f"{indent}  {sub}")
+        else:
+            lines.append(f"{indent}{key}:{pad} {value}")
+    return lines
+
+
+_SEVERITY_TAGS: Mapping[str, str] = {
+    "error": "ERR ",
+    "warn": "WARN",
+    "warning": "WARN",
+    "info": "INFO",
+    "debug": "DBG ",
+}
+
+
 def render_text(run: LensRun) -> str:
-    lines = [
-        f"{run.tool} {run.workflow} report",
-        f"schema_version: {run.schema_version}",
-        f"run_id: {run.run_id}",
-        f"objects: {len(run.inputs.objects)}",
-        f"invalid_inputs: {len(run.inputs.invalid)}",
-        f"duplicate_inputs: {run.inputs.duplicate_count}",
+    """Plain-text report — ASCII only, no ANSI. Grep-friendly.
+
+    Layout: framed header, key-value summary block, sectioned bullets for
+    warnings/errors/invalid inputs, per-result block with sources, summary,
+    and findings broken out as readable key-value pairs (no JSON dumps).
+    """
+    bar = "=" * 72
+    sub_bar = "-" * 72
+    lines: list[str] = [
+        bar,
+        f"  {run.tool} {run.workflow} report",
+        bar,
     ]
+    header = {
+        "run_id": run.run_id,
+        "schema_version": run.schema_version,
+        "objects": len(run.inputs.objects),
+        "invalid_inputs": len(run.inputs.invalid),
+        "duplicate_inputs": run.inputs.duplicate_count,
+        "results": len(run.results),
+        "warnings": len(run.warnings),
+        "errors": len(run.errors),
+    }
+    lines.extend(_format_kv_block(header, indent=""))
+
     if run.warnings:
         lines.extend(["", "warnings:"])
-        lines.extend(f"- {warning}" for warning in run.warnings)
+        lines.extend(f"  - {warning}" for warning in run.warnings)
     if run.errors:
         lines.extend(["", "errors:"])
-        lines.extend(f"- {error}" for error in run.errors)
+        lines.extend(f"  - {error}" for error in run.errors)
     if run.inputs.invalid:
         lines.extend(["", "invalid inputs:"])
-        lines.extend(
-            f"- {invalid.original}: {invalid.reason}" for invalid in run.inputs.invalid
-        )
+        for invalid in run.inputs.invalid:
+            lines.append(f"  - {invalid.original}")
+            lines.append(f"    reason: {invalid.reason}")
+
     if run.results:
         lines.extend(["", "results:"])
         for result in run.results:
             obj = result.lens_object
-            lines.append(f"- {obj.value} ({obj.object_type.value}) status: {result.status}")
+            lines.append("")
+            lines.append(f"  {sub_bar}")
+            lines.append(
+                f"  {obj.value}  [{obj.object_type.value}]  status: {result.status}"
+            )
+            lines.append(f"  {sub_bar}")
+            if obj.original and obj.original != obj.value:
+                lines.append(f"    original    : {obj.original}")
+            if obj.normalized and obj.normalized != obj.value:
+                lines.append(f"    normalized  : {obj.normalized}")
+            if obj.notes:
+                lines.append(f"    notes       : {'; '.join(obj.notes)}")
             if result.sources:
-                lines.append(f"  sources: {_join_mapping(result.sources)}")
+                lines.append("    sources:")
+                src_keys = sorted(result.sources)
+                src_w = max(len(k) for k in src_keys)
+                for k in src_keys:
+                    pad = " " * (src_w - len(k))
+                    lines.append(f"      {k}:{pad} {result.sources[k]}")
             if result.summary:
-                lines.append(f"  summary: {json.dumps(_plain_value(result.summary), sort_keys=True)}")
-            for finding in result.findings:
-                lines.append(
-                    f"  finding: {finding.severity} {finding.source}: {finding.message}"
+                lines.append("    summary:")
+                lines.extend(
+                    _format_kv_block(_plain_value(result.summary), indent="      ")
                 )
+            if result.findings:
+                lines.append("    findings:")
+                for finding in result.findings:
+                    tag = _SEVERITY_TAGS.get(finding.severity.lower(), finding.severity.upper())
+                    lines.append(
+                        f"      [{tag}] {finding.source}: {finding.message}"
+                    )
+                    if finding.detail:
+                        for sub in _format_kv_block(
+                            _plain_value(finding.detail), indent="          "
+                        ):
+                            lines.append(sub)
     return "\n".join(lines) + "\n"
 
 
+_SEVERITY_STYLES: Mapping[str, str] = {
+    "error": "bold red",
+    "warn": "yellow",
+    "warning": "yellow",
+    "info": "cyan",
+    "debug": "dim",
+}
+
+_STATUS_STYLES: Mapping[str, str] = {
+    "classified": "cyan",
+    "ok": "green",
+    "found": "green",
+    "matched": "green",
+    "not_found": "yellow",
+    "missing": "yellow",
+    "warn": "yellow",
+    "error": "bold red",
+    "failed": "bold red",
+    "unsupported": "red",
+    "invalid": "red",
+}
+
+
 def render_human(run: LensRun) -> str:
-    return render_text(run)
+    """Rich-formatted report with ANSI color, tables, and panels.
+
+    Designed for reading on a terminal. For grep/automation use ``--format
+    text`` instead. Pipes/files keep the ANSI codes so terminal redirection
+    (e.g. ``cn-lens ... | less -R``) still colors output.
+    """
+    from io import StringIO
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    buf = StringIO()
+    console = Console(file=buf, force_terminal=True, color_system="truecolor", width=100)
+
+    title = Text(f"{run.tool} {run.workflow} report", style="bold white on blue")
+    console.print(Panel.fit(title, border_style="blue"))
+
+    header_table = Table.grid(padding=(0, 2))
+    header_table.add_column(style="bold cyan", justify="right")
+    header_table.add_column()
+    header_table.add_row("run_id", run.run_id)
+    header_table.add_row("schema", str(run.schema_version))
+    header_table.add_row("objects", str(len(run.inputs.objects)))
+    header_table.add_row("invalid", str(len(run.inputs.invalid)))
+    header_table.add_row("duplicates", str(run.inputs.duplicate_count))
+    header_table.add_row("results", str(len(run.results)))
+    header_table.add_row(
+        "warnings",
+        Text(str(len(run.warnings)), style="yellow" if run.warnings else "dim"),
+    )
+    header_table.add_row(
+        "errors",
+        Text(str(len(run.errors)), style="bold red" if run.errors else "dim"),
+    )
+    console.print(header_table)
+
+    if run.warnings:
+        console.print()
+        console.print(Text("warnings", style="bold yellow"))
+        for warning in run.warnings:
+            console.print(Text(f"  • {warning}", style="yellow"))
+    if run.errors:
+        console.print()
+        console.print(Text("errors", style="bold red"))
+        for error in run.errors:
+            console.print(Text(f"  • {error}", style="red"))
+    if run.inputs.invalid:
+        console.print()
+        console.print(Text("invalid inputs", style="bold red"))
+        for invalid in run.inputs.invalid:
+            console.print(
+                Text("  • ", style="red")
+                + Text(invalid.original, style="bold")
+                + Text(f"  ({invalid.reason})", style="dim")
+            )
+
+    if run.results:
+        console.print()
+        for result in run.results:
+            obj = result.lens_object
+            status_style = _STATUS_STYLES.get(result.status.lower(), "white")
+            head = (
+                Text(obj.value, style="bold")
+                + Text(f"  [{obj.object_type.value}]  ", style="dim")
+                + Text(f"status: {result.status}", style=status_style)
+            )
+            body_lines: list[Any] = []
+
+            if obj.original and obj.original != obj.value:
+                body_lines.append(Text(f"original   : {obj.original}", style="dim"))
+            if obj.normalized and obj.normalized != obj.value:
+                body_lines.append(Text(f"normalized : {obj.normalized}", style="dim"))
+            if obj.notes:
+                body_lines.append(Text(f"notes      : {'; '.join(obj.notes)}", style="dim"))
+
+            if result.sources:
+                src_table = Table(
+                    show_header=False, box=None, padding=(0, 1), expand=False
+                )
+                src_table.add_column(style="cyan", justify="right")
+                src_table.add_column()
+                for key in sorted(result.sources):
+                    val = str(result.sources[key])
+                    style = _STATUS_STYLES.get(val.lower(), "white")
+                    src_table.add_row(key, Text(val, style=style))
+                body_lines.append(Text("sources:", style="bold"))
+                body_lines.append(src_table)
+
+            if result.summary:
+                summary_table = Table(
+                    show_header=False, box=None, padding=(0, 1), expand=False
+                )
+                summary_table.add_column(style="cyan", justify="right")
+                summary_table.add_column()
+                plain_summary = _plain_value(result.summary)
+                for key, value in plain_summary.items():
+                    if isinstance(value, (Mapping, list, tuple)) and not isinstance(value, str):
+                        rendered = yaml.safe_dump(value, sort_keys=False).rstrip()
+                        summary_table.add_row(str(key), Text(rendered, style="white"))
+                    else:
+                        summary_table.add_row(str(key), Text(str(value), style="white"))
+                body_lines.append(Text("summary:", style="bold"))
+                body_lines.append(summary_table)
+
+            if result.findings:
+                body_lines.append(Text("findings:", style="bold"))
+                for finding in result.findings:
+                    style = _SEVERITY_STYLES.get(finding.severity.lower(), "white")
+                    body_lines.append(
+                        Text(f"  [{finding.severity.upper()}] ", style=style)
+                        + Text(f"{finding.source}: ", style="cyan")
+                        + Text(finding.message, style="white")
+                    )
+
+            from rich.console import Group
+            border = _STATUS_STYLES.get(result.status.lower(), "white")
+            console.print(Panel(Group(*body_lines), title=head, title_align="left", border_style=border))
+
+    return buf.getvalue()
 
 
 def write_xlsx(run: LensRun, path: Path) -> None:

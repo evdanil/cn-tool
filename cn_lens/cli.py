@@ -594,11 +594,58 @@ def _add_common_input_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--output", "-o", help="write rendered output to a file")
 
 
+def _default_config_paths() -> list[Path]:
+    """Return layered .cn config paths in priority order (low -> high).
+
+    1. Global config (.cn next to the script / repo root)
+    2. User config (~/.cn)
+    3. Current working directory (./.cn)
+
+    The script-dir slot is probed via two sources to cover both invocation styles:
+    - ``./cn-lens.py`` wrapper -> ``sys.argv[0]`` parent is the repo root.
+    - ``python -m cn_lens.cli`` -> ``sys.argv[0]`` is the module file; the repo
+      root is ``Path(__file__).resolve().parent.parent``.
+    Duplicate resolved paths are collapsed while preserving low->high priority.
+    """
+    argv_dir = Path(sys.argv[0]).resolve().parent if sys.argv and sys.argv[0] else None
+    module_repo_root = Path(__file__).resolve().parent.parent
+    candidates: list[Path] = []
+    if argv_dir is not None:
+        candidates.append(argv_dir / ".cn")
+    candidates.append(module_repo_root / ".cn")
+    candidates.append(Path.home() / ".cn")
+    candidates.append(Path.cwd() / ".cn")
+    return _dedupe_paths(candidates)
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    """Drop duplicate resolved paths, keeping the highest-priority slot.
+
+    Within layered ``.cn`` lookup the list is ordered low -> high priority, so
+    when the same file appears twice (e.g. running from the repo root makes
+    script-dir and CWD identical) we keep the last occurrence so the log shows
+    the slot that actually wins.
+    """
+    seen: set[Path] = set()
+    reversed_out: list[Path] = []
+    for p in reversed(paths):
+        try:
+            key = p.resolve()
+        except OSError:
+            key = p
+        if key in seen:
+            continue
+        seen.add(key)
+        reversed_out.append(p)
+    return list(reversed(reversed_out))
+
+
 def _build_runtime_from_namespace(namespace: argparse.Namespace) -> LensRuntime:
     """Build a LensRuntime from parsed CLI namespace."""
-    config_paths = []
+    config_paths = _default_config_paths()
     if getattr(namespace, "config", None):
-        config_paths.append(Path(namespace.config))
+        config_paths.append(Path(namespace.config).expanduser())
+        config_paths = _dedupe_paths(config_paths)
     opts = LensOptions(
         offline=getattr(namespace, "offline", False),
         format=getattr(namespace, "format", "human") or "human",

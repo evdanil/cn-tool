@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.base import ScriptContext
 from core.event_bus import EventBus
+from core.loader import collect_plugin_schemas
 from utils.auth import ensure_infoblox_auth, ensure_device_auth
 from utils.config import BASE_CONFIG_SCHEMA, read_config
 from utils.logging import ThreadSafeFileHandler
@@ -266,8 +267,14 @@ def _build_logger(cfg: Dict[str, Any]) -> logging.Logger:
 
 
 def _build_cfg(config_paths: List[Path], logger: logging.Logger) -> Dict[str, Any]:
-    """Read merged config using the same schema and helper as main.py."""
-    return read_config(config_paths, BASE_CONFIG_SCHEMA, logger)
+    """Read merged config using the same schema and helper as main.py.
+
+    Extends BASE_CONFIG_SCHEMA with plugin-contributed keys via
+    ``core.loader.collect_plugin_schemas`` so adapters that rely on plugin
+    schemas (sdwan_yaml_search, ad, email, …) read their values from ``.cn``.
+    """
+    schema = collect_plugin_schemas(BASE_CONFIG_SCHEMA)
+    return read_config(config_paths, schema, logger)
 
 
 def _try_build_cache(cfg: Dict[str, Any], logger: logging.Logger) -> Any:

@@ -56,7 +56,7 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.86 hash b883c09'
+VERSION = '0.2.87 hash f3e2d64'
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
