@@ -5,7 +5,6 @@ Public surface
 ping(runtime, target, *, count, timeout) -> PingResult
 ping_many(runtime, targets, *, count, max_workers) -> PingBatchResult
 trace(runtime, target, *, max_hops) -> TraceResult
-trace_many(runtime, targets, *, max_workers) -> TraceBatchResult
 trace_with_site_mapping(runtime, target, *, ad_lookup) -> EnrichedTraceResult
 
 Design constraints
@@ -102,12 +101,6 @@ class TraceResult:
     hops: Tuple[Hop, ...]
     reached: bool
     error: str
-
-
-@dataclass(frozen=True)
-class TraceBatchResult:
-    """Aggregated result of trace_many."""
-    results: Tuple[TraceResult, ...]
 
 
 @dataclass(frozen=True)
@@ -425,53 +418,6 @@ def ping_many(
                 ))
 
     return PingBatchResult(results=tuple(results))
-
-
-def trace_many(
-    runtime: "LensRuntime",
-    targets: Sequence[str],
-    *,
-    max_workers: int = 4,
-) -> TraceBatchResult:
-    """Traceroute to multiple targets concurrently.
-
-    Parameters
-    ----------
-    runtime:
-        LensRuntime.
-    targets:
-        Sequence of IP addresses or hostnames.
-    max_workers:
-        Maximum concurrent threads (default low; traces are slow).
-
-    Returns
-    -------
-    TraceBatchResult
-    """
-    if runtime.offline:
-        results = tuple(_offline_trace_result(t) for t in targets)
-        return TraceBatchResult(results=results)
-
-    results: list[TraceResult] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(trace, runtime, t): t for t in targets}
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as exc:
-                target = futures[future]
-                runtime.logger.error(
-                    "reachability.trace_many: unhandled exception for %s: %s",
-                    target, exc,
-                )
-                results.append(TraceResult(
-                    target=target,
-                    hops=(),
-                    reached=False,
-                    error=_trim_error(f"unexpected error: {exc}"),
-                ))
-
-    return TraceBatchResult(results=tuple(results))
 
 
 def trace_with_site_mapping(

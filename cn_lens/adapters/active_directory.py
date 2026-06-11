@@ -5,11 +5,11 @@ Wraps ``utils.ad_helper`` (and mirrors the connection lifecycle from
 that return frozen dataclasses and ``LensFinding``-compatible dicts.
 
 Public surface:
-    name          — adapter identifier ``"ad"``
-    health(runtime)  → AdapterHealth
-    lookup_site(runtime, site_code_or_subnet)  → (AdSiteResult, list[dict])
-    lookup_device(runtime, hostname)           → (AdDeviceResult, list[dict])
-    enrich_ip(runtime, ip)                     → (AdIpEnrichment, list[dict])
+    name               — adapter identifier ``"ad"``
+    deep_health(runtime)  → AdapterHealth  (LDAP-binding probe for doctor workflow)
+    lookup_site(runtime, site_code, prefixes)  → (AdSiteResult, List[LensFinding])
+    lookup_device(runtime, hostname)           → (AdDeviceResult, List[LensFinding])
+    enrich_ip(runtime, ip)                     → (AdIpEnrichment, List[LensFinding])
 
 Design notes:
 - No ``print``, ``console``, or ``press_any_key`` — logger only.
@@ -21,13 +21,23 @@ Design notes:
   the ADSubnetEnrichmentPlugin stores) before creating a new connection.
   A newly-created connection is also stored on the context for subsequent
   calls within the same runtime lifetime.
+
+lookup_site strategy (B9 fix):
+- AD subnet objects are NAMED BY CIDR (e.g. "10.20.0.0/22"), so querying by
+  bare site code under CN=Subnets never matches anything.
+- Callers must pass ``prefixes`` (the CIDR list from Infoblox) for per-subnet
+  queries via ``_lookup_subnet_in_ad``.
+- Additionally a direct site-object lookup is always attempted:
+  ``(&(objectClass=site)(cn=<escaped site_code>))`` under the sites container
+  ``CN=Sites,CN=Configuration,<DC root>`` derived from ``ad_search_base``.
+- Either evidence source (subnet hit OR site object hit) → found=True.
 """
 from __future__ import annotations
 
 import socket
 import threading
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from ldap3.core.exceptions import LDAPException
 from ldap3.utils.conv import escape_filter_chars
@@ -60,7 +70,7 @@ name: str = "ad"
 
 @dataclass(frozen=True)
 class AdSiteResult:
-    """AD site metadata resolved from a subnet or site-code query.
+    """AD site metadata resolved from subnet queries and/or a site-object lookup.
 
     Attributes
     ----------
@@ -75,6 +85,10 @@ class AdSiteResult:
         The distinguished name of the site object or subnet object found.
     found:
         ``True`` if an AD entry was located; ``False`` otherwise.
+    matched_prefixes:
+        Tuple of CIDR strings (from the ``prefixes`` argument) that returned
+        AD subnet data.  Empty when the match was via site-object lookup only,
+        or when no match was found at all.
     """
 
     site_code: str
@@ -82,6 +96,7 @@ class AdSiteResult:
     country_code: str
     ou_path: str
     found: bool
+    matched_prefixes: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -103,6 +118,32 @@ class AdDeviceResult:
     ou_path: str
     last_site_code: str
     computer_dn: str
+    found: bool
+
+
+@dataclass(frozen=True)
+class AdSubnetResult:
+    """AD subnet metadata resolved from a single CIDR query.
+
+    Attributes
+    ----------
+    site:
+        The AD site name extracted from the subnet's ``siteObject`` attribute
+        (e.g. ``"SYD01"``).  Empty string when not found.
+    location:
+        Free-text location string from the AD ``location`` attribute
+        (e.g. ``"Sydney, AU"``).  Empty string when not found or absent.
+    description:
+        Description string from the AD ``description`` attribute.
+        Empty string when not found or absent.
+    found:
+        ``True`` if an AD subnet entry was located for this CIDR; ``False``
+        otherwise.
+    """
+
+    site: str
+    location: str
+    description: str
     found: bool
 
 
@@ -129,11 +170,12 @@ class AdIpEnrichment:
 # ---------------------------------------------------------------------------
 
 _NOT_FOUND_SITE = AdSiteResult(
-    site_code="", location="", country_code="", ou_path="", found=False
+    site_code="", location="", country_code="", ou_path="", found=False, matched_prefixes=()
 )
 _NOT_FOUND_DEVICE = AdDeviceResult(
     ou_path="", last_site_code="", computer_dn="", found=False
 )
+_NOT_FOUND_SUBNET = AdSubnetResult(site="", location="", description="", found=False)
 
 # Sentinel returned by _find_computer when an LDAP error occurs (distinct from
 # None which means "not found").  Callers check ``entry is _LDAP_ERROR`` to
@@ -147,6 +189,10 @@ def _not_found_finding() -> LensFinding:
 
 def _error_finding(detail: str) -> LensFinding:
     return LensFinding(severity="error", source="ad", message="ldap_error", detail={"error": detail})
+
+
+def _warning_finding(message: str, detail: str) -> LensFinding:
+    return LensFinding(severity="warning", source="ad", message=message, detail={"detail": detail})
 
 
 def _is_configured(runtime: "LensRuntime") -> bool:
@@ -267,7 +313,8 @@ def _find_computer(runtime: "LensRuntime", conn, hostname: str):
     - ``None`` if the computer was not found (clean not-found).
     - ``_LDAP_ERROR`` sentinel if an LDAP error occurs.
 
-    Never re-raises ``LDAPException`` — callers check the return value.
+    Catches ``LDAPException`` internally; other unexpected exceptions propagate
+    to the caller.
     """
     cfg = runtime.cfg
     # Use the configuration base but switch to the domain root for computer search.
@@ -298,21 +345,95 @@ def _find_computer(runtime: "LensRuntime", conn, hostname: str):
         return _LDAP_ERROR
 
 
+def _find_site_object(runtime: "LensRuntime", conn, site_code: str):
+    """Search AD for a site object by CN under the Sites container.
+
+    The sites container is derived from ``ad_search_base`` by stripping
+    everything up to (but not including) the first ``CN=Sites`` component.
+    For example, if ``ad_search_base`` is::
+
+        CN=Subnets,CN=Sites,CN=Configuration,DC=example,DC=com
+
+    the sites container used here is::
+
+        CN=Sites,CN=Configuration,DC=example,DC=com
+
+    This mirrors the pattern used in ``_find_computer`` for deriving the
+    domain root.  If ``CN=Sites`` is not present in ``ad_search_base`` we
+    fall back to building ``CN=Sites,CN=Configuration,<DC root>`` from the
+    DC parts alone — a best-effort search that covers the common deployment
+    topology.
+
+    Returns
+    -------
+    - The first ldap3 Entry if found.
+    - ``None`` if no site object matched (clean not-found).
+    - ``_LDAP_ERROR`` sentinel if an LDAP error occurs.
+
+    Catches ``LDAPException`` internally; other unexpected exceptions propagate
+    to the caller.
+    """
+    cfg = runtime.cfg
+    search_base_cfg = cfg.get("ad_search_base", DEFAULT_SEARCH_BASE)
+    timeout = cfg.get("ad_operation_timeout", DEFAULT_OPERATION_TIMEOUT)
+
+    # Derive the sites container:
+    # Primary: find "CN=Sites" in ad_search_base and use from there onward.
+    # Fallback: CN=Sites,CN=Configuration,<DC parts>
+    sites_container: str = ""
+    upper_parts = [p.strip() for p in search_base_cfg.split(",")]
+    for idx, part in enumerate(upper_parts):
+        if part.upper() == "CN=SITES":
+            sites_container = ",".join(upper_parts[idx:])
+            break
+
+    if not sites_container:
+        # Fallback: build from DC parts
+        dc_parts = [p for p in upper_parts if p.upper().startswith("DC=")]
+        dc_root = ",".join(dc_parts) if dc_parts else search_base_cfg
+        sites_container = f"CN=Sites,CN=Configuration,{dc_root}"
+        runtime.logger.debug(
+            "AD adapter: CN=Sites not found in ad_search_base; "
+            "using fallback sites container: %s", sites_container
+        )
+
+    safe_code = escape_filter_chars(site_code)
+    search_filter = f"(&(objectClass=site)(cn={safe_code}))"
+
+    try:
+        conn.search(
+            sites_container,
+            search_filter,
+            attributes=["distinguishedName", "cn", "location"],
+            time_limit=timeout,
+        )
+        if conn.entries:
+            return conn.entries[0]
+        return None
+    except LDAPException as exc:
+        runtime.logger.error("AD adapter: LDAP error during site-object search: %s", exc)
+        return _LDAP_ERROR
+
+
 # ---------------------------------------------------------------------------
-# Protocol surface: health()
+# Protocol surface: deep_health()
 # ---------------------------------------------------------------------------
 
 
-def health(runtime: "LensRuntime") -> AdapterHealth:
-    """Return the adapter's health/availability for the given runtime.
+def deep_health(runtime: "LensRuntime") -> AdapterHealth:
+    """LDAP-binding connectivity probe — intended for the ``doctor`` workflow (P2.2).
+
+    Unlike ``ActiveDirectoryAdapter.health()``, which is cheap and config-only,
+    this function opens a real LDAP connection to verify end-to-end reachability.
+    It should NOT be called on every workflow run.
 
     Returns
     -------
     AdapterHealth
-        ``disabled``       — offline mode
-        ``not_configured`` — AD not enabled or URI missing
-        ``ok``             — connection opened successfully
-        ``error``          — AD configured but connection failed
+        ``disabled``       — offline mode; no LDAP I/O attempted.
+        ``not_configured`` — ``ad_enabled`` is False/missing or ``ad_uri`` is absent.
+        ``ok``             — LDAP bind succeeded.
+        ``error``          — AD is configured but the connection attempt failed.
     """
     if runtime.offline:
         return AdapterHealth(status="disabled", detail="offline mode")
@@ -328,6 +449,69 @@ def health(runtime: "LensRuntime") -> AdapterHealth:
 
 
 # ---------------------------------------------------------------------------
+# Public: lookup_subnet
+# ---------------------------------------------------------------------------
+
+
+def lookup_subnet(
+    runtime: "LensRuntime",
+    subnet: str,
+) -> Tuple[AdSubnetResult, List["LensFinding"]]:
+    """Look up a CIDR subnet in Active Directory and return site/location/description.
+
+    Uses ``_lookup_subnet_in_ad`` (which calls ``get_ad_subnet_info``) to query
+    the ``CN=Subnets`` container by exact CIDR name match.
+
+    Degrades gracefully:
+    - Offline mode or AD not configured → returns ``_NOT_FOUND_SUBNET`` with no findings.
+    - LDAP connection failure → returns ``_NOT_FOUND_SUBNET`` with an error finding.
+    - Subnet not found → returns ``_NOT_FOUND_SUBNET`` with a not-found info finding.
+
+    Parameters
+    ----------
+    runtime:
+        Active ``LensRuntime``.
+    subnet:
+        CIDR string to query (e.g. ``"10.20.0.0/22"``).
+
+    Returns
+    -------
+    Tuple[AdSubnetResult, List[LensFinding]]
+        Result dataclass and a list of ``LensFinding`` objects.
+    """
+    if runtime.offline:
+        return _NOT_FOUND_SUBNET, []
+
+    if not _is_configured(runtime):
+        return _NOT_FOUND_SUBNET, []
+
+    conn = _get_connection(runtime)
+    if conn is None:
+        return _NOT_FOUND_SUBNET, [_error_finding("LDAP connection failed")]
+
+    try:
+        ad_data = _lookup_subnet_in_ad(runtime, conn, subnet)
+    except Exception as exc:
+        runtime.logger.error("AD adapter: lookup_subnet error for %s: %s", subnet, exc)
+        return _NOT_FOUND_SUBNET, [_error_finding(str(exc))]
+
+    if not ad_data:
+        return _NOT_FOUND_SUBNET, [_not_found_finding()]
+
+    site = ad_data.get("AD Site", "")
+    location = ad_data.get("AD Location", "")
+    description = ad_data.get("AD Description", "")
+
+    result = AdSubnetResult(
+        site=site,
+        location=location,
+        description=description,
+        found=True,
+    )
+    return result, []
+
+
+# ---------------------------------------------------------------------------
 # Public: lookup_site
 # ---------------------------------------------------------------------------
 
@@ -335,19 +519,45 @@ def health(runtime: "LensRuntime") -> AdapterHealth:
 def lookup_site(
     runtime: "LensRuntime",
     site_code: str,
-) -> Tuple[AdSiteResult, List[Dict[str, Any]]]:
-    """Resolve a subnet (or site code) to AD site metadata.
+    prefixes: Sequence[str] = (),
+) -> Tuple[AdSiteResult, List["LensFinding"]]:
+    """Resolve a site to AD metadata via per-subnet queries and/or site-object lookup.
 
     Parameters
     ----------
     site_code:
-        A subnet CIDR (``"10.0.0.0/24"``) or a bare site code.  The function
-        queries AD subnets using ``get_ad_subnet_info``.
+        The bare site code (e.g. ``"SYD01"``).  Used as the ``cn`` value in
+        the direct site-object lookup.
+    prefixes:
+        Optional sequence of CIDR strings (e.g. ``["10.20.0.0/22"]``) obtained
+        from Infoblox.  Each prefix is queried individually via
+        ``_lookup_subnet_in_ad`` (the helper that calls ``get_ad_subnet_info``).
+        AD subnet objects are named by CIDR, so this is the only reliable way
+        to find them — a bare site code as the ``name`` filter can never match.
+
+    Strategy
+    --------
+    1. For every CIDR in *prefixes*, call ``_lookup_subnet_in_ad``.  Collect
+       all CIDRs that returned data into ``matched_prefixes``; use the first
+       successful hit as the AD site metadata source.  Per-prefix exceptions
+       are caught, logged, and collected as warning/error findings — the loop
+       continues so evidence from earlier successful prefixes is never discarded.
+       Only when zero evidence was gathered AND errors occurred is a not-found
+       error result returned.
+    2. Always attempt a direct site-object lookup:
+       ``(&(objectClass=site)(cn=<escaped site_code>))`` under the sites
+       container derived from ``ad_search_base``.
+    3. Either step finding data → ``found=True``.  Subnet evidence takes
+       precedence for metadata; site-object evidence supplements when subnets
+       yield nothing.  When the site-object search fails with an LDAP error but
+       subnet evidence exists, a warning finding is emitted alongside the
+       found=True result.
+    4. No prefixes + site object not found → ``found=False`` (honest not-found).
 
     Returns
     -------
-    (AdSiteResult, list[dict])
-        Result dataclass and a list of finding dicts.
+    Tuple[AdSiteResult, List[LensFinding]]
+        Result dataclass and a list of ``LensFinding`` objects.
     """
     if runtime.offline:
         return _NOT_FOUND_SITE, []
@@ -359,31 +569,95 @@ def lookup_site(
     if conn is None:
         return _NOT_FOUND_SITE, [_error_finding("LDAP connection failed")]
 
+    # --- Step 1: per-subnet queries (evidence-preserving) ---
+    first_subnet_data: Dict[str, str] = {}
+    matched_prefixes: List[str] = []
+    subnet_error_findings: List[LensFinding] = []
+
+    for prefix in prefixes:
+        try:
+            ad_data = _lookup_subnet_in_ad(runtime, conn, prefix)
+        except Exception as exc:
+            runtime.logger.error(
+                "AD adapter: lookup_site subnet query for %s error: %s", prefix, exc
+            )
+            subnet_error_findings.append(
+                _warning_finding("subnet_query_error", f"{prefix}: {exc}")
+            )
+            continue  # preserve evidence from earlier successful prefixes
+        if ad_data:
+            matched_prefixes.append(prefix)
+            if not first_subnet_data:
+                first_subnet_data = ad_data
+
+    # If every prefix errored and we have no evidence at all, bail early.
+    if subnet_error_findings and not first_subnet_data and not matched_prefixes:
+        return _NOT_FOUND_SITE, subnet_error_findings
+
+    # --- Step 2: direct site-object lookup (always attempted) ---
     try:
-        ad_data = _lookup_subnet_in_ad(runtime, conn, site_code)
+        site_entry = _find_site_object(runtime, conn, site_code)
     except Exception as exc:
-        runtime.logger.error("AD adapter: lookup_site error: %s", exc)
-        return _NOT_FOUND_SITE, [_error_finding(str(exc))]
+        runtime.logger.error("AD adapter: lookup_site site-object query error: %s", exc)
+        if first_subnet_data or matched_prefixes:
+            # We have subnet evidence — keep going, attach an error finding below.
+            site_entry = _LDAP_ERROR
+        else:
+            return _NOT_FOUND_SITE, subnet_error_findings + [_error_finding(str(exc))]
 
-    if not ad_data:
-        return _NOT_FOUND_SITE, [_not_found_finding()]
+    if site_entry is _LDAP_ERROR:
+        # LDAP error during site-object search.
+        if not first_subnet_data and not matched_prefixes:
+            return _NOT_FOUND_SITE, subnet_error_findings + [
+                _error_finding("LDAP error during site-object search")
+            ]
+        # Subnet evidence exists — note the degraded state via a warning finding.
+        subnet_error_findings.append(
+            _warning_finding(
+                "site_object_lookup_failed",
+                "site-object lookup failed; result based on subnet evidence",
+            )
+        )
 
-    location = ad_data.get("AD Location", "")
-    country_code = _extract_country_code(location)
-    site_cn = ad_data.get("AD Site", "") or ad_data.get("AD Name", "")
+    # --- Step 3: aggregate evidence ---
+    # Prefer subnet evidence for metadata; fall back to site-object entry.
+    if first_subnet_data:
+        location = first_subnet_data.get("AD Location", "")
+        country_code = _extract_country_code(location)
+        site_cn = first_subnet_data.get("AD Site", "") or first_subnet_data.get("AD Name", "")
+        search_base = runtime.cfg.get("ad_search_base", DEFAULT_SEARCH_BASE)
+        ou_path = f"CN={site_cn},{search_base}" if site_cn else search_base
 
-    # Build a representative OU path from the site name and search base.
-    search_base = runtime.cfg.get("ad_search_base", DEFAULT_SEARCH_BASE)
-    ou_path = f"CN={site_cn},{search_base}" if site_cn else search_base
+        result = AdSiteResult(
+            site_code=site_cn,
+            location=location,
+            country_code=country_code,
+            ou_path=ou_path,
+            found=True,
+            matched_prefixes=tuple(matched_prefixes),
+        )
+        return result, subnet_error_findings
 
-    result = AdSiteResult(
-        site_code=site_cn,
-        location=location,
-        country_code=country_code,
-        ou_path=ou_path,
-        found=True,
-    )
-    return result, []
+    if site_entry is not None and site_entry is not _LDAP_ERROR:
+        # Site-object hit — extract metadata from the AD entry
+        site_cn = str(site_entry.cn) if site_entry.cn else site_code
+        location = str(site_entry.location) if site_entry.location else ""
+        country_code = _extract_country_code(location)
+        dn = str(site_entry.distinguishedName) if site_entry.distinguishedName else ""
+        ou_path = dn or site_cn
+
+        result = AdSiteResult(
+            site_code=site_cn,
+            location=location,
+            country_code=country_code,
+            ou_path=ou_path,
+            found=True,
+            matched_prefixes=(),  # match was via site-object, not subnet CIDR
+        )
+        return result, []
+
+    # --- Step 4: nothing found ---
+    return _NOT_FOUND_SITE, [_not_found_finding()]
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +668,7 @@ def lookup_site(
 def lookup_device(
     runtime: "LensRuntime",
     hostname: str,
-) -> Tuple[AdDeviceResult, List[Dict[str, Any]]]:
+) -> Tuple[AdDeviceResult, List["LensFinding"]]:
     """Look up an AD computer object by hostname.
 
     Parameters
@@ -404,8 +678,8 @@ def lookup_device(
 
     Returns
     -------
-    (AdDeviceResult, list[dict])
-        Result dataclass and a list of finding dicts.
+    Tuple[AdDeviceResult, List[LensFinding]]
+        Result dataclass and a list of ``LensFinding`` objects.
     """
     if runtime.offline:
         return _NOT_FOUND_DEVICE, []
@@ -457,7 +731,7 @@ def lookup_device(
 def enrich_ip(
     runtime: "LensRuntime",
     ip: str,
-) -> Tuple[AdIpEnrichment, List[Dict[str, Any]]]:
+) -> Tuple[AdIpEnrichment, List["LensFinding"]]:
     """Enrich an IP address via reverse-DNS then AD device lookup.
 
     Steps:
@@ -473,8 +747,8 @@ def enrich_ip(
 
     Returns
     -------
-    (AdIpEnrichment, list[dict])
-        Enrichment result and findings.
+    Tuple[AdIpEnrichment, List[LensFinding]]
+        Enrichment result and ``LensFinding`` objects.
     """
     if runtime.offline:
         return AdIpEnrichment(resolved_hostname="", device_result=_NOT_FOUND_DEVICE), []
@@ -499,3 +773,42 @@ def enrich_ip(
     # --- Step 2: AD device lookup ---
     device_result, findings = lookup_device(runtime, resolved_hostname)
     return AdIpEnrichment(resolved_hostname=resolved_hostname, device_result=device_result), findings
+
+
+# ---------------------------------------------------------------------------
+# Adapter class (satisfies LensAdapter Protocol)
+# ---------------------------------------------------------------------------
+
+
+class ActiveDirectoryAdapter:
+    """cn-lens adapter for Active Directory.
+
+    Satisfies the ``LensAdapter`` Protocol: has a ``name`` class attribute and
+    a ``health(runtime)`` method.  Does not inherit from any base class.
+
+    Adapter ``name`` is ``"ad"`` — matching the vocabulary used throughout
+    all workflow ``sources`` dicts.
+
+    Health is config-derived only (does NOT open an LDAP connection), because
+    the LDAP bind is expensive.  The deep connectivity probe is reserved for
+    the ``doctor`` workflow (P2.2).
+
+    Status mapping
+    --------------
+    - ``disabled``       — runtime is in offline mode.
+    - ``not_configured`` — ``ad_enabled`` is False/missing or ``ad_uri`` is absent.
+    - ``ok``             — both ``ad_enabled`` is truthy and ``ad_uri`` is present.
+    """
+
+    name: str = "ad"
+
+    def health(self, runtime: "LensRuntime") -> AdapterHealth:
+        """Return config-derived health (cheap — no LDAP I/O)."""
+        if runtime.offline:
+            return AdapterHealth(status="disabled", detail="offline mode")
+        if not _is_configured(runtime):
+            return AdapterHealth(
+                status="not_configured",
+                detail="ad_enabled=False or ad_uri missing",
+            )
+        return AdapterHealth(status="ok", detail="ad_enabled=True and ad_uri present")

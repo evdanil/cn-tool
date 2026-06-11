@@ -9,9 +9,8 @@ class LensObjectType(str, Enum):
     FQDN = "fqdn"
     SITE = "site"
     DEVICE = "device"
-    KEYWORD = "keyword"
-    INVALID = "invalid"
     REPORT = "report"
+    QUERY = "query"  # config find raw query token (not classifier-classified)
 
 
 @dataclass(frozen=True)

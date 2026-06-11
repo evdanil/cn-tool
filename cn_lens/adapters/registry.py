@@ -6,6 +6,7 @@ dict.  At T6 the registry is always empty; adapters are registered in T7-T12.
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from cn_lens.adapters.types import AdapterHealth, VALID_SOURCE_STATUSES
@@ -60,26 +61,34 @@ class AdapterRegistry:
         """Return adapter names in insertion order."""
         return [a.name for a in self._adapters]
 
-    def source_statuses(self, runtime: Any = None) -> Dict[str, str]:
+    def source_statuses(self, runtime: Any = None, offline: bool = False) -> Dict[str, str]:
         """Build the ``sources`` dict used by ``LensResult``.
 
-        When ``runtime`` is provided each adapter's ``health()`` is called;
-        otherwise ``not_queried`` is returned for every adapter.  In T6
-        (no adapters registered) this always returns an empty dict; the
-        ``classifier: ok`` entry is added by the workflow, not the registry.
+        Parameters
+        ----------
+        runtime:
+            Active ``LensRuntime``.  When ``None`` every adapter returns
+            ``not_queried`` regardless of the ``offline`` flag.
+        offline:
+            When ``True`` every registered adapter returns ``not_queried``
+            without calling any ``health()`` method.  This replaces the
+            per-workflow ``_OFFLINE_SOURCES`` dicts (bug B1).
 
         All returned values are members of ``VALID_SOURCE_STATUSES``.
         """
         result: Dict[str, str] = {}
         for adapter in self._adapters:
-            if runtime is not None:
+            if offline or runtime is None:
+                status = "not_queried"
+            else:
                 try:
                     health: AdapterHealth = adapter.health(runtime)
                     status = health.status if health.status in VALID_SOURCE_STATUSES else "error"
-                except Exception:
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "health check for %s failed: %s", adapter.name, exc
+                    )
                     status = "error"
-            else:
-                status = "not_queried"
             result[adapter.name] = status
         return result
 

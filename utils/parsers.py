@@ -455,6 +455,118 @@ def parse_nexus_show_version(output: str) -> Dict[str, Any]:
     return result
 
 
+def parse_show_switch(output: str) -> Dict[str, Any]:
+    """Parse the output of 'show switch' from Cisco IOS/IOS-XE devices.
+
+    Ported from ``modules/e911_info.parse_show_switch`` so that
+    ``cn_lens/workflows/e911.py`` can import it without pulling in the UI-coupled
+    ``modules/`` package.
+
+    Returns a dictionary with:
+        - stack_mac: The stack/switch MAC address (dot notation, lowercase)
+        - members: List of switch members with their details
+        - is_valid: Boolean indicating if this is valid switch output
+        - error: Error message if parsing failed
+    """
+    result: Dict[str, Any] = {
+        "stack_mac": None,
+        "members": [],
+        "is_valid": False,
+        "error": None,
+    }
+
+    # Check for error indicators (non-switch devices)
+    error_patterns = [
+        r'Invalid input detected',
+        r'Incomplete command',
+        r'Invalid syntax',
+        r'% .*command',
+    ]
+    for pattern in error_patterns:
+        if re.search(pattern, output, re.IGNORECASE):
+            result["error"] = "Device does not support 'show switch' command"
+            return result
+
+    # Parse Stack/Switch MAC Address
+    stack_mac_match = re.search(
+        r'Switch/Stack Mac Address\s*:\s*([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})',
+        output,
+    )
+    if stack_mac_match:
+        result["stack_mac"] = stack_mac_match.group(1).lower()
+
+    # Parse member switch lines
+    member_pattern = re.compile(
+        r'^\s*\*?(\d+)\s+'
+        r'(Active|Standby|Member|Master)\s+'
+        r'([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+'
+        r'(\d+)\s+'
+        r'(V?\d+)\s+'
+        r'(\w+)',
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    for match in member_pattern.finditer(output):
+        switch_num = match.group(1)
+        role = match.group(2)
+        mac_address = match.group(3).lower()
+        priority = match.group(4)
+        hw_version = match.group(5)
+        state = match.group(6)
+
+        # Skip unprovisioned switches (MAC 0000.0000.0000)
+        if mac_address == "0000.0000.0000":
+            continue
+
+        # Skip entries that are not in Ready state
+        if state.lower() == "unprovisioned":
+            continue
+
+        result["members"].append({
+            "switch_num": switch_num,
+            "role": role,
+            "mac_address": mac_address,
+            "priority": priority,
+            "hw_version": hw_version,
+            "state": state,
+        })
+
+    if result["members"]:
+        result["is_valid"] = True
+    elif not result["error"]:
+        result["error"] = "No valid switch stack members found in output"
+
+    return result
+
+
+def normalize_mac_format(mac: str, output_format: str = "colon") -> str:
+    """Convert MAC address to specified format.
+
+    Ported from ``modules/e911_info.normalize_mac_format`` so that
+    ``cn_lens/workflows/e911.py`` can use it without importing the UI-coupled
+    ``modules/`` package.
+
+    Args:
+        mac: MAC address in any format (e.g., ``"c4ab.4dec.3b60"``)
+        output_format: ``"colon"`` for ``XX:XX:XX:XX:XX:XX``,
+                       ``"dot"`` for ``XXXX.XXXX.XXXX``
+
+    Returns:
+        Formatted MAC address in uppercase.
+    """
+    clean_mac = mac.replace(":", "").replace("-", "").replace(".", "").lower()
+
+    if len(clean_mac) != 12:
+        return mac.upper()  # Return original if invalid
+
+    if output_format == "colon":
+        return ":".join(clean_mac[i:i + 2] for i in range(0, 12, 2)).upper()
+    elif output_format == "dot":
+        return ".".join(clean_mac[i:i + 4] for i in range(0, 12, 4)).upper()
+    else:
+        return clean_mac.upper()
+
+
 def parse_nexus_show_license_all(output: str) -> List[Dict[str, str]]:
     """
     Parses 'show license all' output for modern Smart Licensing on NX-OS.

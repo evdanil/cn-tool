@@ -35,7 +35,11 @@ _WORKFLOW_SUMMARY_KEYS: frozenset[str] = frozenset(
         "decommission_site",
         "allocate",
         "config_find",
+        "config_diff",
         "report",
+        "bssid",
+        "stats",
+        "e911",
     }
 )
 
@@ -367,19 +371,24 @@ _STATUS_STYLES: Mapping[str, str] = {
     "not_found": "yellow",
     "missing": "yellow",
     "warn": "yellow",
+    "partial": "yellow",
     "error": "bold red",
     "failed": "bold red",
     "unsupported": "red",
     "invalid": "red",
+    "not_queried": "dim",
+    "not_configured": "dim",
+    "disabled": "dim",
 }
 
 
-def render_human(run: LensRun) -> str:
+def render_human(run: LensRun, *, force_ansi: bool = True) -> str:
     """Rich-formatted report with ANSI color, tables, and panels.
 
     Designed for reading on a terminal. For grep/automation use ``--format
-    text`` instead. Pipes/files keep the ANSI codes so terminal redirection
-    (e.g. ``cn-lens ... | less -R``) still colors output.
+    text`` instead. When writing to a file (``--output``), pass
+    ``force_ansi=False`` to suppress ANSI escape codes so the file contains
+    plain text suitable for downstream tools (diff, grep, email).
     """
     from io import StringIO
     from rich.console import Console
@@ -388,7 +397,10 @@ def render_human(run: LensRun) -> str:
     from rich.text import Text
 
     buf = StringIO()
-    console = Console(file=buf, force_terminal=True, color_system="truecolor", width=100)
+    if force_ansi:
+        console = Console(file=buf, force_terminal=True, color_system="truecolor", width=100)
+    else:
+        console = Console(file=buf, force_terminal=False, no_color=True, width=100)
 
     title = Text(f"{run.tool} {run.workflow} report", style="bold white on blue")
     console.print(Panel.fit(title, border_style="blue"))
@@ -495,6 +507,147 @@ def render_human(run: LensRun) -> str:
             console.print(Panel(Group(*body_lines), title=head, title_align="left", border_style=border))
 
     return buf.getvalue()
+
+
+_SUBNET_DETAIL_BASE_COLUMNS: tuple[str, ...] = (
+    "Original Input",
+    "IP",
+    "Mask",
+    "Name",
+    "MAC",
+    "DHCP",
+    "DHCP Scope Start",
+    "DHCP Scope End",
+    "DHCP Servers",
+    "DHCP Options\nOption - Value",
+    "DHCP Options\nOption - Decoded Value",
+    "DHCP Failover Association",
+    "Notes",
+    "Inherited Fields",
+)
+
+
+def _write_subnet_data_detail(workbook: Any, run: LensRun) -> None:
+    """Append a 'Subnet Data Detail' sheet when any result has deep infoblox data.
+
+    Mirrors the layout of the ``modules/subnet_request.py:_save_subnet_data``
+    "Subnet Data Detail" sheet.  Only created when at least one result contains
+    a deep infoblox block (``summary["infoblox"]["deep"] == True``).
+
+    Row structure (one prefix = one main row + secondary rows per sub-object):
+    - Main row: subnet identity + DHCP scope + member/option summary + Notes
+    - DNS record rows: one per in-subnet DNS record (IP + /32 Mask + A Record)
+    - Fixed address rows: one per fixedaddress (IP + /32 Mask + Name + MAC)
+    """
+    detail_rows: list[tuple[Any, ...]] = []
+
+    for result in run.results:
+        ib = result.summary.get("infoblox", {})
+        if not ib.get("deep"):
+            continue
+
+        obj_value = result.lens_object.value
+        network = ib.get("network", obj_value)
+
+        # Split network into IP + mask components (e.g. "10.0.0.0/24" → "10.0.0.0", "/24")
+        if "/" in network:
+            ip_part, mask_suffix = network.split("/", 1)
+            mask_part = f"/{mask_suffix}"
+        else:
+            ip_part, mask_part = network, ""
+
+        dhcp_ranges = ib.get("dhcp_ranges", [])
+        members = ib.get("members", [])
+        dhcp_options = ib.get("dhcp_options", [])
+        dns_records = ib.get("dns_records", [])
+        fixed_addresses = ib.get("fixed_addresses", [])
+
+        first_range = dhcp_ranges[0] if dhcp_ranges else {}
+        is_dhcp = "Y" if (members or dhcp_ranges) else "N"
+
+        # DHCP servers summary: "name - IP" per member
+        dhcp_servers_str = "\n".join(
+            f"{m.get('name', '')} - {m.get('ip', '')}" for m in members
+        )
+
+        # DHCP options value summary
+        dhcp_options_value_str = "\n".join(
+            f"{o.get('name', '')} - {o.get('value', '')}" for o in dhcp_options
+        )
+        # DHCP options decoded value summary
+        has_decoded = any(o.get("decoded_value") for o in dhcp_options)
+        dhcp_options_decoded_str = (
+            "\n".join(
+                f"{o.get('name', '')} - {o.get('decoded_value', '')}"
+                for o in dhcp_options
+            )
+            if has_decoded
+            else ""
+        )
+
+        failover_str = first_range.get("failover_association", "") if first_range else ""
+        comment = ib.get("comment", "")
+
+        main_row = (
+            obj_value,          # Original Input
+            ip_part,            # IP
+            mask_part,          # Mask
+            "Subnet",           # Name
+            "",                 # MAC
+            is_dhcp,            # DHCP
+            first_range.get("start_addr", "") if first_range else "",  # DHCP Scope Start
+            first_range.get("end_addr", "") if first_range else "",    # DHCP Scope End
+            dhcp_servers_str,   # DHCP Servers
+            dhcp_options_value_str,    # DHCP Options\nOption - Value
+            dhcp_options_decoded_str,  # DHCP Options\nOption - Decoded Value
+            failover_str,       # DHCP Failover Association
+            comment,            # Notes
+            "",                 # Inherited Fields
+        )
+        detail_rows.append(main_row)
+
+        # DNS record rows
+        for rec in dns_records:
+            rec_ip = rec.get("ip", "")
+            detail_rows.append((
+                "",             # Original Input (blank for secondary rows)
+                rec_ip,         # IP
+                "/32",          # Mask
+                rec.get("name", ""),  # Name (A Record)
+                "",             # MAC
+                "",             # DHCP
+                "", "",         # Scope Start / End
+                "",             # DHCP Servers
+                "", "",         # Options
+                "",             # Failover
+                "DNS record",   # Notes
+                "",             # Inherited Fields
+            ))
+
+        # Fixed address rows
+        for fa in fixed_addresses:
+            detail_rows.append((
+                "",             # Original Input
+                fa.get("ip", ""),   # IP
+                "/32",          # Mask
+                fa.get("name", ""),  # Name
+                fa.get("mac", ""),   # MAC
+                "",             # DHCP
+                "", "",         # Scope Start / End
+                "",             # DHCP Servers
+                "", "",         # Options
+                "",             # Failover
+                "Fixed IP",     # Notes
+                "",             # Inherited Fields
+            ))
+
+    if not detail_rows:
+        return
+
+    detail_sheet = workbook.create_sheet("Subnet Data Detail")
+    _append_xlsx_row(detail_sheet, _SUBNET_DETAIL_BASE_COLUMNS)
+    for row in detail_rows:
+        _append_xlsx_row(detail_sheet, row)
 
 
 def write_xlsx(run: LensRun, path: Path) -> None:
@@ -609,6 +762,9 @@ def write_xlsx(run: LensRun, path: Path) -> None:
         _append_xlsx_row(pw_sheet, ("object", "workflow", "key", "value"))
         for row in per_workflow_rows:
             _append_xlsx_row(pw_sheet, row)
+
+    # --- Subnet Data Detail sheet (parity with modules/subnet_request.py) ---
+    _write_subnet_data_detail(workbook, run)
 
     workbook.save(path)
 
@@ -792,6 +948,251 @@ def _write_report_xlsx(report: "LensReport", path: Path) -> None:
     workbook.save(path)
 
 
+# ---------------------------------------------------------------------------
+# P5.2 — config find xlsx writer (per-device tabs + =HYPERLINK formulas)
+# ---------------------------------------------------------------------------
+
+#: Maximum number of per-device config tabs to write (mirrors cn-tool cap).
+_CONFIG_FIND_MAX_DEVICE_TABS = 50
+
+
+def write_config_find_xlsx(
+    result: Any,
+    path: Path,
+    *,
+    runtime: Any = None,
+) -> None:
+    """Write a ``MultiTermResult`` to an xlsx workbook.
+
+    Sheet layout
+    ------------
+    ``Matches``
+        One row per ``ConfigMatch``.  The ``Line #`` cell contains an
+        ``=HYPERLINK("#'DEVICE'!A<row>", <line_no>)`` formula that jumps to
+        the matching line in the device's config sheet.
+    ``<DEVICE>`` (up to ``_CONFIG_FIND_MAX_DEVICE_TABS`` device tabs)
+        Full config content of each matched device file, one line per row.
+        Only created when the source file is readable and under the
+        ``report_max_config_tab_kb`` size limit (default 512 KB).
+
+    Parameters
+    ----------
+    result:
+        A ``MultiTermResult`` from ``adapters.config_repo.search_multi_term``.
+    path:
+        Destination ``*.xlsx`` file path.
+    runtime:
+        Optional runtime used to read ``cfg["report_max_config_tab_kb"]``.
+    """
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+
+    # ---- Matches sheet -----
+    matches_sheet = workbook.active
+    matches_sheet.title = "Matches"
+    _append_xlsx_row(
+        matches_sheet,
+        ("Search Term", "Device", "Line #", "Line Content", "File Path"),
+    )
+
+    # Collect unique devices with their file paths (preserve insertion order)
+    device_file_map: dict[str, str] = {}
+    for match in result.matches:
+        if match.device not in device_file_map:
+            device_file_map[match.device] = match.file_path
+
+    # F6 (donor parity): when >50 matched devices, write only the Matches sheet
+    # with plain line numbers — no per-device config tabs and no HYPERLINK formulas.
+    # This mirrors modules/config_search.py:473-475 which returns after the Matches
+    # sheet when device count exceeds the cap (all-or-nothing behaviour).
+    over_cap = len(device_file_map) > _CONFIG_FIND_MAX_DEVICE_TABS
+
+    # Build a term index for grouping — needed for the Matches sheet regardless of cap.
+    import re as _re
+
+    term_for_match: list[str] = []
+    terms_list = list(result.term_results.keys()) if result.term_results else []
+    compiled_terms: list[Any] = []
+    for t in terms_list:
+        try:
+            compiled_terms.append((t, _re.compile(t, _re.IGNORECASE)))
+        except _re.error:
+            compiled_terms.append((t, None))
+
+    for match in result.matches:
+        assigned = ""
+        for term, pat in compiled_terms:
+            if pat is not None and pat.search(match.snippet):
+                assigned = term
+                break
+            elif pat is None and term.lower() in match.snippet.lower():
+                assigned = term
+                break
+        term_for_match.append(assigned)
+
+    if over_cap:
+        # Plain Matches sheet only — no HYPERLINK formulas, no per-device tabs.
+        for i, match in enumerate(result.matches):
+            term_label = term_for_match[i] if i < len(term_for_match) else ""
+            _append_xlsx_row(
+                matches_sheet,
+                (term_label, match.device, match.line_number, match.snippet, match.file_path),
+            )
+        workbook.save(path)
+        return
+
+    # Tabs + hyperlinks path (<=50 devices).
+    # Determine which devices will get tabs (cap at 50)
+    tabbed_devices: set[str] = set(list(device_file_map.keys())[:_CONFIG_FIND_MAX_DEVICE_TABS])
+
+    # Map device name → (1-based row number in the device tab) for each match
+    # so we can build HYPERLINK formulas.  We track line offsets per device sheet.
+    # Each device sheet row 1 = header; row 2+ = config lines.
+    # HYPERLINK formula: =HYPERLINK("#'DEVICE'!A<row_in_device_sheet>", line_no)
+    # Since device sheets have one config line per row (starting at row 1, no
+    # header), the sheet row = match.line_number + 1 (1-based).
+
+    for i, match in enumerate(result.matches):
+        term_label = term_for_match[i] if i < len(term_for_match) else ""
+        if match.device in tabbed_devices:
+            # Sheet row = line_number + 1 (0-based line → 1-based row, no header in device sheet)
+            sheet_row = match.line_number + 1
+            # hyperlink_formula is the only raw formula cell; all other cells are
+            # sanitised via _xlsx_safe_value to prevent formula injection (F4).
+            hyperlink_formula = f'=HYPERLINK("#\'{match.device}\'!A{sheet_row}", {match.line_number})'
+            matches_sheet.append(
+                [
+                    _xlsx_safe_value(term_label),
+                    _xlsx_safe_value(match.device),
+                    hyperlink_formula,  # intentional formula — keep raw
+                    _xlsx_safe_value(match.snippet),
+                    _xlsx_safe_value(match.file_path),
+                ]
+            )
+        else:
+            _append_xlsx_row(
+                matches_sheet,
+                (term_label, match.device, match.line_number, match.snippet, match.file_path),
+            )
+
+    # ---- Per-device config sheets ----
+    cfg = {}
+    if runtime is not None and hasattr(runtime, "cfg"):
+        cfg = runtime.cfg or {}
+    max_config_tab_kb = int(cfg.get("report_max_config_tab_kb", 512) or 512)
+    max_config_tab_bytes = max(1, max_config_tab_kb) * 1024
+
+    for device in list(device_file_map.keys())[:_CONFIG_FIND_MAX_DEVICE_TABS]:
+        file_path = Path(device_file_map[device])
+        try:
+            file_size = file_path.stat().st_size
+        except OSError:
+            # File not accessible — write a notice tab
+            dev_sheet = workbook.create_sheet(title=device[:31])
+            _append_xlsx_row(dev_sheet, (f"Config file not found: {device_file_map[device]}",))
+            continue
+
+        if file_size > max_config_tab_bytes:
+            dev_sheet = workbook.create_sheet(title=device[:31])
+            _append_xlsx_row(
+                dev_sheet,
+                (
+                    f"Config omitted: size {round(file_size / 1024, 1)} KB exceeds "
+                    f"limit {max_config_tab_kb} KB.",
+                ),
+            )
+            continue
+
+        try:
+            lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            dev_sheet = workbook.create_sheet(title=device[:31])
+            _append_xlsx_row(dev_sheet, (f"Error reading config: {device_file_map[device]}",))
+            continue
+
+        dev_sheet = workbook.create_sheet(title=device[:31])
+        for line in lines:
+            # Protect formula injection
+            safe = _xlsx_safe_value(line)
+            dev_sheet.append([safe])
+
+    workbook.save(path)
+
+
+def _write_config_find_run_xlsx(run: LensRun, path: Path, *, runtime: Any = None) -> None:
+    """Dispatch a config_find LensRun to the specialised xlsx writer.
+
+    Reconstructs a ``MultiTermResult``-compatible object from the per-result
+    ``summary["config_find"]["cfg_matches"]`` dicts so that
+    :func:`write_config_find_xlsx` can build the Matches sheet and per-device
+    config tabs.
+
+    Only cfg_matches (config-repo hits) are included in the specialised xlsx;
+    yaml_matches are omitted because they reference YAML paths, not line-numbered
+    config files, and the writer's hyperlink formula assumes line-numbered tabs.
+    """
+    from cn_lens.adapters.config_repo import ConfigMatch, MultiTermResult
+
+    all_matches: list[ConfigMatch] = []
+    for result in run.results:
+        cf = result.summary.get("config_find", {})
+        for m_dict in cf.get("cfg_matches", []):
+            try:
+                all_matches.append(ConfigMatch(
+                    device=m_dict.get("device", ""),
+                    file_path=m_dict.get("file_path", ""),
+                    line_number=int(m_dict.get("line_number", 0)),
+                    snippet=m_dict.get("snippet", ""),
+                    context_before=tuple(m_dict.get("context_before", ())),
+                    context_after=tuple(m_dict.get("context_after", ())),
+                ))
+            except (TypeError, ValueError):
+                # Malformed entry — skip rather than crash.
+                pass
+
+    # Use the query terms (object values) as the term keys for the term_results dict.
+    # Consume real term_status and source_status stored in the summary (F2 fix).
+    term_results: dict[str, Any] = {}
+    source_status = "live"
+    for result in run.results:
+        cf = result.summary.get("config_find", {})
+        term = result.lens_object.value
+        # Use persisted term_status when available; fall back to computed count.
+        stored_term_stat = cf.get("term_status")
+        if stored_term_stat is not None:
+            term_results[term] = stored_term_stat
+        else:
+            n_matches = len([
+                m for m in all_matches
+                if any(
+                    m_d.get("device") == m.device and m_d.get("line_number") == m.line_number
+                    for m_d in cf.get("cfg_matches", [])
+                )
+            ])
+            term_results[term] = {"matched": n_matches, "missed": n_matches == 0}
+        # Take the most specific source_status ("indexed" wins over "live").
+        stored_ss = cf.get("source_status", "live")
+        if stored_ss == "indexed":
+            source_status = "indexed"
+
+    multi_term = MultiTermResult(
+        matches=tuple(all_matches),
+        total_files_scanned=sum(
+            result.summary.get("config_find", {}).get("total_cfg_files_scanned", 0)
+            for result in run.results
+        ),
+        truncated=any(
+            result.summary.get("config_find", {}).get("truncated", False)
+            for result in run.results
+        ),
+        term_results=term_results,
+        source_status=source_status,
+    )
+
+    write_config_find_xlsx(multi_term, path, runtime=runtime)
+
+
 def render_run(run: LensRun, fmt: str, output: Path | None = None) -> str | None:
     normalized_fmt = fmt.lower()
     if normalized_fmt == "yml":
@@ -799,7 +1200,10 @@ def render_run(run: LensRun, fmt: str, output: Path | None = None) -> str | None
     if normalized_fmt == "xlsx":
         if output is None:
             raise ValueError("xlsx output requires an output path")
-        write_xlsx(run, output)
+        if run.workflow == "config_find":
+            _write_config_find_run_xlsx(run, output)
+        else:
+            write_xlsx(run, output)
         return None
 
     renderers = {
@@ -815,7 +1219,11 @@ def render_run(run: LensRun, fmt: str, output: Path | None = None) -> str | None
     if renderer is None:
         raise ValueError(f"unknown render format: {fmt}")
 
-    rendered = renderer(run)
+    # Suppress ANSI when rendering to a file so the output is plain text.
+    if normalized_fmt == "human" and output is not None:
+        rendered = render_human(run, force_ansi=False)
+    else:
+        rendered = renderer(run)
     if output is None:
         return rendered
     output.write_text(rendered, encoding="utf-8")

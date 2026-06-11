@@ -41,8 +41,14 @@ def configure_logging(logfile_location: str, log_level_str: str) -> logging.Logg
     if logger.hasHandlers():
         logger.handlers.clear()
 
-    # Create a file handler
-    if not Path(logfile_location).is_file():
+    # Create a file handler at the configured location, creating parent
+    # directories on first run. Fall back to ~/cn.log only if the configured
+    # path is unusable (permissions, read-only filesystem, ...).
+    try:
+        log_path = Path(logfile_location)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.touch(exist_ok=True)
+    except OSError:
         logfile_location = str(Path.home() / "cn.log")
 
     file_handler = ThreadSafeFileHandler(logfile_location)
@@ -56,12 +62,23 @@ def configure_logging(logfile_location: str, log_level_str: str) -> logging.Logg
     # Add the file handler to the logger
     logger.addHandler(file_handler)
 
-    # Ensure Netmiko uses the same handler instead of creating its own netmiko.log
-    netmiko_logger = logging.getLogger("netmiko")
-    netmiko_logger.setLevel(log_level_numeric)
-    netmiko_logger.propagate = False
-    netmiko_logger.handlers.clear()
-    netmiko_logger.addHandler(file_handler)
+    # Route library and package loggers to the same file handler. Without
+    # this, getLogger(__name__) loggers (route_baseline.*, utils.*, paramiko)
+    # would propagate to the handler-less root logger, where Python's
+    # lastResort handler prints WARNING+ to stderr and corrupts the Rich Live
+    # display. route_baseline.* is the active leaker today; netmiko/paramiko/
+    # utils are routed pre-emptively.
+    for managed_name in ("netmiko", "paramiko", "route_baseline", "utils"):
+        managed = logging.getLogger(managed_name)
+        if managed_name in ("netmiko", "paramiko"):
+            # packet-level DEBUG from these floods the shared log during
+            # large collections; clamp to INFO even when --log-level DEBUG
+            managed.setLevel(max(log_level_numeric, logging.INFO))
+        else:
+            managed.setLevel(log_level_numeric)
+        managed.propagate = False
+        managed.handlers.clear()
+        managed.addHandler(file_handler)
 
     # Log the successful configuration
     # logger.debug(f"Logger '{logger.name}' configured with level {log_level_str} ({log_level_numeric}) writing to {logfile_location}")

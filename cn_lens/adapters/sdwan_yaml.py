@@ -25,6 +25,7 @@ import yaml
 
 from cn_lens.adapters.types import AdapterHealth
 from cn_lens.models import LensFinding
+from utils.config import parse_optional_bool
 
 if TYPE_CHECKING:
     from cn_lens.runtime import LensRuntime
@@ -36,8 +37,34 @@ if TYPE_CHECKING:
 
 _CFG_REPO_PATHS = "sdwan_yaml_repo_paths"
 _CFG_REPO_PATH_LEGACY = "sdwan_yaml_repo_path"  # backward compat
+_CFG_ENABLED = "sdwan_yaml_enabled"
 
 _IP_PATTERN = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+
+
+# ---------------------------------------------------------------------------
+# Enabled-flag helper
+# ---------------------------------------------------------------------------
+
+def _is_sdwan_enabled(cfg: Dict[str, Any]) -> bool:
+    """Return True iff SD-WAN YAML search is enabled in *cfg*.
+
+    Replicates plugin semantics (``plugins/sdwan_yaml_search.py``):
+
+    * ``config_schema`` declares ``fallback: False`` for ``sdwan_yaml_enabled``,
+      so an absent key defaults to **disabled**.
+    * ``connect()`` gates on ``ctx.cfg.get("sdwan_yaml_enabled")`` — falsy ⇒ skip.
+
+    Therefore:
+    * Absent key  →  ``None`` from ``parse_optional_bool``  →  **disabled**.
+    * ``"false"`` / ``"0"`` / ``"no"`` / ``"off"`` / ``"f"`` / ``"n"``  →  **disabled**.
+    * ``"true"``  / ``"1"`` / ``"yes"`` / ``"on"``  / ``"t"`` / ``"y"``  →  **enabled**.
+    * Unrecognized non-empty string  →  ``None``  →  **disabled** (safe default).
+    """
+    raw = cfg.get(_CFG_ENABLED)
+    parsed = parse_optional_bool(raw)
+    # None (absent / unrecognized) → False, matching plugin fallback=False
+    return bool(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +78,12 @@ class SdwanPrefixResult:
     Fields
     ------
     prefix      : The queried prefix string.
-    status      : "found" | "not_found" | "partial".
+    status      : "found" | "not_found" | "partial" | "not_configured".
+                  ``"not_configured"`` means the adapter is explicitly disabled
+                  (``sdwan_yaml_enabled`` is false or absent); the data source
+                  was never consulted.  ``"not_found"`` means the adapter is
+                  active but the prefix is absent from the store (or the runtime
+                  is offline so data is unavailable).
     site_code   : Site that owns the match (empty string when not found).
     file_path   : Path to the YAML file containing the match.
     match_type  : "exact" | "contained" | "" (when not found).
@@ -76,7 +108,12 @@ class SdwanSiteResult:
     Fields
     ------
     site_code   : Queried site code.
-    status      : "found" | "not_found".
+    status      : "found" | "not_found" | "not_configured".
+                  ``"not_configured"`` means the adapter is explicitly disabled
+                  (``sdwan_yaml_enabled`` is false or absent); the data source
+                  was never consulted.  ``"not_found"`` means the adapter is
+                  active but the site is absent from the store (or the runtime
+                  is offline so data is unavailable).
     site_name   : Human-readable name from YAML (empty if not_found).
     file_path   : Path to the YAML file for this site.
     prefixes    : List of prefix strings configured at the site.
@@ -126,13 +163,23 @@ def _sdwan_finding(severity: str, message: str, detail: str = "") -> LensFinding
 
 
 def _short_circuit_prefix(runtime: "LensRuntime", prefix: str) -> Optional[SdwanPrefixResult]:
-    """Return a short-circuit SdwanPrefixResult when offline or unconfigured; else None."""
+    """Return a short-circuit SdwanPrefixResult when offline, disabled, or unconfigured; else None."""
+    # offline → data is unavailable (absence of data) → not_found
     if runtime.offline:
         return SdwanPrefixResult(
             prefix=prefix,
             status="not_found",
             findings=(
                 _sdwan_finding("info", "SD-WAN YAML adapter is disabled (offline mode)", "offline"),
+            ),
+        )
+    # disabled → config gate is closed (absence of config) → not_configured
+    if not _is_sdwan_enabled(runtime.cfg):
+        return SdwanPrefixResult(
+            prefix=prefix,
+            status="not_configured",
+            findings=(
+                _sdwan_finding("info", "SD-WAN YAML adapter is disabled (sdwan_yaml_enabled is false or absent)", "not_configured"),
             ),
         )
     repo_paths = _resolve_repo_paths(runtime.cfg)
@@ -148,13 +195,23 @@ def _short_circuit_prefix(runtime: "LensRuntime", prefix: str) -> Optional[Sdwan
 
 
 def _short_circuit_site(runtime: "LensRuntime", site_code: str) -> Optional[SdwanSiteResult]:
-    """Return a short-circuit SdwanSiteResult when offline or unconfigured; else None."""
+    """Return a short-circuit SdwanSiteResult when offline, disabled, or unconfigured; else None."""
+    # offline → data is unavailable (absence of data) → not_found
     if runtime.offline:
         return SdwanSiteResult(
             site_code=site_code,
             status="not_found",
             findings=(
                 _sdwan_finding("info", "SD-WAN YAML adapter is disabled (offline mode)", "offline"),
+            ),
+        )
+    # disabled → config gate is closed (absence of config) → not_configured
+    if not _is_sdwan_enabled(runtime.cfg):
+        return SdwanSiteResult(
+            site_code=site_code,
+            status="not_configured",
+            findings=(
+                _sdwan_finding("info", "SD-WAN YAML adapter is disabled (sdwan_yaml_enabled is false or absent)", "not_configured"),
             ),
         )
     repo_paths = _resolve_repo_paths(runtime.cfg)
@@ -246,6 +303,38 @@ def _site_code_from_file(file_path: str, yaml_content: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-runtime memoised store access
+# ---------------------------------------------------------------------------
+
+def _get_sdwan_store(runtime: "LensRuntime", repo_paths: List[str]) -> Dict[str, Any]:
+    """Return the parsed YAML store, loading it at most once per runtime.
+
+    The memo is keyed per-runtime only; ``repo_paths`` from the first call wins
+    for the runtime's lifetime (config is stable per invocation).
+
+    The result is cached on ``runtime._sdwan_store``.  When the attribute is
+    ``None`` (initial state set in ``LensRuntime.__init__``) or absent (e.g. a
+    MagicMock runtime in tests that has not yet had the attribute set), the
+    store is loaded via ``_load_yaml_files`` and stored back on the runtime.
+
+    The REPL ``reload`` command resets ``runtime._sdwan_store = None`` so that
+    the next call here re-parses from disk.
+
+    Parameters
+    ----------
+    runtime:
+        The active ``LensRuntime`` (or a test MagicMock with a ``logger``).
+    repo_paths:
+        Pre-resolved list of repository directory paths.
+    """
+    store = getattr(runtime, "_sdwan_store", None)
+    if store is None:
+        store = _load_yaml_files(repo_paths, runtime.logger)
+        runtime._sdwan_store = store
+    return store
+
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 
@@ -254,6 +343,14 @@ def _health(runtime: "LensRuntime") -> AdapterHealth:
     # Offline wins first
     if runtime.offline:
         return AdapterHealth(status="disabled", detail="runtime is offline")
+
+    # Explicit disabled via sdwan_yaml_enabled (absent key also means disabled —
+    # plugin config_schema fallback is False)
+    if not _is_sdwan_enabled(runtime.cfg):
+        return AdapterHealth(
+            status="not_configured",
+            detail="sdwan_yaml_enabled is false or absent in config",
+        )
 
     # Check configuration
     repo_paths = _resolve_repo_paths(runtime.cfg)
@@ -310,7 +407,7 @@ def lookup_prefix(runtime: "LensRuntime", prefix: str) -> SdwanPrefixResult:
             ),
         )
 
-    yaml_data = _load_yaml_files(repo_paths, logger)
+    yaml_data = _get_sdwan_store(runtime, repo_paths)
 
     # Single-pass: accumulate best_exact (highest priority) and best_supernet
     best_exact: Optional[SdwanPrefixResult] = None
@@ -343,6 +440,10 @@ def lookup_prefix(runtime: "LensRuntime", prefix: str) -> SdwanPrefixResult:
                             ),
                         ),
                     )
+
+                # Skip cross-version comparisons (IPv4 vs IPv6) — raises TypeError
+                if candidate.version != query_net.version:
+                    continue
 
                 # Supernet check: query_net is a subnet of candidate
                 if (
@@ -422,7 +523,7 @@ def lookup_site(runtime: "LensRuntime", site_code: str) -> SdwanSiteResult:
         return sc
 
     repo_paths = _resolve_repo_paths(runtime.cfg)
-    yaml_data = _load_yaml_files(repo_paths, logger)
+    yaml_data = _get_sdwan_store(runtime, repo_paths)
     query_upper = site_code.upper()
 
     for file_path, content in yaml_data.items():
@@ -482,6 +583,135 @@ def lookup_site(runtime: "LensRuntime", site_code: str) -> SdwanSiteResult:
     )
 
 
+def lookup_prefix_all(runtime: "LensRuntime", prefix: str) -> List[SdwanPrefixResult]:
+    """Exhaustive prefix lookup — return ALL matching entries across ALL files.
+
+    This is the plugin-equivalent mode (plan D9 ``--all-matches`` flag).  Unlike
+    :func:`lookup_prefix` which returns the single best match (exact > supernet
+    > IP-containment) and stops on the first exact hit, this function collects
+    **every** file entry that matches the query prefix in any way (exact match,
+    query is a subnet of a configured supernet, or an IP within the file value
+    falls inside the query prefix).
+
+    Parameters
+    ----------
+    runtime:
+        Active ``LensRuntime``.
+    prefix:
+        Network prefix string (e.g. ``"10.2.1.0/24"``).
+
+    Returns
+    -------
+    list[SdwanPrefixResult]
+        One ``SdwanPrefixResult`` per matching entry across all YAML files.
+        Returns an empty list when offline, disabled, unconfigured, or when
+        no entries match (never returns a ``not_found`` sentinel — callers
+        distinguish "no match" by checking ``len(result) == 0``).
+    """
+    logger = runtime.logger  # noqa: F841
+
+    # Short-circuit: offline or disabled → empty list (not "not_found" sentinel)
+    if runtime.offline:
+        return []
+    if not _is_sdwan_enabled(runtime.cfg):
+        return []
+    repo_paths = _resolve_repo_paths(runtime.cfg)
+    if not repo_paths:
+        return []
+
+    try:
+        query_net = ipaddress.ip_network(prefix, strict=False)
+    except ValueError:
+        return []
+
+    yaml_data = _get_sdwan_store(runtime, repo_paths)
+    all_matches: List[SdwanPrefixResult] = []
+
+    for file_path, content in yaml_data.items():
+        site_code = _site_code_from_file(file_path, content)
+
+        for yaml_path, value in _traverse(content):
+            str_val = str(value)
+
+            # --- Network literal check ---
+            try:
+                candidate = ipaddress.ip_network(str_val, strict=False)
+
+                # Exact match
+                if candidate == query_net:
+                    all_matches.append(SdwanPrefixResult(
+                        prefix=prefix,
+                        status="found",
+                        site_code=site_code,
+                        file_path=file_path,
+                        match_type="exact",
+                        raw=str_val,
+                        findings=(
+                            _sdwan_finding(
+                                "info",
+                                f"Exact match found in {site_code}",
+                                f"path={yaml_path}",
+                            ),
+                        ),
+                    ))
+                    continue  # move on to next leaf — don't double-count
+
+                # Skip cross-version comparisons (IPv4 vs IPv6) — raises TypeError
+                if candidate.version != query_net.version:
+                    continue
+
+                # Supernet check: query_net is a subnet of candidate
+                if (
+                    query_net.network_address >= candidate.network_address
+                    and query_net.broadcast_address <= candidate.broadcast_address
+                ):
+                    all_matches.append(SdwanPrefixResult(
+                        prefix=prefix,
+                        status="partial",
+                        site_code=site_code,
+                        file_path=file_path,
+                        match_type="contained",
+                        raw=str_val,
+                        findings=(
+                            _sdwan_finding(
+                                "info",
+                                f"{prefix} is contained within {str_val} in {site_code}",
+                                f"path={yaml_path}",
+                            ),
+                        ),
+                    ))
+                    continue
+
+            except ValueError:
+                pass  # not a network literal — check IP containment below
+
+            # --- IP containment: IPs extracted from the value inside query_net ---
+            for ip_str in _IP_PATTERN.findall(str_val):
+                try:
+                    ip_addr = ipaddress.ip_address(ip_str)
+                    if ip_addr in query_net:
+                        all_matches.append(SdwanPrefixResult(
+                            prefix=prefix,
+                            status="found",
+                            site_code=site_code,
+                            file_path=file_path,
+                            match_type="contained",
+                            raw=str_val,
+                            findings=(
+                                _sdwan_finding(
+                                    "info",
+                                    f"IP {ip_str} within {prefix} found in {site_code}",
+                                    f"path={yaml_path}",
+                                ),
+                            ),
+                        ))
+                        break  # one match per leaf value is sufficient
+                except ValueError:
+                    continue
+
+    return all_matches
+
+
 def search_by_keyword(runtime: "LensRuntime", term: str) -> List[SdwanMatch]:
     """Search all loaded YAML files for a keyword (case-insensitive regex).
 
@@ -493,6 +723,9 @@ def search_by_keyword(runtime: "LensRuntime", term: str) -> List[SdwanMatch]:
     if runtime.offline:
         return []
 
+    if not _is_sdwan_enabled(runtime.cfg):
+        return []
+
     repo_paths = _resolve_repo_paths(runtime.cfg)
     if not repo_paths:
         return []
@@ -500,7 +733,7 @@ def search_by_keyword(runtime: "LensRuntime", term: str) -> List[SdwanMatch]:
     # re.escape always produces a valid regex — no try/except needed.
     pattern = re.compile(re.escape(term), re.IGNORECASE)
 
-    yaml_data = _load_yaml_files(repo_paths, logger)
+    yaml_data = _get_sdwan_store(runtime, repo_paths)
     matches: List[SdwanMatch] = []
 
     for file_path, content in yaml_data.items():

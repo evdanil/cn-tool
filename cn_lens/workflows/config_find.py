@@ -58,9 +58,10 @@ from cn_lens.models import (
     ObjectSet,
 )
 from cn_lens.workflows._helpers import (
-    make_run_id as _make_run_id,
+    OFFLINE_FINDING_MESSAGE,
+    make_run_id,
     maybe_persist,
-    synthesise_error_finding as _synthesise_error_finding,
+    synthesise_error_finding,
 )
 
 if TYPE_CHECKING:
@@ -73,10 +74,6 @@ if TYPE_CHECKING:
 
 _VALID_SCOPES = frozenset({"all", "cfg", "yaml"})
 
-_OFFLINE_SOURCES: Dict[str, str] = {
-    "config_repo": "not_queried",
-    "sdwan_yaml": "not_queried",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +82,7 @@ _OFFLINE_SOURCES: Dict[str, str] = {
 
 # _error_finding is an alias for the shared helper; kept for readability at
 # call sites within this module.
-_error_finding = _synthesise_error_finding
+_error_finding = synthesise_error_finding
 
 
 # ---------------------------------------------------------------------------
@@ -217,41 +214,148 @@ def config_find_objects(
     elif runtime is not None and runtime.options.run_id is not None:
         effective_run_id = runtime.options.run_id
     else:
-        effective_run_id = _make_run_id()
+        effective_run_id = make_run_id()
 
     # --- Offline / None runtime path ---
     if runtime is None or runtime.offline:
+        registry = get_registry()
+        offline_sources: Dict[str, str] = {"classifier": "ok"}
+        offline_sources.update(registry.source_statuses(runtime, offline=True))
+        offline_finding = LensFinding(
+            severity="info",
+            source="classifier",
+            message=OFFLINE_FINDING_MESSAGE,
+            detail={},
+        )
+        offline_results = tuple(
+            LensResult(
+                lens_object=obj,
+                status="classified",
+                summary={
+                    "original": obj.original,
+                    "normalized": obj.normalized,
+                    "type": obj.object_type.value,
+                },
+                sources=offline_sources,
+                findings=(offline_finding,),
+            )
+            for obj in object_set.objects
+        )
         return LensRun(
             schema_version=1,
             tool="cn-lens",
             workflow="config_find",
             run_id=effective_run_id,
             inputs=object_set,
-            results=(),
+            results=offline_results,
             warnings=(),
             errors=(),
         )
 
     # --- Online path ---
+    from cn_lens.adapters import config_repo as _cr_mod
+    from cn_lens.adapters import sdwan_yaml as _sdwan_mod
+
     registry = get_registry()
-    sources: Dict[str, str] = {"config_repo": "not_queried", "sdwan_yaml": "not_queried"}
+    # classifier: ok is always present for uniformity with other workflows (e.g. inspect)
+    sources: Dict[str, str] = {"classifier": "ok"}
     sources.update(registry.source_statuses(runtime))
 
     results: List[LensResult] = []
     warnings: List[str] = []
 
-    for obj in object_set.objects:
-        # Skip INVALID objects
-        if obj.object_type == LensObjectType.INVALID:
-            continue
+    # ---- single-pass multi-term config_repo search (F2) ----
+    # One search_multi_term call over all query terms replaces N calls to
+    # config_repo.search (N-pass).  This surfaces source_status (indexed/live)
+    # and per-term matched/missed statistics from MultiTermResult.
+    terms = [obj.value for obj in object_set.objects]
+    multi_result = None
+    multi_findings: List[LensFinding] = []
 
-        cf_summary, findings = _run_object(obj, runtime, scope, limit)
-
-        # Emit a workflow-level warning if config_repo truncated
-        if cf_summary.get("truncated"):
-            warnings.append(
-                f"config_find: results for {obj.value!r} were truncated by config_repo (limit={limit})"
+    if scope in ("all", "cfg") and terms:
+        try:
+            multi_result = _cr_mod.search_multi_term(runtime, terms, limit=limit)
+            if multi_result.truncated:
+                warnings.append(
+                    f"config_find: config_repo results were truncated (limit={limit})"
+                )
+        except Exception as exc:
+            runtime.logger.error(
+                "config_find: config_repo.search_multi_term raised unexpectedly: %s", exc
             )
+            multi_findings.append(_error_finding("config_repo", exc))
+
+    # Build per-term match dicts for fast lookup using the authoritative
+    # matches_by_term mapping produced directly by the scan loop.  This avoids
+    # the unreliable snippet re-inference that misattributed CIDR/IP matches
+    # whose lines contain an IP inside the queried prefix (but not the CIDR
+    # text itself) to terms[0] instead of the prefix term that claimed them.
+    per_term_matches: Dict[str, List[dict]] = {t: [] for t in terms}
+    if multi_result is not None:
+        for term in terms:
+            per_term_matches[term] = [
+                dataclasses.asdict(m)
+                for m in multi_result.matches_by_term.get(term, [])
+            ]
+
+    for obj in object_set.objects:
+        query = obj.value
+        findings: List[LensFinding] = list(multi_findings)
+        cfg_matches = per_term_matches.get(query, [])
+
+        # term_status from multi_result (or fallback when search failed/offline)
+        if multi_result is not None:
+            term_stat = multi_result.term_results.get(query, {"matched": len(cfg_matches), "missed": len(cfg_matches) == 0})
+            source_status = multi_result.source_status
+        else:
+            term_stat = {"matched": len(cfg_matches), "missed": len(cfg_matches) == 0}
+            source_status = "live"
+
+        total_cfg_files_scanned = (
+            multi_result.total_files_scanned if multi_result is not None else 0
+        )
+        truncated = multi_result.truncated if multi_result is not None else False
+
+        # ---- sdwan_yaml side (per-object, unchanged) ----
+        yaml_matches: List[dict] = []
+        if scope in ("all", "yaml"):
+            try:
+                kw_matches = _sdwan_mod.search_by_keyword(runtime, query)
+                yaml_matches.extend(dataclasses.asdict(m) for m in kw_matches)
+            except Exception as exc:
+                runtime.logger.error(
+                    "config_find: sdwan_yaml.search_by_keyword raised unexpectedly: %s", exc
+                )
+                findings.append(_error_finding("sdwan_yaml", exc))
+
+            if obj.object_type == LensObjectType.PREFIX:
+                try:
+                    pfx_result = _sdwan_mod.lookup_prefix(runtime, query)
+                    findings.extend(pfx_result.findings)
+                except Exception as exc:
+                    runtime.logger.error(
+                        "config_find: sdwan_yaml.lookup_prefix raised unexpectedly: %s", exc
+                    )
+                    findings.append(_error_finding("sdwan_yaml.lookup_prefix", exc))
+
+            if obj.object_type == LensObjectType.SITE:
+                try:
+                    site_result = _sdwan_mod.lookup_site(runtime, query)
+                    findings.extend(site_result.findings)
+                except Exception as exc:
+                    runtime.logger.error(
+                        "config_find: sdwan_yaml.lookup_site raised unexpectedly: %s", exc
+                    )
+                    findings.append(_error_finding("sdwan_yaml.lookup_site", exc))
+
+        cf_summary: Dict[str, Any] = {
+            "cfg_matches": cfg_matches,
+            "yaml_matches": yaml_matches,
+            "total_cfg_files_scanned": total_cfg_files_scanned,
+            "truncated": truncated,
+            "term_status": term_stat,
+            "source_status": source_status,
+        }
 
         result_summary: Dict[str, Any] = {
             "original": obj.original,
@@ -263,7 +367,7 @@ def config_find_objects(
         results.append(
             LensResult(
                 lens_object=obj,
-                status="searched",
+                status="classified",
                 summary=result_summary,
                 sources=sources,
                 findings=tuple(findings),

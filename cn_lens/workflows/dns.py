@@ -24,7 +24,7 @@ Per-type adapter mapping:
 workflow-level summary["dns"] block
 --------------------------------------
   forward:           dict[name, list[ip]]   — name-to-IPs from forward lookups
-  reverse:           dict[ip, str|None]     — ip-to-PTR from reverse lookups
+  reverse:           dict[ip, {"ptr": str|None, "aliases": list[str]}]  — ip-to-PTR/aliases from reverse lookups
   infoblox_records:  dict[str, ...]         — IB cross-reference per name/IP
 
 LensRun.warnings gets a string when prefix > /28 truncation occurs.
@@ -37,13 +37,13 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from cn_lens.adapters import dns as _dns
 from cn_lens.adapters import infoblox as _ib
 from cn_lens.adapters.registry import get_registry
-from cn_lens.models import LensFinding, LensObject, LensObjectType, LensResult, LensRun, ObjectSet
+from cn_lens.models import LensFinding, LensObject, LensObjectType, LensRun, ObjectSet
 from cn_lens.workflows._helpers import (
     OFFLINE_FINDING_MESSAGE as _OFFLINE_MESSAGE,
     CLASSIFIED_FINDING_MESSAGE as _CLASSIFIED_MESSAGE,
     is_short_hostname as _is_fqdn_prefix,
-    make_run_id,
-    maybe_persist,
+    run_workflow,
+    synthesise_error_finding,
 )
 
 if TYPE_CHECKING:
@@ -69,14 +69,6 @@ def _classifier_finding(
     )
 
 
-def _error_finding(source: str, exc: Exception) -> LensFinding:
-    return LensFinding(
-        severity="error",
-        source=source,
-        message=str(exc),
-        detail={"exception": type(exc).__name__},
-    )
-
 
 def _warning_finding(source: str, message: str) -> LensFinding:
     return LensFinding(
@@ -97,17 +89,11 @@ def _info_finding(source: str, message: str, detail: Dict[str, Any] | None = Non
 
 
 # ---------------------------------------------------------------------------
-# Offline / None path
+# Offline result builder
 # ---------------------------------------------------------------------------
 
-_OFFLINE_SOURCES: Dict[str, str] = {
-    "classifier": "ok",
-    "dns": "not_queried",
-    "infoblox": "not_queried",
-}
-
-
-def _build_offline_result(obj: LensObject) -> LensResult:
+def _build_offline_result(obj: LensObject, sources: Dict[str, str]):
+    from cn_lens.models import LensResult
     return LensResult(
         lens_object=obj,
         status="classified",
@@ -116,7 +102,7 @@ def _build_offline_result(obj: LensObject) -> LensResult:
             "normalized": obj.normalized,
             "type": obj.object_type.value,
         },
-        sources=_OFFLINE_SOURCES,
+        sources=sources,
         findings=(_classifier_finding(message=_OFFLINE_MESSAGE),),
     )
 
@@ -133,7 +119,7 @@ def _run_ip(
 ) -> Tuple[Dict[str, Any], List[LensFinding]]:
     """IP: dns.resolve_reverse + infoblox.lookup_ip."""
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     ip = obj.value
 
     dns_reverse: Dict[str, Optional[str]] = {}
@@ -141,13 +127,13 @@ def _run_ip(
     # 1. dns.resolve_reverse
     try:
         rev = _dns.resolve_reverse(runtime, ip)
-        dns_reverse[ip] = rev.ptr
+        dns_reverse[ip] = {"ptr": rev.ptr, "aliases": list(rev.aliases)}
         if rev.status != "ok" and rev.ptr is None:
             findings.append(_info_finding("dns", f"reverse lookup returned no PTR for {ip}", {"status": rev.status}))
     except Exception as exc:
         runtime.logger.error("dns: resolve_reverse raised unexpectedly: %s", exc)
-        findings.append(_error_finding("dns", exc))
-        dns_reverse[ip] = None
+        findings.append(synthesise_error_finding("dns", exc))
+        dns_reverse[ip] = {"ptr": None, "aliases": []}
 
     # 2. infoblox.lookup_ip
     ib_records: Dict[str, Any] = {}
@@ -162,7 +148,7 @@ def _run_ip(
         findings.extend(ib_result.findings)
     except Exception as exc:
         runtime.logger.error("dns: infoblox.lookup_ip raised unexpectedly: %s", exc)
-        findings.append(_error_finding("infoblox", exc))
+        findings.append(synthesise_error_finding("infoblox", exc))
         ib_records[ip] = {"found": False, "error": str(exc)}
 
     summary["dns"] = {
@@ -181,7 +167,7 @@ def _run_fqdn(
 ) -> Tuple[Dict[str, Any], List[LensFinding]]:
     """FQDN: dns.resolve_forward + infoblox.lookup_fqdn + optional expand."""
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     fqdn = obj.value
 
     dns_forward: Dict[str, List[str]] = {}
@@ -193,7 +179,7 @@ def _run_fqdn(
         dns_forward[fqdn] = list(fwd.a_records) + list(fwd.aaaa_records)
     except Exception as exc:
         runtime.logger.error("dns: resolve_forward raised unexpectedly: %s", exc)
-        findings.append(_error_finding("dns", exc))
+        findings.append(synthesise_error_finding("dns", exc))
         dns_forward[fqdn] = []
 
     # 2. infoblox.lookup_fqdn
@@ -207,7 +193,7 @@ def _run_fqdn(
         findings.extend(ib_result.findings)
     except Exception as exc:
         runtime.logger.error("dns: infoblox.lookup_fqdn raised unexpectedly: %s", exc)
-        findings.append(_error_finding("infoblox", exc))
+        findings.append(synthesise_error_finding("infoblox", exc))
         ib_records[fqdn] = {"found": False, "error": str(exc)}
 
     # 3. dns.expand_fqdn_prefix (only for short labels)
@@ -218,12 +204,40 @@ def _run_fqdn(
             expansion = {"names": list(exp.names), "status": exp.status}
         except Exception as exc:
             runtime.logger.error("dns: expand_fqdn_prefix raised unexpectedly: %s", exc)
-            findings.append(_error_finding("dns", exc))
+            findings.append(synthesise_error_finding("dns", exc))
             expansion = {"error": str(exc)}
+
+    # 4. Bidirectional cross-check: for each forward-resolved IP, reverse-resolve
+    #    and compare PTR back to the queried FQDN (mirrors bulk_resolve semantics).
+    #    DNS names are case-insensitive and resolvers may return trailing-dot
+    #    canonical forms, so normalise both sides before comparing.  The raw ptr
+    #    value in the output is never modified.
+    def _normalise_dns_name(name: str) -> str:
+        return name.lower().rstrip(".")
+
+    reverse_check: Dict[str, Any] = {}
+    resolved_ips = dns_forward.get(fqdn, [])
+    for ip in resolved_ips:
+        try:
+            rev = _dns.resolve_reverse(runtime, ip)
+            match = (
+                _normalise_dns_name(rev.ptr) == _normalise_dns_name(fqdn)
+                if rev.ptr is not None
+                else False
+            )
+            reverse_check[ip] = {
+                "ptr": rev.ptr,
+                "match": match,
+            }
+        except Exception as exc:
+            runtime.logger.error("dns: resolve_reverse raised for %s during cross-check: %s", ip, exc)
+            findings.append(synthesise_error_finding("dns", exc))
+            reverse_check[ip] = {"ptr": None, "match": False}
 
     dns_block: Dict[str, Any] = {
         "forward": dns_forward,
         "reverse": {},
+        "reverse_check": reverse_check,
         "infoblox_records": ib_records,
     }
     if expansion:
@@ -239,14 +253,9 @@ def _run_prefix(
     base_summary: Dict[str, Any],
     run_warnings: List[str],
 ) -> Tuple[Dict[str, Any], List[LensFinding]]:
-    """PREFIX: per-host dns.resolve_reverse (if <=16 hosts) + infoblox.lookup_prefix.
-
-    The per-host reverse loop is capped at _PREFIX_REVERSE_CAP (16) hosts.
-    When the prefix size exceeds /28 (> 16 host addresses) the loop is skipped
-    entirely and a warning is emitted.
-    """
+    """PREFIX: per-host dns.resolve_reverse (if <=16 hosts) + infoblox.lookup_prefix."""
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     prefix_str = obj.value
 
     dns_reverse: Dict[str, Optional[str]] = {}
@@ -274,11 +283,11 @@ def _run_prefix(
             ip = str(host)
             try:
                 rev = _dns.resolve_reverse(runtime, ip)
-                dns_reverse[ip] = rev.ptr
+                dns_reverse[ip] = {"ptr": rev.ptr, "aliases": list(rev.aliases)}
             except Exception as exc:
                 runtime.logger.error("dns: resolve_reverse raised for %s: %s", ip, exc)
-                findings.append(_error_finding("dns", exc))
-                dns_reverse[ip] = None
+                findings.append(synthesise_error_finding("dns", exc))
+                dns_reverse[ip] = {"ptr": None, "aliases": []}
 
     # infoblox.lookup_prefix — always called regardless of size
     try:
@@ -291,7 +300,7 @@ def _run_prefix(
         findings.extend(ib_result.findings)
     except Exception as exc:
         runtime.logger.error("dns: infoblox.lookup_prefix raised unexpectedly: %s", exc)
-        findings.append(_error_finding("infoblox", exc))
+        findings.append(synthesise_error_finding("infoblox", exc))
         ib_records[prefix_str] = {"found": False, "error": str(exc)}
 
     summary["dns"] = {
@@ -308,64 +317,33 @@ def _run_site_or_device(
     base_summary: Dict[str, Any],
     run_warnings: List[str],
 ) -> Tuple[Dict[str, Any], List[LensFinding]]:
-    """SITE / DEVICE: classifier-only; info finding; no adapter calls.
-
-    ``run_warnings`` is accepted but intentionally unused here — the parameter
-    is kept to maintain a uniform dispatch-table signature across all handlers.
-    """
+    """SITE / DEVICE: classifier-only; info finding; no adapter calls."""
     summary: Dict[str, Any] = dict(base_summary)
     findings: List[LensFinding] = [
-        _info_finding("dns", _NOT_ENRICHED_MESSAGE, {"type": obj.object_type.value})
+        _classifier_finding(),
+        _info_finding("dns", _NOT_ENRICHED_MESSAGE, {"type": obj.object_type.value}),
     ]
     return summary, findings
 
 
 # ---------------------------------------------------------------------------
-# Online per-object runner
+# Dispatch table builder (closures capture run_warnings)
 # ---------------------------------------------------------------------------
 
-_DISPATCH = {
-    LensObjectType.IP: _run_ip,
-    LensObjectType.FQDN: _run_fqdn,
-    LensObjectType.PREFIX: _run_prefix,
-    LensObjectType.SITE: _run_site_or_device,
-    LensObjectType.DEVICE: _run_site_or_device,
-}
+def _make_dispatch(run_warnings: List[str]) -> Dict[LensObjectType, Any]:
+    """Return a dispatch table whose handlers capture the shared run_warnings list."""
+    def wrap(fn):
+        def handler(runtime, obj, base_summary):
+            return fn(runtime, obj, base_summary, run_warnings)
+        return handler
 
-
-def _build_online_result(
-    obj: LensObject,
-    runtime: "LensRuntime",
-    sources: Dict[str, str],
-    run_warnings: List[str],
-) -> LensResult:
-    base_summary: Dict[str, Any] = {
-        "original": obj.original,
-        "normalized": obj.normalized,
-        "type": obj.object_type.value,
+    return {
+        LensObjectType.IP: wrap(_run_ip),
+        LensObjectType.FQDN: wrap(_run_fqdn),
+        LensObjectType.PREFIX: wrap(_run_prefix),
+        LensObjectType.SITE: wrap(_run_site_or_device),
+        LensObjectType.DEVICE: wrap(_run_site_or_device),
     }
-
-    findings: List[LensFinding] = [_classifier_finding()]
-
-    dispatcher = _DISPATCH.get(obj.object_type)
-    if dispatcher is not None:
-        try:
-            summary, adapter_findings = dispatcher(runtime, obj, base_summary, run_warnings)
-            findings.extend(adapter_findings)
-        except Exception as exc:
-            runtime.logger.error("dns: unexpected error in dispatcher: %s", exc)
-            summary = dict(base_summary)
-            findings.append(_error_finding("dns", exc))
-    else:
-        summary = dict(base_summary)
-
-    return LensResult(
-        lens_object=obj,
-        status="classified",
-        summary=summary,
-        sources=sources,
-        findings=tuple(findings),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -400,49 +378,15 @@ def dns_objects(
     LensRun
         Always returned; never raises.
     """
-    # Resolve run_id
-    if run_id is not None:
-        effective_run_id = run_id
-    elif runtime is not None and runtime.options.run_id is not None:
-        effective_run_id = runtime.options.run_id
-    else:
-        effective_run_id = make_run_id()
-
-    # Offline path
-    if runtime is None or runtime.offline:
-        results = tuple(_build_offline_result(obj) for obj in object_set.objects)
-        return LensRun(
-            schema_version=1,
-            tool="cn-lens",
-            workflow="dns",
-            run_id=effective_run_id,
-            inputs=object_set,
-            results=results,
-            warnings=(),
-            errors=(),
-        )
-
-    # Online path
-    registry = get_registry()
-    sources: Dict[str, str] = {"classifier": "ok"}
-    sources.update(registry.source_statuses(runtime))
-
     run_warnings: List[str] = []
 
-    results = tuple(
-        _build_online_result(obj, runtime, sources, run_warnings)
-        for obj in object_set.objects
+    return run_workflow(
+        "dns",
+        object_set,
+        runtime,
+        registry=get_registry(),
+        run_id=run_id,
+        dispatch=_make_dispatch(run_warnings),
+        offline_result_fn=_build_offline_result,
+        run_warnings=run_warnings,
     )
-
-    run = LensRun(
-        schema_version=1,
-        tool="cn-lens",
-        workflow="dns",
-        run_id=effective_run_id,
-        inputs=object_set,
-        results=results,
-        warnings=tuple(run_warnings),
-        errors=(),
-    )
-    maybe_persist(run, runtime)
-    return run

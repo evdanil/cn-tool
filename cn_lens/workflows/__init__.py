@@ -7,7 +7,6 @@ everywhere it is currently called (cli.py, interactive.py, tests).
 from cn_lens.workflows.inspect import (
     inspect_objects,
     make_run_id,
-    MVP_FINDING_MESSAGE,
     OFFLINE_FINDING_MESSAGE,
     CLASSIFIED_FINDING_MESSAGE,
 )
@@ -19,12 +18,14 @@ from cn_lens.workflows.allocate import allocate_objects
 from cn_lens.workflows.validate_site import validate_site_objects
 from cn_lens.workflows.device import device_objects
 from cn_lens.workflows.reachability import reachability_objects
-from cn_lens.workflows.report import report_objects, report_runs
+from cn_lens.workflows.bssid import bssid_convert
+from cn_lens.workflows.report import report_runs
+from cn_lens.workflows.stats import stats_objects
+from cn_lens.workflows.e911 import e911_objects
 
 __all__ = [
     "inspect_objects",
     "make_run_id",
-    "MVP_FINDING_MESSAGE",
     "OFFLINE_FINDING_MESSAGE",
     "CLASSIFIED_FINDING_MESSAGE",
     "impact_objects",
@@ -35,6 +36,8 @@ __all__ = [
     "validate_site_objects",
     "device_objects",
     "reachability_objects",
-    "report_objects",
     "report_runs",
+    "bssid_convert",
+    "stats_objects",
+    "e911_objects",
 ]

@@ -53,8 +53,15 @@ _DEFAULT_OUTPUT_DIR = "./output"
 # ---------------------------------------------------------------------------
 
 def _output_dir(runtime: "LensRuntime") -> Path:
-    """Resolve the base output directory from the runtime config."""
-    raw = runtime.cfg.get("output_dir") or _DEFAULT_OUTPUT_DIR
+    """Resolve the base output directory from the runtime config.
+
+    Only accepts a ``str`` or ``Path`` value from the config; any other type
+    (e.g. a ``MagicMock`` in tests, or an unexpected object at runtime) is
+    silently discarded in favour of ``_DEFAULT_OUTPUT_DIR``.
+    """
+    raw = runtime.cfg.get("output_dir")
+    if not isinstance(raw, (str, Path)) or not str(raw).strip():
+        raw = _DEFAULT_OUTPUT_DIR
     return Path(str(raw)).expanduser()
 
 
@@ -173,6 +180,177 @@ def list_runs(
     if limit is not None:
         paths = paths[:limit]
     return paths
+
+
+# ---------------------------------------------------------------------------
+# prune_runs
+# ---------------------------------------------------------------------------
+
+def prune_runs(
+    runtime: "LensRuntime | None",
+    *,
+    keep: int | None = None,
+    older_than_days: int | None = None,
+) -> list[str]:
+    """Delete persisted runs according to the given pruning policy.
+
+    Parameters
+    ----------
+    runtime:
+        Active runtime.  Returns ``[]`` when ``None``.
+    keep:
+        When provided, keep the *keep* newest runs and delete all others.
+        Mutually exclusive with *older_than_days*.
+    older_than_days:
+        When provided, delete every run whose ``run.json.gz`` was last modified
+        more than *older_than_days* days ago.  Mutually exclusive with *keep*.
+
+    Returns
+    -------
+    list[str]
+        List of run_ids that were deleted.
+
+    Raises
+    ------
+    ValueError
+        When both *keep* and *older_than_days* are given (mutually exclusive),
+        or when neither is given.
+    """
+    if keep is not None and older_than_days is not None:
+        raise ValueError(
+            "prune_runs: --keep and --older-than are mutually exclusive; provide exactly one"
+        )
+    if keep is None and older_than_days is None:
+        raise ValueError(
+            "prune_runs: specify either keep= or older_than_days="
+        )
+    if older_than_days is not None and older_than_days < 0:
+        raise ValueError(
+            f"prune_runs: older_than_days must be >= 0, got {older_than_days!r}"
+        )
+    if keep is not None and keep < 0:
+        raise ValueError(
+            f"prune_runs: keep must be >= 0, got {keep!r}"
+        )
+
+    if runtime is None:
+        return []
+
+    all_paths = list_runs(runtime)  # newest-first, each is run.json.gz
+    to_delete: list[Path] = []
+
+    if keep is not None:
+        # Keep the *keep* newest; delete the rest
+        to_delete = all_paths[keep:]
+    else:
+        # older_than_days is set
+        import time as _time
+        cutoff = _time.time() - (older_than_days * 86400)  # type: ignore[operator]
+        to_delete = [p for p in all_paths if p.stat().st_mtime < cutoff]
+
+    deleted_ids: list[str] = []
+    for p in to_delete:
+        run_dir = p.parent
+        run_id = run_dir.name
+        try:
+            import shutil
+            shutil.rmtree(run_dir)
+            deleted_ids.append(run_id)
+            _LOG.debug("prune_runs: removed %s", run_dir)
+        except Exception as exc:
+            _LOG.warning("prune_runs: could not remove %s: %s", run_dir, exc)
+
+    return deleted_ids
+
+
+# ---------------------------------------------------------------------------
+# delete_run
+# ---------------------------------------------------------------------------
+
+def delete_run(
+    run_id: str,
+    runtime: "LensRuntime | None",
+) -> bool:
+    """Delete the run directory for *run_id*.
+
+    The delete is strictly scoped to ``<output_dir>/cn-lens/``.  Any *run_id*
+    that would resolve to a path outside that directory (path traversal via
+    ``../../``, absolute paths, or symlinks) is rejected with ``ValueError``
+    before any filesystem access.
+
+    Parameters
+    ----------
+    run_id:
+        The run identifier (directory name under ``<output_dir>/cn-lens/``).
+    runtime:
+        Active runtime.  Returns ``False`` when ``None``.
+
+    Returns
+    -------
+    bool
+        ``True`` if the run directory existed and was removed; ``False``
+        if it did not exist (or *runtime* is ``None``).
+
+    Raises
+    ------
+    ValueError
+        When *run_id* resolves to a path outside the lens directory.
+    """
+    if runtime is None:
+        return False
+
+    # Early token-level validation: run_id must be a single directory-name
+    # token with no path separators and must not be a dot-alias.
+    if (
+        not run_id
+        or not run_id.strip()
+        or "/" in run_id
+        or "\\" in run_id
+        or run_id in (".", "..")
+    ):
+        raise ValueError(
+            f"delete_run: invalid run_id {run_id!r} — must be a single "
+            "non-empty directory name with no path separators"
+        )
+
+    base = (_output_dir(runtime) / "cn-lens").resolve()
+
+    # Resolve the candidate path.  We use .resolve() so that both relative
+    # traversal (``../../etc``) and symlinks pointing outside are caught.
+    candidate = (base / run_id).resolve()
+
+    # Safety: the resolved candidate must be a strict child of base.
+    try:
+        rel = candidate.relative_to(base)
+    except ValueError:
+        raise ValueError(
+            f"delete_run: run_id {run_id!r} resolves outside the lens directory "
+            f"({candidate} is not under {base})"
+        )
+
+    # Guard against self-deletion: reject candidates that resolve to the
+    # lens directory itself (e.g. run_id="./", or "../cn-lens").
+    if rel == Path(".") or candidate == base:
+        raise ValueError(
+            f"delete_run: run_id {run_id!r} resolves to the lens directory "
+            "itself, refusing to delete"
+        )
+
+    # The run directory is candidate itself (which equals base / run_id after
+    # resolution).  Only delete if it is a real directory (not a file, not a
+    # symlink to outside — already guarded above).
+    if not candidate.is_dir():
+        return False
+
+    try:
+        import shutil
+        shutil.rmtree(candidate)
+        _LOG.debug("delete_run: removed %s", candidate)
+        return True
+    except Exception as exc:
+        logger = getattr(runtime, "logger", _LOG)
+        logger.warning("delete_run: could not remove %s: %s", candidate, exc)
+        return False
 
 
 # ---------------------------------------------------------------------------

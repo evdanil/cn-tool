@@ -35,13 +35,14 @@ except ImportError:
     pass
 
 # --- Core Application Imports ---
+import cn_buildstamp
 from core.base import ScriptContext
 from core.event_bus import EventBus
 from core.loader import load_modules_and_plugins
 
 # --- Utility Imports ---
 from utils.app_lifecycle import exit_now
-from utils.config import BASE_CONFIG_SCHEMA, parse_optional_bool, read_config, setup_from_args
+from utils.config import BASE_CONFIG_SCHEMA, normalize_runtime_flags, parse_optional_bool, read_config, setup_from_args
 from utils.display import console, get_global_color_scheme, set_global_color_scheme
 from utils.file_io import start_worker, check_dir_accessibility
 from utils.logging import configure_logging
@@ -56,7 +57,16 @@ del EMOJI["cd"]
 
 
 # --- Global Constants ---
-VERSION = '0.2.88 hash 1b5d97f'
+# Read at runtime from the repo-root ``version`` file (CI-managed). Previously
+# the CI injected this string into the source via sed at build time; reading it
+# at runtime keeps cn-tool consistent with the bundled CLIs and lets it report a
+# real version straight from a git checkout. Falls back to "unknown" only when
+# the version file is absent.
+# NOTE: the ``VERSION`` name is load-bearing — .github/workflows/build.yml's
+# menu_header sed (around line 136) injects an f-string referencing ``{VERSION}``
+# into this file for the shell build, so renaming this global passes local tests
+# but NameErrors in the patched release.
+VERSION = cn_buildstamp.package_version_string()
 
 
 def _get_config_paths(args: argparse.Namespace) -> list[Path]:
@@ -198,47 +208,21 @@ Please send any feedback/feature requests to evdanil@gmail.com
     # Add non-user-configurable values to the config dict
     cfg["version"] = VERSION
 
-    # 1. Check for Infoblox API readiness
+    # 1 & 2. Normalize infoblox_enabled and config_repo_enabled booleans.
+    #    normalize_runtime_flags encapsulates the same logic used by cn-lens so
+    #    both entry-points share identical semantics.
     final_message = ''
-    if cfg.get("api_endpoint") == "API_URL" or not cfg.get("api_endpoint"):
-        log_msg = "Infoblox API URL is not set. Infoblox-related modules will be disabled."
-        logger.warning(log_msg)
-        final_message += log_msg + '\n'
-        cfg['infoblox_enabled'] = False
-    else:
-        cfg['infoblox_enabled'] = True
+    _repo_explicit_true = parse_optional_bool(cfg.get("config_repo_enabled")) is True
+    normalize_runtime_flags(cfg, logger)
 
-    # 2. Check for Configuration Repo readiness
-    #    enabled = true/false  → explicit opt-in/out
-    #    enabled absent        → auto-detect from directory accessibility
-    #    [config_repo] absent  → disabled (no warning)
-    repo_enabled_value = cfg.get("config_repo_enabled", "")
-    repo_enabled_raw = str(repo_enabled_value).strip()
-    repo_enabled = parse_optional_bool(repo_enabled_value)
-    if repo_enabled is False:
-        logger.info("Configuration repository explicitly disabled in config.")
-        cfg['config_repo_enabled'] = False
-    elif repo_enabled is True:
-        if not check_dir_accessibility(logger, cfg.get("config_repo_directory", "dummy_dir")):
-            log_msg = "Configuration repository directory is not accessible. Config search modules will be disabled."
-            logger.warning(log_msg)
-            final_message += log_msg + '\n'
-            cfg['config_repo_enabled'] = False
-        else:
-            cfg['config_repo_enabled'] = True
-    else:
-        if repo_enabled_raw:
-            logger.warning(
-                "Invalid value for config_repo.enabled: %r. Falling back to auto-detect.",
-                repo_enabled_raw,
-            )
-        # Not set — auto-detect: check directory only if it looks intentionally configured
-        repo_dir = cfg.get("config_repo_directory")
-        if repo_dir and check_dir_accessibility(logger, repo_dir):
-            cfg['config_repo_enabled'] = True
-        else:
-            logger.info("Configuration repository not configured or directory not accessible, skipping.")
-            cfg['config_repo_enabled'] = False
+    # Rebuild the user-visible banner from the normalized bools so the
+    # interactive UI still shows the startup warning with the sleep delay.
+    if not cfg['infoblox_enabled']:
+        log_msg = "Infoblox API URL is not set. Infoblox-related modules will be disabled."
+        final_message += log_msg + '\n'
+    if _repo_explicit_true and not cfg['config_repo_enabled']:
+        log_msg = "Configuration repository directory is not accessible. Config search modules will be disabled."
+        final_message += log_msg + '\n'
 
     # 3. Check report file accessibility
     if not check_dir_accessibility(logger, cfg["report_file"].parent):

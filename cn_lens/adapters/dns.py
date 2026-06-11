@@ -1,19 +1,16 @@
 """DNS / Bulk Resolve adapter for cn-lens (Task 11).
 
 Wraps stdlib ``socket`` (getaddrinfo / gethostbyaddr) — dnspython is not in
-requirements.txt so we stay with the stdlib.  Concurrency lives here via
-``ThreadPoolExecutor``; workflows need not know about threading.
+requirements.txt so we stay with the stdlib.
 
 Public surface
 --------------
 DnsForwardResult   — A + AAAA records for a single name
 DnsReverseResult   — PTR record for a single IP
-DnsBatchResult     — per-name forward results keyed by input name
 DnsPrefixExpansion — mirrors fqdn_request.py prefix-expansion semantics
 
 resolve_forward(runtime, name)         → DnsForwardResult
 resolve_reverse(runtime, ip)           → DnsReverseResult
-resolve_many(runtime, names, ...)      → DnsBatchResult
 expand_fqdn_prefix(runtime, prefix)    → DnsPrefixExpansion
 
 Rules
@@ -28,9 +25,8 @@ from __future__ import annotations
 import logging
 import re
 import socket
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from cn_lens.runtime import LensRuntime
@@ -84,13 +80,15 @@ class DnsReverseResult:
 
     Fields
     ------
-    ip:     The queried IP address.
-    ptr:    Hostname returned by gethostbyaddr; None when not found.
-    status: One of ``VALID_RESULT_STATUSES``.
-    error:  Short error message; None when status is ``ok``.
+    ip:      The queried IP address.
+    ptr:     Hostname returned by gethostbyaddr; None when not found.
+    aliases: Additional aliases returned by gethostbyaddr (may be empty).
+    status:  One of ``VALID_RESULT_STATUSES``.
+    error:   Short error message; None when status is ``ok``.
     """
     ip: str
     ptr: Optional[str] = None
+    aliases: Tuple[str, ...] = field(default_factory=tuple)
     status: str = "ok"
     error: Optional[str] = None
 
@@ -99,29 +97,6 @@ class DnsReverseResult:
             allowed = ", ".join(sorted(VALID_RESULT_STATUSES))
             raise ValueError(
                 f"DnsReverseResult status {self.status!r} is not valid; "
-                f"allowed: {allowed}"
-            )
-
-
-@dataclass(frozen=True)
-class DnsBatchResult:
-    """Aggregate result of resolve_many().
-
-    Fields
-    ------
-    results:  Mapping of each input name → DnsForwardResult, in input order.
-    status:   One of ``VALID_RESULT_STATUSES``.  ``ok`` when all succeeded,
-              ``partial`` when mixed, ``error`` when all failed, ``disabled``
-              when offline.
-    """
-    results: Mapping[str, "DnsForwardResult"] = field(default_factory=dict)
-    status: str = "ok"
-
-    def __post_init__(self) -> None:
-        if self.status not in VALID_RESULT_STATUSES:
-            allowed = ", ".join(sorted(VALID_RESULT_STATUSES))
-            raise ValueError(
-                f"DnsBatchResult status {self.status!r} is not valid; "
                 f"allowed: {allowed}"
             )
 
@@ -215,7 +190,7 @@ def _reverse_one(ip: str, log: Optional[logging.Logger] = None) -> DnsReverseRes
     """
     _log = log or _module_logger
     try:
-        hostname, _aliases, _addresses = socket.gethostbyaddr(ip)
+        hostname, raw_aliases, _addresses = socket.gethostbyaddr(ip)
     except socket.timeout as exc:
         msg = f"timeout reverse-resolving {ip!r}: {exc}"
         _log.debug(msg)
@@ -229,19 +204,7 @@ def _reverse_one(ip: str, log: Optional[logging.Logger] = None) -> DnsReverseRes
         _log.warning(msg)
         return DnsReverseResult(ip=ip, status="error", error=msg)
 
-    return DnsReverseResult(ip=ip, ptr=hostname, status="ok")
-
-
-def _batch_status(results: Dict[str, DnsForwardResult]) -> str:
-    """Derive aggregate status from per-name results."""
-    if not results:
-        return "ok"
-    statuses = {r.status for r in results.values()}
-    if statuses == {"ok"}:
-        return "ok"
-    if "ok" in statuses:
-        return "partial"
-    return "error"
+    return DnsReverseResult(ip=ip, ptr=hostname, aliases=tuple(raw_aliases), status="ok")
 
 
 # ---------------------------------------------------------------------------
@@ -268,61 +231,6 @@ def resolve_reverse(runtime: "LensRuntime", ip: str) -> DnsReverseResult:
     if runtime.offline:
         return DnsReverseResult(ip=ip, status="disabled", error="offline mode")
     return _reverse_one(ip, log=runtime.logger)
-
-
-def resolve_many(
-    runtime: "LensRuntime",
-    names: Sequence[str],
-    *,
-    max_workers: int = 16,
-) -> DnsBatchResult:
-    """Forward-resolve multiple names concurrently.
-
-    Results are keyed by the original name and returned in input order.
-    Concurrency is handled internally via ``ThreadPoolExecutor``; callers do
-    not need to manage threads.
-
-    Parameters
-    ----------
-    runtime:      Active LensRuntime.
-    names:        Sequence of hostnames to resolve.
-    max_workers:  Thread-pool size (default 16).
-
-    Returns
-    -------
-    DnsBatchResult
-        ``status`` is ``disabled`` when offline, ``ok``/``partial``/``error``
-        based on per-name outcomes.
-    """
-    if runtime.offline:
-        return DnsBatchResult(status="disabled")
-
-    name_list = list(names)
-    if not name_list:
-        return DnsBatchResult(status="ok")
-
-    # Preserve input order: use a dict initialised with None placeholders
-    results: Dict[str, Optional[DnsForwardResult]] = {n: None for n in name_list}
-
-    _log = runtime.logger
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_name = {executor.submit(_forward_one, n, _log): n for n in name_list}
-        for future in as_completed(future_to_name):
-            name = future_to_name[future]
-            try:
-                results[name] = future.result()
-            except Exception as exc:
-                msg = f"unexpected executor error for {name!r}: {exc}"
-                _log.warning(msg)
-                results[name] = DnsForwardResult(name=name, status="error", error=msg)
-
-    # Fill any gaps (shouldn't happen, but be safe)
-    for n in name_list:
-        if results[n] is None:
-            results[n] = DnsForwardResult(name=n, status="error", error="no result")
-
-    final: Dict[str, DnsForwardResult] = {n: results[n] for n in name_list}  # type: ignore[assignment]
-    return DnsBatchResult(results=final, status=_batch_status(final))
 
 
 def expand_fqdn_prefix(runtime: "LensRuntime", prefix: str) -> DnsPrefixExpansion:

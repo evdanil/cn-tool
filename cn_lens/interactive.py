@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cn_lens.classifier import classify_many
+from cn_lens.commands import COMMAND_TABLE, CommandSpec, get_command
 from cn_lens.input_sources import (
     collect_raw_inputs_from_sources,
-    extract_ordered_input_sources,
+    extract_input_sources_from_namespace,
 )
 from cn_lens.models import LensRun
 from cn_lens.renderers import render_run, render_report
@@ -19,12 +20,21 @@ from cn_lens.workflows import (
     decommission_site_objects,
     device_objects,
     dns_objects,
+    e911_objects,
     impact_objects,
     inspect_objects,
     reachability_objects,
-    report_runs,
     validate_site_objects,
 )
+from cn_lens.workflows.bssid import bssid_convert
+from cn_lens.workflows.config_diff import config_diff
+from cn_lens.workflows.report import (
+    _build_report_artifacts,
+    _make_empty_object_set,
+    dispatch_report_email,
+)
+from cn_lens.workflows.stats import stats_objects
+from cn_lens.workflows._helpers import make_run_id, maybe_persist
 
 if TYPE_CHECKING:
     from cn_lens.runtime import LensRuntime
@@ -32,43 +42,15 @@ if TYPE_CHECKING:
 
 DISPLAY_FORMATS = ("human", "text", "txt", "md", "markdown", "json", "yaml", "yml")
 EXPORT_FORMATS = (*DISPLAY_FORMATS, "xlsx")
-INSPECT_FILE_OPTIONS = {"--file", "-f"}
-INSPECT_VALUE_OPTIONS = {"--column", "--format", "--output", "-o"}
-
-# Commands that are dispatched through the workflow helper rather than as
-# bare-object fallback.  Used to gate the default-inspect fallback.
-_WORKFLOW_COMMANDS = frozenset(
-    {
-        "inspect",
-        "impact",
-        "dns",
-        "reachability",
-        "device",
-        "validate-site",
-        "decommission-site",
-        "allocate",
-        "config",
-        "report",
-    }
-)
-
 # All commands known to the REPL, used for autocomplete and the help listing.
+# Built from COMMAND_TABLE plus shell-only commands.
 _ALL_REPL_COMMANDS: tuple[str, ...] = (
-    "inspect",
-    "impact",
-    "dns",
-    "reachability",
-    "device",
-    "validate-site",
-    "decommission-site",
-    "allocate",
-    "config",
-    "report",
+    *(spec.name for spec in COMMAND_TABLE if spec.name != "interactive"),
     "set",
     "export",
     "history",
+    "reload",
     "help",
-    "doctor",
     "quit",
     "exit",
 )
@@ -85,13 +67,21 @@ cn-lens interactive shell — available commands:
     validate-site    Validate site consistency across AD/IB/DNS/config.
     decommission-site  Run decommission-readiness checks for a site.
     allocate         Safety-check a candidate prefix  (--target-site SITE).
+    e911             Resolve E911 location records for IP/MAC objects.
     config find      Search config-repo / SD-WAN YAML  (--scope cfg|yaml|all).
+    config diff      Diff two device snapshots  (--repo-root / --snapshots A B).
+    config get       Show current configuration values  (--format human|json).
+    config set       Write a config value to ~/.cn  (key value).
+    config test      Probe adapter connectivity  (--format human|json).
     report           Bundle persisted runs  (--from-last / --include RUN_ID).
+    stats            Display cn-tool/cn-lens usage statistics  (--period 7d|4w|1m|12m|all).
+    bssid            Convert wired MAC addresses to Aruba BSSID radio MACs (offline).
 
   Shell commands:
     set format <fmt>            Change default output format.
     export last --format <fmt> --output <path>   Export last run to file.
     history                     Show command history.
+    reload                      Clear cached source data (re-reads on next use).
     doctor                      Check live adapter health.
     help [command]              Show this help, or per-command usage.
     quit / exit                 Leave the shell.
@@ -99,117 +89,43 @@ cn-lens interactive shell — available commands:
 Type 'help <command>' for per-command flags and examples.
 """
 
-_COMMAND_HELP: dict[str, str] = {
-    "inspect": (
-        "inspect [<object>...] [--file PATH] [--column COL] [--format FMT] [--output PATH]\n\n"
-        "Classify network objects and render an offline inspection run.\n\n"
-        "Examples:\n"
-        "  inspect 10.0.0.1\n"
-        "  inspect 10.0.0.1 10.0.0.0/24 host.example.net\n"
-        "  inspect --file objects.txt --format md\n"
-        "  inspect --file data.csv --column target --format json"
-    ),
-    "impact": (
-        "impact [<object>...] [--file PATH] [--column COL] [--format FMT] [--output PATH]\n\n"
-        "Find all references to objects across config_repo, SD-WAN YAML, Infoblox, and AD.\n\n"
-        "Examples:\n"
-        "  impact 10.1.0.0/24\n"
-        "  impact SITE01 --format json"
-    ),
-    "dns": (
-        "dns [<object>...] [--file PATH] [--column COL] [--format FMT] [--output PATH]\n\n"
-        "Resolve DNS and Infoblox DNS records (forward, reverse, PTR, FQDN expansion).\n\n"
-        "Examples:\n"
-        "  dns host.example.net\n"
-        "  dns 10.0.0.1 --format json"
-    ),
-    "reachability": (
-        "reachability [<object>...] [--mode ping|trace|both] [--format FMT] [--output PATH]\n\n"
-        "Perform reachability checks (ping and/or traceroute).\n\n"
-        "Flags:\n"
-        "  --mode ping|trace|both   Probe mode (default: ping).\n\n"
-        "Examples:\n"
-        "  reachability 10.0.0.1\n"
-        "  reachability 10.0.0.1 --mode trace\n"
-        "  reachability --file hosts.txt --mode both"
-    ),
-    "device": (
-        "device [<object>...] [--probe] [--format FMT] [--output PATH]\n\n"
-        "Classify and enrich device-oriented objects via AD, Infoblox, and config-repo.\n\n"
-        "Flags:\n"
-        "  --probe   Ping resolved IPs to test reachability (default: false).\n\n"
-        "Examples:\n"
-        "  device router1.example.net\n"
-        "  device router1.example.net --probe\n"
-        "  device --file devices.txt --format json"
-    ),
-    "validate-site": (
-        "validate-site [<object>...] [--format FMT] [--output PATH]\n\n"
-        "Validate site consistency across AD, SD-WAN, Infoblox, config-repo, and DNS.\n\n"
-        "Examples:\n"
-        "  validate-site SITE01\n"
-        "  validate-site SITE01 SITE02 --format json"
-    ),
-    "decommission-site": (
-        "decommission-site [<object>...] [--format FMT] [--output PATH]\n\n"
-        "Run decommission-readiness checks. Active prefixes, config refs, AD accounts,\n"
-        "or DHCP scopes block decommission (reported as error findings).\n\n"
-        "Examples:\n"
-        "  decommission-site SITE01\n"
-        "  decommission-site SITE01 --format json"
-    ),
-    "allocate": (
-        "allocate [<object>...] [--target-site SITE_CODE] [--format FMT] [--output PATH]\n\n"
-        "Safety-check a candidate prefix before allocation in Infoblox.\n\n"
-        "Flags:\n"
-        "  --target-site SITE_CODE   Destination site for the allocation.\n\n"
-        "Examples:\n"
-        "  allocate 10.5.0.0/24 --target-site SITE01\n"
-        "  allocate 10.5.0.0/24 --format json"
-    ),
-    "config": (
-        "config find <query>... [--scope all|cfg|yaml] [--limit N] [--format FMT] [--output PATH]\n\n"
-        "Search config repository and SD-WAN YAML for the given query strings.\n\n"
-        "Flags:\n"
-        "  --scope all|cfg|yaml   Search scope (default: all).\n"
-        "  --limit N              Maximum matches per query.\n\n"
-        "Examples:\n"
-        "  config find 10.1.0.0/24\n"
-        "  config find bgp --scope cfg --limit 20"
-    ),
-    "report": (
-        "report [--from-last] [--include RUN_ID]... [--email ADDR] [--format FMT] [--output PATH]\n\n"
-        "Bundle persisted LensRun objects into a LensReport.\n"
-        "Runs are stored under <output_dir>/cn-lens/<run_id>/run.json.gz.\n\n"
-        "Flags:\n"
-        "  --from-last          Include the most recent persisted run.\n"
-        "  --include RUN_ID     Add a specific run (repeatable).\n"
-        "  --email ADDR         Send via email plugin (if loaded).\n\n"
-        "Examples:\n"
-        "  report --from-last\n"
-        "  report --from-last --format xlsx --output report.xlsx\n"
-        "  report --include 20260511T120000Z --email ops@example.com"
-    ),
-    "set": (
+# Per-command help text — derived from COMMAND_TABLE (spec.repl_help) where
+# available, supplemented with shell-only commands below.
+def _build_command_help() -> dict[str, str]:
+    """Build the _COMMAND_HELP dict from COMMAND_TABLE and static shell commands."""
+    result: dict[str, str] = {}
+    for spec in COMMAND_TABLE:
+        if spec.repl_help:
+            result[spec.name] = spec.repl_help
+    # Shell-only commands not in COMMAND_TABLE:
+    result["set"] = (
         "set format <fmt>\n\n"
         "Change the default output format for this session.\n\n"
         "Formats: human, text, txt, md, markdown, json, yaml, yml.\n\n"
         "Example:\n"
         "  set format json"
-    ),
-    "export": (
+    )
+    result["export"] = (
         "export last --format <fmt> --output <path>\n\n"
         "Export the last run result to a file.\n\n"
         "Formats: human, text, txt, md, markdown, json, yaml, yml, xlsx.\n\n"
         "Example:\n"
         "  export last --format xlsx --output result.xlsx"
-    ),
-    "history": "history\n\nShow the session command history.",
-    "doctor": "doctor\n\nCheck health of live source adapters (Infoblox, AD, config-repo, DNS).",
-    "help": "help [command]\n\nShow the command list, or per-command usage for the given command.",
-    "quit": "quit\n\nExit the interactive shell (also: exit).",
-    "exit": "exit\n\nExit the interactive shell (also: quit).",
-}
+    )
+    result["history"] = "history\n\nShow the session command history."
+    result["reload"] = (
+        "reload\n\n"
+        "Clear all cached source data for this session so the next lookup\n"
+        "re-reads from disk.  Useful after updating the SD-WAN YAML repository\n"
+        "or other configuration files without restarting the shell."
+    )
+    result["help"] = "help [command]\n\nShow the command list, or per-command usage for the given command."
+    result["quit"] = "quit\n\nExit the interactive shell (also: exit)."
+    result["exit"] = "exit\n\nExit the interactive shell (also: quit)."
+    return result
+
+
+_COMMAND_HELP: dict[str, str] = _build_command_help()
 
 
 def _make_completer() -> "Callable[[str, int], str | None]":
@@ -295,8 +211,10 @@ class LensShell:
         if command == "history":
             return 0, self._render_history()
         if command == "doctor":
-            self.history.append(command_line)
-            return 0, "cn-lens doctor: informational — check the 'sources' block of any workflow output for live adapter health\n"
+            code, output = self._handle_doctor(tokens[1:])
+            if code == 0:
+                self.history.append(command_line)
+            return code, output
         if command == "set":
             code, output = self._handle_set(tokens[1:])
             if code == 0:
@@ -307,52 +225,42 @@ class LensShell:
             if code == 0:
                 self.history.append(command_line)
             return code, output
+        if command == "reload":
+            code, output = self._handle_reload()
+            if code == 0:
+                self.history.append(command_line)
+            return code, output
         if command == "report":
             code, output = self._handle_report(tokens[1:])
             if code == 0:
                 self.history.append(command_line)
             return code, output
 
-        # --- workflow dispatch ---
-        if command == "impact":
+        if command == "bssid":
+            code, output = self._handle_bssid(tokens[1:])
+            if code == 0:
+                self.history.append(command_line)
+            return code, output
+
+        if command == "stats":
+            code, output = self._handle_stats(tokens[1:])
+            if code == 0:
+                self.history.append(command_line)
+            return code, output
+
+        # --- workflow dispatch driven by COMMAND_TABLE ---
+        # Look up the command in the table to find standard workflow commands.
+        spec = _get_command_from_table(command)
+        workflow_callable = _get_workflow_callable_for(command) if spec is not None and spec.is_standard_workflow else None
+        if spec is not None and spec.is_standard_workflow and workflow_callable is not None:
+            extra_args = _spec_to_extra_args(spec) if spec.options else None
+            extra_kwargs_fn = spec.dispatch_kwargs_fn
             code, output = self._handle_workflow(
-                "impact", tokens[1:], impact_objects
-            )
-        elif command == "dns":
-            code, output = self._handle_workflow(
-                "dns", tokens[1:], dns_objects
-            )
-        elif command == "reachability":
-            code, output = self._handle_workflow(
-                "reachability",
+                command,
                 tokens[1:],
-                reachability_objects,
-                extra_args=_reachability_extra_args(),
-                extra_kwargs_from_namespace=lambda ns: {"mode": ns.mode},
-            )
-        elif command == "device":
-            code, output = self._handle_workflow(
-                "device",
-                tokens[1:],
-                device_objects,
-                extra_args=_device_extra_args(),
-                extra_kwargs_from_namespace=lambda ns: {"probe": ns.probe},
-            )
-        elif command == "validate-site":
-            code, output = self._handle_workflow(
-                "validate-site", tokens[1:], validate_site_objects
-            )
-        elif command == "decommission-site":
-            code, output = self._handle_workflow(
-                "decommission-site", tokens[1:], decommission_site_objects
-            )
-        elif command == "allocate":
-            code, output = self._handle_workflow(
-                "allocate",
-                tokens[1:],
-                allocate_objects,
-                extra_args=_allocate_extra_args(),
-                extra_kwargs_from_namespace=lambda ns: {"target_site": ns.target_site},
+                workflow_callable,
+                extra_args=extra_args,
+                extra_kwargs_from_namespace=extra_kwargs_fn,
             )
         elif command == "config":
             code, output = self._handle_config(tokens[1:])
@@ -367,18 +275,107 @@ class LensShell:
 
     def run(self) -> int:
         setup_readline()
-        while True:
-            try:
-                line = input("cn-lens> ")
-            except (EOFError, KeyboardInterrupt):
-                print("bye")
-                return 0
+        try:
+            while True:
+                try:
+                    line = input("cn-lens> ")
+                except (EOFError, KeyboardInterrupt):
+                    print("bye")
+                    self._finalize_session("completed")
+                    return 0
 
-            code, output = self.handle_line(line)
-            if output:
-                print(output, end="")
-            if line.strip() in {"quit", "exit"}:
-                return 0
+                code, output = self.handle_line(line)
+                if output:
+                    print(output, end="")
+                _first_token = line.split()[0] if line.split() else ""
+                if _first_token in {"quit", "exit"}:
+                    self._finalize_session("completed")
+                    return 0
+        except Exception:
+            self._finalize_session("failed")
+            raise
+
+    def _finalize_session(self, status: str) -> None:
+        """Finalize the stats session on REPL exit."""
+        if self.runtime is not None and self.runtime.stats is not None:
+            try:
+                self.runtime.stats.finalize_session(status)
+                self.runtime.stats.close()
+            except Exception:
+                pass
+
+    def _handle_doctor(
+        self,
+        args: Sequence[str],
+        _registry=None,
+    ) -> tuple[int, str]:
+        """Run the doctor health check and return (exit_code, output_string).
+
+        Parameters
+        ----------
+        args:
+            Token list after the ``doctor`` command name.
+        _registry:
+            Optional ``AdapterRegistry`` to pass through to ``run_doctor``.
+            When ``None`` the shared singleton is used.  Exposed as a seam for
+            tests — mirrors the pattern used by the CLI ``main()`` function.
+        """
+        import argparse as _ap  # local import to avoid shadowing module-level name
+        from cn_lens.doctor import run_doctor
+
+        # Parse doctor-specific flags inline.
+        p = _ap.ArgumentParser(prog="doctor", add_help=False)
+        p.add_argument(
+            "--format",
+            choices=("human", "json"),
+            default="human",
+            dest="fmt",
+        )
+        p.add_argument(
+            "--offline",
+            action="store_true",
+            default=False,
+        )
+        try:
+            ns, unknown = p.parse_known_args(list(args))
+        except SystemExit:
+            return 2, "cn-lens: usage: doctor [--format human|json] [--offline]\n"
+
+        if unknown:
+            return 2, f"cn-lens: doctor: unrecognized arguments: {' '.join(unknown)}\n"
+
+        # Determine effective runtime.
+        # Priority:
+        #   1. If `--offline` flag was given on the doctor line, produce an
+        #      offline twin of the existing runtime (or create a fresh one) so
+        #      this specific invocation runs offline without mutating the
+        #      shell's persistent runtime.  Uses LensRuntime.as_offline() to
+        #      safely copy all current fields — new fields added in the future
+        #      will automatically be included without updating this code.
+        #   2. If the shell has a runtime, use it as-is (it already knows
+        #      whether it is offline from the shell startup flags).
+        #   3. If no runtime on the shell, build a minimal transient offline
+        #      one (cannot run online without a live config + credentials).
+        runtime = self.runtime
+        if ns.offline and runtime is not None and not runtime.offline:
+            # Produce a transient offline twin — session format is NOT overridden
+            # here because fmt is passed explicitly to run_doctor anyway.
+            runtime = runtime.as_offline()
+        elif runtime is None:
+            # No shell runtime at all — build a transient offline runtime.
+            from cn_lens.runtime import build_runtime, LensOptions  # noqa: PLC0415
+            opts = LensOptions(
+                offline=True,
+                run_id=None,
+            )
+            runtime = build_runtime(opts, config_paths=[])
+
+        try:
+            output = run_doctor(runtime, _registry, fmt=ns.fmt)
+        except Exception as exc:
+            return 2, f"cn-lens doctor: internal error: {exc}\n"
+
+        return 0, output
 
     def _handle_set(self, args: Sequence[str]) -> tuple[int, str]:
         if len(args) != 2 or args[0] != "format":
@@ -415,6 +412,21 @@ class LensShell:
             return 2, f"cn-lens: {exc}\n"
 
         return 0, f"Wrote {output}\n"
+
+    def _handle_reload(self) -> tuple[int, str]:
+        """Clear all per-runtime source caches so the next lookup re-reads from disk.
+
+        Currently clears:
+        * SD-WAN YAML store (``runtime._sdwan_store``) — re-parsed on first
+          subsequent sdwan_yaml adapter call.
+
+        Returns ``(0, message)`` always; ``(1, message)`` when no runtime is
+        attached to the shell (no-op).
+        """
+        if self.runtime is None:
+            return 1, "cn-lens: reload: no active runtime\n"
+        self.runtime._sdwan_store = None
+        return 0, "Source caches cleared. Data will be re-read on next use.\n"
 
     def _handle_workflow(
         self,
@@ -456,18 +468,16 @@ class LensShell:
         except (ShellUsageError, SystemExit) as exc:
             return 2, _usage_message(exc)
 
-        if namespace.format not in DISPLAY_FORMATS:
-            return 2, (
-                "cn-lens: invalid format "
-                f"{namespace.format!r}; expected one of {', '.join(DISPLAY_FORMATS)}\n"
-            )
+        # xlsx requires --output (same guard as CLI _run_workflow)
+        if namespace.format == "xlsx" and not namespace.output:
+            return 2, "cn-lens: xlsx output requires --output\n"
 
         try:
             raw_inputs = collect_raw_inputs_from_sources(
-                extract_ordered_input_sources(
+                extract_input_sources_from_namespace(
+                    namespace,
                     arg_list,
-                    file_options=INSPECT_FILE_OPTIONS,
-                    value_options=INSPECT_VALUE_OPTIONS,
+                    extra_positionals=unknown_args,
                 ),
                 csv_column=getattr(namespace, "column", None),
             )
@@ -498,12 +508,31 @@ class LensShell:
         return 0 if object_set.objects else 1, rendered or ""
 
     def _handle_config(self, args: Sequence[str]) -> tuple[int, str]:
-        """Handle 'config find <query>...' REPL command (two-token form)."""
+        """Handle 'config find/diff/get/set/test ...' REPL commands."""
         arg_list = list(args)
-        if not arg_list or arg_list[0] != "find":
-            sub = arg_list[0] if arg_list else "(none)"
+        if not arg_list:
             return 2, (
-                f"cn-lens: config: unknown subcommand {sub!r}; expected 'find'\n"
+                "cn-lens: config: missing subcommand; "
+                "expected 'find', 'diff', 'get', 'set', or 'test'\n"
+            )
+
+        if arg_list[0] == "diff":
+            return self._handle_config_diff(arg_list[1:])
+
+        if arg_list[0] == "get":
+            return self._handle_config_get(arg_list[1:])
+
+        if arg_list[0] == "set":
+            return self._handle_config_set(arg_list[1:])
+
+        if arg_list[0] == "test":
+            return self._handle_config_test(arg_list[1:])
+
+        if arg_list[0] != "find":
+            sub = arg_list[0]
+            return 2, (
+                f"cn-lens: config: unknown subcommand {sub!r}; "
+                "expected 'find', 'diff', 'get', 'set', or 'test'\n"
             )
 
         # Parse the 'find' arguments
@@ -517,7 +546,15 @@ class LensShell:
         if not queries:
             return 1, "cn-lens: config find requires at least one query\n"
 
-        object_set = classify_many(queries)
+        # xlsx requires --output (same guard as CLI config find path)
+        if namespace.format == "xlsx" and not namespace.output:
+            return 2, "cn-lens: xlsx output requires --output\n"
+
+        # Build ObjectSet directly — config find accepts arbitrary regex /
+        # multi-word patterns that must not be routed through classify_many.
+        # shlex tokenisation already delivers each shell-quoted argument as
+        # one token; we map each token to a QUERY LensObject intact.
+        object_set = _make_query_object_set(queries)
         run = config_find_objects(
             object_set,
             runtime=self.runtime,
@@ -536,6 +573,154 @@ class LensShell:
             return 0 if object_set.objects else 1, f"Wrote {output}\n"
         return 0 if object_set.objects else 1, rendered or ""
 
+    def _handle_config_diff(self, args: Sequence[str]) -> tuple[int, str]:
+        """Handle 'config diff DEVICE [--repo-root PATH] [--snapshots A B] ...' REPL command."""
+        parser = _build_config_diff_parser(self.default_format)
+        try:
+            namespace = parser.parse_args(list(args))
+        except (ShellUsageError, SystemExit) as exc:
+            return 2, _usage_message(exc)
+
+        device: str = namespace.device
+        repo_root: str | None = getattr(namespace, "repo_root", None)
+        snapshots: list[str] | None = getattr(namespace, "snapshots", None)
+        snapshot_a: str | None = snapshots[0] if snapshots else None
+        snapshot_b: str | None = snapshots[1] if snapshots else None
+        side_by_side: bool = getattr(namespace, "side_by_side", False)
+        context: int = getattr(namespace, "context", 3)
+
+        if namespace.format == "xlsx" and not namespace.output:
+            return 2, "cn-lens: xlsx output requires --output\n"
+
+        run = config_diff(
+            device=device,
+            repo_root=repo_root,
+            snapshot_a=snapshot_a,
+            snapshot_b=snapshot_b,
+            side_by_side=side_by_side,
+            context=context,
+            runtime=self.runtime,
+        )
+        self.last_run = run
+
+        output = Path(namespace.output) if namespace.output else None
+        try:
+            rendered = render_run(run, namespace.format, output)
+        except (OSError, ValueError) as exc:
+            return 2, f"cn-lens: {exc}\n"
+
+        if output is not None:
+            result_str = f"Wrote {output}\n"
+        else:
+            result_str = rendered or ""
+
+        # Exit code: 1 = differences, 0 = identical (like diff(1))
+        # REPL does not exit on non-zero — the code is just returned.
+        if run.results:
+            cd = run.results[0].summary.get("config_diff", {})
+            if any(f.severity == "error" for f in run.results[0].findings):
+                return 2, result_str
+            exit_code = 1 if cd.get("has_changes") else 0
+        else:
+            exit_code = 2
+        return exit_code, result_str
+
+    def _handle_config_get(self, args: Sequence[str]) -> tuple[int, str]:
+        """Handle 'config get [KEY] [--format human|json]' REPL command."""
+        import json as _json
+        from cn_lens.workflows.config_cmd import config_get
+
+        arg_list = list(args)
+        # Parse optional --format and optional positional key
+        fmt = "human"
+        key = None
+        i = 0
+        while i < len(arg_list):
+            token = arg_list[i]
+            if token in ("--format", "-f") and i + 1 < len(arg_list):
+                fmt = arg_list[i + 1]
+                i += 2
+            elif token.startswith("--format="):
+                fmt = token.split("=", 1)[1]
+                i += 1
+            elif not token.startswith("-"):
+                key = token
+                i += 1
+            else:
+                return 2, f"cn-lens: config get: unknown argument {token!r}\n"
+
+        if fmt not in ("human", "json"):
+            return 2, f"cn-lens: config get: invalid format {fmt!r}; expected human or json\n"
+
+        entries = config_get(key=key, runtime=self.runtime)
+
+        if key is not None and not entries:
+            return 1, f"cn-lens: unknown config key: {key!r}\n"
+
+        if fmt == "json":
+            return 0, _json.dumps(entries, indent=2) + "\n"
+
+        lines = [f"{e['key']} = {e['value']}" for e in entries]
+        return 0, "\n".join(lines) + "\n" if lines else ""
+
+    def _handle_config_set(self, args: Sequence[str]) -> tuple[int, str]:
+        """Handle 'config set KEY VALUE' REPL command."""
+        from cn_lens.workflows.config_cmd import config_set
+
+        arg_list = list(args)
+        if len(arg_list) < 2:
+            return 2, "cn-lens: usage: config set KEY VALUE\n"
+
+        key = arg_list[0]
+        value = " ".join(arg_list[1:])
+
+        result = config_set(key=key, value=value, runtime=self.runtime)
+        if result["status"] == "ok":
+            from cn_lens.workflows.config_cmd import is_secret_key
+            display_value = "***" if is_secret_key(key) else value
+            return 0, f"Set {key} = {display_value}\n"
+        else:
+            msg = result.get("message", "unknown error")
+            return 1, f"cn-lens: config set failed: {msg}\n"
+
+    def _handle_config_test(self, args: Sequence[str]) -> tuple[int, str]:
+        """Handle 'config test [--format human|json]' REPL command."""
+        import json as _json
+        from cn_lens.workflows.config_cmd import config_test
+
+        arg_list = list(args)
+        fmt = "human"
+        i = 0
+        while i < len(arg_list):
+            token = arg_list[i]
+            if token in ("--format",) and i + 1 < len(arg_list):
+                fmt = arg_list[i + 1]
+                i += 2
+            elif token.startswith("--format="):
+                fmt = token.split("=", 1)[1]
+                i += 1
+            else:
+                return 2, f"cn-lens: config test: unknown argument {token!r}\n"
+
+        if fmt not in ("human", "json"):
+            return 2, f"cn-lens: config test: invalid format {fmt!r}; expected human or json\n"
+
+        result = config_test(runtime=self.runtime)
+
+        if fmt == "json":
+            output = _json.dumps(result, indent=2) + "\n"
+        else:
+            lines = []
+            for source, info in result.items():
+                status = info.get("status", "unknown")
+                detail = info.get("detail", "")
+                detail_str = f"  {detail}" if detail else ""
+                lines.append(f"{source}: {status}{detail_str}")
+            output = "\n".join(lines) + "\n"
+
+        exit_code = 1 if any(info.get("status") == "error" for info in result.values()) else 0
+        return exit_code, output
+
     def _handle_inspect(self, args: Sequence[str]) -> tuple[int, str]:
         return self._handle_workflow("inspect", args, inspect_objects)
 
@@ -544,6 +729,13 @@ class LensShell:
 
         Mirrors CLI: --from-last, --include RUN_ID (repeatable), --email ADDR,
         --format FMT, --output PATH.  Does not take object positionals.
+
+        Mirrors cli._run_report exactly:
+          1. build with email=None (no dispatch yet)
+          2. render
+          3. dispatch email after render so attachment exists
+          4. fold email outcome into summary_run via dataclasses.replace
+          5. maybe_persist(summary_run, self.runtime)
         """
         parser = _build_report_parser(self.default_format)
         try:
@@ -554,21 +746,186 @@ class LensShell:
         include: list[str] = namespace.include or []
         from_last: bool = namespace.from_last
         email: str | None = namespace.email
+        prune: bool = getattr(namespace, "prune", False)
+        keep: int | None = getattr(namespace, "keep", None)
+        older_than: int | None = getattr(namespace, "older_than", None)
+        delete_run_id: str | None = getattr(namespace, "delete_run_id", None)
+
+        # --- prune / delete dispatch (mutually exclusive with bundling) ---
+        if delete_run_id is not None:
+            from cn_lens.reports.persistence import delete_run
+            try:
+                deleted = delete_run(delete_run_id, self.runtime)
+            except ValueError as exc:
+                return 2, f"cn-lens: {exc}\n"
+            if deleted:
+                return 0, f"Deleted run: {delete_run_id}\n"
+            return 1, f"cn-lens: run not found: {delete_run_id}\n"
+
+        if prune:
+            if keep is not None and older_than is not None:
+                return 2, "cn-lens: --keep and --older-than are mutually exclusive\n"
+            if keep is None and older_than is None:
+                return 2, "cn-lens: --prune requires --keep N or --older-than DAYS\n"
+            from cn_lens.reports.persistence import prune_runs
+            try:
+                deleted_ids = prune_runs(self.runtime, keep=keep, older_than_days=older_than)
+            except ValueError as exc:
+                return 2, f"cn-lens: {exc}\n"
+            if deleted_ids:
+                lines = "\n".join(f"  {rid}" for rid in deleted_ids)
+                return 0, f"Pruned {len(deleted_ids)} run(s):\n{lines}\n"
+            return 0, "No runs pruned.\n"
 
         if not include and not from_last:
             return 1, "cn-lens: no runs available to bundle\n"
 
-        report = report_runs(
+        output = Path(namespace.output) if namespace.output else None
+
+        # Resolve an effective run_id for the synthesised summary LensRun.
+        effective_run_id: str = (
+            self.runtime.options.run_id
+            if self.runtime is not None and self.runtime.options.run_id is not None
+            else make_run_id()
+        )
+
+        # Step 1: build the report aggregate (no email dispatch here).
+        report, summary_run = _build_report_artifacts(
             runtime=self.runtime,
+            run_id=effective_run_id,
             include=include or None,
             from_last=from_last,
-            email=email,
+            email=None,  # email dispatched after render; see below
             _last_run=self.last_run if from_last else None,
+            object_set=_make_empty_object_set(),
         )
+
+        # Step 2: render — writes the output file when --output is given.
+        try:
+            rendered = render_report(report, namespace.format, output)
+        except (OSError, ValueError) as exc:
+            return 2, f"cn-lens: {exc}\n"
+
+        # Step 3: email dispatch AFTER render so the attachment file exists.
+        email_findings: list = []
+        _sent = False
+        if email and self.runtime is not None:
+            _sent, email_findings = dispatch_report_email(
+                self.runtime,
+                to=email,
+                report_id=report.report_id,
+                run_count=len(report.runs),
+                attachment_path=output,
+            )
+
+        # Step 4: fold email outcome into summary_run (mirrors cli._run_report).
+        if email and summary_run.results:
+            import dataclasses
+            old_result = summary_run.results[0]
+            old_report_block = dict(old_result.summary.get("report", {}))
+            old_report_block["email_sent"] = _sent
+            new_summary = dict(old_result.summary)
+            new_summary["report"] = old_report_block
+            new_findings = old_result.findings + tuple(email_findings)
+            new_result = dataclasses.replace(
+                old_result,
+                summary=new_summary,
+                findings=new_findings,
+            )
+            summary_run = dataclasses.replace(
+                summary_run,
+                results=(new_result,) + summary_run.results[1:],
+            )
+
+        # Step 5: persist the synthesised summary LensRun — AFTER email dispatch.
+        maybe_persist(summary_run, self.runtime)
+
+        # Surface email-related findings so the REPL user sees send failures and
+        # "no attachment" warnings inline.  Anchor on source=="report" (set by all
+        # email findings) plus "email" in the message as a secondary filter.
+        all_findings = list(report.findings) + list(email_findings)
+        email_finding_lines: list[str] = []
+        for finding in all_findings:
+            if (
+                finding.severity in ("warning", "error")
+                and finding.source == "report"
+                and "email" in finding.message.lower()
+            ):
+                email_finding_lines.append(
+                    f"cn-lens: report: {finding.severity}: {finding.message}\n"
+                )
+
+        if output is not None:
+            base = f"Wrote {output}\n"
+        else:
+            base = rendered or ""
+
+        return 0, base + "".join(email_finding_lines)
+
+    def _handle_bssid(self, args: Sequence[str]) -> tuple[int, str]:
+        """Handle the 'bssid <mac>...' REPL command.
+
+        Accepts MAC addresses as positionals and/or via ``--file PATH``.
+        Returns converted 2.4GHz and 5GHz BSSIDs.  Offline-always.
+        """
+        parser = _build_bssid_parser(self.default_format)
+        try:
+            namespace = parser.parse_args(list(args))
+        except (ShellUsageError, SystemExit) as exc:
+            return 2, _usage_message(exc)
+
+        if namespace.format == "xlsx" and not namespace.output:
+            return 2, "cn-lens: xlsx output requires --output\n"
+
+        # Collect raw MAC strings from positionals and --file paths.
+        targets: list[str] = list(namespace.targets or [])
+        for file_path in namespace.file or []:
+            try:
+                lines = Path(file_path).read_text(encoding="utf-8").splitlines()
+                targets.extend(line.strip() for line in lines if line.strip())
+            except OSError as exc:
+                return 2, f"cn-lens: {exc}\n"
+
+        if not targets:
+            return 1, "cn-lens: bssid requires at least one MAC address\n"
+
+        run = bssid_convert(targets)
+        self.last_run = run
 
         output = Path(namespace.output) if namespace.output else None
         try:
-            rendered = render_report(report, namespace.format, output)
+            rendered = render_run(run, namespace.format, output)
+        except (OSError, ValueError) as exc:
+            return 2, f"cn-lens: {exc}\n"
+
+        if output is not None:
+            return 0 if run.results else 1, f"Wrote {output}\n"
+        return 0 if run.results else 1, rendered or ""
+
+    def _handle_stats(self, args: Sequence[str]) -> tuple[int, str]:
+        """Handle the 'stats [--period all|7d|4w|1m|12m] [--format FMT] [--output PATH]' REPL command.
+
+        Offline-capable: reads local stats files.  Never calls sys.exit.
+        """
+        from cn_lens.models import ObjectSet
+
+        parser = _build_stats_parser(self.default_format)
+        try:
+            namespace = parser.parse_args(list(args))
+        except (ShellUsageError, SystemExit) as exc:
+            return 2, _usage_message(exc)
+
+        if namespace.format == "xlsx" and not namespace.output:
+            return 2, "cn-lens: xlsx output requires --output\n"
+
+        period_key: str = getattr(namespace, "period", "all") or "all"
+        object_set = ObjectSet(objects=(), invalid=(), duplicate_count=0)
+        run = stats_objects(object_set, runtime=self.runtime, period_key=period_key)
+        self.last_run = run
+
+        output = Path(namespace.output) if namespace.output else None
+        try:
+            rendered = render_run(run, namespace.format, output)
         except (OSError, ValueError) as exc:
             return 2, f"cn-lens: {exc}\n"
 
@@ -591,25 +948,88 @@ class LensShell:
         if not args:
             return 0, _HELP_TEXT
         cmd = args[0]
-        text = _COMMAND_HELP.get(cmd)
+        # Read from COMMAND_TABLE dynamically so that injected probe specs are visible.
+        text = _get_repl_help(cmd)
         if text is None:
             return 2, f"cn-lens: help: unknown command {cmd!r}\n"
         return 0, text + "\n"
 
 
 # ---------------------------------------------------------------------------
-# Parser builders
+# Dynamic dispatch helpers (read from COMMAND_TABLE at call time)
 # ---------------------------------------------------------------------------
 
+# Module-level mapping from command name to the workflow callable name.
+# Derived from COMMAND_TABLE so that adding a new workflow spec is the only
+# required edit.  Using module-level attribute names means tests can patch
+# ``cn_lens.interactive.<name>_objects`` and have the patch take effect in
+# the dispatch path — the same pattern tests used with the old entry-point
+# that imported workflows directly.
+def _derive_workflow_callable_names() -> dict[str, str]:
+    """Build the command-name → module-attr-name mapping from COMMAND_TABLE."""
+    import cn_lens.commands as _cmd_mod
+    result: dict[str, str] = {}
+    for spec in _cmd_mod.COMMAND_TABLE:
+        if spec.workflow_callable is not None:
+            fn_name = spec.workflow_callable.__name__
+            result[spec.name] = fn_name
+    return result
 
-def _build_inspect_parser(default_format: str) -> argparse.ArgumentParser:
-    parser = ShellArgumentParser(prog="inspect", add_help=False)
-    parser.add_argument("objects", nargs="*")
-    parser.add_argument("--file", "-f", action="append", default=[])
-    parser.add_argument("--column")
-    parser.add_argument("--format", choices=DISPLAY_FORMATS, default=default_format)
-    parser.add_argument("--output", "-o")
-    return parser
+
+_WORKFLOW_CALLABLE_NAMES: dict[str, str] = _derive_workflow_callable_names()
+
+
+def _get_command_from_table(name: str) -> CommandSpec | None:
+    """Look up *name* in the live COMMAND_TABLE (module-level, patchable by tests)."""
+    import cn_lens.commands as _cmd_mod
+    for spec in _cmd_mod.COMMAND_TABLE:
+        if spec.name == name or name in spec.aliases:
+            return spec
+    return None
+
+
+def _get_workflow_callable_for(name: str):
+    """Return the module-level workflow callable for command *name*.
+
+    Uses the module's own namespace so that ``patch("cn_lens.interactive.impact_objects")``
+    correctly intercepts calls made via this function.  Falls back to the
+    ``CommandSpec.workflow_callable`` for dynamically-injected probe specs that
+    are not in :data:`_WORKFLOW_CALLABLE_NAMES`.
+    """
+    import cn_lens.interactive as _self
+    attr = _WORKFLOW_CALLABLE_NAMES.get(name)
+    if attr is not None:
+        return getattr(_self, attr)
+    # For dynamically-injected specs (e.g. probe-cmd in tests), fall back to
+    # the callable stored in the spec itself.
+    spec = _get_command_from_table(name)
+    if spec is not None:
+        return spec.workflow_callable
+    return None
+
+
+def _get_repl_help(cmd: str) -> str | None:
+    """Return per-command help text for *cmd* from the live COMMAND_TABLE or static dict."""
+    import cn_lens.commands as _cmd_mod
+    # Check COMMAND_TABLE first (covers dynamically injected specs).
+    for spec in _cmd_mod.COMMAND_TABLE:
+        if spec.name == cmd and spec.repl_help:
+            return spec.repl_help
+    # Fall back to static shell-only commands.
+    return _COMMAND_HELP.get(cmd)
+
+
+def _spec_to_extra_args(
+    spec: CommandSpec,
+) -> list[tuple[list[str], dict[str, Any]]]:
+    """Convert a CommandSpec's options tuple to the extra_args format used by
+    :meth:`LensShell._handle_workflow`."""
+    return [(list(flags), dict(kwargs)) for flags, kwargs in spec.options]
+
+
+# ---------------------------------------------------------------------------
+# Parser builders
+# ---------------------------------------------------------------------------
 
 
 def _build_workflow_parser(
@@ -623,7 +1043,9 @@ def _build_workflow_parser(
     parser.add_argument("objects", nargs="*")
     parser.add_argument("--file", "-f", action="append", default=[])
     parser.add_argument("--column")
-    parser.add_argument("--format", choices=DISPLAY_FORMATS, default=default_format)
+    # Accept xlsx (same surface as CLI); xlsx without --output is rejected in
+    # _handle_workflow (not here) so argparse can parse the namespace first.
+    parser.add_argument("--format", choices=EXPORT_FORMATS, default=default_format)
     parser.add_argument("--output", "-o")
     if extra_args:
         for positionals, kwargs in extra_args:
@@ -639,8 +1061,51 @@ def _build_config_find_parser(default_format: str) -> argparse.ArgumentParser:
         "--scope", choices=("all", "cfg", "yaml"), default="all"
     )
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--format", choices=DISPLAY_FORMATS, default=default_format)
+    # Accept xlsx (same surface as CLI); xlsx without --output rejected in _handle_config.
+    parser.add_argument("--format", choices=EXPORT_FORMATS, default=default_format)
     parser.add_argument("--output", "-o")
+    return parser
+
+
+def _build_config_diff_parser(default_format: str) -> argparse.ArgumentParser:
+    """Build parser for 'config diff DEVICE [--repo-root PATH] [--snapshots A B] ...'."""
+    parser = ShellArgumentParser(prog="config diff", add_help=False)
+    parser.add_argument("device", help="device name (without .cfg extension)")
+    parser.add_argument("--repo-root", default=None, dest="repo_root", metavar="PATH")
+    parser.add_argument("--snapshots", nargs=2, default=None, metavar=("A", "B"))
+    parser.add_argument(
+        "--side-by-side", action="store_true", default=False, dest="side_by_side"
+    )
+    parser.add_argument("--context", type=int, default=3)
+    parser.add_argument("--format", choices=EXPORT_FORMATS, default=default_format)
+    parser.add_argument("--output", "-o", default=None)
+    return parser
+
+
+def _build_bssid_parser(default_format: str) -> argparse.ArgumentParser:
+    """Build parser for 'bssid <mac>... [--file PATH] [--format FMT] [--output PATH]'."""
+    parser = ShellArgumentParser(prog="bssid", add_help=False)
+    parser.add_argument("targets", nargs="*", help="wired MAC addresses to convert")
+    parser.add_argument("--file", "-f", action="append", default=[],
+                        help="read MAC addresses from a text file")
+    # Accept xlsx; xlsx without --output rejected in _handle_bssid.
+    parser.add_argument("--format", choices=EXPORT_FORMATS, default=default_format)
+    parser.add_argument("--output", "-o", default=None)
+    return parser
+
+
+def _build_stats_parser(default_format: str) -> argparse.ArgumentParser:
+    """Build parser for 'stats [--period all|7d|4w|1m|12m] [--format FMT] [--output PATH]'."""
+    parser = ShellArgumentParser(prog="stats", add_help=False)
+    parser.add_argument(
+        "--period",
+        choices=("all", "7d", "4w", "1m", "12m"),
+        default="all",
+        dest="period",
+        help="reporting period: all (default), 7d, 4w, 1m, 12m",
+    )
+    parser.add_argument("--format", choices=EXPORT_FORMATS, default=default_format)
+    parser.add_argument("--output", "-o", default=None)
     return parser
 
 
@@ -670,46 +1135,85 @@ def _build_report_parser(default_format: str) -> argparse.ArgumentParser:
         dest="from_last",
     )
     parser.add_argument("--email", default=None, metavar="TO_ADDR")
-    parser.add_argument("--format", choices=DISPLAY_FORMATS, default=default_format)
+    parser.add_argument("--format", choices=EXPORT_FORMATS, default=default_format)
     parser.add_argument("--output", "-o", default=None)
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        default=False,
+        help="prune persisted runs (requires --keep or --older-than)",
+    )
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=None,
+        metavar="N",
+        help="keep N newest runs; delete the rest (use with --prune)",
+    )
+    parser.add_argument(
+        "--older-than",
+        type=int,
+        default=None,
+        dest="older_than",
+        metavar="DAYS",
+        help="delete runs older than DAYS days (use with --prune)",
+    )
+    parser.add_argument(
+        "--delete",
+        default=None,
+        metavar="RUN_ID",
+        dest="delete_run_id",
+        help="delete a single persisted run by run_id",
+    )
     return parser
-
-
-# ---------------------------------------------------------------------------
-# Extra-arg descriptors for subcommand-specific flags
-# ---------------------------------------------------------------------------
-
-
-def _reachability_extra_args() -> list[tuple[list[str], dict[str, Any]]]:
-    return [
-        (
-            ["--mode"],
-            {"choices": ("ping", "trace", "both"), "default": "ping"},
-        )
-    ]
-
-
-def _device_extra_args() -> list[tuple[list[str], dict[str, Any]]]:
-    return [
-        (
-            ["--probe"],
-            {"action": "store_true", "default": False},
-        )
-    ]
-
-
-def _allocate_extra_args() -> list[tuple[list[str], dict[str, Any]]]:
-    return [
-        (
-            ["--target-site"],
-            {"default": None, "metavar": "SITE_CODE", "dest": "target_site"},
-        )
-    ]
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+
+def _make_query_object_set(queries: list[str]) -> "Any":
+    """Build an ObjectSet from raw config-find query tokens.
+
+    Each token is wrapped as a ``LensObjectType.QUERY`` LensObject so that
+    arbitrary regex patterns and special characters are preserved intact.
+    The classifier is intentionally bypassed — config find must not reject
+    legitimate search patterns as "invalid" objects.
+
+    Parameters
+    ----------
+    queries:
+        Raw query strings as delivered by shlex tokenisation (one per token).
+
+    Returns
+    -------
+    ObjectSet
+        All non-empty tokens as QUERY LensObjects; invalid tuple is always empty.
+    """
+    from cn_lens.models import LensObject, LensObjectType, ObjectSet
+
+    objects: list[LensObject] = []
+    seen: set[str] = set()
+    for q in queries:
+        if not q:
+            continue
+        if q in seen:
+            continue
+        seen.add(q)
+        objects.append(
+            LensObject(
+                original=q,
+                normalized=q,
+                object_type=LensObjectType.QUERY,
+                value=q,
+            )
+        )
+    return ObjectSet(
+        objects=tuple(objects),
+        invalid=(),
+        duplicate_count=len(queries) - len(objects),
+    )
 
 
 def _usage_message(exc: BaseException) -> str:

@@ -30,32 +30,25 @@ prefix rather than a fully qualified domain name.
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from cn_lens.adapters.registry import get_registry
-from cn_lens.models import LensFinding, LensObject, LensObjectType, LensResult, LensRun, ObjectSet
+from cn_lens.models import LensFinding, LensObject, LensObjectType, LensRun, ObjectSet
 from cn_lens.workflows._helpers import (
     OFFLINE_FINDING_MESSAGE,
     CLASSIFIED_FINDING_MESSAGE,
+    call_adapter,
     is_short_hostname,
     make_run_id,
-    maybe_persist,
+    run_workflow,
     synthesise_error_finding as _synthesise_error_finding,
 )
-
-# Re-export for backwards compatibility (e.g. tests that import MVP_FINDING_MESSAGE
-# from cn_lens.workflows.inspect).  The value now equals OFFLINE_FINDING_MESSAGE.
-MVP_FINDING_MESSAGE = OFFLINE_FINDING_MESSAGE
 
 if TYPE_CHECKING:
     from cn_lens.runtime import LensRuntime
 
 
-# MVP_FINDING_MESSAGE is kept as a backwards-compatible alias equal to
-# OFFLINE_FINDING_MESSAGE so that existing importers are not broken.
-# CLASSIFIED_FINDING_MESSAGE and OFFLINE_FINDING_MESSAGE are the preferred names.
 __all__ = [
-    "MVP_FINDING_MESSAGE",
     "OFFLINE_FINDING_MESSAGE",
     "CLASSIFIED_FINDING_MESSAGE",
     "make_run_id",
@@ -95,120 +88,119 @@ def _classifier_finding(message: str = CLASSIFIED_FINDING_MESSAGE) -> LensFindin
 
 
 # ---------------------------------------------------------------------------
-# Offline path
-# ---------------------------------------------------------------------------
-
-_OFFLINE_SOURCES: Dict[str, str] = {
-    "classifier": "ok",
-    "infoblox": "not_queried",
-    "config_repo": "not_queried",
-    "ad": "not_queried",
-}
-
-
-def _build_offline_result(obj: LensObject) -> LensResult:
-    """Build the offline-shape LensResult when offline or runtime is None."""
-    return LensResult(
-        lens_object=obj,
-        status="classified",
-        summary={
-            "original": obj.original,
-            "normalized": obj.normalized,
-            "type": obj.object_type.value,
-        },
-        sources=_OFFLINE_SOURCES,
-        findings=(_classifier_finding(OFFLINE_FINDING_MESSAGE),),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Per-type adapter dispatch (online path)
+# Per-type adapter runners (online path)
 # ---------------------------------------------------------------------------
 
 def _run_ip(
     runtime: "LensRuntime",
     obj: LensObject,
     base_summary: Dict[str, Any],
+    *,
+    deep: bool = False,
 ) -> Tuple[Dict[str, Any], List[LensFinding]]:
-    """Run IP-specific adapters in documented order and return (summary, findings)."""
+    """Run IP-specific adapters in documented order and return (summary, findings).
+
+    Parameters
+    ----------
+    deep:
+        When ``True``, also call ``infoblox.contains_address`` to find the
+        parent subnet, then surface the parent network CIDR in the summary.
+    """
     from cn_lens.adapters import infoblox, active_directory, config_repo, sdwan_yaml, dns
 
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     ip = obj.value
 
-    # 1. infoblox.lookup_ip
-    try:
-        ib_result = infoblox.lookup_ip(runtime, ip)
-        summary["infoblox"] = {
-            "found": ib_result.found,
-            "ip": ib_result.ip,
-            "network": ib_result.network,
-            "name": ib_result.name,
-            "status": ib_result.status,
-            "lease_state": ib_result.lease_state,
-            "record_type": ib_result.record_type,
-            "mac": ib_result.mac,
+    # 1. infoblox.lookup_ip (always run, deep or not)
+    def _ip_to_row(r) -> Dict[str, Any]:
+        row: Dict[str, Any] = {
+            "found": r.found,
+            "ip": r.ip,
+            "network": r.network,
+            "name": r.name,
+            "status": r.status,
+            "lease_state": r.lease_state,
+            "record_type": r.record_type,
+            "mac": r.mac,
         }
-        findings.extend(ib_result.findings)
-    except Exception as exc:
-        runtime.logger.error("inspect: infoblox.lookup_ip raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("infoblox", exc))
-        summary["infoblox"] = {"found": False, "error": str(exc)}
+        if deep:
+            # Also find the parent subnet via contains_address
+            try:
+                parent = infoblox.contains_address(runtime, ip)
+                row["parent_network"] = parent.network if parent.found else ""
+                findings.extend(parent.findings)
+            except Exception as exc:
+                runtime.logger.error(
+                    "inspect: infoblox.contains_address raised: %s", exc
+                )
+                row["parent_network"] = ""
+        return row
+
+    call_adapter(
+        summary, "infoblox",
+        fn=lambda: infoblox.lookup_ip(runtime, ip),
+        to_row=_ip_to_row,
+        findings=findings,
+        log_prefix="inspect: infoblox.lookup_ip",
+        on_success=lambda r: findings.extend(r.findings),
+        on_error_extra={"found": False},
+    )
 
     # 2. ad.enrich_ip
-    try:
-        ad_enrichment, ad_findings = active_directory.enrich_ip(runtime, ip)
-        summary["ad"] = {
-            "resolved_hostname": ad_enrichment.resolved_hostname,
-            "ou_path": ad_enrichment.device_result.ou_path,
-            "last_site_code": ad_enrichment.device_result.last_site_code,
-            "computer_dn": ad_enrichment.device_result.computer_dn,
-            "found": ad_enrichment.device_result.found,
-        }
-        findings.extend(ad_findings)
-    except Exception as exc:
-        runtime.logger.error("inspect: ad.enrich_ip raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("ad", exc))
-        summary["ad"] = {"found": False, "error": str(exc)}
+    call_adapter(
+        summary, "ad",
+        fn=lambda: active_directory.enrich_ip(runtime, ip),
+        to_row=lambda r: {
+            "resolved_hostname": r[0].resolved_hostname,
+            "ou_path": r[0].device_result.ou_path,
+            "last_site_code": r[0].device_result.last_site_code,
+            "computer_dn": r[0].device_result.computer_dn,
+            "found": r[0].device_result.found,
+        },
+        findings=findings,
+        log_prefix="inspect: ad.enrich_ip",
+        on_success=lambda r: findings.extend(r[1]),
+        on_error_extra={"found": False},
+    )
 
     # 3. config_repo.search
-    try:
-        cr_result = config_repo.search(runtime, ip)
-        summary["config_repo"] = {
-            "total_files_scanned": cr_result.total_files_scanned,
-            "match_count": len(cr_result.matches),
-            "truncated": cr_result.truncated,
-        }
-    except Exception as exc:
-        runtime.logger.error("inspect: config_repo.search raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("config_repo", exc))
-        summary["config_repo"] = {"error": str(exc)}
+    call_adapter(
+        summary, "config_repo",
+        fn=lambda: config_repo.search(runtime, ip),
+        to_row=lambda r: {
+            "total_files_scanned": r.total_files_scanned,
+            "match_count": len(r.matches),
+            "truncated": r.truncated,
+        },
+        findings=findings,
+        log_prefix="inspect: config_repo.search",
+    )
 
     # 4. sdwan_yaml.search_by_keyword
-    try:
-        sdwan_matches = sdwan_yaml.search_by_keyword(runtime, ip)
-        summary["sdwan_yaml"] = {
-            "match_count": len(sdwan_matches),
-            "sites": list({m.site_code for m in sdwan_matches}),
-        }
-    except Exception as exc:
-        runtime.logger.error("inspect: sdwan_yaml.search_by_keyword raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("sdwan_yaml", exc))
-        summary["sdwan_yaml"] = {"error": str(exc)}
+    call_adapter(
+        summary, "sdwan_yaml",
+        fn=lambda: sdwan_yaml.search_by_keyword(runtime, ip),
+        to_row=lambda r: {
+            "match_count": len(r),
+            "sites": list({m.site_code for m in r}),
+        },
+        findings=findings,
+        log_prefix="inspect: sdwan_yaml.search_by_keyword",
+    )
 
     # 5. dns.resolve_reverse
-    try:
-        dns_result = dns.resolve_reverse(runtime, ip)
-        summary["dns"] = {
-            "ptr": dns_result.ptr,
-            "status": dns_result.status,
-            "error": dns_result.error,
-        }
-    except Exception as exc:
-        runtime.logger.error("inspect: dns.resolve_reverse raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("dns", exc))
-        summary["dns"] = {"error": str(exc)}
+    call_adapter(
+        summary, "dns",
+        fn=lambda: dns.resolve_reverse(runtime, ip),
+        to_row=lambda r: {
+            "ptr": r.ptr,
+            "status": r.status,
+            "error": r.error,
+        },
+        findings=findings,
+        log_prefix="inspect: dns.resolve_reverse",
+    )
 
     return summary, findings
 
@@ -217,58 +209,152 @@ def _run_prefix(
     runtime: "LensRuntime",
     obj: LensObject,
     base_summary: Dict[str, Any],
+    *,
+    deep: bool = False,
 ) -> Tuple[Dict[str, Any], List[LensFinding]]:
-    """Run PREFIX-specific adapters in documented order."""
-    from cn_lens.adapters import infoblox, config_repo, sdwan_yaml
+    """Run PREFIX-specific adapters in documented order.
+
+    Parameters
+    ----------
+    deep:
+        When ``True``, call ``infoblox.lookup_prefix_deep`` (fan-out to DHCP
+        ranges, fixed addresses, in-subnet DNS records, member assignments, and
+        decoded DHCP options) instead of the shallow ``infoblox.lookup_prefix``.
+        Also checks whether the prefix is a network container and expands its
+        children via ``infoblox.network_container_children``.
+    """
+    from cn_lens.adapters import infoblox, config_repo, sdwan_yaml, active_directory
 
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     prefix = obj.value
 
-    # 1. infoblox.lookup_prefix
-    try:
-        ib_result = infoblox.lookup_prefix(runtime, prefix)
-        summary["infoblox"] = {
-            "found": ib_result.found,
-            "prefix": ib_result.prefix,
-            "network": ib_result.network,
-            "comment": ib_result.comment,
-            "inherited_comment": ib_result.inherited_comment,
-            "extattrs_count": len(ib_result.extattrs),
-            "dhcp_options_count": len(ib_result.dhcp_options),
-        }
-        findings.extend(ib_result.findings)
-    except Exception as exc:
-        runtime.logger.error("inspect: infoblox.lookup_prefix raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("infoblox", exc))
-        summary["infoblox"] = {"found": False, "error": str(exc)}
+    if deep:
+        # Deep path: fan-out to all related WAPI objects
+        def _deep_to_row(r):
+            row: Dict[str, Any] = {
+                "found": r.found,
+                "prefix": r.prefix,
+                "network": r.network,
+                "comment": r.comment,
+                "inherited_comment": r.inherited_comment,
+                "extattrs_count": len(r.extattrs),
+                "dhcp_options_count": len(r.dhcp_options),
+                "dhcp_ranges_count": len(r.dhcp_ranges),
+                "fixed_addresses_count": len(r.fixed_addresses),
+                "dns_records_count": len(r.dns_records),
+                "members_count": len(r.members),
+                "deep": True,
+                "dhcp_ranges": [
+                    {
+                        "start_addr": rng.start_addr,
+                        "end_addr": rng.end_addr,
+                        "member": rng.member,
+                        "failover_association": rng.failover_association,
+                    }
+                    for rng in r.dhcp_ranges
+                ],
+                "fixed_addresses": [
+                    {"ip": fa.ip, "mac": fa.mac, "name": fa.name}
+                    for fa in r.fixed_addresses
+                ],
+                "dns_records": [
+                    {"ip": rec.ip, "name": rec.name}
+                    for rec in r.dns_records
+                ],
+                "members": [
+                    {"name": m.name, "ip": m.ip}
+                    for m in r.members
+                ],
+                "dhcp_options": list(r.dhcp_options),
+            }
+            # Container expansion: when is_container, add children list
+            if r.is_container:
+                try:
+                    children = infoblox.network_container_children(runtime, prefix)
+                    row["container_children"] = children
+                    row["container_children_count"] = len(children)
+                    row["is_container"] = True
+                except Exception as exc:
+                    runtime.logger.error(
+                        "inspect: network_container_children raised: %s", exc
+                    )
+                    row["container_children"] = []
+                    row["container_children_count"] = 0
+                    row["is_container"] = True
+            return row
+
+        call_adapter(
+            summary, "infoblox",
+            fn=lambda: infoblox.lookup_prefix_deep(runtime, prefix),
+            to_row=_deep_to_row,
+            findings=findings,
+            log_prefix="inspect: infoblox.lookup_prefix_deep",
+            on_success=lambda r: findings.extend(r.findings),
+            on_error_extra={"found": False},
+        )
+    else:
+        # Shallow path (default)
+        call_adapter(
+            summary, "infoblox",
+            fn=lambda: infoblox.lookup_prefix(runtime, prefix),
+            to_row=lambda r: {
+                "found": r.found,
+                "prefix": r.prefix,
+                "network": r.network,
+                "comment": r.comment,
+                "inherited_comment": r.inherited_comment,
+                "extattrs_count": len(r.extattrs),
+                "dhcp_options_count": len(r.dhcp_options),
+            },
+            findings=findings,
+            log_prefix="inspect: infoblox.lookup_prefix",
+            on_success=lambda r: findings.extend(r.findings),
+            on_error_extra={"found": False},
+        )
 
     # 2. config_repo.search
-    try:
-        cr_result = config_repo.search(runtime, prefix)
-        summary["config_repo"] = {
-            "total_files_scanned": cr_result.total_files_scanned,
-            "match_count": len(cr_result.matches),
-            "truncated": cr_result.truncated,
-        }
-    except Exception as exc:
-        runtime.logger.error("inspect: config_repo.search raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("config_repo", exc))
-        summary["config_repo"] = {"error": str(exc)}
+    call_adapter(
+        summary, "config_repo",
+        fn=lambda: config_repo.search(runtime, prefix),
+        to_row=lambda r: {
+            "total_files_scanned": r.total_files_scanned,
+            "match_count": len(r.matches),
+            "truncated": r.truncated,
+        },
+        findings=findings,
+        log_prefix="inspect: config_repo.search",
+    )
 
     # 3. sdwan_yaml.lookup_prefix
-    try:
-        sdwan_result = sdwan_yaml.lookup_prefix(runtime, prefix)
-        summary["sdwan_yaml"] = {
-            "status": sdwan_result.status,
-            "site_code": sdwan_result.site_code,
-            "match_type": sdwan_result.match_type,
-        }
-        findings.extend(sdwan_result.findings)
-    except Exception as exc:
-        runtime.logger.error("inspect: sdwan_yaml.lookup_prefix raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("sdwan_yaml", exc))
-        summary["sdwan_yaml"] = {"error": str(exc)}
+    call_adapter(
+        summary, "sdwan_yaml",
+        fn=lambda: sdwan_yaml.lookup_prefix(runtime, prefix),
+        to_row=lambda r: {
+            "status": r.status,
+            "site_code": r.site_code,
+            "match_type": r.match_type,
+        },
+        findings=findings,
+        log_prefix="inspect: sdwan_yaml.lookup_prefix",
+        on_success=lambda r: findings.extend(r.findings),
+    )
+
+    # 4. active_directory.lookup_subnet — AD enrichment (site/location/description)
+    call_adapter(
+        summary, "ad",
+        fn=lambda: active_directory.lookup_subnet(runtime, prefix),
+        to_row=lambda r: {
+            "found": r[0].found,
+            "site": r[0].site,
+            "location": r[0].location,
+            "description": r[0].description,
+        },
+        findings=findings,
+        log_prefix="inspect: active_directory.lookup_subnet",
+        on_success=lambda r: findings.extend(r[1]),
+        on_error_extra={"found": False},
+    )
 
     return summary, findings
 
@@ -282,63 +368,64 @@ def _run_fqdn(
     from cn_lens.adapters import infoblox, dns, config_repo
 
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     fqdn = obj.value
 
     # 1. infoblox.lookup_fqdn
-    try:
-        ib_result = infoblox.lookup_fqdn(runtime, fqdn)
-        summary["infoblox"] = {
-            "found": ib_result.found,
-            "fqdn": ib_result.fqdn,
-            "record_count": len(ib_result.records),
-        }
-        findings.extend(ib_result.findings)
-    except Exception as exc:
-        runtime.logger.error("inspect: infoblox.lookup_fqdn raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("infoblox", exc))
-        summary["infoblox"] = {"found": False, "error": str(exc)}
+    call_adapter(
+        summary, "infoblox",
+        fn=lambda: infoblox.lookup_fqdn(runtime, fqdn),
+        to_row=lambda r: {
+            "found": r.found,
+            "fqdn": r.fqdn,
+            "record_count": len(r.records),
+        },
+        findings=findings,
+        log_prefix="inspect: infoblox.lookup_fqdn",
+        on_success=lambda r: findings.extend(r.findings),
+        on_error_extra={"found": False},
+    )
 
     # 2. dns.resolve_forward
-    try:
-        dns_fwd = dns.resolve_forward(runtime, fqdn)
-        dns_summary: Dict[str, Any] = {
-            "a_records": list(dns_fwd.a_records),
-            "aaaa_records": list(dns_fwd.aaaa_records),
-            "status": dns_fwd.status,
-        }
-    except Exception as exc:
-        runtime.logger.error("inspect: dns.resolve_forward raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("dns", exc))
-        dns_summary = {"error": str(exc)}
+    call_adapter(
+        summary, "dns",
+        fn=lambda: dns.resolve_forward(runtime, fqdn),
+        to_row=lambda r: {
+            "a_records": list(r.a_records),
+            "aaaa_records": list(r.aaaa_records),
+            "status": r.status,
+        },
+        findings=findings,
+        log_prefix="inspect: dns.resolve_forward",
+    )
 
-    # 3. dns.expand_fqdn_prefix (only for prefix-shape values)
+    # 3. dns.expand_fqdn_prefix (only for prefix-shape values) — augments the
+    # dns sub-block in-place; not structurally identical to the top-level
+    # adapter pattern so kept as an explicit try/except.
     if _is_fqdn_prefix(fqdn):
         try:
             expansion = dns.expand_fqdn_prefix(runtime, fqdn)
-            dns_summary["expansion"] = {
+            summary["dns"]["expansion"] = {
                 "names": list(expansion.names),
                 "status": expansion.status,
             }
         except Exception as exc:
             runtime.logger.error("inspect: dns.expand_fqdn_prefix raised unexpectedly: %s", exc)
             findings.append(_synthesise_error_finding("dns", exc))
-            dns_summary["expansion"] = {"error": str(exc)}
-
-    summary["dns"] = dns_summary
+            summary["dns"]["expansion"] = {"error": str(exc)}
 
     # 4. config_repo.search
-    try:
-        cr_result = config_repo.search(runtime, fqdn)
-        summary["config_repo"] = {
-            "total_files_scanned": cr_result.total_files_scanned,
-            "match_count": len(cr_result.matches),
-            "truncated": cr_result.truncated,
-        }
-    except Exception as exc:
-        runtime.logger.error("inspect: config_repo.search raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("config_repo", exc))
-        summary["config_repo"] = {"error": str(exc)}
+    call_adapter(
+        summary, "config_repo",
+        fn=lambda: config_repo.search(runtime, fqdn),
+        to_row=lambda r: {
+            "total_files_scanned": r.total_files_scanned,
+            "match_count": len(r.matches),
+            "truncated": r.truncated,
+        },
+        findings=findings,
+        log_prefix="inspect: config_repo.search",
+    )
 
     return summary, findings
 
@@ -352,52 +439,53 @@ def _run_site(
     from cn_lens.adapters import active_directory, sdwan_yaml, config_repo
 
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     site = obj.value
 
     # 1. ad.lookup_site
-    try:
-        ad_result, ad_findings = active_directory.lookup_site(runtime, site)
-        summary["ad"] = {
-            "found": ad_result.found,
-            "site_code": ad_result.site_code,
-            "location": ad_result.location,
-            "country_code": ad_result.country_code,
-            "ou_path": ad_result.ou_path,
-        }
-        findings.extend(ad_findings)
-    except Exception as exc:
-        runtime.logger.error("inspect: ad.lookup_site raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("ad", exc))
-        summary["ad"] = {"found": False, "error": str(exc)}
+    call_adapter(
+        summary, "ad",
+        fn=lambda: active_directory.lookup_site(runtime, site),
+        to_row=lambda r: {
+            "found": r[0].found,
+            "site_code": r[0].site_code,
+            "location": r[0].location,
+            "country_code": r[0].country_code,
+            "ou_path": r[0].ou_path,
+        },
+        findings=findings,
+        log_prefix="inspect: ad.lookup_site",
+        on_success=lambda r: findings.extend(r[1]),
+        on_error_extra={"found": False},
+    )
 
     # 2. sdwan_yaml.lookup_site
-    try:
-        sdwan_result = sdwan_yaml.lookup_site(runtime, site)
-        summary["sdwan_yaml"] = {
-            "status": sdwan_result.status,
-            "site_name": sdwan_result.site_name,
-            "prefix_count": len(sdwan_result.prefixes),
-            "device_count": len(sdwan_result.devices),
-        }
-        findings.extend(sdwan_result.findings)
-    except Exception as exc:
-        runtime.logger.error("inspect: sdwan_yaml.lookup_site raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("sdwan_yaml", exc))
-        summary["sdwan_yaml"] = {"error": str(exc)}
+    call_adapter(
+        summary, "sdwan_yaml",
+        fn=lambda: sdwan_yaml.lookup_site(runtime, site),
+        to_row=lambda r: {
+            "status": r.status,
+            "site_name": r.site_name,
+            "prefix_count": len(r.prefixes),
+            "device_count": len(r.devices),
+        },
+        findings=findings,
+        log_prefix="inspect: sdwan_yaml.lookup_site",
+        on_success=lambda r: findings.extend(r.findings),
+    )
 
     # 3. config_repo.search
-    try:
-        cr_result = config_repo.search(runtime, site)
-        summary["config_repo"] = {
-            "total_files_scanned": cr_result.total_files_scanned,
-            "match_count": len(cr_result.matches),
-            "truncated": cr_result.truncated,
-        }
-    except Exception as exc:
-        runtime.logger.error("inspect: config_repo.search raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("config_repo", exc))
-        summary["config_repo"] = {"error": str(exc)}
+    call_adapter(
+        summary, "config_repo",
+        fn=lambda: config_repo.search(runtime, site),
+        to_row=lambda r: {
+            "total_files_scanned": r.total_files_scanned,
+            "match_count": len(r.matches),
+            "truncated": r.truncated,
+        },
+        findings=findings,
+        log_prefix="inspect: config_repo.search",
+    )
 
     return summary, findings
 
@@ -411,105 +499,92 @@ def _run_device(
     from cn_lens.adapters import active_directory, infoblox, config_repo
 
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     device = obj.value
 
     # 1. ad.lookup_device
-    try:
-        ad_result, ad_findings = active_directory.lookup_device(runtime, device)
-        summary["ad"] = {
-            "found": ad_result.found,
-            "ou_path": ad_result.ou_path,
-            "last_site_code": ad_result.last_site_code,
-            "computer_dn": ad_result.computer_dn,
-        }
-        findings.extend(ad_findings)
-    except Exception as exc:
-        runtime.logger.error("inspect: ad.lookup_device raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("ad", exc))
-        summary["ad"] = {"found": False, "error": str(exc)}
+    call_adapter(
+        summary, "ad",
+        fn=lambda: active_directory.lookup_device(runtime, device),
+        to_row=lambda r: {
+            "found": r[0].found,
+            "ou_path": r[0].ou_path,
+            "last_site_code": r[0].last_site_code,
+            "computer_dn": r[0].computer_dn,
+        },
+        findings=findings,
+        log_prefix="inspect: ad.lookup_device",
+        on_success=lambda r: findings.extend(r[1]),
+        on_error_extra={"found": False},
+    )
 
     # 2. infoblox.search_by_keyword
-    try:
-        ib_rows = infoblox.search_by_keyword(runtime, device)
-        summary["infoblox"] = {
-            "match_count": len(ib_rows),
-            "networks": [r.network for r in ib_rows],
-        }
-    except Exception as exc:
-        runtime.logger.error("inspect: infoblox.search_by_keyword raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("infoblox", exc))
-        summary["infoblox"] = {"error": str(exc)}
+    call_adapter(
+        summary, "infoblox",
+        fn=lambda: infoblox.search_by_keyword(runtime, device),
+        to_row=lambda r: {
+            "match_count": len(r),
+            "networks": [row.network for row in r],
+        },
+        findings=findings,
+        log_prefix="inspect: infoblox.search_by_keyword",
+    )
 
     # 3. config_repo.search
-    try:
-        cr_result = config_repo.search(runtime, device)
-        summary["config_repo"] = {
-            "total_files_scanned": cr_result.total_files_scanned,
-            "match_count": len(cr_result.matches),
-            "truncated": cr_result.truncated,
-        }
-    except Exception as exc:
-        runtime.logger.error("inspect: config_repo.search raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("config_repo", exc))
-        summary["config_repo"] = {"error": str(exc)}
+    call_adapter(
+        summary, "config_repo",
+        fn=lambda: config_repo.search(runtime, device),
+        to_row=lambda r: {
+            "total_files_scanned": r.total_files_scanned,
+            "match_count": len(r.matches),
+            "truncated": r.truncated,
+        },
+        findings=findings,
+        log_prefix="inspect: config_repo.search",
+    )
 
     return summary, findings
 
 
-# Dispatch table: maps LensObjectType → adapter runner
-_AdapterRunner = Callable[
-    ["LensRuntime", LensObject, Dict[str, Any]],
-    Tuple[Dict[str, Any], List[LensFinding]],
-]
-_DISPATCH: Dict[LensObjectType, _AdapterRunner] = {
-    LensObjectType.IP: _run_ip,
-    LensObjectType.PREFIX: _run_prefix,
-    LensObjectType.FQDN: _run_fqdn,
-    LensObjectType.SITE: _run_site,
-    LensObjectType.DEVICE: _run_device,
-}
-
-
 # ---------------------------------------------------------------------------
-# Online per-object runner
+# Dispatch table builder — deep flag captured via closure
 # ---------------------------------------------------------------------------
 
-def _build_online_result(
-    obj: LensObject,
-    runtime: "LensRuntime",
-    sources: Dict[str, str],
-) -> LensResult:
-    """Build a LensResult for a single object using live adapters."""
-    base_summary: Dict[str, Any] = {
-        "original": obj.original,
-        "normalized": obj.normalized,
-        "type": obj.object_type.value,
+def _make_dispatch(deep: bool = False) -> Dict[Any, Any]:
+    """Build the dispatch table, capturing the ``deep`` flag via closure.
+
+    When ``deep=True`` the IP and PREFIX handlers receive ``deep=True`` so
+    they call the fan-out Infoblox functions instead of the shallow ones.
+    """
+    return {
+        LensObjectType.IP: lambda rt, obj, bs: _run_ip(rt, obj, bs, deep=deep),
+        LensObjectType.PREFIX: lambda rt, obj, bs: _run_prefix(rt, obj, bs, deep=deep),
+        LensObjectType.FQDN: _run_fqdn,
+        LensObjectType.SITE: _run_site,
+        LensObjectType.DEVICE: _run_device,
     }
 
-    # Always start with the classifier finding
-    findings: List[LensFinding] = [_classifier_finding()]
 
-    dispatcher = _DISPATCH.get(obj.object_type)
-    if dispatcher is not None:
-        try:
-            summary, adapter_findings = dispatcher(runtime, obj, base_summary)
-            findings.extend(adapter_findings)
-        except Exception as exc:
-            # Last-resort guard: should not happen since each dispatcher already wraps
-            runtime.logger.error("inspect: unexpected error in adapter dispatcher: %s", exc)
-            summary = dict(base_summary)
-            findings.append(_synthesise_error_finding("inspect", exc))
-    else:
-        # KEYWORD, INVALID, or any future type without a dispatcher
-        summary = dict(base_summary)
+# Default (non-deep) dispatch table — kept for backward compatibility
+_DISPATCH = _make_dispatch(deep=False)
 
+
+# ---------------------------------------------------------------------------
+# Offline result builder
+# ---------------------------------------------------------------------------
+
+def _build_offline_result(obj: LensObject, sources: Dict[str, str]):
+    from cn_lens.models import LensResult
     return LensResult(
         lens_object=obj,
         status="classified",
-        summary=summary,
+        summary={
+            "original": obj.original,
+            "normalized": obj.normalized,
+            "type": obj.object_type.value,
+        },
         sources=sources,
-        findings=tuple(findings),
+        findings=(_classifier_finding(OFFLINE_FINDING_MESSAGE),),
     )
 
 
@@ -522,6 +597,7 @@ def inspect_objects(
     *,
     runtime: Optional["LensRuntime"] = None,
     run_id: Optional[str] = None,
+    deep: bool = False,
 ) -> LensRun:
     """Classify and inspect a batch of network objects.
 
@@ -539,57 +615,27 @@ def inspect_objects(
         1. ``run_id`` kwarg (if not None)
         2. ``runtime.options.run_id`` (if runtime is not None and options.run_id is not None)
         3. Auto-generated UTC timestamp via ``make_run_id()``.
+    deep:
+        When ``True``, perform a deep-dive for PREFIX and IP objects:
+        fan-out to DHCP ranges, fixed addresses, in-subnet DNS records,
+        member assignments, and decoded DHCP options.  Mirrors the
+        "Subnet Data Detail" sheet from ``modules/subnet_request.py``.
+        For IP objects, also calls ``infoblox.contains_address`` to find the
+        parent subnet.  Network containers are expanded via
+        ``infoblox.network_container_children``.
 
     Returns
     -------
     LensRun
         Always returned; never raises.
     """
-    # --- Resolve run_id ---
-    effective_run_id: str
-    if run_id is not None:
-        effective_run_id = run_id
-    elif runtime is not None and runtime.options.run_id is not None:
-        effective_run_id = runtime.options.run_id
-    else:
-        effective_run_id = make_run_id()
-
-    # --- Offline path ---
-    if runtime is None or runtime.offline:
-        results = tuple(
-            _build_offline_result(obj) for obj in objects.objects
-        )
-        return LensRun(
-            schema_version=1,
-            tool="cn-lens",
-            workflow="inspect",
-            run_id=effective_run_id,
-            inputs=objects,
-            results=results,
-            warnings=(),
-            errors=(),
-        )
-
-    # --- Online path ---
-    # Build sources map once from the registry; share across all results in this run.
-    registry = get_registry()
-    sources: Dict[str, str] = {"classifier": "ok"}
-    sources.update(registry.source_statuses(runtime))
-
-    results = tuple(
-        _build_online_result(obj, runtime, sources)
-        for obj in objects.objects
+    dispatch = _make_dispatch(deep=deep) if deep else _DISPATCH
+    return run_workflow(
+        "inspect",
+        objects,
+        runtime,
+        registry=get_registry(),
+        run_id=run_id,
+        dispatch=dispatch,
+        offline_result_fn=_build_offline_result,
     )
-
-    run = LensRun(
-        schema_version=1,
-        tool="cn-lens",
-        workflow="inspect",
-        run_id=effective_run_id,
-        inputs=objects,
-        results=results,
-        warnings=(),
-        errors=(),
-    )
-    maybe_persist(run, runtime)
-    return run

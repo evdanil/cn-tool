@@ -50,6 +50,9 @@ BASE_CONFIG_SCHEMA = {
     "config_analyzer_layout":      {"section": "config_analyzer", "ini_key": "layout", "type": "str", "fallback": "right"},
     "config_analyzer_scroll_to_end": {"section": "config_analyzer", "ini_key": "scroll_to_end", "type": "bool", "fallback": False},
     "config_analyzer_debug":       {"section": "config_analyzer", "ini_key": "debug", "type": "bool", "fallback": False},
+    # SSH / Device query settings
+    "device_ssh_enabled":        {"section": "ssh", "ini_key": "device_ssh_enabled", "type": "bool", "fallback": False},
+    "device_query_workers":      {"section": "ssh", "ini_key": "device_query_workers", "type": "int", "fallback": 10},
 }
 
 # Backward/forward compatibility across section renames.
@@ -297,18 +300,97 @@ def make_dir_list(ctx: ScriptContext) -> List[Path]:
     return dir_list
 
 
+def normalize_runtime_flags(cfg: Dict[str, Any], logger: logging.Logger) -> Dict[str, Any]:
+    """Normalize derived runtime flags in *cfg* in-place and return cfg.
+
+    Applies the same post-read normalization that ``main.py`` performs after
+    ``read_config`` so that both the interactive cn-tool and cn-lens CLI share
+    identical semantics:
+
+    1. ``infoblox_enabled`` (bool) — ``True`` iff ``api_endpoint`` is set to a
+       real URL (not the sentinel ``"API_URL"`` and not empty).
+
+    2. ``config_repo_enabled`` (bool) — resolved via ``parse_optional_bool``:
+
+       - Explicit ``true`` / ``1`` / ``yes`` / ``on``  →  ``True`` (then
+         directory accessibility is also verified; inaccessible → ``False``).
+       - Explicit ``false`` / ``0`` / ``no`` / ``off`` →  ``False``.
+       - Blank or absent (schema fallback ``""`` / ``None``)  →  auto-detect:
+         ``True`` iff ``config_repo_directory`` is set *and* accessible.
+       - Unrecognized non-empty value  →  warning then auto-detect as above.
+
+    Mutates *cfg* directly and also returns it for convenience.
+    """
+    # 1. Infoblox readiness
+    if cfg.get("api_endpoint") == "API_URL" or not cfg.get("api_endpoint"):
+        logger.warning(
+            "Infoblox API URL is not set. Infoblox-related modules will be disabled."
+        )
+        cfg["infoblox_enabled"] = False
+    else:
+        cfg["infoblox_enabled"] = True
+
+    # 2. Config-repo readiness
+    repo_enabled_value = cfg.get("config_repo_enabled", "")
+    repo_enabled_raw = str(repo_enabled_value).strip()
+    repo_enabled = parse_optional_bool(repo_enabled_value)
+
+    if repo_enabled is False:
+        logger.info("Configuration repository explicitly disabled in config.")
+        cfg["config_repo_enabled"] = False
+    elif repo_enabled is True:
+        if not check_dir_accessibility(logger, cfg.get("config_repo_directory") or ""):
+            logger.warning(
+                "Configuration repository directory is not accessible."
+                " Config search modules will be disabled."
+            )
+            cfg["config_repo_enabled"] = False
+        else:
+            cfg["config_repo_enabled"] = True
+    else:
+        if repo_enabled_raw:
+            logger.warning(
+                "Invalid value for config_repo.enabled: %r. Falling back to auto-detect.",
+                repo_enabled_raw,
+            )
+        # Not set — auto-detect: enabled iff directory is configured and accessible
+        repo_dir = cfg.get("config_repo_directory")
+        if repo_dir and check_dir_accessibility(logger, repo_dir):
+            cfg["config_repo_enabled"] = True
+        else:
+            logger.info(
+                "Configuration repository not configured or directory not accessible,"
+                " skipping."
+            )
+            cfg["config_repo_enabled"] = False
+
+    return cfg
+
+
 def write_config_value(
     logger: logging.Logger,
     user_config_path: Path,
     section: str,
     key: str,
-    value: str
+    value: str,
+    log_value: bool = True,
 ) -> None:
     """
     Writes a single key-value pair to the user's configuration file.
     Creates the file or section if it doesn't exist.
+
+    Parameters
+    ----------
+    log_value:
+        When ``True`` (default) the value is included in the log message.
+        Pass ``False`` for secret/credential values so that they are never
+        written to the log file in plain text.  The console display is
+        controlled separately by the caller (config_set already redacts).
     """
-    logger.info(f"CONFIG_WRITER: Attempting to set [{section}] {key} = {value} in {user_config_path}")
+    log_display = value if log_value else "***"
+    logger.info(
+        f"CONFIG_WRITER: Attempting to set [{section}] {key} = {log_display} in {user_config_path}"
+    )
     config = configparser.ConfigParser()
 
     # Read the existing file to not overwrite other values

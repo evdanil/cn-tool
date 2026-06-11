@@ -35,11 +35,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from cn_lens.adapters.registry import get_registry
-from cn_lens.models import LensFinding, LensObject, LensObjectType, LensResult, LensRun, ObjectSet
+from cn_lens.models import LensFinding, LensObject, LensObjectType, LensResult, ObjectSet
 from cn_lens.workflows._helpers import (
     OFFLINE_FINDING_MESSAGE,
-    make_run_id,
-    maybe_persist,
+    run_workflow,
 )
 
 if TYPE_CHECKING:
@@ -51,16 +50,6 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _WRONG_TYPE_MESSAGE = "validate_site requires a site code input"
-
-_OFFLINE_SOURCES: Dict[str, str] = {
-    "classifier": "ok",
-    "infoblox": "not_queried",
-    "config_repo": "not_queried",
-    "ad": "not_queried",
-    "sdwan_yaml": "not_queried",
-    "dns": "not_queried",
-}
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -76,17 +65,7 @@ def _offline_classifier_finding() -> LensFinding:
     )
 
 
-def _wrong_type_classifier_finding() -> LensFinding:
-    """Return the wrong-type classifier info finding for non-SITE objects."""
-    return LensFinding(
-        severity="info",
-        source="classifier",
-        message=_WRONG_TYPE_MESSAGE,
-        detail={"workflow": "validate_site"},
-    )
-
-
-def _offline_result(obj: LensObject) -> LensResult:
+def _offline_result(obj: LensObject, sources: Dict[str, str]) -> LensResult:
     """MVP-shape result for offline / no-runtime path (all object types)."""
     return LensResult(
         lens_object=obj,
@@ -96,23 +75,8 @@ def _offline_result(obj: LensObject) -> LensResult:
             "normalized": obj.normalized,
             "type": obj.object_type.value,
         },
-        sources=_OFFLINE_SOURCES,
-        findings=(_offline_classifier_finding(),),
-    )
-
-
-def _wrong_type_result(obj: LensObject, sources: Dict[str, str]) -> LensResult:
-    """Return a classifier-only result for non-SITE objects (online path)."""
-    return LensResult(
-        lens_object=obj,
-        status="classified",
-        summary={
-            "original": obj.original,
-            "normalized": obj.normalized,
-            "type": obj.object_type.value,
-        },
         sources=sources,
-        findings=(_wrong_type_classifier_finding(),),
+        findings=(_offline_classifier_finding(),),
     )
 
 
@@ -165,10 +129,16 @@ def _check_ad_known(
     checks: List[Dict[str, str]],
     findings: List[LensFinding],
 ) -> bool:
-    """Check 1: ad_known — site found in Active Directory."""
+    """Check 1: ad_known — site found in Active Directory.
+
+    Called before the Infoblox check (check 3), so no prefix list is available
+    at this point.  The lookup falls back to the site-object path only.  If a
+    future refactor reorders the checks or runs Infoblox first, prefixes can be
+    wired in here (P5 follow-up).
+    """
     from cn_lens.adapters import active_directory as ad
     try:
-        ad_result, _ad_findings = ad.lookup_site(runtime, site)
+        ad_result, _ad_findings = ad.lookup_site(runtime, site, prefixes=())
         if ad_result.found:
             checks.append(_check_result("ad_known", "pass", "info", "Site found in AD"))
             return True
@@ -217,7 +187,7 @@ def _check_infoblox_subnets(
     """Check 3: infoblox_subnets_present — site has subnets in Infoblox."""
     from cn_lens.adapters import infoblox
     try:
-        rows = infoblox.search_by_keyword(runtime, site)
+        rows = infoblox.search_by_keyword(runtime, site, mode="site")
         if rows:
             checks.append(_check_result("infoblox_subnets_present", "pass", "info", "Infoblox subnets reference this site"))
         else:
@@ -290,15 +260,15 @@ def _check_dns_subdomain(
 
 
 # ---------------------------------------------------------------------------
-# Per-SITE online runner
+# Per-type online handlers (runtime, obj, base_summary) -> (summary, findings)
 # ---------------------------------------------------------------------------
 
-def _run_site_checks(
+def _run_site(
     runtime: "LensRuntime",
     obj: LensObject,
-    sources: Dict[str, str],
-) -> LensResult:
-    """Run all validate_site checks for a SITE object and build a LensResult."""
+    base_summary: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[LensFinding]]:
+    """Run all validate_site checks for a SITE object."""
     site = obj.value
     checks: List[Dict[str, str]] = []
     findings: List[LensFinding] = []
@@ -313,22 +283,39 @@ def _run_site_checks(
     overall = _overall_status(checks)
 
     summary: Dict[str, Any] = {
-        "original": obj.original,
-        "normalized": obj.normalized,
-        "type": obj.object_type.value,
+        **base_summary,
         "validate_site": {
             "checks": checks,
             "overall_status": overall,
         },
     }
+    return summary, findings
 
-    return LensResult(
-        lens_object=obj,
-        status="classified",
-        summary=summary,
-        sources=sources,
-        findings=tuple(findings),
-    )
+
+def _run_wrong_type(
+    runtime: "LensRuntime",
+    obj: LensObject,
+    base_summary: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[LensFinding]]:
+    """Return classifier-only result for non-SITE objects."""
+    findings: List[LensFinding] = [
+        LensFinding(
+            severity="info",
+            source="classifier",
+            message=_WRONG_TYPE_MESSAGE,
+            detail={"workflow": "validate_site"},
+        )
+    ]
+    return dict(base_summary), findings
+
+
+_DISPATCH = {
+    LensObjectType.SITE: _run_site,
+    LensObjectType.IP: _run_wrong_type,
+    LensObjectType.PREFIX: _run_wrong_type,
+    LensObjectType.FQDN: _run_wrong_type,
+    LensObjectType.DEVICE: _run_wrong_type,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -341,69 +328,13 @@ def validate_site_objects(
     runtime: Optional["LensRuntime"] = None,
     run_id: Optional[str] = None,
 ) -> LensRun:
-    """Validate site objects across AD, SD-WAN YAML, Infoblox, config-repo, and DNS.
-
-    Parameters
-    ----------
-    object_set:
-        The ``ObjectSet`` produced by ``classify_many``.
-    runtime:
-        Optional ``LensRuntime``.  When ``None`` or ``runtime.offline`` is
-        ``True``, returns offline MVP-shape output without adapter I/O.
-    run_id:
-        Explicit run identifier.  Precedence order:
-        1. ``run_id`` kwarg (if not None)
-        2. ``runtime.options.run_id`` (if runtime is not None and options.run_id is not None)
-        3. Auto-generated UTC timestamp via ``make_run_id()``.
-
-    Returns
-    -------
-    LensRun
-        Always returned; never raises.
-    """
-    # --- Resolve run_id ---
-    if run_id is not None:
-        effective_run_id = run_id
-    elif runtime is not None and runtime.options.run_id is not None:
-        effective_run_id = runtime.options.run_id
-    else:
-        effective_run_id = make_run_id()
-
-    # --- Offline path ---
-    if runtime is None or runtime.offline:
-        results = tuple(_offline_result(obj) for obj in object_set.objects)
-        return LensRun(
-            schema_version=1,
-            tool="cn-lens",
-            workflow="validate_site",
-            run_id=effective_run_id,
-            inputs=object_set,
-            results=results,
-            warnings=(),
-            errors=(),
-        )
-
-    # --- Online path ---
-    registry = get_registry()
-    sources: Dict[str, str] = {"classifier": "ok"}
-    sources.update(registry.source_statuses(runtime))
-
-    results_list: List[LensResult] = []
-    for obj in object_set.objects:
-        if obj.object_type == LensObjectType.SITE:
-            results_list.append(_run_site_checks(runtime, obj, sources))
-        else:
-            results_list.append(_wrong_type_result(obj, sources))
-
-    run = LensRun(
-        schema_version=1,
-        tool="cn-lens",
-        workflow="validate_site",
-        run_id=effective_run_id,
-        inputs=object_set,
-        results=tuple(results_list),
-        warnings=(),
-        errors=(),
+    """Validate site objects across AD, SD-WAN YAML, Infoblox, config-repo, and DNS."""
+    return run_workflow(
+        "validate_site",
+        object_set,
+        runtime,
+        registry=get_registry(),
+        run_id=run_id,
+        dispatch=_DISPATCH,
+        offline_result_fn=_offline_result,
     )
-    maybe_persist(run, runtime)
-    return run

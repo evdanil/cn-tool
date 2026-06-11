@@ -34,7 +34,6 @@ Verdict calculation
 from __future__ import annotations
 
 import ipaddress
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from cn_lens.adapters.registry import get_registry
@@ -46,8 +45,7 @@ from cn_lens.models import (
     LensRun,
     ObjectSet,
 )
-from cn_lens.workflows.inspect import make_run_id
-from cn_lens.workflows._helpers import maybe_persist
+from cn_lens.workflows._helpers import run_workflow, synthesise_error_finding
 
 if TYPE_CHECKING:
     from cn_lens.runtime import LensRuntime
@@ -87,16 +85,6 @@ def _classifier_finding(obj: LensObject) -> LensFinding:
         source="classifier",
         message=CLASSIFIER_FINDING_MESSAGE,
         detail={"workflow": "allocate", "type": obj.object_type.value},
-    )
-
-
-def _synthesise_error_finding(source: str, exc: Exception) -> LensFinding:
-    """Return a synthesised error finding for an unexpected adapter exception."""
-    return LensFinding(
-        severity="error",
-        source=source,
-        message=str(exc),
-        detail={"exception": type(exc).__name__},
     )
 
 
@@ -170,15 +158,7 @@ def _supernet_of(prefix: str) -> Optional[str]:
 # Offline path
 # ---------------------------------------------------------------------------
 
-_OFFLINE_SOURCES: Dict[str, str] = {
-    "classifier": "ok",
-    "infoblox": "not_queried",
-    "config_repo": "not_queried",
-    "ad": "not_queried",
-}
-
-
-def _build_offline_result(obj: LensObject) -> LensResult:
+def _build_offline_result(obj: LensObject, sources: Dict[str, str]) -> LensResult:
     """Build the MVP-shape LensResult when offline or runtime is None."""
     return LensResult(
         lens_object=obj,
@@ -188,7 +168,7 @@ def _build_offline_result(obj: LensObject) -> LensResult:
             "normalized": obj.normalized,
             "type": obj.object_type.value,
         },
-        sources=_OFFLINE_SOURCES,
+        sources=sources,
         findings=(_classifier_finding(obj),),
     )
 
@@ -208,7 +188,7 @@ def _check_ipam_availability(
         result = infoblox.lookup_prefix(runtime, prefix)
     except Exception as exc:
         runtime.logger.error("allocate: ipam_availability: unexpected error: %s", exc)
-        finding = _synthesise_error_finding("infoblox", exc)
+        finding = synthesise_error_finding("infoblox", exc)
         return (
             _make_check_result(
                 "ipam_availability",
@@ -254,7 +234,7 @@ def _check_overlap(
         rows = infoblox.search_by_keyword(runtime, network_addr)
     except Exception as exc:
         runtime.logger.error("allocate: overlap_check: unexpected error: %s", exc)
-        finding = _synthesise_error_finding("infoblox", exc)
+        finding = synthesise_error_finding("infoblox", exc)
         return (
             _make_check_result(
                 "overlap_check",
@@ -325,7 +305,7 @@ def _check_inheritance_acceptable(
         parent_result = infoblox.lookup_prefix(runtime, supernet)
     except Exception as exc:
         runtime.logger.error("allocate: inheritance_acceptable: unexpected error: %s", exc)
-        finding = _synthesise_error_finding("infoblox", exc)
+        finding = synthesise_error_finding("infoblox", exc)
         return (
             _make_check_result(
                 "inheritance_acceptable",
@@ -398,14 +378,19 @@ def _check_target_site_known(
     runtime: "LensRuntime",
     target_site: str,
 ) -> Tuple[CheckResult, List[LensFinding]]:
-    """Check 4: is target_site resolvable in AD?"""
+    """Check 4: is target_site resolvable in AD?
+
+    No prefix list is available in the allocate flow (the candidate prefix
+    has not yet been allocated, so no Infoblox-backed CIDR evidence exists).
+    The site-object LDAP path covers this case.
+    """
     from cn_lens.adapters import active_directory as ad
 
     try:
-        site_result, ad_findings = ad.lookup_site(runtime, target_site)
+        site_result, ad_findings = ad.lookup_site(runtime, target_site, prefixes=())
     except Exception as exc:
         runtime.logger.error("allocate: target_site_known: unexpected error: %s", exc)
-        finding = _synthesise_error_finding("ad", exc)
+        finding = synthesise_error_finding("ad", exc)
         return (
             _make_check_result(
                 "target_site_known",
@@ -450,7 +435,7 @@ def _check_no_config_reference(
         cr_result = config_repo.search(runtime, prefix)
     except Exception as exc:
         runtime.logger.error("allocate: no_existing_config_reference: unexpected error: %s", exc)
-        finding = _synthesise_error_finding("config_repo", exc)
+        finding = synthesise_error_finding("config_repo", exc)
         return (
             _make_check_result(
                 "no_existing_config_reference",
@@ -493,15 +478,15 @@ def _check_no_config_reference(
 
 
 # ---------------------------------------------------------------------------
-# Online per-object runner
+# Per-type online handlers — (runtime, obj, base_summary) -> (summary, findings)
 # ---------------------------------------------------------------------------
 
-def _build_online_prefix_result(
-    obj: LensObject,
+def _run_prefix(
     runtime: "LensRuntime",
-    sources: Dict[str, str],
+    obj: LensObject,
+    base_summary: Dict[str, Any],
     target_site: Optional[str],
-) -> LensResult:
+) -> Tuple[Dict[str, Any], List[LensFinding]]:
     """Run all allocate checks for a PREFIX object."""
     prefix = obj.value
     findings: List[LensFinding] = []
@@ -553,9 +538,7 @@ def _build_online_prefix_result(
     verdict = _derive_verdict(checks)
 
     summary: Dict[str, Any] = {
-        "original": obj.original,
-        "normalized": obj.normalized,
-        "type": obj.object_type.value,
+        **base_summary,
         "allocate": {
             "checks": checks,
             "verdict": verdict,
@@ -564,31 +547,30 @@ def _build_online_prefix_result(
     if target_site is not None:
         summary["allocate"]["target_site"] = target_site
 
-    return LensResult(
-        lens_object=obj,
-        status="classified",
-        summary=summary,
-        sources=sources,
-        findings=tuple(findings),
-    )
+    return summary, findings
 
 
-def _build_online_non_prefix_result(
+def _run_wrong_type(
+    runtime: "LensRuntime",
     obj: LensObject,
-    sources: Dict[str, str],
-) -> LensResult:
-    """Return a classifier-only result for non-PREFIX objects."""
-    return LensResult(
-        lens_object=obj,
-        status="classified",
-        summary={
-            "original": obj.original,
-            "normalized": obj.normalized,
-            "type": obj.object_type.value,
-        },
-        sources=sources,
-        findings=(_classifier_finding(obj),),
-    )
+    base_summary: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[LensFinding]]:
+    """Return classifier-only result for non-PREFIX objects."""
+    return dict(base_summary), [_classifier_finding(obj)]
+
+
+def _make_dispatch(target_site: Optional[str]) -> Dict[LensObjectType, Any]:
+    """Build dispatch table, capturing target_site in the PREFIX handler closure."""
+    def _handle_prefix(runtime: "LensRuntime", obj: LensObject, base_summary: Dict[str, Any]):
+        return _run_prefix(runtime, obj, base_summary, target_site)
+
+    return {
+        LensObjectType.PREFIX: _handle_prefix,
+        LensObjectType.IP: _run_wrong_type,
+        LensObjectType.FQDN: _run_wrong_type,
+        LensObjectType.DEVICE: _run_wrong_type,
+        LensObjectType.SITE: _run_wrong_type,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -602,101 +584,13 @@ def allocate_objects(
     run_id: Optional[str] = None,
     target_site: Optional[str] = None,
 ) -> LensRun:
-    """Safety-check a candidate prefix before allocation.
-
-    Parameters
-    ----------
-    object_set:
-        The ``ObjectSet`` produced by ``classify_many``.  Only ``PREFIX``
-        objects are checked; all others receive a classifier-only result.
-    runtime:
-        Optional ``LensRuntime``.  When ``None`` or ``runtime.offline`` is
-        ``True`` the function returns the offline MVP-shape output without
-        contacting any live adapters.  When online, all applicable checks are
-        run and their results are included in each ``LensResult``.
-    run_id:
-        Explicit run identifier.  Precedence order:
-        1. ``run_id`` kwarg (if not None)
-        2. ``runtime.options.run_id`` (if runtime is not None and options.run_id is not None)
-        3. Auto-generated UTC timestamp via ``make_run_id()``.
-    target_site:
-        Optional site code the prefix would be allocated to.  When provided,
-        ``inheritance_acceptable`` and ``target_site_known`` checks are run.
-        When absent, those checks are skipped.
-
-    Returns
-    -------
-    LensRun
-        Always returned; never raises.
-    """
-    # --- Resolve run_id ---
-    effective_run_id: str
-    if run_id is not None:
-        effective_run_id = run_id
-    elif runtime is not None and runtime.options.run_id is not None:
-        effective_run_id = runtime.options.run_id
-    else:
-        effective_run_id = make_run_id()
-
-    # --- Offline path ---
-    if runtime is None or runtime.offline:
-        results = tuple(
-            _build_offline_result(obj) for obj in object_set.objects
-        )
-        return LensRun(
-            schema_version=1,
-            tool="cn-lens",
-            workflow="allocate",
-            run_id=effective_run_id,
-            inputs=object_set,
-            results=results,
-            warnings=(),
-            errors=(),
-        )
-
-    # --- Online path ---
-    registry = get_registry()
-    sources: Dict[str, str] = {"classifier": "ok"}
-    sources.update(registry.source_statuses(runtime))
-
-    results: List[LensResult] = []
-    for obj in object_set.objects:
-        if obj.object_type == LensObjectType.PREFIX:
-            try:
-                result = _build_online_prefix_result(obj, runtime, sources, target_site)
-            except Exception as exc:
-                runtime.logger.error(
-                    "allocate: unexpected error processing prefix %s: %s", obj.value, exc
-                )
-                result = LensResult(
-                    lens_object=obj,
-                    status="classified",
-                    summary={
-                        "original": obj.original,
-                        "normalized": obj.normalized,
-                        "type": obj.object_type.value,
-                        "allocate": {
-                            "checks": [],
-                            "verdict": "unsafe",
-                            "error": str(exc),
-                        },
-                    },
-                    sources=sources,
-                    findings=(_synthesise_error_finding("allocate", exc),),
-                )
-        else:
-            result = _build_online_non_prefix_result(obj, sources)
-        results.append(result)
-
-    run = LensRun(
-        schema_version=1,
-        tool="cn-lens",
-        workflow="allocate",
-        run_id=effective_run_id,
-        inputs=object_set,
-        results=tuple(results),
-        warnings=(),
-        errors=(),
+    """Safety-check a candidate prefix before allocation."""
+    return run_workflow(
+        "allocate",
+        object_set,
+        runtime,
+        registry=get_registry(),
+        run_id=run_id,
+        dispatch=_make_dispatch(target_site),
+        offline_result_fn=_build_offline_result,
     )
-    maybe_persist(run, runtime)
-    return run

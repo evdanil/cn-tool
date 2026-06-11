@@ -47,29 +47,19 @@ Hard constraints
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, TYPE_CHECKING
 
 from cn_lens.adapters.registry import get_registry
-from cn_lens.models import LensFinding, LensObject, LensObjectType, LensResult, LensRun, ObjectSet
+from cn_lens.models import LensFinding, LensObject, LensObjectType, LensRun, ObjectSet
 from cn_lens.workflows._helpers import (
     OFFLINE_FINDING_MESSAGE,
     CLASSIFIED_FINDING_MESSAGE,
-    make_run_id as _make_run_id,
-    maybe_persist,
-    synthesise_error_finding as _synthesise_error_finding,
+    call_adapter,
+    run_workflow,
 )
 
 if TYPE_CHECKING:
     from cn_lens.runtime import LensRuntime
-
-
-# ---------------------------------------------------------------------------
-# Public constants
-# ---------------------------------------------------------------------------
-
-# Deprecated alias — kept for backwards compatibility with existing tests/callers.
-# Value equals OFFLINE_FINDING_MESSAGE (the offline-path message).
-IMPACT_MVP_FINDING_MESSAGE: str = OFFLINE_FINDING_MESSAGE
 
 
 # ---------------------------------------------------------------------------
@@ -121,21 +111,11 @@ def _classifier_finding(message: str = CLASSIFIED_FINDING_MESSAGE) -> LensFindin
 
 
 # ---------------------------------------------------------------------------
-# Offline path
+# Offline result builder
 # ---------------------------------------------------------------------------
 
-_OFFLINE_SOURCES: Dict[str, str] = {
-    "classifier": "ok",
-    "infoblox": "not_queried",
-    "config_repo": "not_queried",
-    "ad": "not_queried",
-    "sdwan_yaml": "not_queried",
-    "dns": "not_queried",
-}
-
-
-def _build_offline_result(obj: LensObject) -> LensResult:
-    """Build the offline-shape LensResult when offline or runtime is None."""
+def _build_offline_result(obj: LensObject, sources: Dict[str, str]):
+    from cn_lens.models import LensResult
     return LensResult(
         lens_object=obj,
         status="classified",
@@ -144,7 +124,7 @@ def _build_offline_result(obj: LensObject) -> LensResult:
             "normalized": obj.normalized,
             "type": obj.object_type.value,
         },
-        sources=_OFFLINE_SOURCES,
+        sources=sources,
         findings=(_classifier_finding(OFFLINE_FINDING_MESSAGE),),
     )
 
@@ -173,28 +153,27 @@ def _call_config_repo(
     summary: Dict[str, Any],
     findings: List[LensFinding],
     matches: List[ImpactMatch],
-    source: str = "config_repo",
 ) -> None:
     """Call config_repo.search and update summary/findings/matches in-place.
 
-    On success populates ``summary["config_repo"]`` with scan stats and extends
-    ``matches`` with translated ImpactMatch entries.  On error appends an error
-    finding and sets ``summary["config_repo"]`` to an error dict.
+    Thin wrapper around ``call_adapter`` that also extends *matches* on the
+    success path — kept as a named helper because every impact chain starts
+    with this identical config_repo call + matches extension.
     """
     from cn_lens.adapters import config_repo
 
-    try:
-        cr_result = config_repo.search(runtime, query)
-        summary["config_repo"] = {
-            "total_files_scanned": cr_result.total_files_scanned,
-            "match_count": len(cr_result.matches),
-            "truncated": cr_result.truncated,
-        }
-        matches.extend(_matches_from_config_repo(cr_result))
-    except Exception as exc:
-        runtime.logger.error("impact: config_repo.search raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding(source, exc))
-        summary["config_repo"] = {"error": str(exc)}
+    call_adapter(
+        summary, "config_repo",
+        fn=lambda: config_repo.search(runtime, query),
+        to_row=lambda r: {
+            "total_files_scanned": r.total_files_scanned,
+            "match_count": len(r.matches),
+            "truncated": r.truncated,
+        },
+        findings=findings,
+        log_prefix="impact: config_repo.search",
+        on_success=lambda r: matches.extend(_matches_from_config_repo(r)),
+    )
 
 
 def _matches_from_sdwan_keyword(sdwan_matches: Any) -> List[ImpactMatch]:
@@ -314,66 +293,125 @@ def _matches_from_dns_forward(dns_result: Any) -> List[ImpactMatch]:
 
 
 # ---------------------------------------------------------------------------
-# Per-type adapter dispatch (online path)
+# Per-type adapter dispatch handlers (online path)
 # ---------------------------------------------------------------------------
+
+def _matches_from_sdwan_prefix_all(sdwan_results: List[Any]) -> List[ImpactMatch]:
+    """Translate a list[SdwanPrefixResult] (from lookup_prefix_all) into ImpactMatch records."""
+    out: List[ImpactMatch] = []
+    for r in sdwan_results:
+        if r.status in ("found", "partial"):
+            out.append(ImpactMatch(
+                source="sdwan_yaml",
+                device_or_file=r.file_path or r.site_code,
+                location=r.match_type,
+                snippet=r.raw or r.prefix,
+            ))
+    return out
+
 
 def _run_prefix(
     runtime: "LensRuntime",
     obj: LensObject,
     base_summary: Dict[str, Any],
-) -> Tuple[Dict[str, Any], List[LensFinding], List[ImpactMatch]]:
-    """Run PREFIX-specific adapters: config_repo → sdwan_prefix → ib_keyword."""
-    from cn_lens.adapters import sdwan_yaml, infoblox
+    *,
+    all_matches: bool = False,
+) -> Tuple[Dict[str, Any], List[LensFinding]]:
+    """Run PREFIX-specific adapters: config_repo → sdwan_prefix → ib_keyword → ad_subnet.
+
+    Parameters
+    ----------
+    all_matches:
+        When ``True``, calls ``sdwan_yaml.lookup_prefix_all`` (exhaustive mode,
+        plan D9 ``--all-matches`` flag) instead of ``sdwan_yaml.lookup_prefix``
+        (best-match mode).
+    """
+    from cn_lens.adapters import sdwan_yaml, infoblox, active_directory
 
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     matches: List[ImpactMatch] = []
     prefix = obj.value
 
     # 1. config_repo.search
     _call_config_repo(runtime, prefix, summary=summary, findings=findings, matches=matches)
 
-    # 2. sdwan_yaml.lookup_prefix
-    try:
-        sdwan_result = sdwan_yaml.lookup_prefix(runtime, prefix)
-        summary["sdwan_yaml"] = {
-            "status": sdwan_result.status,
-            "site_code": sdwan_result.site_code,
-            "match_type": sdwan_result.match_type,
-        }
-        findings.extend(sdwan_result.findings)
-        matches.extend(_matches_from_sdwan_prefix(sdwan_result))
-    except Exception as exc:
-        runtime.logger.error("impact: sdwan_yaml.lookup_prefix raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("sdwan_yaml", exc))
-        summary["sdwan_yaml"] = {"error": str(exc)}
+    # 2. sdwan_yaml lookup — exhaustive (all-matches) or best-match (default)
+    if all_matches:
+        call_adapter(
+            summary, "sdwan_yaml",
+            fn=lambda: sdwan_yaml.lookup_prefix_all(runtime, prefix),
+            to_row=lambda r: {
+                "match_count": len(r),
+                "sites": [x.site_code for x in r if x.status in ("found", "partial")],
+            },
+            findings=findings,
+            log_prefix="impact: sdwan_yaml.lookup_prefix_all",
+            on_success=lambda r: (
+                [findings.extend(x.findings) for x in r],
+                matches.extend(_matches_from_sdwan_prefix_all(r)),
+            ),
+        )
+    else:
+        call_adapter(
+            summary, "sdwan_yaml",
+            fn=lambda: sdwan_yaml.lookup_prefix(runtime, prefix),
+            to_row=lambda r: {
+                "status": r.status,
+                "site_code": r.site_code,
+                "match_type": r.match_type,
+            },
+            findings=findings,
+            log_prefix="impact: sdwan_yaml.lookup_prefix",
+            on_success=lambda r: (
+                findings.extend(r.findings),
+                matches.extend(_matches_from_sdwan_prefix(r)),
+            ),
+        )
 
     # 3. infoblox.search_by_keyword
-    try:
-        ib_rows = infoblox.search_by_keyword(runtime, prefix)
-        summary["infoblox"] = {
-            "match_count": len(ib_rows),
-            "networks": [r.network for r in ib_rows],
-        }
-        matches.extend(_matches_from_ib_keyword(ib_rows))
-    except Exception as exc:
-        runtime.logger.error("impact: infoblox.search_by_keyword raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("infoblox", exc))
-        summary["infoblox"] = {"error": str(exc)}
+    call_adapter(
+        summary, "infoblox",
+        fn=lambda: infoblox.search_by_keyword(runtime, prefix),
+        to_row=lambda r: {
+            "match_count": len(r),
+            "networks": [row.network for row in r],
+        },
+        findings=findings,
+        log_prefix="impact: infoblox.search_by_keyword",
+        on_success=lambda r: matches.extend(_matches_from_ib_keyword(r)),
+    )
 
-    return summary, findings, matches
+    # 4. active_directory.lookup_subnet — AD enrichment (site/location/description)
+    call_adapter(
+        summary, "ad",
+        fn=lambda: active_directory.lookup_subnet(runtime, prefix),
+        to_row=lambda r: {
+            "found": r[0].found,
+            "site": r[0].site,
+            "location": r[0].location,
+            "description": r[0].description,
+        },
+        findings=findings,
+        log_prefix="impact: active_directory.lookup_subnet",
+        on_success=lambda r: findings.extend(r[1]),
+        on_error_extra={"found": False},
+    )
+
+    summary["impact"] = {"matches": matches}
+    return summary, findings
 
 
 def _run_site(
     runtime: "LensRuntime",
     obj: LensObject,
     base_summary: Dict[str, Any],
-) -> Tuple[Dict[str, Any], List[LensFinding], List[ImpactMatch]]:
+) -> Tuple[Dict[str, Any], List[LensFinding]]:
     """Run SITE-specific adapters: config_repo → sdwan_site → ad_site."""
     from cn_lens.adapters import sdwan_yaml, active_directory
 
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     matches: List[ImpactMatch] = []
     site = obj.value
 
@@ -381,51 +419,60 @@ def _run_site(
     _call_config_repo(runtime, site, summary=summary, findings=findings, matches=matches)
 
     # 2. sdwan_yaml.lookup_site
-    try:
-        sdwan_result = sdwan_yaml.lookup_site(runtime, site)
-        summary["sdwan_yaml"] = {
-            "status": sdwan_result.status,
-            "site_name": sdwan_result.site_name,
-            "prefix_count": len(sdwan_result.prefixes),
-            "device_count": len(sdwan_result.devices),
-        }
-        findings.extend(sdwan_result.findings)
-        matches.extend(_matches_from_sdwan_site(sdwan_result))
-    except Exception as exc:
-        runtime.logger.error("impact: sdwan_yaml.lookup_site raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("sdwan_yaml", exc))
-        summary["sdwan_yaml"] = {"error": str(exc)}
+    call_adapter(
+        summary, "sdwan_yaml",
+        fn=lambda: sdwan_yaml.lookup_site(runtime, site),
+        to_row=lambda r: {
+            "status": r.status,
+            "site_name": r.site_name,
+            "prefix_count": len(r.prefixes),
+            "device_count": len(r.devices),
+        },
+        findings=findings,
+        log_prefix="impact: sdwan_yaml.lookup_site",
+        on_success=lambda r: (
+            findings.extend(r.findings),
+            matches.extend(_matches_from_sdwan_site(r)),
+        ),
+    )
 
     # 3. ad.lookup_site
-    try:
-        ad_result, ad_findings = active_directory.lookup_site(runtime, site)
-        summary["ad"] = {
-            "found": ad_result.found,
-            "site_code": ad_result.site_code,
-            "location": ad_result.location,
-            "country_code": ad_result.country_code,
-            "ou_path": ad_result.ou_path,
-        }
-        findings.extend(ad_findings)
-        matches.extend(_matches_from_ad_site(ad_result))
-    except Exception as exc:
-        runtime.logger.error("impact: ad.lookup_site raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("ad", exc))
-        summary["ad"] = {"found": False, "error": str(exc)}
+    # Prefixes are not available in the impact SITE chain (no Infoblox call
+    # precedes this point).  The site-object lookup path still runs.
+    # P5 follow-up: wire Infoblox prefix list if the chain is extended.
+    call_adapter(
+        summary, "ad",
+        fn=lambda: active_directory.lookup_site(runtime, site, prefixes=()),
+        to_row=lambda r: {
+            "found": r[0].found,
+            "site_code": r[0].site_code,
+            "location": r[0].location,
+            "country_code": r[0].country_code,
+            "ou_path": r[0].ou_path,
+        },
+        findings=findings,
+        log_prefix="impact: ad.lookup_site",
+        on_success=lambda r: (
+            findings.extend(r[1]),
+            matches.extend(_matches_from_ad_site(r[0])),
+        ),
+        on_error_extra={"found": False},
+    )
 
-    return summary, findings, matches
+    summary["impact"] = {"matches": matches}
+    return summary, findings
 
 
 def _run_device(
     runtime: "LensRuntime",
     obj: LensObject,
     base_summary: Dict[str, Any],
-) -> Tuple[Dict[str, Any], List[LensFinding], List[ImpactMatch]]:
+) -> Tuple[Dict[str, Any], List[LensFinding]]:
     """Run DEVICE-specific adapters: config_repo → ib_keyword → ad_device."""
     from cn_lens.adapters import infoblox, active_directory
 
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     matches: List[ImpactMatch] = []
     device = obj.value
 
@@ -433,47 +480,51 @@ def _run_device(
     _call_config_repo(runtime, device, summary=summary, findings=findings, matches=matches)
 
     # 2. infoblox.search_by_keyword
-    try:
-        ib_rows = infoblox.search_by_keyword(runtime, device)
-        summary["infoblox"] = {
-            "match_count": len(ib_rows),
-            "networks": [r.network for r in ib_rows],
-        }
-        matches.extend(_matches_from_ib_keyword(ib_rows))
-    except Exception as exc:
-        runtime.logger.error("impact: infoblox.search_by_keyword raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("infoblox", exc))
-        summary["infoblox"] = {"error": str(exc)}
+    call_adapter(
+        summary, "infoblox",
+        fn=lambda: infoblox.search_by_keyword(runtime, device),
+        to_row=lambda r: {
+            "match_count": len(r),
+            "networks": [row.network for row in r],
+        },
+        findings=findings,
+        log_prefix="impact: infoblox.search_by_keyword",
+        on_success=lambda r: matches.extend(_matches_from_ib_keyword(r)),
+    )
 
     # 3. ad.lookup_device
-    try:
-        ad_result, ad_findings = active_directory.lookup_device(runtime, device)
-        summary["ad"] = {
-            "found": ad_result.found,
-            "ou_path": ad_result.ou_path,
-            "last_site_code": ad_result.last_site_code,
-            "computer_dn": ad_result.computer_dn,
-        }
-        findings.extend(ad_findings)
-        matches.extend(_matches_from_ad_device(ad_result))
-    except Exception as exc:
-        runtime.logger.error("impact: ad.lookup_device raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("ad", exc))
-        summary["ad"] = {"found": False, "error": str(exc)}
+    call_adapter(
+        summary, "ad",
+        fn=lambda: active_directory.lookup_device(runtime, device),
+        to_row=lambda r: {
+            "found": r[0].found,
+            "ou_path": r[0].ou_path,
+            "last_site_code": r[0].last_site_code,
+            "computer_dn": r[0].computer_dn,
+        },
+        findings=findings,
+        log_prefix="impact: ad.lookup_device",
+        on_success=lambda r: (
+            findings.extend(r[1]),
+            matches.extend(_matches_from_ad_device(r[0])),
+        ),
+        on_error_extra={"found": False},
+    )
 
-    return summary, findings, matches
+    summary["impact"] = {"matches": matches}
+    return summary, findings
 
 
 def _run_ip(
     runtime: "LensRuntime",
     obj: LensObject,
     base_summary: Dict[str, Any],
-) -> Tuple[Dict[str, Any], List[LensFinding], List[ImpactMatch]]:
+) -> Tuple[Dict[str, Any], List[LensFinding]]:
     """Run IP-specific adapters: config_repo → sdwan_keyword → ib_lookup_ip."""
     from cn_lens.adapters import sdwan_yaml, infoblox
 
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     matches: List[ImpactMatch] = []
     ip = obj.value
 
@@ -481,48 +532,52 @@ def _run_ip(
     _call_config_repo(runtime, ip, summary=summary, findings=findings, matches=matches)
 
     # 2. sdwan_yaml.search_by_keyword
-    try:
-        sdwan_matches = sdwan_yaml.search_by_keyword(runtime, ip)
-        summary["sdwan_yaml"] = {
-            "match_count": len(sdwan_matches),
-            "sites": list({m.site_code for m in sdwan_matches}),
-        }
-        matches.extend(_matches_from_sdwan_keyword(sdwan_matches))
-    except Exception as exc:
-        runtime.logger.error("impact: sdwan_yaml.search_by_keyword raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("sdwan_yaml", exc))
-        summary["sdwan_yaml"] = {"error": str(exc)}
+    call_adapter(
+        summary, "sdwan_yaml",
+        fn=lambda: sdwan_yaml.search_by_keyword(runtime, ip),
+        to_row=lambda r: {
+            "match_count": len(r),
+            "sites": list({m.site_code for m in r}),
+        },
+        findings=findings,
+        log_prefix="impact: sdwan_yaml.search_by_keyword",
+        on_success=lambda r: matches.extend(_matches_from_sdwan_keyword(r)),
+    )
 
     # 3. infoblox.lookup_ip  (treat the host record as a reference)
-    try:
-        ib_result = infoblox.lookup_ip(runtime, ip)
-        summary["infoblox"] = {
-            "found": ib_result.found,
-            "ip": ib_result.ip,
-            "network": ib_result.network,
-            "name": ib_result.name,
-            "status": ib_result.status,
-        }
-        findings.extend(ib_result.findings)
-        matches.extend(_matches_from_ib_ip(ib_result))
-    except Exception as exc:
-        runtime.logger.error("impact: infoblox.lookup_ip raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("infoblox", exc))
-        summary["infoblox"] = {"found": False, "error": str(exc)}
+    call_adapter(
+        summary, "infoblox",
+        fn=lambda: infoblox.lookup_ip(runtime, ip),
+        to_row=lambda r: {
+            "found": r.found,
+            "ip": r.ip,
+            "network": r.network,
+            "name": r.name,
+            "status": r.status,
+        },
+        findings=findings,
+        log_prefix="impact: infoblox.lookup_ip",
+        on_success=lambda r: (
+            findings.extend(r.findings),
+            matches.extend(_matches_from_ib_ip(r)),
+        ),
+        on_error_extra={"found": False},
+    )
 
-    return summary, findings, matches
+    summary["impact"] = {"matches": matches}
+    return summary, findings
 
 
 def _run_fqdn(
     runtime: "LensRuntime",
     obj: LensObject,
     base_summary: Dict[str, Any],
-) -> Tuple[Dict[str, Any], List[LensFinding], List[ImpactMatch]]:
+) -> Tuple[Dict[str, Any], List[LensFinding]]:
     """Run FQDN-specific adapters: config_repo → ib_lookup_fqdn → dns_resolve_forward."""
     from cn_lens.adapters import infoblox, dns
 
     summary: Dict[str, Any] = dict(base_summary)
-    findings: List[LensFinding] = []
+    findings: List[LensFinding] = [_classifier_finding()]
     matches: List[ImpactMatch] = []
     fqdn = obj.value
 
@@ -530,96 +585,61 @@ def _run_fqdn(
     _call_config_repo(runtime, fqdn, summary=summary, findings=findings, matches=matches)
 
     # 2. infoblox.lookup_fqdn
-    try:
-        ib_result = infoblox.lookup_fqdn(runtime, fqdn)
-        summary["infoblox"] = {
-            "found": ib_result.found,
-            "fqdn": ib_result.fqdn,
-            "record_count": len(ib_result.records),
-        }
-        findings.extend(ib_result.findings)
-        matches.extend(_matches_from_ib_fqdn(ib_result))
-    except Exception as exc:
-        runtime.logger.error("impact: infoblox.lookup_fqdn raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("infoblox", exc))
-        summary["infoblox"] = {"found": False, "error": str(exc)}
+    call_adapter(
+        summary, "infoblox",
+        fn=lambda: infoblox.lookup_fqdn(runtime, fqdn),
+        to_row=lambda r: {
+            "found": r.found,
+            "fqdn": r.fqdn,
+            "record_count": len(r.records),
+        },
+        findings=findings,
+        log_prefix="impact: infoblox.lookup_fqdn",
+        on_success=lambda r: (
+            findings.extend(r.findings),
+            matches.extend(_matches_from_ib_fqdn(r)),
+        ),
+        on_error_extra={"found": False},
+    )
 
     # 3. dns.resolve_forward  (reverse-locate behind the name)
-    try:
-        dns_result = dns.resolve_forward(runtime, fqdn)
-        summary["dns"] = {
-            "a_records": list(dns_result.a_records),
-            "aaaa_records": list(dns_result.aaaa_records),
-            "status": dns_result.status,
-        }
-        matches.extend(_matches_from_dns_forward(dns_result))
-    except Exception as exc:
-        runtime.logger.error("impact: dns.resolve_forward raised unexpectedly: %s", exc)
-        findings.append(_synthesise_error_finding("dns", exc))
-        summary["dns"] = {"error": str(exc)}
-
-    return summary, findings, matches
-
-
-# Dispatch table: maps LensObjectType → adapter runner
-_AdapterRunner = Callable[
-    ["LensRuntime", LensObject, Dict[str, Any]],
-    Tuple[Dict[str, Any], List[LensFinding], List[ImpactMatch]],
-]
-_DISPATCH: Dict[LensObjectType, _AdapterRunner] = {
-    LensObjectType.PREFIX: _run_prefix,
-    LensObjectType.SITE: _run_site,
-    LensObjectType.DEVICE: _run_device,
-    LensObjectType.IP: _run_ip,
-    LensObjectType.FQDN: _run_fqdn,
-}
-
-
-# ---------------------------------------------------------------------------
-# Online per-object runner
-# ---------------------------------------------------------------------------
-
-def _build_online_result(
-    obj: LensObject,
-    runtime: "LensRuntime",
-    sources: Dict[str, str],
-) -> LensResult:
-    """Build a LensResult for a single object using live adapters."""
-    base_summary: Dict[str, Any] = {
-        "original": obj.original,
-        "normalized": obj.normalized,
-        "type": obj.object_type.value,
-    }
-
-    # Always start with the classifier finding
-    findings: List[LensFinding] = [_classifier_finding()]
-    matches: List[ImpactMatch] = []
-
-    dispatcher = _DISPATCH.get(obj.object_type)
-    if dispatcher is not None:
-        try:
-            summary, adapter_findings, adapter_matches = dispatcher(runtime, obj, base_summary)
-            findings.extend(adapter_findings)
-            matches.extend(adapter_matches)
-        except Exception as exc:
-            # Last-resort guard: should not happen since each dispatcher already wraps
-            runtime.logger.error("impact: unexpected error in adapter dispatcher: %s", exc)
-            summary = dict(base_summary)
-            findings.append(_synthesise_error_finding("impact", exc))
-    else:
-        # KEYWORD, INVALID, or any future type without a dispatcher
-        summary = dict(base_summary)
-
-    # Attach impact matches block to the summary
-    summary["impact"] = {"matches": matches}
-
-    return LensResult(
-        lens_object=obj,
-        status="classified",
-        summary=summary,
-        sources=sources,
-        findings=tuple(findings),
+    call_adapter(
+        summary, "dns",
+        fn=lambda: dns.resolve_forward(runtime, fqdn),
+        to_row=lambda r: {
+            "a_records": list(r.a_records),
+            "aaaa_records": list(r.aaaa_records),
+            "status": r.status,
+        },
+        findings=findings,
+        log_prefix="impact: dns.resolve_forward",
+        on_success=lambda r: matches.extend(_matches_from_dns_forward(r)),
     )
+
+    summary["impact"] = {"matches": matches}
+    return summary, findings
+
+
+# ---------------------------------------------------------------------------
+# Dispatch table builder
+# ---------------------------------------------------------------------------
+
+def _build_dispatch(all_matches: bool = False) -> dict:
+    """Build the per-type handler dispatch table, capturing *all_matches* via closure.
+
+    When *all_matches* is ``True``, the PREFIX handler routes to
+    ``sdwan_yaml.lookup_prefix_all`` instead of ``sdwan_yaml.lookup_prefix``.
+    All other handlers are unaffected.
+    """
+    return {
+        LensObjectType.PREFIX: lambda rt, obj, bs: _run_prefix(
+            rt, obj, bs, all_matches=all_matches
+        ),
+        LensObjectType.SITE: _run_site,
+        LensObjectType.DEVICE: _run_device,
+        LensObjectType.IP: _run_ip,
+        LensObjectType.FQDN: _run_fqdn,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +651,7 @@ def impact_objects(
     *,
     runtime: Optional["LensRuntime"] = None,
     run_id: Optional[str] = None,
+    all_matches: bool = False,
 ) -> LensRun:
     """Find all references to the given objects across available sources.
 
@@ -648,58 +669,24 @@ def impact_objects(
 
         1. ``run_id`` kwarg (if not None)
         2. ``runtime.options.run_id`` (if runtime is not None and options.run_id is not None)
-        3. Auto-generated UTC timestamp via ``_make_run_id()``.
+        3. Auto-generated UTC timestamp via ``make_run_id()`` (in _helpers).
+    all_matches:
+        When ``True``, use exhaustive SD-WAN YAML prefix matching
+        (``sdwan_yaml.lookup_prefix_all``) for PREFIX objects instead of the
+        default best-match mode (``sdwan_yaml.lookup_prefix``).  Equivalent to
+        the ``--all-matches`` CLI flag (plan D9).
 
     Returns
     -------
     LensRun
         Always returned; never raises.
     """
-    # --- Resolve run_id ---
-    effective_run_id: str
-    if run_id is not None:
-        effective_run_id = run_id
-    elif runtime is not None and runtime.options.run_id is not None:
-        effective_run_id = runtime.options.run_id
-    else:
-        effective_run_id = _make_run_id()
-
-    # --- Offline path ---
-    if runtime is None or runtime.offline:
-        results = tuple(
-            _build_offline_result(obj) for obj in object_set.objects
-        )
-        return LensRun(
-            schema_version=1,
-            tool="cn-lens",
-            workflow="impact",
-            run_id=effective_run_id,
-            inputs=object_set,
-            results=results,
-            warnings=(),
-            errors=(),
-        )
-
-    # --- Online path ---
-    # Build sources map once from the registry; share across all results in this run.
-    registry = get_registry()
-    sources: Dict[str, str] = {"classifier": "ok"}
-    sources.update(registry.source_statuses(runtime))
-
-    results = tuple(
-        _build_online_result(obj, runtime, sources)
-        for obj in object_set.objects
+    return run_workflow(
+        "impact",
+        object_set,
+        runtime,
+        registry=get_registry(),
+        run_id=run_id,
+        dispatch=_build_dispatch(all_matches=all_matches),
+        offline_result_fn=_build_offline_result,
     )
-
-    run = LensRun(
-        schema_version=1,
-        tool="cn-lens",
-        workflow="impact",
-        run_id=effective_run_id,
-        inputs=object_set,
-        results=results,
-        warnings=(),
-        errors=(),
-    )
-    maybe_persist(run, runtime)
-    return run
