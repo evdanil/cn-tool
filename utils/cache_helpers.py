@@ -148,7 +148,7 @@ def _cfg_vendor_set(ctx: ScriptContext, key: str) -> Set[str]:
     return {str(item).strip().lower() for item in values if str(item).strip()}
 
 
-def _parse_repo_metadata(ctx: ScriptContext, filename: Path) -> Optional[Tuple[str, str, str]]:
+def parse_repo_metadata(ctx: ScriptContext, filename: Path) -> Optional[Tuple[str, str, str]]:
     """
     Parse vendor/type/region from config-repo relative path in a layout-safe way.
 
@@ -451,7 +451,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
                 logger.error(f"Failed to enumerate configs in {folder}: {exc}")
                 continue
             for file_path in folder_files:
-                if _parse_repo_metadata(ctx, file_path) is None:
+                if parse_repo_metadata(ctx, file_path) is None:
                     logger.debug(f"Skipping non-canonical config path: {file_path}")
                     continue
                 # All keys should be upper case to match cache keys
@@ -712,7 +712,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     # 5. Handle Additions/Updates
     index_inputs_by_host: Dict[str, Tuple[str, str, str, str, Path]] = {}
     for file_path in files_to_reindex:
-        parsed = _parse_repo_metadata(ctx, file_path)
+        parsed = parse_repo_metadata(ctx, file_path)
         if parsed is None:
             logger.debug(f"Skipping file with unsupported path layout before indexing: {file_path}")
             continue
@@ -922,7 +922,7 @@ def get_facts_helper(
     It can either return data or put it on a queue for batch processing.
     """
     hostname = filename.stem.upper()
-    parsed = _parse_repo_metadata(ctx, filename)
+    parsed = parse_repo_metadata(ctx, filename)
     if parsed is None:
         ctx.logger.debug(f"Skipping file with unsupported path layout: {filename}")
         result = ({}, {}, {}, {})
@@ -987,17 +987,11 @@ def get_device_facts(ctx: ScriptContext, hostname: str, vendor: str, region: str
                 if len(line_strip) > MAX_INDEXABLE_LINE_LENGTH:
                     continue
 
-                # Index extraction: skip stop words and noise patterns
-                # P3 Optimization: Use precompiled regex via matches_stopword()
-                if (
-                    matches_stopword(line_strip, vendor_lower)
-                    or HEX8_RE.match(line_strip)
-                    or LONG_HEX_RE.match(line_strip)
-                    or B64ish_RE.match(line_strip)
-                ):
-                    continue
-
-                # Extract IPs
+                # Extract IPs first — IPs are routable facts, never noise.
+                # Index them even on stop-word/hex/base64 lines (e.g. cisco
+                # route-map "set ip next-hop verify-availability X.X.X.X"),
+                # otherwise cached subnet search misses them while live search
+                # (-nc) finds them.
                 if not skip_ips:
                     for match in ip_regexp.finditer(line_strip):
                         s = match.group()
@@ -1011,12 +1005,22 @@ def get_device_facts(ctx: ScriptContext, hostname: str, vendor: str, region: str
                         except ValueError:
                             pass
 
-                # Extract keywords
-                if not skip_keywords:
-                    for word in extract_keywords(line_strip, vendor=vendor_lower):
-                        line_numbers = kw_list[(word, hostname)]
-                        if len(line_numbers) < max_positions:
-                            line_numbers.append(index)
+                # Keyword extraction: skip stop words and noise patterns to keep
+                # the keyword index lean.
+                # P3 Optimization: Use precompiled regex via matches_stopword()
+                if skip_keywords:
+                    continue
+                if (
+                    matches_stopword(line_strip, vendor_lower)
+                    or HEX8_RE.match(line_strip)
+                    or LONG_HEX_RE.match(line_strip)
+                    or B64ish_RE.match(line_strip)
+                ):
+                    continue
+                for word in extract_keywords(line_strip, vendor=vendor_lower):
+                    line_numbers = kw_list[(word, hostname)]
+                    if len(line_numbers) < max_positions:
+                        line_numbers.append(index)
 
         content_hash = hasher.hexdigest()
 
