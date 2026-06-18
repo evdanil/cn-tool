@@ -27,7 +27,7 @@ history_dir = history
 [cache]
 enabled = true
 directory = ~/.cn-cache
-version = 5
+version = 6
 # check_workers = 4
 # index_workers = 4
 # index_executor = thread

@@ -16,7 +16,7 @@ from utils.config import make_dir_list
 from utils.process_data import remove_duplicate_rows_sorted_by_col
 from utils.api import fetch_network_data
 from utils.cache import CacheManager
-from utils.cache_helpers import build_config_path
+from utils.cache_helpers import build_config_path, parse_repo_metadata
 
 # Assuming search_cache_config is a helper you'll create in a cache_helpers.py or similar
 # For now, this module will handle both live and cached logic paths.
@@ -347,20 +347,27 @@ class ConfigSearchModule(BaseModule):
         except FileNotFoundError:
             return data_to_save, matched_nets
 
-        parts = folder.parts
-
+        # Derive vendor/type/region by anchoring on the repo base (parts[0..]),
+        # the same way the cache indexer does (parse_repo_metadata). Negative
+        # indexing off the absolute folder path (parts[-4]) depended on
+        # filesystem depth and mis-derived vendor (often the base-dir name),
+        # silently disabling stop-word filtering and diverging from cached
+        # search. This label is for display/fallback; per-file vendor is
+        # resolved authoritatively in _matched_lines via parse_repo_metadata.
         vendor, device_type, region = 'vendor', 'type', 'region'
-        if len(parts) < 6:
-            ctx.logger.warning('Repository has non-expected directory path(missing vendor/type/region)')
-        else:
-            regions = ctx.cfg.get("config_repo_regions", [])
+        base_dir = ctx.cfg.get("config_repo_directory")
+        regions = bool(ctx.cfg.get("config_repo_regions", []))
+        try:
+            rel_parts = folder.relative_to(base_dir).parts if base_dir else ()
+        except ValueError:
+            rel_parts = ()
+        if len(rel_parts) >= (3 if regions else 2):
+            vendor = str(rel_parts[0]).lower()
+            device_type = str(rel_parts[1]).upper()
             if regions:
-                vendor = str(parts[-4]).lower()
-                device_type = str(parts[-3]).upper()
-                region = str(parts[-2]).upper()
-            else:
-                vendor = str(parts[-3]).lower()
-                device_type = str(parts[-2]).upper()
+                region = str(rel_parts[2]).upper()
+        else:
+            ctx.logger.warning('Repository has non-expected directory path(missing vendor/type/region)')
 
         with ThreadPoolExecutor() as executor, console.status(f"[{colors['description']}]Searching through [{colors['type']}]{vendor.upper()}/{device_type}[/] configurations...[/]"):
             futures = [
@@ -385,15 +392,25 @@ class ConfigSearchModule(BaseModule):
         rows_to_save: Dict[int, str] = {}
         device = filename.stem.upper()
 
-        vendor_stop_list = stop_words.get(vendor.lower(), ("NEVERMATCHED",))
+        # Resolve vendor via the same helper the cache indexer uses so live
+        # and cached searches classify the device identically (parity on
+        # stop-word filtering). Fall back to the caller-supplied vendor for
+        # off-layout files the helper cannot classify.
+        meta = parse_repo_metadata(ctx, filename)
+        resolved_vendor = meta[0] if meta else str(vendor).lower()
+        vendor_stop_list = stop_words.get(resolved_vendor, ("NEVERMATCHED",))
 
         try:
             with open(filename, "r", encoding="utf-8", errors='ignore') as f:
                 for index, line in enumerate(f):
                     line_strip = line.strip()
-                    if line_strip.startswith(vendor_stop_list):
-                        continue
 
+                    # IP matching runs regardless of stop words: a routable IP
+                    # (e.g. a route-map "set ip next-hop ... 10.1.2.3") is a
+                    # legitimate hit even on a stop-word line. This mirrors the
+                    # cache indexer (utils.cache_helpers.get_device_facts), which
+                    # also extracts IPs before applying the stop-word skip, so
+                    # cached and --no-cache subnet searches stay consistent.
                     if ip_nets:
                         found_matches = re.finditer(ip_regexp, line_strip)
                         for match in found_matches:
@@ -409,6 +426,11 @@ class ConfigSearchModule(BaseModule):
                                         matched_nets.add(net)
                                         rows_to_save[index] = line_strip
                                         break
+
+                    # Stop-word skip applies to free-text term search only, to
+                    # keep keyword noise down (parity with the keyword index).
+                    if line_strip.startswith(vendor_stop_list):
+                        continue
 
                     if search_terms:
                         for search_term in search_terms:
