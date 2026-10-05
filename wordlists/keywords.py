@@ -1187,3 +1187,14 @@ standard_keywords: Dict[str, Tuple[str, ...]] = {
         "ipv",
     ),
 }
+
+
+# Optional site-specific additions. A ``wordlists/site_keywords.py`` module (not part of
+# this package) may define ``EXTRA_STOP_WORDS: Dict[str, Tuple[str, ...]]`` mapping a
+# vendor to extra stop-word prefixes; they are appended to ``stop_words`` above.
+try:
+    from wordlists.site_keywords import EXTRA_STOP_WORDS as _EXTRA_STOP_WORDS  # type: ignore[import-not-found]
+except ImportError:
+    _EXTRA_STOP_WORDS = {}
+for _vendor, _extra in _EXTRA_STOP_WORDS.items():
+    stop_words[_vendor] = tuple(stop_words.get(_vendor, ())) + tuple(_extra)

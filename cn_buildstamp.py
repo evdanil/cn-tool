@@ -2,7 +2,7 @@
 
 The repo-root ``version`` file is the single CI-managed source of truth for the
 *platform* version (``MAJOR.MINOR.BUILD``) plus the short git ``BUILD_HASH``.
-It is rewritten on every release by ``.github/workflows/build.yml``.
+It is rewritten on every release by ``.github/workflows/release-public.yml``.
 
 Each bundled tool additionally carries its own
 *component* ``__version__`` and renders a combined ``--version`` line through

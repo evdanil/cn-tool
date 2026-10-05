@@ -1,7 +1,7 @@
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 import threading
 
 
@@ -15,11 +15,12 @@ class ThreadSafeFileHandler(logging.FileHandler):
             super().emit(record)
 
 
-def configure_logging(logfile_location: str, log_level_str: str) -> logging.Logger:
+def configure_logging(logfile_location: str, log_level_str: str, extra_loggers: Iterable[str] = ()) -> logging.Logger:
     """
     Sets up logger facility
 
     @param logfile_location(str): path and filename to write log to
+    @param extra_loggers: names of additional package loggers to route to the same file (besides netmiko, paramiko, utils)
     @param log_level(int): severity level number for log message (logger.[INFO|WARNING|ERROR] and etc)
 
     @return instance(logger): initialised logger instance.
@@ -63,12 +64,11 @@ def configure_logging(logfile_location: str, log_level_str: str) -> logging.Logg
     logger.addHandler(file_handler)
 
     # Route library and package loggers to the same file handler. Without
-    # this, getLogger(__name__) loggers (utils.*, paramiko)
-    # would propagate to the handler-less root logger, where Python's
-    # lastResort handler prints WARNING+ to stderr and corrupts the Rich Live
-    # display. netmiko/paramiko/
-    # utils are routed pre-emptively.
-    for managed_name in ("netmiko", "paramiko", "utils"):
+    # this, getLogger(__name__) loggers (utils.*, paramiko, and any package named
+    # in extra_loggers) would propagate to the handler-less root logger, where
+    # Python's lastResort handler prints WARNING+ to stderr and corrupts a Rich
+    # Live display.
+    for managed_name in ("netmiko", "paramiko", "utils", *extra_loggers):
         managed = logging.getLogger(managed_name)
         if managed_name in ("netmiko", "paramiko"):
             # packet-level DEBUG from these floods the shared log during

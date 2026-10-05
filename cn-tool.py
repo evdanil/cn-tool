@@ -62,10 +62,9 @@ del EMOJI["cd"]
 # at runtime keeps cn-tool consistent with the bundled CLIs and lets it report a
 # real version straight from a git checkout. Falls back to "unknown" only when
 # the version file is absent.
-# NOTE: the ``VERSION`` name is load-bearing — .github/workflows/build.yml's
-# menu_header sed (around line 136) injects an f-string referencing ``{VERSION}``
-# into this file for the shell build, so renaming this global passes local tests
-# but NameErrors in the patched release.
+# NOTE: the ``VERSION`` name is load-bearing — downstream release patching
+# injects an f-string referencing ``{VERSION}`` into this file, so renaming this
+# global passes local tests but NameErrors in the patched release.
 VERSION = cn_buildstamp.package_version_string()
 
 
@@ -174,7 +173,7 @@ EOF
 Re-login and start using cn-tool by running:
 cn
 
-Please send any feedback/feature requests to evdanil@gmail.com
+Please send any feedback/feature requests to =EMAIL=
 """
     parser = argparse.ArgumentParser(description=description.format(version=VERSION, exec_file=Path(__file__).name), formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("-c", "--config", default=None, help="specify configuration file")
