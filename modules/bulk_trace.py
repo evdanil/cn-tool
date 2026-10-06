@@ -132,8 +132,9 @@ class BulkTraceModule(BaseModule):
         results_to_save = self.execute_hook('pre_save', ctx, data_for_display)
         if results_to_save:
             ctx.logger.info(f"Queueing {len(results_to_save)} rows of data for saving to sheet 'Bulk Trace'.")
+            # ctx must stay positional: the save worker reads it from args[0] to lock the report.
             queue_save(
-                ctx=ctx,
+                ctx,
                 columns=final_columns,
                 raw_data=results_to_save,
                 sheet_name='Bulk Trace',

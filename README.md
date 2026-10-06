@@ -3,15 +3,16 @@
 `cn-tool` is a modular network utility for Infoblox lookups, bulk network
 checks, configuration repository searches, and device inventory collection.
 
-## What's new in 0.4.0
+## What's new in 0.4.1
 
-Infoblox network views. On a grid with several, `ip`, `subnet` and `site` list one row per network
-view instead of the first copy, `fqdn` lists a record once per DNS view, and `--view NAME`,
-`--all-views` and `[api] network_view` choose the view to search. `cn doctor` gains a `Network view`
-check, and JSON rows carry `network_view` (`fqdn`: `dns_view`) on every grid. The full list, the
-behaviour changes and the migration notes are in the release notes of 0.4.0 on the Releases page of
-this repository. Version 0.3.0 added the command line, `cn diff`, `cn doctor` and Config Analyzer
-0.2.0; its notes are on the same page.
+Faster start. A command loads only the libraries it uses: pandas and openpyxl when it saves a
+report, netmiko when it queries a device, ldap3 when Active Directory connects. On a shared dev host
+`cn --help` took 0.53 s and now takes 0.15 s, and `cn ip` reached its credentials check in 0.87 s
+and now does it in 0.28 s. Two report changes come with it: a new report is always created with
+openpyxl, and Bulk Trace saves now take the report lock like every other save. The details are in
+the release notes of 0.4.1 on the Releases page of this repository. Version 0.4.0 added Infoblox
+network views, and version 0.3.0 the command line, `cn diff`, `cn doctor` and Config Analyzer
+0.2.0; their notes are on the same page.
 
 ## Included Features
 
@@ -51,6 +52,12 @@ cp .cn ~/.cn
 ```bash
 python main.py
 ```
+
+On a shared server where users cannot write to the install directory, run
+`python -m compileall -q /path/to/cn-tool` after each install or update, with the Python that runs
+`cn`. Python cannot cache compiled modules in a read-only directory, so without this step it
+compiles every cn module on every start: about 0.14 s more for a lookup (0.42 s instead of 0.28 s
+on a shared dev host).
 
 ## Command line
 
@@ -92,6 +99,12 @@ Objects are arguments, or one per line from `--file PATH`; a positional `-` or `
 standard input. Blank lines and `#` comments are ignored. Global options (`-c`, `-nc`, `-t`, `-l`,
 `-r`, `-g`, `--log-level`) work before and after the command. `cn <command> --help` shows the
 details of one command.
+
+A command loads only the libraries it uses: pandas and openpyxl when it saves a report, netmiko
+(with paramiko) when it queries a device over SSH, ldap3 when Active Directory connects, yaml for
+the SD-WAN YAML search and diskcache for the cache. On a shared dev host (2 cores, load 2-3)
+`cn --help` starts in about 0.15 s and `cn ip` reaches its credentials check in about 0.28 s;
+before 0.4.1 they took about 0.5 s and 0.9 s. The menu starts faster for the same reason.
 
 A bare object is routed by its shape: `cn 10.1.2.3` runs `ip`, `cn 10.0.0.0/24` runs `subnet`,
 `cn host.example.com` runs `fqdn`. Only a CIDR network, an IPv4 address or an FQDN is recognised;
@@ -301,6 +314,13 @@ With status 3, stdout still holds what was found.
 `--report` appends the result to the xlsx report (`[report] filename`, or `-r FILE`, which implies
 `--report`); the command line does not save without it. A report that cannot be written makes the
 status 3.
+
+pandas and openpyxl load at the first save, not at start-up. If they cannot be loaded, the save
+fails with a message that names the library and the `pip install -r requirements.txt` command for
+the Python that runs `cn` (status 3 on the command line); lookups and `cn doctor` still work. A new
+report is created with openpyxl on every machine, as every append already was. Before 0.4.1 a
+machine that had xlsxwriter installed created it with that library instead, and URL-like text in
+the first rows became a link; it is plain text now, as in every later row.
 
 ### JSON for scripts
 

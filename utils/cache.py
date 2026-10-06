@@ -1,5 +1,4 @@
 from pathlib import Path
-from diskcache import FanoutCache, JSONDisk
 from typing import Dict, Optional, Any
 import logging
 
@@ -20,6 +19,10 @@ class CacheManager:
         cache_size = parse_cache_pages((cfg or {}).get("cache_sqlite_cache_size", "16M"))
         mmap_size = parse_size((cfg or {}).get("cache_sqlite_mmap_size", "32M"))
         logger.info(f"SQLite tuning: cache_size={cache_size} pages, mmap_size={mmap_size} bytes")
+
+        # diskcache loads here, when a cache is really built, so importing this module (which every
+        # start does) stays cheap. A CacheManager exists only when the cache is enabled.
+        from diskcache import FanoutCache, JSONDisk
 
         # Main cache object
         self.dc = FanoutCache(

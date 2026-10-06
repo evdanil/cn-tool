@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-from typing import Dict, List, Optional
+"""Active Directory subnet lookups over LDAP.
 
-import ldap3
-from ldap3.utils.conv import escape_filter_chars
-from ldap3.core.exceptions import (
-    LDAPException,
-    LDAPResponseTimeoutError,
-    LDAPSocketOpenError,
-    LDAPSocketReceiveError,
-    LDAPSocketSendError,
-)
+ldap3 is imported inside the functions that use it, not at module level, so that starting
+cn (which imports every plugin) does not load the library when Active Directory is unused.
+The first connection or lookup of a process pays the import.
+"""
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+if TYPE_CHECKING:
+    import ldap3  # annotations only; imported when a connection is made
 
 # It's good practice to request only the attributes you need instead of '*'
 DEFAULT_ATTRS: List[str] = [
@@ -39,12 +40,27 @@ DEFAULT_ATTRS: List[str] = [
 DEFAULT_SEARCH_BASE: str = 'CN=Subnets,CN=Sites,CN=Configuration,DC=domain,DC=com'
 DEFAULT_OPERATION_TIMEOUT: int = 10
 
-RETRYABLE_EXCEPTIONS = (
-    LDAPSocketOpenError,
-    LDAPSocketReceiveError,
-    LDAPSocketSendError,
-    LDAPResponseTimeoutError,
-)
+
+def retryable_exceptions() -> tuple[type[Exception], ...]:
+    """Return the ldap3 errors that mean the connection dropped, so a lookup is worth retrying.
+
+    This is a function and not a module constant because it imports ldap3: the library
+    loads the first time the tuple is needed, which is when an exception is being matched
+    against it or a lookup has failed.
+    """
+    from ldap3.core.exceptions import (
+        LDAPResponseTimeoutError,
+        LDAPSocketOpenError,
+        LDAPSocketReceiveError,
+        LDAPSocketSendError,
+    )
+
+    return (
+        LDAPSocketOpenError,
+        LDAPSocketReceiveError,
+        LDAPSocketSendError,
+        LDAPResponseTimeoutError,
+    )
 
 
 def init_ad_link(
@@ -65,10 +81,16 @@ def init_ad_link(
 
     Returns:
         An ldap3.Connection object if successful, otherwise None.
+
+    ldap3 is imported here, after the settings check: incomplete settings never load it.
     """
     if not user or not ldap_uri or not password:
         logger.warning("AD username, password, or LDAP URI is missing. Cannot initiate connection.")
         return None
+
+    # Resolved before the try block so that the except clause below always has the class.
+    import ldap3
+    from ldap3.core.exceptions import LDAPException
 
     server = ldap3.Server(ldap_uri, get_info=ldap3.ALL)
     try:
@@ -119,7 +141,15 @@ def get_ad_subnet_info(
     Returns:
         A dictionary containing the subnet's information if found,
         otherwise an empty dictionary.
+
+    Raises:
+        The ldap3 errors listed by retryable_exceptions(): the caller decides whether to
+        reconnect and try again. Any other LDAP error is logged and gives an empty dictionary.
     """
+    # Resolved before the try block so that the except clause below always has the class.
+    from ldap3.core.exceptions import LDAPException
+    from ldap3.utils.conv import escape_filter_chars
+
     if not ldap_link or not ldap_link.bound:
         logger.warning("AD connection is not available or not bound. Skipping search.")
         return {}
@@ -159,7 +189,7 @@ def get_ad_subnet_info(
             logger.info(f"AD - No results found for subnet: {subnet}")
 
     except LDAPException as e:
-        if isinstance(e, RETRYABLE_EXCEPTIONS):
+        if isinstance(e, retryable_exceptions()):
             raise
         logger.error(f"An LDAP error occurred during search: {e}")
 

@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 from pathlib import Path
 from socket import gethostbyaddr
-from typing import Optional, List, Dict, Any, Set, Tuple
-from netmiko import ConnLogOnly, SSHDetect, BaseConnection
+from typing import TYPE_CHECKING, Optional, List, Dict, Any, Set, Tuple
 import logging
 import re
 
 from utils.ssh import build_netmiko_device, describe_ssh_error, get_ssh_config_file
+
+if TYPE_CHECKING:
+    # Annotations only: netmiko is imported in process_device_commands, when a device is queried.
+    from netmiko import BaseConnection
 
 
 def parse_show_version(output: str) -> Dict[str, Any]:
@@ -331,7 +336,15 @@ def process_device_commands(
     log_file: Optional[str] = None,
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    # interrogate device and get serial/mac/license data
+    """
+    Interrogate one device over SSH and return its serial, MAC and license data.
+
+    netmiko (with paramiko) is loaded here, the first time a device is actually
+    queried, so a run that never queries a device never pays for the import. A
+    device skipped by [ssh] device_name_filter does not load it either. If the
+    library cannot be loaded, that is reported as this device's result, like any
+    other connection error.
+    """
 
     # Optional [ssh] device_name_filter: skip hosts whose reverse-DNS name does not match,
     # e.g. to keep a bulk run to network devices. No filter means every host is tried.
@@ -365,6 +378,9 @@ def process_device_commands(
 
     conn: Optional[BaseConnection] = None
     try:
+        # First use of netmiko in this process; later calls find it already loaded.
+        from netmiko import ConnLogOnly, SSHDetect
+
         # We don't connect right away, we detect first.
         guesser = SSHDetect(**dev)
         detected_type = guesser.autodetect()

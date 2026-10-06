@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import functools
 import hashlib
 import ipaddress
 import logging
@@ -10,9 +13,8 @@ import uuid
 from time import time
 from pathlib import Path
 from time import perf_counter
-from typing import Dict, List, Optional, Set, Tuple, Union, Any
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union, Any
 from types import SimpleNamespace
-from diskcache import Index
 from wordlists.keywords import stop_words
 from core.base import ScriptContext
 from .cache import CacheManager
@@ -27,6 +29,9 @@ from .hash import calculate_config_hash
 from .search_helpers import extract_keywords, extract_literal_ips
 from .validation import ip_regexp
 
+if TYPE_CHECKING:
+    from diskcache import Index  # annotations only: diskcache loads when a cache is built
+
 HEX8_RE = re.compile(r"^[0-9A-F]{8}\b")
 LONG_HEX_RE = re.compile(r"^[0-9A-Fa-f]{24,}$")
 B64ish_RE = re.compile(r"^[0-9A-Za-z+/=]{64,}$")
@@ -36,7 +41,9 @@ MAX_INDEXABLE_LINE_LENGTH = 4096
 # P3 Optimization: Precompiled Stop Word Patterns
 # =============================================================================
 # Instead of using tuple.startswith() which iterates O(n) prefixes,
-# compile all stop words for each vendor into a single regex pattern.
+# compile all stop words for each vendor into a single regex pattern. Each
+# pattern is built the first time its vendor is looked up (see stopword_pattern),
+# so importing this module, which every start does, compiles nothing.
 
 
 def _build_stopword_regex(prefixes: Tuple[str, ...]) -> Optional[re.Pattern]:
@@ -60,11 +67,22 @@ def _build_stopword_regex(prefixes: Tuple[str, ...]) -> Optional[re.Pattern]:
     return re.compile(pattern)
 
 
-# Precompiled stop word patterns per vendor (built once at module load)
-STOPWORD_PATTERNS: Dict[str, Optional[re.Pattern]] = {
-    vendor: _build_stopword_regex(prefixes)
-    for vendor, prefixes in stop_words.items()
-}
+@functools.cache
+def stopword_pattern(vendor: str) -> Optional[re.Pattern]:
+    """
+    Return the compiled stop word pattern of a vendor, building it on first use.
+
+    The result is remembered per vendor for the life of the process;
+    ``stopword_pattern.cache_info().currsize`` tells how many vendors were built.
+
+    Args:
+        vendor: The vendor name (lowercase).
+
+    Returns:
+        Compiled regex pattern, or None when the vendor has no stop words.
+    """
+    return _build_stopword_regex(stop_words.get(vendor, ()))
+
 
 # Volatile config line prefixes for hash computation (skip these lines)
 HASH_SKIP_PREFIXES: Tuple[str, ...] = (
@@ -85,7 +103,7 @@ def matches_stopword(line: str, vendor: str) -> bool:
     Returns:
         True if line starts with a stop word, False otherwise.
     """
-    pattern = STOPWORD_PATTERNS.get(vendor)
+    pattern = stopword_pattern(vendor)
     if pattern is None:
         return False
     return pattern.match(line) is not None
@@ -929,6 +947,9 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
 
     # Produce data (read/parse files) via threads or processes.
     if executor_mode == "process":
+        # The process pool machinery (about 6-9 ms) loads only when this mode is chosen.
+        from concurrent.futures import ProcessPoolExecutor
+
         worker_cfg = _index_worker_cfg_from_cfg(ctx.cfg)
         with ProcessPoolExecutor(max_workers=index_workers) as executor:
             future_to_hostname = {

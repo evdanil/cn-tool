@@ -9,12 +9,16 @@ Performance Improvements:
 - Subnet IP search: O(subnet_size) -> O(log n + k)
 """
 
+from __future__ import annotations
+
 import bisect
 import ipaddress
 import threading
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple, Any
-from diskcache import Index
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Any
+
+if TYPE_CHECKING:
+    from diskcache import Index  # annotations only: diskcache loads when a cache is built
 
 
 class SortedKeyIndex:

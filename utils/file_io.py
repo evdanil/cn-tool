@@ -1,17 +1,26 @@
+from __future__ import annotations
+
 from datetime import datetime, timedelta
 import logging
 import os
 from pathlib import Path
 import re
+import sys
 import zipfile
 from queue import Queue
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from core.base import ScriptContext
 import threading
-import pandas as pd
 import time
 
+from rich.text import Text
+
 from utils.display import get_global_color_scheme
+
+if TYPE_CHECKING:
+    # Annotations only: pandas and openpyxl load when the first report is saved
+    # (see append_df_to_excel), so a run that never saves a report never pays for them.
+    import pandas as pd
 
 # Adding another thread to save data into xlsx in the background
 save_queue: Queue[Dict[str, Any]] = Queue()
@@ -79,6 +88,21 @@ def _sanitize_dataframe_for_excel(df: pd.DataFrame) -> int:
     df.columns = cleaned_columns
 
     return replacements
+
+
+def _report_library_missing(error: ImportError) -> str:
+    """Return the console and log text for a save that failed because a library did not load.
+
+    It names the library, then the command that reinstalls the requirements for the Python
+    that is running cn (a bare ``pip`` may belong to another interpreter).
+    """
+    detail = (str(error).splitlines() or [""])[0].removesuffix(".") or type(error).__name__
+    requirements = Path(__file__).resolve().parents[1] / "requirements.txt"
+    return (
+        f"Error: the report was not saved: {error.name or 'a report library'} cannot be loaded "
+        f"({detail}). Reinstall the requirements with: "
+        f"{sys.executable or 'python'} -m pip install -r {requirements}"
+    )
 
 
 def _lock_path_for(report_path: Path) -> Path:
@@ -326,6 +350,15 @@ def worker() -> None:
                         {"component": "report", "state": "warning", "error": str(e)},
                     )
 
+        except ImportError as e:
+            # pandas or openpyxl failed to load at the first save (they load lazily).
+            _save_failures += 1
+            message = _report_library_missing(e)
+            if ctx:
+                ctx.logger.error(message, exc_info=True)
+                label, _, rest = message.partition(" ")
+                ctx.console.print(Text.assemble((label, "bold red"), " " + rest), soft_wrap=True)
+
         except Exception as e:
             _save_failures += 1
             if ctx:
@@ -498,7 +531,12 @@ def append_df_to_excel(
 ) -> None:
     """
     Append a DataFrame [df] to existing Excel file [filename] into [sheet_name] Sheet.
-    If [filename] doesn't exist, then this function will create it.
+    If [filename] doesn't exist, then this function will create it (with openpyxl, never
+    xlsxwriter, so the first batch looks like every later one).
+
+    pandas and openpyxl are imported here, at the first save of the process, not at start-up:
+    a run that never saves a report never loads them. If they cannot be loaded, the
+    ImportError reaches the caller (the save worker reports it, with the install command).
 
     @param logger(Logger): logger instance.
     @param filename: File path or existing ExcelWriter
@@ -527,6 +565,7 @@ def append_df_to_excel(
             - added required parameters to integrate into common codebase
             - minor fixes/checks
     """
+    import pandas as pd
 
     logger = ctx.logger
     filename = Path(report_path).expanduser() if report_path else Path(ctx.cfg["report_file"]).expanduser()
@@ -558,11 +597,14 @@ def append_df_to_excel(
     if not check_file_accessibility(logger, filename):
         # Log report creation
         logger.info(f"Export - Report {filename} doesn't exist - creating...")
+        # pandas would pick xlsxwriter for a new workbook on machines that have it, while
+        # every append goes through openpyxl: pin the creating library so the first batch
+        # looks the same everywhere. A caller's own engine still wins here.
         df.to_excel(
             filename,
             sheet_name=sheet_name,
             startrow=startrow if startrow is not None else 0,
-            **to_excel_kwargs,
+            **{"engine": "openpyxl", **to_excel_kwargs},
         )
 
         # Log success

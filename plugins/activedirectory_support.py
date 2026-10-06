@@ -5,9 +5,9 @@ from core.base import BasePlugin, BaseModule, ScriptContext
 from utils.ad_helper import (
     DEFAULT_OPERATION_TIMEOUT,
     DEFAULT_SEARCH_BASE,
-    RETRYABLE_EXCEPTIONS,
     get_ad_subnet_info,
     init_ad_link,
+    retryable_exceptions,
 )
 
 
@@ -194,7 +194,8 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
                         operation_timeout=timeout,
                     )
                 break
-            except RETRYABLE_EXCEPTIONS as exc:
+            # The expression is evaluated only while an exception is being matched.
+            except retryable_exceptions() as exc:
                 attempts += 1
                 ctx.logger.warning(
                     "AD Plugin: LDAP communication error during subnet lookup (%s). Attempt %s of %s.",

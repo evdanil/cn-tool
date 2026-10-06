@@ -5,8 +5,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterator, Tuple
 
-import yaml
-
 from core.base import BasePlugin, BaseModule, ScriptContext
 
 
@@ -92,6 +90,10 @@ class SDWANYamlSearchPlugin(BasePlugin):
             return {}, {"status": "invalid", "files": 0, "errors": 0}, []
 
         ctx.logger.debug(f"SD-WAN YAML Search: Processing repository: {repo_path}")
+
+        # PyYAML loads here, when a repository is really read, so importing the plugin stays cheap.
+        # An import failure reaches the caller once per repository, not once per file.
+        import yaml
 
         for file in repo.rglob("*"):
             if file.suffix.lower() in {".yml", ".yaml"} and file.is_file():
