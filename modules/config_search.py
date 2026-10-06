@@ -13,6 +13,7 @@ from utils.auth import ensure_infoblox_auth
 from utils.display import console, get_global_color_scheme, print_search_config_data, print_table_data
 from utils.file_io import check_dir_accessibility, queue_save
 from utils.infoblox_ux import format_no_match_message, format_partial_results_message
+from utils.network_views import NETWORK_VIEW, present_rows, view_scope
 from utils.validation import is_valid_site, site_hostname_regex
 from utils.config import make_dir_list
 from utils.process_data import remove_duplicate_rows_sorted_by_col
@@ -207,6 +208,10 @@ class ConfigSearchModule(BaseModule):
         Executes the search logic for a given sitecode.
         This is a public method designed to be called by other modules.
 
+        The subnets come from ``fetch_network_data`` with the configured network view (``[api]
+        network_view``; every view when it is unset), so a subnet that exists in several views is one
+        row per view in the table. Each CIDR is searched in the configurations once.
+
         Args:
             ctx: The script context.
             sitecode: The validated site code to search for.
@@ -227,7 +232,8 @@ class ConfigSearchModule(BaseModule):
         if ensure_auth:
             ensure_infoblox_auth(ctx)
 
-        # Step 1: Fetch network data from Infoblox
+        # Step 1: Fetch network data from Infoblox (the configured network view applies)
+        scope = view_scope(ctx)
         lookup_result = fetch_network_data(ctx, sitecode, ensure_auth=False)
         processed_data = lookup_result.data
 
@@ -243,11 +249,13 @@ class ConfigSearchModule(BaseModule):
             console.print(f"[{colors['warning']}]{escape(notice)}[/]")
 
         if not processed_data.get("location"):
-            console.print(f"[{colors['error']}]{format_no_match_message('subnet records', sitecode)}[/]")
+            console.print(f"[{colors['error']}]{escape(scope.scoped(format_no_match_message('subnet records', sitecode)))}[/]")
             press_any_key(ctx)
             return
 
-        print_table_data(ctx, processed_data)
+        view_labels = [row.get(NETWORK_VIEW) for row in processed_data["location"]]
+        shown_rows = present_rows(processed_data["location"], NETWORK_VIEW, scope.column(view_labels), fallback=scope.requested)
+        print_table_data(ctx, {**processed_data, "location": shown_rows})
         console.print(f'[{colors["description"]}]Received {len(processed_data["location"])} subnet records for [{colors["success"]} {colors["bold"]}]{sitecode}[/]')
 
         if read_user_input(ctx, f"[{colors['warning']}]Proceed with configuration search for this site code (Y/N)? [/]").lower() != "y":
@@ -272,6 +280,7 @@ class ConfigSearchModule(BaseModule):
                 networks.append(net)
             except ValueError:
                 logger.warning(f"Skipping invalid network from Infoblox: {location.get('network')}")
+        networks = list(dict.fromkeys(networks))  # a CIDR in several network views is searched once
 
         # Device names are found with [site] hostname_pattern (default: names starting with the
         # site code); the template may use {site}, {site_compact} and {country}.

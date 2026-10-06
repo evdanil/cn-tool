@@ -19,6 +19,7 @@ from utils.infoblox_safety import (
     infoblox_debug_payloads_enabled,
     redact_infoblox_uri,
 )
+from utils.network_views import NETWORK_VIEW, configured_view, scope_network
 from utils.process_data import process_data
 
 
@@ -579,9 +580,10 @@ def site_attribute_filter(ea_name: str, code: str) -> str:
     return f"*{quote(ea_name, safe='')}:={quote(code, safe='')}"
 
 
-# dhcp_utilization is an IPv4 ``network`` field: ``ipv6network`` answers 400 to it.
-_NETWORK_FIELDS_IPV4 = "_return_fields=network,comment,dhcp_utilization"
-_NETWORK_FIELDS_IPV6 = "_return_fields=network,comment"
+# dhcp_utilization is an IPv4 ``network`` field: ``ipv6network`` answers 400 to it. Both ask for the
+# ``network_view`` of each subnet, so one CIDR held by two network views comes back as two rows.
+_NETWORK_FIELDS_IPV4 = "_return_fields=network,comment,dhcp_utilization,network_view"
+_NETWORK_FIELDS_IPV6 = "_return_fields=network,comment,network_view"
 
 
 def _query_families(
@@ -603,19 +605,24 @@ def _network_result(
     result_ipv4: InfobloxResult,
     result_ipv6: InfobloxResult,
 ) -> NetworkSearchResult:
-    """Parse both families' answers as ``search_type``, merge them and judge the outcome."""
+    """
+    Parse both families' answers as ``search_type``, merge them and judge the outcome.
+
+    The merge drops (network, network view) duplicates and keeps the first row of each, in the
+    order the grid returned them (IPv4, then IPv6): one CIDR in two network views stays two rows.
+    """
     processed_data_ipv4: Dict[str, Any] = process_data(ctx, type=search_type, content=result_ipv4.content) if result_ipv4.ok else {}
     processed_data_ipv6: Dict[str, Any] = process_data(ctx, type=search_type, content=result_ipv6.content) if result_ipv6.ok else {}
 
     # Merge and deduplicate
     united_locations = processed_data_ipv4.get('location', []) + processed_data_ipv6.get('location', [])
-    unique_networks: Set[str] = set()
+    unique_networks: Set[Tuple[str, str]] = set()
     merged_locations: List[Dict[str, str]] = []
 
     for item in united_locations:
-        network = item['network']
-        if network not in unique_networks:
-            unique_networks.add(network)
+        key = (item['network'], item.get(NETWORK_VIEW, ""))
+        if key not in unique_networks:
+            unique_networks.add(key)
             merged_locations.append(item)
 
     failures = [lookup_result for lookup_result in (result_ipv4, result_ipv6) if lookup_result.failed]
@@ -647,9 +654,12 @@ def _network_result(
 
 
 def _search_comments(
-    ctx: ScriptContext, search_term: str, keyword: bool, ensure_auth: bool
+    ctx: ScriptContext, search_term: str, keyword: bool, ensure_auth: bool, network_view: str = ""
 ) -> NetworkSearchResult:
-    """Subnets whose comment names the site code (``[site] comment_pattern``) or, for a keyword, contains it."""
+    """
+    Subnets whose comment names the site code (``[site] comment_pattern``) or, for a keyword, contains it.
+    A ``network_view`` limits the search to that view; "" searches every view.
+    """
     if not keyword:
         # Match the site code in the subnet comment the way [site] comment_pattern defines it.
         comment_regex = site_comment_regex(search_term, ctx.cfg.get("site_comment_pattern"))
@@ -659,25 +669,30 @@ def _search_comments(
         encoded_pattern = selective_url_encode(search_term)
         search_type = "location_keyword"
 
-    uri_ipv4 = f"network?comment:~={encoded_pattern}&_max_results=1000&{_NETWORK_FIELDS_IPV4}"
-    uri_ipv6 = f"ipv6network?comment:~={encoded_pattern}&_max_results=1000&{_NETWORK_FIELDS_IPV6}"
+    uri_ipv4 = scope_network(
+        f"network?comment:~={encoded_pattern}&_max_results=1000&{_NETWORK_FIELDS_IPV4}", network_view
+    )
+    uri_ipv6 = scope_network(
+        f"ipv6network?comment:~={encoded_pattern}&_max_results=1000&{_NETWORK_FIELDS_IPV6}", network_view
+    )
     result_ipv4, result_ipv6 = _query_families(ctx, uri_ipv4, uri_ipv6, ensure_auth)
     return _network_result(ctx, search_type, result_ipv4, result_ipv6)
 
 
 def _search_attribute_then_comments(
-    ctx: ScriptContext, ea_name: str, code: str, ensure_auth: bool
+    ctx: ScriptContext, ea_name: str, code: str, ensure_auth: bool, network_view: str = ""
 ) -> NetworkSearchResult:
     """
     Subnets that carry the site code in the extensible attribute ``ea_name``; when none does, the
     subnets whose comment names it (the result then carries a ``note``). A failed attribute query
     never falls back: a mistyped ``[site] ea_name`` must not look like a site without subnets.
+    A ``network_view`` limits both searches to that view; "" searches every view.
     """
     attribute_filter = site_attribute_filter(ea_name, code)
     result_ipv4, result_ipv6 = _query_families(
         ctx,
-        f"network?{attribute_filter}&{_NETWORK_FIELDS_IPV4}",
-        f"ipv6network?{attribute_filter}&{_NETWORK_FIELDS_IPV6}",
+        scope_network(f"network?{attribute_filter}&{_NETWORK_FIELDS_IPV4}", network_view),
+        scope_network(f"ipv6network?{attribute_filter}&{_NETWORK_FIELDS_IPV6}", network_view),
         ensure_auth,
     )
 
@@ -699,7 +714,7 @@ def _search_attribute_then_comments(
 
     if found.status == "ok" and not found.has_data:
         # Both answers came back empty. The comment search covers IPv6 as well, so nothing stays "skipped".
-        by_comment = _search_comments(ctx, code, keyword=False, ensure_auth=ensure_auth)
+        by_comment = _search_comments(ctx, code, keyword=False, ensure_auth=ensure_auth, network_view=network_view)
         if by_comment.has_data:
             note = (
                 f"No subnet has the extensible attribute {ea_name} = {code.upper()}; "
@@ -716,23 +731,30 @@ def fetch_network_data(
     search_term: str,
     keyword: bool = False,
     ensure_auth: bool = True,
+    *,
+    network_view: Optional[str] = None,
 ) -> NetworkSearchResult:
     """
     Fetches and processes IPv4 and IPv6 network data based on a search term.
-    Merges results, removes duplicates, and returns the processed data.
+    Merges results, removes (network, network view) duplicates keeping the first row, and returns
+    the processed data.
 
     A site code is looked up in the extensible attribute ``[site] ea_name`` when one is configured
     (and in subnet comments when no subnet carries it), otherwise in subnet comments only; a keyword
     is always searched in subnet comments.
+
+    ``network_view`` limits every query to one network view: None uses ``[api] network_view``,
+    "" searches every view, a name searches that view.
     """
 
     colors = get_global_color_scheme(ctx.cfg)
     ea_name = "" if keyword else site_ea_name(ctx)
+    view = configured_view(ctx) if network_view is None else network_view
 
     with ctx.console.status(
         status=f"[{colors['description']}]Fetching subnet data for [{colors['header']}]{search_term.upper()}[/]...[/]",
         spinner="dots12",
     ):
         if ea_name:
-            return _search_attribute_then_comments(ctx, ea_name, search_term, ensure_auth)
-        return _search_comments(ctx, search_term, keyword, ensure_auth)
+            return _search_attribute_then_comments(ctx, ea_name, search_term, ensure_auth, view)
+        return _search_comments(ctx, search_term, keyword, ensure_auth, view)

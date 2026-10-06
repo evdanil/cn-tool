@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import partial
 from time import perf_counter
-from typing import Any, Dict, List, Optional, Sequence, Set, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from rich.markup import escape
 
@@ -26,6 +26,14 @@ from utils.display import get_global_color_scheme, print_table_data
 from utils.file_io import queue_save
 from utils.infoblox_inheritance import normalize_record_fields
 from utils.infoblox_ux import format_no_match_message, format_partial_results_message
+from utils.network_views import (
+    NETWORK_VIEW,
+    NETWORK_VIEW_TITLE,
+    ViewScope,
+    present_rows,
+    scope_network,
+    view_scope,
+)
 from utils.process_data import CONTAINER_UTILIZATION_SCALE, process_data, utilization_percent
 from utils.user_input import press_any_key, read_user_input
 
@@ -40,7 +48,108 @@ CHILD_CONTAINERS = "child containers"
 #: What ``cn subnet`` always returns besides ``subnets``, the child containers and ``warnings``, so the JSON keys do not depend on the data.
 CLI_DETAIL_SECTIONS = (*DETAIL_TABLE_ORDER, "Extensible Attributes", "Active Directory")
 TRUNCATION_NOTICE = f"showing the first {WAPI_MAX_ROWS:,} only (paging limit); query a smaller subnet"
+#: The paging notice when the truncated list holds several network views: the cap is shared by all of them.
+_SHARED_CAP_HEAD = f"showing the first {WAPI_MAX_ROWS:,} only (paging limit), shared by network views "
+_SHARED_CAP_TAIL = "; query a smaller subnet or use --view"
 MALFORMED_MESSAGE = "Not an IPv4 address or network."
+
+
+def _view_of(network: ipaddress.IPv4Network) -> str:
+    """The network view a target network belongs to; "" for a plain network (no view known)."""
+    return getattr(network, "network_view", "")
+
+
+def _in_view(network: ipaddress.IPv4Network) -> str:
+    """" in network view lab" for a network of a view, else "": the words a menu line adds after the network."""
+    view = _view_of(network)
+    return f" in network view {view}" if view else ""
+
+
+def _cache_key(network: ipaddress.IPv4Network) -> str:
+    """The key of a network's data and warnings: its CIDR, and ``(view)`` after it for a network of a view."""
+    view = _view_of(network)
+    return f"{network} ({view})" if view else str(network)
+
+
+def _network_order(network: ipaddress.IPv4Network) -> Tuple[int, int, str]:
+    """Sort key: address, then prefix length, then view. Plain and view networks are never compared with ``<``."""
+    return int(network.network_address), network.prefixlen, _view_of(network)
+
+
+def _is_truncation(warning: str) -> bool:
+    """True for either paging notice: the plain one, or the one that names the views sharing the cap."""
+    return warning.endswith(f": {TRUNCATION_NOTICE}") or (
+        f": {_SHARED_CAP_HEAD}" in warning and warning.endswith(_SHARED_CAP_TAIL)
+    )
+
+
+def _truncation_notice(views: Iterable[str]) -> str:
+    """The paging notice for a list whose items name ``views``: the shared-cap one when several views share it."""
+    named = sorted({view for view in views if view})
+    if len(named) > 1:
+        return f"{_SHARED_CAP_HEAD}{', '.join(named)}{_SHARED_CAP_TAIL}"
+    return TRUNCATION_NOTICE
+
+
+def _view_partitions(items: List[Any]) -> Dict[str, List[Any]]:
+    """The items of an answer grouped by their ``network_view``, in the order the views first appear; "" holds the unlabelled."""
+    groups: Dict[str, List[Any]] = {}
+    for item in items:
+        groups.setdefault(str(item.get("network_view") or ""), []).append(item)
+    return groups
+
+
+def _content_partitions(content: Optional[bytes]) -> Dict[str, Optional[bytes]]:
+    """
+    An answer's JSON content split by network view, each part as JSON again. An answer that names no
+    view (or is not a list) comes back as it is under "", the very bytes: that is today's data.
+    """
+    try:
+        items = json.loads(content)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        items = None
+    if not isinstance(items, list):
+        return {"": content}
+    groups = _view_partitions(items)
+    if set(groups) <= {""}:
+        return {"": content}
+    return {view: json.dumps(group).encode() for view, group in groups.items()}
+
+
+class ViewNetwork(ipaddress.IPv4Network):
+    """
+    A network of one Infoblox network view. It prints and behaves as its CIDR, and carries the view.
+
+    Equality and hash include the view, so the same CIDR in two views makes two dictionary keys. A
+    plain ``IPv4Network`` (no view known) never equals a ViewNetwork; Python tries this class's
+    ``__eq__`` first for the reflected comparison, so that holds both ways. Build one only for a
+    non-empty view.
+    """
+
+    network_view: str
+
+    def __init__(self, address: Any, network_view: str) -> None:
+        if not network_view:
+            raise ValueError("A ViewNetwork needs a network view; use a plain IPv4Network for none.")
+        super().__init__(str(address))
+        self.network_view = network_view
+
+    def __eq__(self, other: object) -> bool:
+        return ipaddress.IPv4Network.__eq__(self, other) is True and self.network_view == _view_of(other)  # type: ignore[arg-type]
+
+    def __hash__(self) -> int:
+        return hash((ipaddress.IPv4Network.__hash__(self), self.network_view))
+
+    def __repr__(self) -> str:
+        return f"ViewNetwork({str(self)!r}, {self.network_view!r})"
+
+    def __reduce__(self) -> Tuple[Any, Tuple[str, str]]:
+        return ViewNetwork, (str(self), self.network_view)
+
+
+def _make_network(address: str, network_view: str = "") -> ipaddress.IPv4Network:
+    """The network of one answer item: a ViewNetwork when the item names a view, else a plain network."""
+    return ViewNetwork(address, network_view) if network_view else ipaddress.IPv4Network(address)
 
 
 @dataclass(frozen=True, eq=True)
@@ -59,8 +168,14 @@ class InputResolutionResult:
 
 @dataclass(frozen=True)
 class SubnetFetchOutcome:
+    """
+    What the four lookups of one CIDR returned. ``data`` is the part of the answers that named no
+    network view (today's data); ``by_view`` has one entry for each view the answers named. The
+    warnings belong to the CIDR, so every view shares them.
+    """
     data: Dict[str, Any]
     warnings: List[str]
+    by_view: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -93,7 +208,8 @@ class SubnetRequestModule(BaseModule):
     def run(self, ctx: ScriptContext) -> None:
         """
         Main execution flow for the module.
-        Orchestrates user input, data fetching, processing, and display.
+        Orchestrates user input, data fetching, processing, and display. A configured network view
+        (``[api] network_view``) is checked before anything is asked, and named under the instructions.
         """
         if not ctx.cfg.get("infoblox_enabled"):
             ctx.console.print("[red]Infoblox feature is disabled. Please configure the API endpoint.[/red]")
@@ -109,8 +225,17 @@ class SubnetRequestModule(BaseModule):
 
             ensure_infoblox_auth(ctx)
 
+            # A configured network view must exist: say so before the user types anything.
+            scope = view_scope(ctx, None, request_result)
+            view_problem = scope.problem()
+            if view_problem:
+                console.print(f"[{colors['error']}]{escape(view_problem.message)}[/]")
+                press_any_key(ctx)
+                return
+            banner = scope.banner()
+
             # --- 1. Get User Input ---
-            user_inputs = self._get_networks_from_user(ctx)
+            user_inputs = self._get_networks_from_user(ctx, banner) if banner else self._get_networks_from_user(ctx)
             if not user_inputs:
                 return
 
@@ -118,10 +243,11 @@ class SubnetRequestModule(BaseModule):
             start = perf_counter()
 
             # --- 2. Resolve all inputs into an ordered list of query targets ---
-            query_targets, resolution_errors, containers = self._resolve_inputs_to_targets(ctx, user_inputs)
+            query_targets, resolution_errors, containers = self._resolve_inputs_to_targets(ctx, user_inputs, scope.requested)
             self._print_resolution_errors(ctx, resolution_errors)
             if not query_targets:
                 if containers:  # only child containers: they are the answer, there is no subnet to look up
+                    *_, containers, _ = self._settle_views(ctx, scope, [], {}, {}, {}, containers)
                     self._print_child_containers(ctx, containers)
                 else:
                     console.print(f"[{colors['error']}]Could not resolve any of the provided inputs to a valid subnet.[{colors['error']}]")
@@ -134,11 +260,14 @@ class SubnetRequestModule(BaseModule):
             logger.info(f"Resolved to {len(unique_networks)} unique subnets for data fetching.")
             console.print(f"[{colors['description']}]Found [{colors['success']}]{len(unique_networks)}[/] unique subnets to query.[/]")
 
-            subnet_data_cache, subnet_warning_cache = self._fetch_subnets(ctx, unique_networks)
+            subnet_data_cache, subnet_warning_cache, views_by_network = self._fetch_subnets(ctx, unique_networks, scope.requested)
 
             # --- 4. Prepare data for display and saving ---
+            query_targets, subnet_data_cache, subnet_warning_cache, containers, save_view = self._settle_views(
+                ctx, scope, query_targets, subnet_data_cache, subnet_warning_cache, views_by_network, containers,
+            )
             grouped_by_network = self._group_by_network(query_targets)
-            all_data_to_save = self._collect_save_data(ctx, grouped_by_network, subnet_data_cache)
+            all_data_to_save = self._collect_save_data(ctx, grouped_by_network, subnet_data_cache, save_view=save_view)
 
             end = perf_counter()
             duration = round(end - start, 3)
@@ -152,7 +281,7 @@ class SubnetRequestModule(BaseModule):
             if ctx.cfg["report_auto_save"] and all_data_to_save:
                 self._save_subnet_data(ctx, query_targets, all_data_to_save)
 
-            self._publish_stats(ctx, len(user_inputs), query_targets, unique_networks, subnet_data_cache)
+            self._publish_stats(ctx, len(user_inputs), query_targets, list(grouped_by_network), subnet_data_cache)
         finally:
             self.execute_hook('post_run', ctx, None)
 
@@ -168,6 +297,11 @@ class SubnetRequestModule(BaseModule):
         lists its child containers in ``child containers`` (not expanded); they count as data. The exit
         status follows ``cli_exit_code``: a failed lookup (even a partial one) 3, a malformed object 2,
         data 0, else 1.
+
+        A network that exists in several views has a row for each of them (``Network view``, JSON
+        ``network_view``); ``--view`` / ``[api] network_view`` limit the search to one view. A view that
+        is not on the grid ends the run with 2, a view list that cannot be read with 3, both after the
+        login and before any lookup, with an empty result.
         """
         self.execute_hook('pre_run', ctx, None)
         try:
@@ -179,10 +313,15 @@ class SubnetRequestModule(BaseModule):
             # Syntax is checked locally first: nobody is asked for credentials to reject "bogus".
             malformed = {item for item in inputs if not self._is_ipv4_network(item)}
             candidates = [item for item in inputs if item not in malformed]
+            scope = view_scope(ctx, args, request_result)
             query_targets, resolution_errors, containers = [], {}, []
             if candidates:
                 ensure_infoblox_auth(ctx)
-                query_targets, resolution_errors, containers = self._resolve_inputs_to_targets(ctx, candidates)
+                view_problem = scope.problem()
+                if view_problem:  # a view that is not on the grid, or a grid that cannot say: nothing is looked up
+                    ctx.console.print(f"cn subnet: {view_problem.message}", markup=False)
+                    return CliResult(view_problem.exit_code, {})
+                query_targets, resolution_errors, containers = self._resolve_inputs_to_targets(ctx, candidates, scope.requested)
             # An input that is only a container prefix, with child containers and no subnets, is answered too.
             resolved_inputs = {target.original_input for target in query_targets} | {row["container"] for row in containers}
             misses = [
@@ -196,21 +335,28 @@ class SubnetRequestModule(BaseModule):
             invalid = bool(malformed)
             failed = bool(resolution_errors)
             if not query_targets:
-                no_sections = self._build_cli_sections(ctx, [], {}, {}, {}, misses, containers)
+                *_, containers, _ = self._settle_views(ctx, scope, [], {}, {}, {}, containers)
+                no_sections = self._build_cli_sections(
+                    ctx, [], {}, {}, {}, misses, containers, fallback_view=scope.requested,
+                )
                 return CliResult(cli_exit_code(found=bool(containers), invalid=invalid, failed=failed), no_sections)
 
             unique_networks = self._unique_networks(query_targets)
             ctx.logger.info(f"Resolved to {len(unique_networks)} unique subnets for data fetching.")
-            subnet_data_cache, subnet_warning_cache = self._fetch_subnets(ctx, unique_networks)
+            subnet_data_cache, subnet_warning_cache, views_by_network = self._fetch_subnets(ctx, unique_networks, scope.requested)
 
+            query_targets, subnet_data_cache, subnet_warning_cache, containers, save_view = self._settle_views(
+                ctx, scope, query_targets, subnet_data_cache, subnet_warning_cache, views_by_network, containers,
+            )
             grouped_by_network = self._group_by_network(query_targets)
-            all_data_to_save = self._collect_save_data(ctx, grouped_by_network, subnet_data_cache)
+            all_data_to_save = self._collect_save_data(ctx, grouped_by_network, subnet_data_cache, save_view=save_view)
             sections = self._build_cli_sections(
                 ctx, list(grouped_by_network), grouped_by_network, subnet_data_cache, subnet_warning_cache, misses, containers,
+                fallback_view=scope.requested,
             )
             if ctx.cfg["report_auto_save"] and all_data_to_save:
                 self._save_subnet_data(ctx, query_targets, all_data_to_save)
-            self._publish_stats(ctx, len(inputs), query_targets, unique_networks, subnet_data_cache)
+            self._publish_stats(ctx, len(inputs), query_targets, list(grouped_by_network), subnet_data_cache)
 
             failed = failed or self._has_failed_lookup(subnet_warning_cache)
             return CliResult(cli_exit_code(found=bool(subnet_data_cache or containers), invalid=invalid, failed=failed), sections)
@@ -219,8 +365,12 @@ class SubnetRequestModule(BaseModule):
 
     @staticmethod
     def _unique_networks(query_targets: List[QueryTarget]) -> List[ipaddress.IPv4Network]:
-        """The distinct networks to query, by address."""
-        return sorted({target.resolved_network for target in query_targets}, key=lambda net: net.network_address)
+        """
+        The distinct CIDRs to query, as plain networks sorted by address then prefix length. One fetch
+        serves a CIDR in every view (the answers carry their view), so the view is dropped here.
+        """
+        cidrs = {ipaddress.IPv4Network(str(target.resolved_network)) for target in query_targets}
+        return sorted(cidrs, key=_network_order)
 
     @staticmethod
     def _group_by_network(query_targets: List[QueryTarget]) -> Dict[ipaddress.IPv4Network, List[str]]:
@@ -229,6 +379,87 @@ class SubnetRequestModule(BaseModule):
         for target in query_targets:
             grouped_by_network[target.resolved_network].append(target.original_input)
         return grouped_by_network
+
+    def _settle_views(
+        self,
+        ctx: ScriptContext,
+        scope: ViewScope,
+        query_targets: List[QueryTarget],
+        subnet_data_cache: Dict[str, Dict],
+        subnet_warning_cache: Dict[str, List[str]],
+        views_by_network: Dict[str, Tuple[str, ...]],
+        containers: List[Dict[str, Any]],
+    ) -> tuple[List[QueryTarget], Dict[str, Dict], Dict[str, List[str]], List[Dict[str, Any]], bool]:
+        """
+        Take the run's two view decisions once, over the labels of the targets, the views the answers
+        named and the child-container rows, then settle the targets with the first one: the rows handed
+        back to the renderer (and the menu) follow ``scope.result_column``, the saved sheet follows
+        ``scope.column`` (asked only when a report is being saved, so a JSON run reads no view list).
+
+        Returns the settled targets, data and warnings (see ``_settle_targets``), the child-container
+        rows with their ``network view`` column shown or hidden, and whether the report names the view.
+        """
+        labels = [
+            *(_view_of(target.resolved_network) for target in query_targets),
+            *(view for views in views_by_network.values() for view in views),
+            *(str(row.get(NETWORK_VIEW) or "") for row in containers),
+        ]
+        label = scope.result_column(labels)
+        save_view = bool(ctx.cfg["report_auto_save"]) and scope.column(labels)
+        settled, data, warnings = self._settle_targets(
+            query_targets, subnet_data_cache, subnet_warning_cache, views_by_network, label,
+        )
+        rows = present_rows(containers, NETWORK_VIEW, label, fallback=scope.requested, before="container")
+        return settled, data, warnings, rows, save_view
+
+    @staticmethod
+    def _settle_targets(
+        query_targets: List[QueryTarget],
+        subnet_data_cache: Dict[str, Dict],
+        subnet_warning_cache: Dict[str, List[str]],
+        views_by_network: Dict[str, Tuple[str, ...]],
+        label_targets: bool,
+    ) -> tuple[List[QueryTarget], Dict[str, Dict], Dict[str, List[str]]]:
+        """
+        Make the targets, data and warnings agree with the run's decision to show the view or not.
+
+        With ``label_targets`` a plain target whose CIDR answered with views is replaced by one
+        ``ViewNetwork`` for each view (names sorted), and a target that already has a view stays; each
+        CIDR's warnings are copied to every view, because a failure belongs to the CIDR. Without it every
+        target is its plain CIDR again and the CIDR's single labelled partition is re-keyed to the CIDR:
+        the shape of the data when no view is named (the column rule leaves at most one view then).
+        The returned data and warnings hold only the keys of the settled targets (``_cache_key``).
+        """
+        settled: List[QueryTarget] = []
+        seen: Set[Tuple[str, ipaddress.IPv4Network]] = set()
+        for target in query_targets:
+            network = target.resolved_network
+            cidr = ipaddress.IPv4Network(str(network))
+            if not label_targets:
+                networks = [cidr]
+            elif _view_of(network):
+                networks = [network]
+            else:
+                networks = [ViewNetwork(cidr, view) for view in views_by_network.get(str(cidr), ())] or [network]
+            for settled_network in networks:
+                if (target.original_input, settled_network) not in seen:
+                    seen.add((target.original_input, settled_network))
+                    settled.append(QueryTarget(original_input=target.original_input, resolved_network=settled_network))
+
+        data: Dict[str, Dict] = {}
+        warnings: Dict[str, List[str]] = {}
+        for target in settled:
+            key = _cache_key(target.resolved_network)
+            cidr = str(target.resolved_network)
+            found = subnet_data_cache.get(key)
+            if not label_targets:
+                partitions = (subnet_data_cache.get(f"{cidr} ({view})") for view in views_by_network.get(cidr, ()))
+                found = next((partition for partition in partitions if partition), found)
+            if found:
+                data[key] = found
+            if cidr in subnet_warning_cache:
+                warnings[key] = list(subnet_warning_cache[cidr])
+        return settled, data, warnings
 
     @staticmethod
     def _print_resolution_errors(ctx: ScriptContext, errors: Dict[str, str]) -> None:
@@ -252,43 +483,63 @@ class SubnetRequestModule(BaseModule):
             ctx.console.print(f"[{colors['description']}]{prefix}: {note}[/]")
 
     def _fetch_subnets(
-        self, ctx: ScriptContext, networks: List[ipaddress.IPv4Network]
-    ) -> tuple[Dict[str, Dict], Dict[str, List[str]]]:
-        """Fetch every network in parallel: (data, warnings), each keyed by the network's text, only when non-empty."""
+        self, ctx: ScriptContext, networks: List[ipaddress.IPv4Network], network_view: str = ""
+    ) -> tuple[Dict[str, Dict], Dict[str, List[str]], Dict[str, Tuple[str, ...]]]:
+        """
+        Fetch every CIDR in parallel (``network_view`` limits the lookups to one view, "" searches every
+        view): (data, warnings, views). Data and warnings are keyed by the CIDR's text, only when
+        non-empty. The part of a CIDR's answers that names no view is its data under the plain CIDR;
+        the part of each view it names is under ``_cache_key(ViewNetwork(cidr, view))``. ``views`` lists,
+        for each CIDR whose answers named any, those views (sorted).
+        """
         colors = get_global_color_scheme(ctx.cfg)
         subnet_data_cache: Dict[str, Dict] = {}
         subnet_warning_cache: Dict[str, List[str]] = {}
+        views_by_network: Dict[str, Tuple[str, ...]] = {}
         with ctx.console.status(f"[{colors['description']}]Fetching subnets information...[/]"):
             with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(networks))) as executor:
                 future_to_net = {
-                    executor.submit(self._fetch_and_process_subnet_data, ctx, network): network
+                    executor.submit(self._fetch_and_process_subnet_data, ctx, network, network_view): network
                     for network in networks
                 }
 
                 for future in as_completed(future_to_net):
-                    net_str = str(future_to_net[future])
+                    network = future_to_net[future]
+                    net_str = str(network)
                     ctx.console.print(f"[{colors['description']}]Processing results for [{colors['header']}]{net_str}[/]...[/]")
                     outcome = future.result()
                     if outcome.data:
                         subnet_data_cache[net_str] = outcome.data
+                    for view, view_data in outcome.by_view.items():
+                        if view_data:
+                            subnet_data_cache[_cache_key(ViewNetwork(network, view))] = view_data
+                    if outcome.by_view:
+                        views_by_network[net_str] = tuple(sorted(outcome.by_view))
                     if outcome.warnings:
                         subnet_warning_cache[net_str] = outcome.warnings
-        return subnet_data_cache, subnet_warning_cache
+        return subnet_data_cache, subnet_warning_cache, views_by_network
 
     def _collect_save_data(
         self,
         ctx: ScriptContext,
         grouped_by_network: Dict[ipaddress.IPv4Network, List[str]],
         subnet_data_cache: Dict[str, Dict],
+        *,
+        save_view: bool = False,
     ) -> List[List[RowDict]]:
-        """The report rows of every network with data, after the ``pre_save`` hook; empty unless saving is on."""
+        """
+        The report rows of every network with data, after the ``pre_save`` hook; empty unless saving is
+        on. ``save_view`` names the network view on every row of a network that has one.
+        """
         all_data_to_save: List[List[RowDict]] = []
         for network, original_inputs in grouped_by_network.items():
-            data = subnet_data_cache.get(str(network), {})
+            data = subnet_data_cache.get(_cache_key(network), {})
 
             if ctx.cfg["report_auto_save"] and data:
                 combined_input_str = ", ".join(original_inputs)
-                save_data = self._prepare_subnet_save_data(combined_input_str, data)
+                save_data = self._prepare_subnet_save_data(
+                    combined_input_str, data, _view_of(network) if save_view else ""
+                )
                 save_data = self.execute_hook('pre_save', ctx, save_data)
                 if save_data:
                     all_data_to_save.append(save_data)
@@ -316,23 +567,26 @@ class SubnetRequestModule(BaseModule):
 
     @staticmethod
     def _has_failed_lookup(subnet_warning_cache: Dict[str, List[str]]) -> bool:
-        """True when any warning is a failed Infoblox lookup rather than only the paging-limit notice."""
+        """True when any warning is a failed Infoblox lookup rather than only a paging-limit notice."""
         return any(
-            not warning.endswith(f": {TRUNCATION_NOTICE}")
+            not _is_truncation(warning)
             for warnings in subnet_warning_cache.values()
             for warning in warnings
         )
 
-    def _get_networks_from_user(self, ctx: ScriptContext) -> List[str]:
+    def _get_networks_from_user(self, ctx: ScriptContext, banner: str = "") -> List[str]:
         """
-        Prompts the user to enter network addresses one per line.
-        Returns a list of unique, non-empty input strings from the user.
+        Prompts the user to enter network addresses one per line; ``banner``, when given, names the
+        network view the lookup searches and follows the instructions. Returns a list of unique,
+        non-empty input strings from the user.
         """
         colors = get_global_color_scheme(ctx.cfg)
         ctx.console.print(
             "\n" f"[{colors['description']}]Enter network addresses and press Enter twice to start.[/]\n"
             f"[{colors['description']}]Formats: '1.2.3.0/24', '1.2.3.0/255.255.255.0', or just '1.2.3.4'[/]\n"
         )
+        if banner:
+            ctx.console.print(f"[{colors['warning']}]{escape(banner)}[/]\n")
         inputs = []
         while True:
             search_input = read_user_input(ctx, "").strip()
@@ -342,12 +596,13 @@ class SubnetRequestModule(BaseModule):
         return list(dict.fromkeys(inputs))
 
     def _resolve_inputs_to_targets(
-        self, ctx: ScriptContext, inputs: List[str]
+        self, ctx: ScriptContext, inputs: List[str], network_view: str = ""
     ) -> tuple[List[QueryTarget], Dict[str, str], List[Dict[str, Any]]]:
         """
         Takes raw user input strings and resolves them into an ordered list of QueryTarget objects.
         This preserves the original input and its order. Also returns the errors by input and the
         child containers of every container prefix, which are listed but never expanded.
+        ``network_view`` limits every lookup to that view; "" searches every view.
         """
         all_targets: List[QueryTarget] = []
         errors: Dict[str, str] = {}
@@ -355,7 +610,9 @@ class SubnetRequestModule(BaseModule):
         with ctx.console.status(f"[{get_global_color_scheme(ctx.cfg)['description']}]Resolving inputs and finding subnets...[/]"):
             # Using executor.map preserves the order of the inputs
             with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(inputs))) as executor:
-                results_generator = executor.map(lambda item: self._resolve_single_input_detailed(ctx, item), inputs)
+                results_generator = executor.map(
+                    lambda item: self._resolve_single_input_detailed(ctx, item, network_view), inputs
+                )
                 for original_input, resolution in zip(inputs, results_generator):
                     if resolution.failure_message:
                         errors[original_input] = resolution.failure_message
@@ -364,13 +621,15 @@ class SubnetRequestModule(BaseModule):
                         if not resolution.containers:
                             ctx.logger.warning(f"Could not resolve '{original_input}' to any subnet.")
                         continue
-                    # Sort to ensure consistent order for supernets
-                    for net in sorted(list(resolution.networks), key=lambda ip: ip.network_address):
+                    # Sort to ensure consistent order for supernets: address, prefix length, then view
+                    for net in sorted(resolution.networks, key=_network_order):
                         all_targets.append(QueryTarget(original_input=original_input, resolved_network=net))
         return all_targets, errors, containers
 
-    def _resolve_single_input(self, ctx: ScriptContext, an_input: str) -> Set[ipaddress.IPv4Network]:
-        return self._resolve_single_input_detailed(ctx, an_input).networks
+    def _resolve_single_input(
+        self, ctx: ScriptContext, an_input: str, network_view: str = ""
+    ) -> Set[ipaddress.IPv4Network]:
+        return self._resolve_single_input_detailed(ctx, an_input, network_view).networks
 
     @staticmethod
     def _parse_ipv4_network(text: str) -> ipaddress.IPv4Network:
@@ -388,39 +647,80 @@ class SubnetRequestModule(BaseModule):
             return False
         return True
 
-    def _resolve_single_input_detailed(self, ctx: ScriptContext, an_input: str) -> InputResolutionResult:
+    def _resolve_single_input_detailed(
+        self, ctx: ScriptContext, an_input: str, network_view: str = ""
+    ) -> InputResolutionResult:
         """
         Worker function to resolve a single input string into one or more network objects.
+
+        Every lookup is limited to ``network_view`` when one is given. An answer item that names its
+        view gives a ``ViewNetwork``: an address found in two views resolves to a target for each, and
+        a container's children are targets per (network, view). An item without a view gives a plain
+        network, as it always did (an address: the first item). A network without a lookup (/30 and
+        longer, or a container prefix without children) belongs to the requested view, if any. Unscoped,
+        children that name a view are followed by one lookup of the prefix itself: it is a target in
+        every view where it is an ordinary network, even when another view holds children for it.
         """
         try:
             net = self._parse_ipv4_network(an_input)
             if net.prefixlen == 32:
-                result = request_result(ctx, f'network?contains_address={net.network_address}', ensure_auth=False)
-                if result.ok and result.has_items and 'network' in result.items[0]:
-                    return InputResolutionResult(networks={ipaddress.IPv4Network(result.items[0]['network'])})
+                result = request_result(
+                    ctx, scope_network(f'network?contains_address={net.network_address}', network_view), ensure_auth=False
+                )
+                if result.ok and result.has_items:
+                    labelled = {
+                        ViewNetwork(item["network"], item["network_view"])
+                        for item in result.items
+                        if item.get("network") and item.get("network_view")
+                    }
+                    if labelled:
+                        return InputResolutionResult(networks=labelled)
+                    if 'network' in result.items[0]:
+                        return InputResolutionResult(networks={ipaddress.IPv4Network(result.items[0]['network'])})
                 if result.failed:
                     return InputResolutionResult(networks=set(), failure_message=describe_infoblox_failure(result))
                 return InputResolutionResult(networks=set())
-            elif net.prefixlen < 30:
-                result = request_result(ctx, f'network?network_container={net.compressed}', ensure_auth=False)
+            own_network = ViewNetwork(net, network_view) if network_view else net
+            if net.prefixlen < 30:
+                result = request_result(
+                    ctx, scope_network(f'network?network_container={net.compressed}', network_view), ensure_auth=False
+                )
                 found_subnets: Set[ipaddress.IPv4Network] = set()
                 if result.ok:
                     supernet_data = process_data(ctx, type='supernet', content=result.content)
-                    found_subnets = {ipaddress.IPv4Network(sub["network"]) for sub in supernet_data.get("subnets", [])}
+                    found_subnets = {
+                        _make_network(sub["network"], sub.get(NETWORK_VIEW, "")) for sub in supernet_data.get("subnets", [])
+                    }
                 elif result.failed:
                     return InputResolutionResult(networks=set(), failure_message=describe_infoblox_failure(result))
                 # The child containers are listed, not expanded. A failed lookup is reported next to what
                 # the first one found, so a grid that refuses it still answers for a plain /24.
                 container_result = request_result(
                     ctx,
-                    f'networkcontainer?network_container={net.compressed}&_return_fields=network,comment,utilization',
+                    scope_network(
+                        f'networkcontainer?network_container={net.compressed}&_return_fields=network,comment,utilization,network_view',
+                        network_view,
+                    ),
                     ensure_auth=False,
                 )
                 containers = self._child_container_rows(an_input, container_result.items) if container_result.ok else []
                 failure = describe_infoblox_failure(container_result) if container_result.failed else ""
-                networks = found_subnets or ({net} if not containers else set())
+                networks = found_subnets or ({own_network} if not containers else set())
+                # Children in one view say nothing about another view, where the prefix may be an ordinary
+                # network. One view holds a prefix as a container or a network, never both, so the question
+                # only exists unscoped and once an answer has named a view.
+                if not network_view and (
+                    any(_view_of(child) for child in found_subnets) or any(row.get(NETWORK_VIEW) for row in containers)
+                ):
+                    exact_result = request_result(
+                        ctx, f'network?network={net.compressed}&_return_fields=network,network_view', ensure_auth=False
+                    )
+                    networks = networks | {
+                        ViewNetwork(net, item["network_view"]) for item in exact_result.items if item.get("network_view")
+                    }
+                    failure = failure or (describe_infoblox_failure(exact_result) if exact_result.failed else "")
                 return InputResolutionResult(networks=networks, failure_message=failure, containers=containers)
-            return InputResolutionResult(networks={net})
+            return InputResolutionResult(networks={own_network})
         except ValueError:
             ctx.logger.warning(f"Invalid IP/Subnet format for input: '{an_input}'")
             return InputResolutionResult(networks=set())
@@ -430,64 +730,96 @@ class SubnetRequestModule(BaseModule):
 
     @staticmethod
     def _child_container_rows(container: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """``networkcontainer`` records as ``child containers`` rows, by address; the first of a repeated network wins."""
-        children: Dict[ipaddress.IPv4Network, Dict[str, Any]] = {}
+        """
+        ``networkcontainer`` records as ``child containers`` rows, sorted by address, prefix length and
+        view. A container that exists in two views is listed once for each (a row names its view in a
+        leading ``network view`` column when the record does); within one view the first of a repeated
+        network wins.
+        """
+        children: Dict[Tuple[ipaddress.IPv4Network, str], Dict[str, Any]] = {}
         for item in items:
             if "network" in item:
-                children.setdefault(ipaddress.IPv4Network(item["network"]), item)
-        return [
-            {
+                children.setdefault((ipaddress.IPv4Network(item["network"]), str(item.get("network_view") or "")), item)
+        rows: List[Dict[str, Any]] = []
+        for child, view in sorted(children, key=lambda key: (int(key[0].network_address), key[0].prefixlen, key[1])):
+            item = children[(child, view)]
+            row = {
                 "container": container,
                 "child container": str(child),
-                "comment": children[child].get("comment", ""),
-                "utilization %": utilization_percent(children[child].get("utilization"), CONTAINER_UTILIZATION_SCALE),
+                "comment": item.get("comment", ""),
+                "utilization %": utilization_percent(item.get("utilization"), CONTAINER_UTILIZATION_SCALE),
             }
-            for child in sorted(children)
-        ]
+            rows.append({NETWORK_VIEW: view, **row} if view else row)
+        return rows
 
-    def _fetch_and_process_subnet_data(self, ctx: ScriptContext, network: ipaddress.IPv4Network) -> SubnetFetchOutcome:
+    def _fetch_and_process_subnet_data(
+        self, ctx: ScriptContext, network: ipaddress.IPv4Network, network_view: str = ""
+    ) -> SubnetFetchOutcome:
         """
         Fetches all data for a single subnet, processes it, and prepares it for display.
         This function is designed to be run in a thread pool for a *unique* network.
-        """
-        outcome = self._fetch_all_data_for_subnet(ctx, network)
-        processed_data = self.execute_hook('process_data', ctx, outcome.data)
-        return SubnetFetchOutcome(data=processed_data, warnings=outcome.warnings)
 
-    def _fetch_all_data_for_subnet(self, ctx: ScriptContext, network: NetworkObject) -> SubnetFetchOutcome:
-        """Fetches all related data points for a single subnet in parallel."""
+        The ``process_data`` hook runs once on the data that named no view (always, when no view was
+        named at all: that is today's single call) and once on the data of each view the answers named.
+        """
+        outcome = self._fetch_all_data_for_subnet(ctx, network, network_view)
+        processed_data = outcome.data
+        if outcome.data or not outcome.by_view:
+            processed_data = self.execute_hook('process_data', ctx, outcome.data)
+        by_view = {view: self.execute_hook('process_data', ctx, data) for view, data in outcome.by_view.items()}
+        return SubnetFetchOutcome(data=processed_data, warnings=outcome.warnings, by_view=by_view)
+
+    def _fetch_all_data_for_subnet(
+        self, ctx: ScriptContext, network: NetworkObject, network_view: str = ""
+    ) -> SubnetFetchOutcome:
+        """
+        Fetches all related data points for a single subnet in parallel: four requests, each one asking
+        for the ``network_view`` field (``network_view`` limits them to that view; "" searches every view).
+
+        Every answer is split by the view its items name. The part that names none is ``data``; each
+        view gets its own entry in ``by_view`` and is parsed on its own, so one view's description or
+        DHCP figure is never read from another view's item.
+        """
         net_str = str(network)
         paged_request = partial(request_result, paged=True)  # these lists can outgrow one WAPI page
         request_specs = {
             "network bundle": {
-                "uri": f"network?network={net_str}&_return_fields=network,comment,extattrs,options,members,dhcp_utilization",
+                "uri": scope_network(
+                    f"network?network={net_str}&_return_fields=network,comment,extattrs,options,members,dhcp_utilization,network_view",
+                    network_view,
+                ),
                 "parser_types": ("general", "network options"),
                 "warning_labels": ("general", "network options"),
                 "request_fn": request_result_with_inheritance,
             },
             "DNS records": {
-                "uri": f"ipv4address?network={net_str}&usage=DNS&_return_fields=ip_address,names",
+                "uri": scope_network(
+                    f"ipv4address?network={net_str}&usage=DNS&_return_fields=ip_address,names,network_view", network_view
+                ),
                 "parser_types": ("DNS records",),
                 "warning_labels": ("DNS records",),
                 "request_fn": paged_request,
             },
             "range bundle": {
-                "uri": (
+                "uri": scope_network(
                     f"range?network={net_str}&_return_fields=network,start_addr,end_addr,member,failover_association,"
-                    "dhcp_utilization,dhcp_utilization_status,dynamic_hosts,static_hosts,total_hosts"
+                    "dhcp_utilization,dhcp_utilization_status,dynamic_hosts,static_hosts,total_hosts,network_view",
+                    network_view,
                 ),
                 "parser_types": ("DHCP range", "DHCP failover"),
                 "warning_labels": ("DHCP range", "DHCP failover"),
                 "request_fn": paged_request,
             },
             "fixed addresses": {
-                "uri": f"fixedaddress?network={net_str}&_return_fields=ipv4addr,mac,name",
+                "uri": scope_network(
+                    f"fixedaddress?network={net_str}&_return_fields=ipv4addr,mac,name,network_view", network_view
+                ),
                 "parser_types": ("fixed addresses",),
                 "warning_labels": ("fixed addresses",),
                 "request_fn": paged_request,
             },
         }
-        processed_data_for_net: Dict[str, Any] = defaultdict(list)
+        partitions: Dict[str, Dict[str, Any]] = {}  # network view -> its parsed sections; "" = no view named
         warnings: List[str] = []
         with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(request_specs))) as executor:
             future_to_label = {
@@ -501,9 +833,8 @@ class SubnetRequestModule(BaseModule):
                     result = future.result()
                     notice = ""
                     if result.ok:
-                        raw_data = None
                         if label == "network bundle":
-                            raw_data = [
+                            items = [
                                 normalize_record_fields(
                                     item,
                                     scalar_fields=("comment",),
@@ -512,11 +843,16 @@ class SubnetRequestModule(BaseModule):
                                 )
                                 for item in result.items
                             ]
-                        payload_content = json.dumps(raw_data).encode() if raw_data is not None else result.content
-                        for parser_type in spec["parser_types"]:
-                            processed_data_for_net.update(process_data(ctx, type=parser_type, content=payload_content))
+                            payloads = {view: json.dumps(group).encode() for view, group in _view_partitions(items).items()}
+                            payloads = payloads or {"": json.dumps(items).encode()}
+                        else:
+                            payloads = _content_partitions(result.content)
+                        for view, payload_content in payloads.items():
+                            sections = partitions.setdefault(view, defaultdict(list))
+                            for parser_type in spec["parser_types"]:
+                                sections.update(process_data(ctx, type=parser_type, content=payload_content))
                         if result.truncated:
-                            notice = TRUNCATION_NOTICE
+                            notice = _truncation_notice(payloads)
                     elif result.failed:
                         notice = describe_infoblox_failure(result)
                     if notice:
@@ -526,11 +862,17 @@ class SubnetRequestModule(BaseModule):
                     ctx.logger.error(f"Failed to fetch data for '{label}' in {net_str}: {e}")
                     for warning_label in spec["warning_labels"]:
                         warnings.append(f"{warning_label}: request processing failed.")
-        if not processed_data_for_net.get("DHCP range"):
-            # WAPI answers 0 for a network that has no DHCP range, which would read as "idle DHCP".
-            for general_row in processed_data_for_net.get("general", []):
-                general_row["DHCP utilization %"] = ""
-        return SubnetFetchOutcome(data=processed_data_for_net, warnings=warnings)
+        for sections in partitions.values():
+            if not sections.get("DHCP range"):
+                # WAPI answers 0 for a network that has no DHCP range, which would read as "idle DHCP".
+                for general_row in sections.get("general", []):
+                    general_row["DHCP utilization %"] = ""
+        unlabelled = partitions.pop("", defaultdict(list))
+        return SubnetFetchOutcome(
+            data=unlabelled,
+            warnings=warnings,
+            by_view={view: partitions[view] for view in sorted(partitions)},
+        )
 
     def _display_results(self, ctx: ScriptContext, query_targets: List[QueryTarget], subnet_data_cache: Dict[str, Dict], grouped_by_network: Dict[ipaddress.IPv4Network, List[str]], subnet_warning_cache: Optional[Dict[str, List[str]]] = None) -> None:
         """Handles the logic for displaying summary and/or detailed views in order."""
@@ -577,18 +919,23 @@ class SubnetRequestModule(BaseModule):
         subnet_data_cache: Dict[str, Dict],
         subnet_warning_cache: Dict[str, List[str]],
     ) -> List[Dict[str, str]]:
-        """One summary row per network, in the order given: the menu's selection list and ``cn subnet``'s ``subnets``."""
+        """
+        One summary row per network, in the order given: the menu's selection list and ``cn subnet``'s
+        ``subnets``. When any of the networks belongs to a view, every row has a ``Network view`` column
+        between the input and the resolved subnet (blank for a network without a view).
+        """
         summary_data: List[Dict[str, str]] = []
         any_inherited = False
+        show_view = any(_view_of(network) for network in networks)
         for network in networks:
-            net_info = subnet_data_cache.get(str(network), {})
-            warnings = subnet_warning_cache.get(str(network), [])
+            net_info = subnet_data_cache.get(_cache_key(network), {})
+            warnings = subnet_warning_cache.get(_cache_key(network), [])
             summary_state = self._build_summary_state(net_info, warnings)
-            summary_net: Dict[str, str] = {
-                "Original Input(s)": ", ".join(grouped_by_network[network]),
-                "Resolved Subnet": str(network),
-                "Status": summary_state.status,
-            }
+            summary_net: Dict[str, str] = {"Original Input(s)": ", ".join(grouped_by_network[network])}
+            if show_view:
+                summary_net[NETWORK_VIEW_TITLE] = _view_of(network)
+            summary_net["Resolved Subnet"] = str(network)
+            summary_net["Status"] = summary_state.status
 
             if net_info and net_info.get("general"):
                 description = net_info["general"][0].get("description", "N/A")
@@ -628,6 +975,7 @@ class SubnetRequestModule(BaseModule):
         subnet_warning_cache: Dict[str, List[str]],
         misses: Sequence[str] = (),
         containers: Sequence[Dict[str, Any]] = (),
+        fallback_view: str = "",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         The sections of a ``cn subnet`` result: ``subnets`` (the summary, then a "No data" row with no
@@ -636,19 +984,33 @@ class SubnetRequestModule(BaseModule):
         expanded), each detail table over all networks with the network as its first column, then ``warnings``.
 
         Detail tables come in the menu's order, the rest alphabetically; the ones every run has (see
-        ``CLI_DETAIL_SECTIONS``) are present even when empty.
+        ``CLI_DETAIL_SECTIONS``) are present even when empty. When any of the networks belongs to a
+        network view, every detail and ``warnings`` row leads with ``network view`` (before ``network``)
+        and the ``subnets`` rows, the misses included, have ``Network view`` (see ``_build_summary_rows``).
+
+        ``fallback_view`` is the requested view (``ViewScope.requested``). A requested view always shows
+        the column, even when no network is left to carry it (every input missed), and it is the view a
+        miss row names; without one a miss row's view is blank.
         """
+        show_view = bool(fallback_view) or any(_view_of(network) for network in networks)
         details: Dict[str, List[Dict[str, Any]]] = {name: [] for name in CLI_DETAIL_SECTIONS}
         for network in networks:
             net_str = str(network)
-            for name, rows in subnet_data_cache.get(net_str, {}).items():
+            lead = {NETWORK_VIEW: _view_of(network), "network": net_str} if show_view else {"network": net_str}
+            for name, rows in subnet_data_cache.get(_cache_key(network), {}).items():
                 details.setdefault(name, []).extend(
-                    {"network": net_str, **{key: value for key, value in row.items() if key != "network"}} for row in rows
+                    {**lead, **{key: value for key, value in row.items() if key not in lead}} for row in rows
                 )
 
         no_data = self._build_summary_state({}, [])
         miss_rows = [
-            {"Original Input(s)": item, "Resolved Subnet": "", "Status": no_data.status, "Description": no_data.description}
+            {
+                "Original Input(s)": item,
+                **({NETWORK_VIEW_TITLE: fallback_view} if show_view else {}),
+                "Resolved Subnet": "",
+                "Status": no_data.status,
+                "Description": no_data.description,
+            }
             for item in misses
         ]
         sections: Dict[str, List[Dict[str, Any]]] = {
@@ -661,9 +1023,13 @@ class SubnetRequestModule(BaseModule):
         ordered = [*DETAIL_TABLE_ORDER, *sorted(name for name in details if name not in DETAIL_TABLE_ORDER)]
         sections.update({name: details[name] for name in ordered})
         sections["warnings"] = [
-            {"network": str(network), "warning": warning}
+            {
+                **({NETWORK_VIEW: _view_of(network)} if show_view else {}),
+                "network": str(network),
+                "warning": warning,
+            }
             for network in networks
-            for warning in subnet_warning_cache.get(str(network), [])
+            for warning in subnet_warning_cache.get(_cache_key(network), [])
         ]
         return sections
 
@@ -718,8 +1084,8 @@ class SubnetRequestModule(BaseModule):
                 ctx,
                 network,
                 grouped_by_network[network],
-                subnet_data_cache.get(str(network), {}),
-                subnet_warning_cache.get(str(network), []),
+                subnet_data_cache.get(_cache_key(network), {}),
+                subnet_warning_cache.get(_cache_key(network), []),
                 index=index,
                 total=total_selected,
             )
@@ -739,14 +1105,18 @@ class SubnetRequestModule(BaseModule):
         console = ctx.console
         inputs_str = ", ".join(f"'{inp}'" for inp in original_inputs)
 
+        in_view = _in_view(network)  # " in network view lab" when the network belongs to a view
         if total > 1:
-            console.print(f"[{colors['description']}]Details [{index}/{total}] for: [{colors['header']} bold]{network}[/][/]")
+            console.print(
+                f"[{colors['description']}]Details [{index}/{total}] for: [{colors['header']} bold]{network}[/]{escape(in_view)}[/]"
+            )
         else:
-            console.print(f"[{colors['description']}]Details for: [{colors['header']} bold]{network}[/][/]")
+            console.print(f"[{colors['description']}]Details for: [{colors['header']} bold]{network}[/]{escape(in_view)}[/]")
         console.print(f"[{colors['description']}] (Resolved from input(s): {inputs_str})[/]\n")
 
         if warnings:
-            console.print(f"[{colors['warning']}]{format_partial_results_message(f'{len(warnings)} lookup issue(s) for {network}.')}[/]")
+            issues = format_partial_results_message(f'{len(warnings)} lookup issue(s) for {network}{in_view}.')
+            console.print(f"[{colors['warning']}]{escape(issues)}[/]")
             for warning in warnings:
                 console.print(f"[{colors['warning']}]Warning:[/] [{colors['error']}]{warning}[/]")
 
@@ -763,7 +1133,10 @@ class SubnetRequestModule(BaseModule):
             console.print(f"[{colors['warning']}]No subnet details available because one or more Infoblox lookups failed.[/]")
             return
 
-        console.print(f"[{colors['error']}]{format_no_match_message('subnet records', str(network))}[/]")
+        no_match = format_no_match_message('subnet records', str(network))
+        if in_view:  # the view goes before the closing period
+            no_match = f"{no_match[:-1]}{in_view}."
+        console.print(f"[{colors['error']}]{escape(no_match)}[/]")
 
     def _build_summary_state(self, data: Dict[str, Any], warnings: List[str]) -> SubnetSummaryState:
         has_primary_details = bool(data.get("general"))
@@ -782,10 +1155,14 @@ class SubnetRequestModule(BaseModule):
             return SubnetSummaryState(status="Warnings only", description=warnings[0])
         return SubnetSummaryState(status="No data", description="No matching subnet records found")
 
-    def _prepare_subnet_save_data(self, original_input: str, processed_data: Dict[str, Any]) -> List[RowDict]:
+    def _prepare_subnet_save_data(
+        self, original_input: str, processed_data: Dict[str, Any], network_view: str = ""
+    ) -> List[RowDict]:
         """
         Prepares data for saving. The Original Input is only added to the main 'Subnet' row
-        for improved report readability.
+        for improved report readability. A ``network_view`` is named in the ``Network view`` column of
+        every row of the subnet (before ``IP``, so right after ``Original Input``), which keeps a filter
+        on that column from splitting a subnet.
         """
         data_rows: List[RowDict] = []
         general_info = processed_data.get("general", [{}])[0]
@@ -839,6 +1216,8 @@ class SubnetRequestModule(BaseModule):
                 "IP": fa.get("IP address"), "Mask": "/32",
                 "Name": fa.get("name"), "MAC": fa.get("MAC"), "Notes": "Fixed IP"
             })
+        if network_view:
+            data_rows = present_rows(data_rows, NETWORK_VIEW_TITLE, True, fallback=network_view, before="IP")
         return data_rows
 
     def _collect_summary_inherited_fields(self, processed_data: Dict[str, Any]) -> List[str]:
@@ -898,6 +1277,8 @@ class SubnetRequestModule(BaseModule):
             for row in all_row_dicts:
                 for key in row.keys():
                     discovered_headers[key] = True
+            if any(NETWORK_VIEW_TITLE in row for row in all_row_dicts):
+                base_columns.insert(1, NETWORK_VIEW_TITLE)  # right after Original Input
             final_columns = list(base_columns)
             for header in discovered_headers.keys():
                 if header not in final_columns:

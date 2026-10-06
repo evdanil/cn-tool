@@ -3,18 +3,21 @@
 `cn-tool` is a modular network utility for Infoblox lookups, bulk network
 checks, configuration repository searches, and device inventory collection.
 
-## What's new in 0.3.0
+## What's new in 0.4.0
 
-A command line (`cn subnet|ip|fqdn|site|ping|diff|doctor`) with JSON, Markdown and CSV output and
-exit codes, site lookup by extensible attribute, PTR checks, DHCP utilization and child
-containers, TCP checks in bulk ping, `cn diff`, `cn doctor` and Config Analyzer 0.2.0. The full
-list, the fixes, the configuration changes and the migration notes are in the release notes of
-0.3.0 on the Releases page of this repository.
+Infoblox network views. On a grid with several, `ip`, `subnet` and `site` list one row per network
+view instead of the first copy, `fqdn` lists a record once per DNS view, and `--view NAME`,
+`--all-views` and `[api] network_view` choose the view to search. `cn doctor` gains a `Network view`
+check, and JSON rows carry `network_view` (`fqdn`: `dns_view`) on every grid. The full list, the
+behaviour changes and the migration notes are in the release notes of 0.4.0 on the Releases page of
+this repository. Version 0.3.0 added the command line, `cn diff`, `cn doctor` and Config Analyzer
+0.2.0; its notes are on the same page.
 
 ## Included Features
 
 - IP, subnet, FQDN, and location lookups using the Infoblox API; a site is found by an Infoblox
-  extensible attribute (`[site] ea_name`) or by subnet comment
+  extensible attribute (`[site] ea_name`) or by subnet comment; an object held in several network
+  views is listed once per view, and `--view NAME` limits a lookup to one
 - Command line (`cn subnet|ip|fqdn|site|ping|diff|doctor`) with table, JSON, Markdown and CSV
   output and exit codes for scripts
 - Bulk ping with an optional TCP port check, resolve, and traceroute operations
@@ -67,10 +70,10 @@ ln -s /path/to/main.py ~/bin/cn
 
 | Command  | Objects | Returns |
 | -------- | ------- | ------- |
-| `subnet` | `10.1.2.0/24`, `10.1.2.0/255.255.255.0` or an IP address (its subnet); a container prefix expands to its subnets and lists its child containers, not expanded | subnet summary with DHCP utilization %, DHCP ranges, DNS records, fixed addresses, extensible attributes; a `child containers` table for a container prefix |
-| `ip`     | IPv4 addresses | subnet, DNS name, status, MAC and PTR name; an unused address is reported as `UNUSED` |
-| `fqdn`   | names or name prefixes (at least three characters) | A, AAAA, host and CNAME records whose name contains the text, with type, zone, TTL and a PTR check |
-| `site`   | site codes; with `-k/--keyword`, keywords | the subnets of each site code, or matching each keyword, with DHCP utilization % |
+| `subnet` | `10.1.2.0/24`, `10.1.2.0/255.255.255.0` or an IP address (its subnet); a container prefix expands to its subnets and lists its child containers, not expanded | subnet summary with DHCP utilization %, DHCP ranges, DNS records, fixed addresses, extensible attributes; a `child containers` table for a container prefix; one summary row and one set of details per network view that holds the subnet |
+| `ip`     | IPv4 addresses | network view (on a grid with several), subnet, DNS name, status, MAC and PTR name, one row per network view that holds the address; an unused address is reported as `UNUSED` |
+| `fqdn`   | names or name prefixes (at least three characters) | A, AAAA, host and CNAME records whose name contains the text, with type, DNS view (on a grid with several), zone, TTL and a PTR check |
+| `site`   | site codes; with `-k/--keyword`, keywords | the subnets of each site code, or matching each keyword, with DHCP utilization % and, on a grid with several network views, the network view |
 | `ping`   | IPv4 addresses, host names, `10.1.2.0/24` networks | ICMP result per host and, with `--tcp 22,443`, the state of each port |
 | `diff`   | device names, as in `<name>.cfg` in the configuration repositories | configuration lines added or removed since the last change or `--since`, with the snapshot, author and time |
 | `doctor` | none | one row per configuration, credential and Infoblox check |
@@ -79,9 +82,11 @@ ln -s /path/to/main.py ~/bin/cn
 fetched separately); at the cap a warning says so. `fqdn` pages each record type (A, AAAA, host,
 CNAME) and its PTR search up to 10,000 rows.
 
-`ping` adds `--tcp PORTS`, and `diff` adds `--since WHEN` and `--line TEXT`. `doctor` takes neither
-objects nor `--file`. `diff` and `doctor` write no report: they have no `--report`, and `-r FILE`
-is refused with exit 2. An option name is never abbreviated (`--rep` is an error, not `--report`).
+`ip`, `subnet`, `fqdn`, `site` and `doctor` add `--view NAME` and `--all-views` (see
+[Network views](#network-views)). `ping` adds `--tcp PORTS`, and `diff` adds `--since WHEN` and
+`--line TEXT`. `doctor` takes neither objects nor `--file`. `diff` and `doctor` write no report:
+they have no `--report`, and `-r FILE` is refused with exit 2. An option name is never abbreviated
+(`--rep` is an error, not `--report`).
 
 Objects are arguments, or one per line from `--file PATH`; a positional `-` or `--file -` reads
 standard input. Blank lines and `#` comments are ignored. Global options (`-c`, `-nc`, `-t`, `-l`,
@@ -96,20 +101,23 @@ a MAC address, an IPv6 address, a partial address such as `10.1.2` and a mix of 
 ### PTR, DHCP utilization and child containers
 
 `fqdn` returns one row per address: `ip`, `name`, `type` (`A`, `AAAA`, `HOST` or `CNAME`),
-`canonical` (a CNAME's target), `zone`, `TTL` (empty = the zone default) and `PTR`. Five requests
+`canonical` (a CNAME's target), `DNS view` (only on a grid with several DNS views, or with a view
+selected), `zone`, `TTL` (empty = the zone default) and `PTR`. Rows are sorted by name, type,
+address and DNS view, and a record held in several DNS views is listed once per view. Five requests
 run for each prefix: the four record types and the PTR records of the same names.
 
 | `PTR` | Meaning |
 | ----- | ------- |
-| `ok` | a PTR record on the grid at this address points back to the name |
-| `missing` | no PTR record on the grid does (`cn ip <address>` shows the PTR the address has) |
+| `ok` | a PTR record on the grid at this address, in the record's DNS view, points back to the name (in any DNS view for a row without one) |
+| `missing` | no such PTR record does, in the record's DNS view (in any DNS view for a row without one); `cn ip <address>` shows the PTR the address has |
 | `host record` | the host record is configured for DNS, so it publishes its own PTR; not checked |
 | *(empty)* | a CNAME row, or the PTR check could not run (a warning says why) |
 
 A host record that is not configured for DNS (DHCP/IPAM only) is checked like an A record: `ok` or
 `missing`. A record type whose search fails adds a `warnings` row and makes the status 3; the other types are
 still listed. `ip` adds `PTR name` (one extra request per address that has a PTR record; a failed
-lookup is a warning and status 3).
+lookup is a warning and status 3); on a grid with several network views a row shows only the PTR
+records of its own network view.
 
 `subnet` and `site` show `DHCP utilization %`: the WAPI `dhcp_utilization` value taken as per mille,
 so divided by 10, with one decimal. `subnet` leaves it empty for a subnet without a DHCP range and
@@ -117,6 +125,85 @@ adds `utilization %`, `utilization status`, `leases`, `static` and `total` to ea
 `site` does not read ranges, so a subnet without one shows `0.0` there and IPv6 rows are empty.
 An input shorter than /30 also lists its child containers (`container`, `child container`,
 `comment`, `utilization %`); they are not expanded, so query one to see its subnets.
+
+### Network views
+
+A network view is an Infoblox partition of the IP space: the same network, address or name can
+exist in several views, each with its own data. A grid with one view has nothing to choose, and
+nothing changes there.
+
+By default `ip`, `subnet`, `fqdn` and `site` search every network view and list one row per view
+that holds the object. A WAPI search without a view answers across every view, so this costs no
+extra request; `cn doctor` tests that on a grid with several views. Choose one view instead with:
+
+| Choice | Effect |
+| ------ | ------ |
+| `--view NAME` | search only this network view (matched exactly; `cn doctor` lists the names) |
+| `--all-views` | search every view, even when `[api] network_view` is set |
+| `[api] network_view = NAME` | the view every lookup searches when no option is given, in the menu too; empty (the default) searches every view |
+
+`--view` and `--all-views` work on `ip`, `subnet`, `fqdn`, `site` and `doctor` (the last one given
+wins), then `[api] network_view`, then every view. `--view ""` is refused (exit 2); `ping` and
+`diff` take neither option. One view can be named at a time.
+
+```bash
+cn ip 10.20.0.5 --view lab
+cn subnet 10.20.0.0/24 --all-views --format json
+cn site syd --view prod --format md
+cn fqdn web01 --view lab
+cn doctor --view lab
+```
+
+**The view column.** `ip` shows `Network view` first; `subnet` shows `Network view` in the summary
+(after `Original Input(s)`) and `network view` first in its detail sections; `site` shows
+`network view` first; `fqdn` shows `DNS view` before `zone`. In `table`, `md`, `csv`, the menu and
+the xlsx report the column shows when a view is selected, when the grid has more than one network
+view (`fqdn`: more than one DNS view), when the rows of a run name two views, or when the grid's
+list of views could not be read. Otherwise it is left out, so a grid with one view prints what
+0.3.0 printed. JSON always carries `network_view` (`fqdn`: `dns_view`) in these rows, on every
+grid, so a script that counts rows on a multi-view grid should key on it:
+
+```bash
+cn ip 10.20.0.5 --format json | jq -r '.ip_information[] | "\(.network_view) \(.subnet)"'
+```
+
+- **`ip`**: one row per address and network view. The PTR request is still one per address. A PTR
+  record goes to the row of the network view that holds its DNS view; one whose DNS view is not
+  listed goes to every row. A PTR record in a DNS view of a network view where the address has no
+  row is not shown.
+- **`subnet`**: four requests per network, however many views hold it. The answers are split by
+  view into one summary row and one set of details per view. The 10,000-row cap of a list is shared
+  by the views, and the warning names them (`shared by network views default, lab`). The menu
+  names the view (`Details [2/2] for: 10.20.0.0/24 in network view lab`), and the "Subnet Data
+  Detail" sheet gets `Network view` on every row.
+- **`site`**: one row per network and view, in the grid's order.
+- **`fqdn`**: rows are sorted by name, type, address and DNS view, and a record in two DNS views is
+  two rows, also on a grid with one network view and split-horizon DNS (`internal`, `external`).
+  The `PTR` verdict is checked in the record's own DNS view, so an `external` record with no PTR
+  in `external` reads `missing`.
+- **`fqdn` with a view**: A, AAAA, CNAME and PTR records are searched in each DNS view of the
+  network view and host records by network view, `1 + 4k` requests for k DNS views (5 without a
+  view). If the PTR search of one DNS view fails, only that view's `PTR` is left empty, and an
+  IPAM-only host may then read `missing`. A view with no DNS view searches host records only, and
+  stderr says so.
+
+A selected view is checked after the login and before the first lookup (in the menu, before any
+input, with a banner naming the view). A view that is not on the grid exits 2 with
+`no network view 'prd' on the grid (--view); network views: default, prod, lab`; a name that is a
+DNS view's says `use --view <network view>`, and a name that differs only in case says
+`did you mean 'prod'?`. If the list of views cannot be read while one is selected, the exit is 3
+with `check with: cn doctor`. With no view selected an unreadable list is not a failure: the lookup
+runs without a view and the column shows.
+
+`cn doctor` adds a `Network view` row after `Site attribute`: the grid's views, the view the lookups
+search and, for a selected view, its DNS views. On a grid with several views and none selected it
+runs a probe (two requests): it asks the first non-default view for one network, then asks for that
+network without a view; if the answer does not name that view, the row is a `warning`. The Setup
+menu status block has an offline `Network view` row (`every view ([api] network_view not set)`).
+
+The list of views is one small request, read at most once per lookup and only when `[api] endpoint`
+is set and the answer needs it. `ip` and `site` send the requests they sent before, `subnet` four
+per CIDR, `fqdn` five per name.
 
 ### Bulk ping (`cn ping`)
 
@@ -170,14 +257,15 @@ cn doctor --format json | jq '.checks[] | select(.status == "error")'
 ```
 
 `cn doctor` prints one row per check (`check`, `status`, `detail`), in a fixed order: Infoblox API,
-Credentials, Infoblox WAPI, Site attribute, Config Repo, Active Dir, Cache, Theme. Credentials,
-Infoblox WAPI and Site attribute are live checks: they run only when Infoblox is configured, and
-they find the credential source, log in and read the WAPI version from `<endpoint>?_schema`, and
-check that `[site] ea_name` is defined on the grid and allowed on networks. The Config Repo row
-is an `error` when none of the configured repository directories can be read. `status` is `ok`,
-`warning`, `error`, `off` (not configured), `info` or `skipped`. Nothing is changed, and it never prompts without a
-terminal. The Application Setup status block in the menu shows the same rows without the live
-checks.
+Credentials, Infoblox WAPI, Site attribute, Network view, Config Repo, Active Dir, Cache, Theme.
+Credentials, Infoblox WAPI, Site attribute and Network view are live checks: they run only when
+Infoblox is configured, and they find the credential source, log in and read the WAPI version from
+`<endpoint>?_schema`, check that `[site] ea_name` is defined on the grid and allowed on networks,
+and list the network views and check the one the lookups search (`--view` or `[api] network_view`;
+see [Network views](#network-views)). The Config Repo row is an `error` when none of the configured
+repository directories can be read. `status` is `ok`, `warning`, `error`, `off` (not configured),
+`info` or `skipped`. Nothing is changed, and it never prompts without a terminal. The Application
+Setup status block in the menu shows the same rows without the live checks.
 
 ### Output
 
@@ -194,8 +282,8 @@ checks.
 | ------ | ------- | -------- |
 | 0 | at least one object returned data | misses are listed in `not_found` |
 | 1 | no object returned data | an IP outside every managed network |
-| 2 | usage or configuration error | unknown command, no or invalid objects, MAC or IPv6 address, Infoblox not configured, unreadable `--file`, no command and no terminal for the menu |
-| 3 | incomplete or not saved | no credentials without a terminal, authentication failure, timeout or server error, rejected or too-large query, report not written |
+| 2 | usage or configuration error | unknown command, no or invalid objects, MAC or IPv6 address, Infoblox not configured, a network view that is not on the grid, an empty `--view`, unreadable `--file`, no command and no terminal for the menu |
+| 3 | incomplete or not saved | no credentials without a terminal, authentication failure, timeout or server error, rejected or too-large query, the network views could not be listed while one was selected, report not written |
 | 130 | interrupted | Ctrl-C |
 
 Status 1 means "no record", not "the IP is free": an unused IP returns `UNUSED` with status 0.
@@ -207,8 +295,8 @@ With status 3, stdout still holds what was found.
 | ------ | --------- | --------- | ----------- |
 | 0 | a host answered ICMP; with `--tcp`, a port was `open` | at least one row in `changes` | no check failed (`warning`, `off`, `info` and `skipped` are allowed) |
 | 1 | no host answered, or no port was open | no change in the window, or no such device or snapshot | never |
-| 2 | no targets, a target that is not an IPv4 address, network or name, IPv6, more than a /16 (1,024 hosts with `--tcp`), bad `--tcp`, no `ping` command without `--tcp` | no devices, bad `--since` or `--line`, `-r FILE`, `[config_repo]` off | the endpoint serves no WAPI schema, `[site] ea_name` is not defined or not allowed on networks, no configuration repository directory can be read, `-r FILE` |
-| 3 | a probe could not run (`ERROR`, `error`), report not written | a repository directory, history folder or snapshot could not be read | no credentials without a terminal, login rejected, timeout or server error |
+| 2 | no targets, a target that is not an IPv4 address, network or name, IPv6, more than a /16 (1,024 hosts with `--tcp`), bad `--tcp`, no `ping` command without `--tcp` | no devices, bad `--since` or `--line`, `-r FILE`, `[config_repo]` off | the endpoint serves no WAPI schema, `[site] ea_name` is not defined or not allowed on networks, `[api] network_view` (or `--view`) names no network view on the grid, no configuration repository directory can be read, `-r FILE` |
+| 3 | a probe could not run (`ERROR`, `error`), report not written | a repository directory, history folder or snapshot could not be read | no credentials without a terminal, login rejected, timeout or server error, the network views could not be listed while one is selected |
 
 `--report` appends the result to the xlsx report (`[report] filename`, or `-r FILE`, which implies
 `--report`); the command line does not save without it. A report that cannot be written makes the
@@ -224,7 +312,7 @@ be read.
 
 | Command  | Sections |
 | -------- | -------- |
-| `subnet` | `subnets`, `child_containers`, the detail sections (`general`, `dhcp_range`, ...), `warnings` |
+| `subnet` | `subnets`, `child_containers`, the detail sections (`general`, `dhcp_range`, ...), `warnings`; the rows carry `network_view` |
 | `ip`     | `ip_information`, `not_found`, `warnings` |
 | `fqdn`   | `fqdn`, `not_found`, `warnings` |
 | `site`   | `location`, `not_found`, `warnings` |
@@ -232,16 +320,20 @@ be read.
 | `diff`   | `compared`, `changes`, `not_found`, `warnings` |
 | `doctor` | `checks` |
 
-New columns: `fqdn` has `type`, `canonical`, `zone`, `ttl` and `ptr`; `ip_information` has
-`ptr_name`; `subnets`, `general` and `location` have `dhcp_utilization`; `dhcp_range` has
-`utilization`, `utilization_status`, `leases`, `static` and `total`; `child_containers` has
-`container`, `child_container`, `comment` and `utilization`. Utilization values are numbers when
-known and `""` when not.
+New columns: `fqdn` has `type`, `canonical`, `dns_view`, `zone`, `ttl` and `ptr`; `ip_information`
+has `network_view` and `ptr_name`; `subnets`, `general` and `location` have `dhcp_utilization`;
+`dhcp_range` has `utilization`, `utilization_status`, `leases`, `static` and `total`;
+`child_containers` has `container`, `child_container`, `comment` and `utilization`. Utilization
+values are numbers when known and `""` when not. `network_view` is in every row of
+`ip_information`, `subnets`, `location`, the detail sections of `subnet`, `child_containers` and the
+`warnings` of `subnet`, and `dns_view` in every row of `fqdn`, on every grid; an object held in
+several views is a row for each.
 
 ```bash
 set -o pipefail
 cn subnet 10.1.2.0/24 --format json | jq -r '.dns_records[].a_record'
 cn ip --file ips.txt --format json | jq -r '.not_found[].object'
+cn ip 10.20.0.5 --format json | jq -r '.ip_information[] | "\(.network_view) \(.subnet)"'
 cn ping web01 --tcp 443 --format json | jq -r '.ping[] | select(.tcp_443 == "open") | .host'
 ```
 
@@ -269,6 +361,8 @@ Example:
 endpoint = https://infoblox.example.com
 verify_ssl = true
 timeout = 10
+# Infoblox network view the lookups search (empty: every view; cn --view / --all-views override it)
+# network_view = prod
 
 [logging]
 logfile = ~/cn.log

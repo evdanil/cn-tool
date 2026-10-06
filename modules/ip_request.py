@@ -1,7 +1,8 @@
 import argparse
 import ipaddress
+import json
 from time import perf_counter
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Callable, Dict, Any, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 from rich.markup import escape
@@ -12,6 +13,7 @@ from utils.auth import ensure_infoblox_auth
 from utils.cli_input import read_objects
 from utils.display import console, get_global_color_scheme, print_table_data, table_columns
 from utils.file_io import queue_save
+from utils.network_views import NETWORK_VIEW, NETWORK_VIEW_TITLE, ViewScope, present_rows, scope_network, view_scope
 from utils.process_data import process_data
 from utils.user_input import press_any_key, read_user_input
 
@@ -21,6 +23,13 @@ INVALID_FORMAT = "Invalid IP format. Please enter a valid IPv4 address."
 NO_RECORD = "No matching IPv4 record found"
 
 COLUMNS = ["Subnet", "IP", "Name", "Status", "Lease State", "Record Type", "MAC", "PTR name"]
+
+# The address lookup answers once per network view that holds the address; the PTR lookup is never scoped,
+# because a PTR record belongs to a DNS view.
+ADDRESS_URI = "ipv4address?ip_address={ip}&_return_fields=network,names,status,types,lease_state,mac_address,network_view"
+PTR_URI = "record:ptr?ipv4addr={ip}&_return_fields=ptrdname,view"
+
+OwnerFn = Callable[[str], str]  # the network view that holds a DNS view ("" when no network view lists it)
 
 
 def _validate_ip(ctx: ScriptContext, text: str) -> Optional[str]:
@@ -45,9 +54,54 @@ def _publishes_ptr(data: Dict[str, Any]) -> bool:
     return "PTR" in str(data.get("extra", [{}])[0].get("record type", "")).split(",")
 
 
-def _ptr_addresses(ip_addresses: List[str], processed_data_by_ip: Dict[str, Dict[str, Any]]) -> List[str]:
-    """The addresses, in input order, that have a record with the PTR type: the ones worth a PTR lookup."""
-    return [ip for ip in ip_addresses if ip in processed_data_by_ip and _publishes_ptr(processed_data_by_ip[ip])]
+def _item_payloads(content: bytes) -> List[bytes]:
+    """
+    The answer of one address split into one JSON payload per network view, in view-name order, so
+    each address-view is parsed (and handed to the ``process_data`` hook) on its own.
+
+    Items that carry no ``network_view`` label keep only the first one, as the lookup always did.
+    An answer that is not a list of items (empty, or not JSON) is returned whole as the only payload.
+    """
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return [content]
+    items = [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+    if not items:
+        return [content]
+
+    payloads: List[bytes] = []
+    seen: Set[Optional[str]] = set()
+    for item in sorted(items, key=lambda item: str(item.get("network_view") or "")):
+        view = str(item["network_view"] or "") if "network_view" in item else None
+        if view not in seen:
+            seen.add(view)
+            payloads.append(json.dumps([item]).encode())
+    return payloads
+
+
+def _ptr_addresses(ip_addresses: List[str], processed_data_by_ip: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+    """The addresses, in input order, with a record of the PTR type in any view: the ones worth a PTR lookup."""
+    return [
+        ip for ip in ip_addresses
+        if any(_publishes_ptr(data) for data in processed_data_by_ip.get(ip, []))
+    ]
+
+
+def _ptr_name(pairs: List[Tuple[str, str]], network_view: str, owner: Optional[OwnerFn]) -> str:
+    """
+    The ``PTR name`` of the row of ``network_view``, from the ``(DNS view, name)`` pairs of its address.
+
+    A name in a DNS view that belongs to ``network_view`` is shown, and so is one in a DNS view no
+    network view lists (or in none): it is shown on every row rather than lost. Without ``owner`` (the
+    views could not be paired) every name is shown, as before the views were told apart. A name
+    held in several views appears once.
+    """
+    names = (
+        name for dns_view, name in pairs
+        if owner is None or not network_view or owner(dns_view) in ("", network_view)
+    )
+    return ",".join(dict.fromkeys(names))
 
 
 def _ptr_warnings(ptr_failures: Dict[str, str]) -> List[Dict[str, str]]:
@@ -56,11 +110,17 @@ def _ptr_warnings(ptr_failures: Dict[str, str]) -> List[Dict[str, str]]:
 
 
 def _explain_misses(
-    ip_addresses: List[str], processed_data_by_ip: Dict[str, Dict[str, Any]], failed_ips: Dict[str, str]
+    ip_addresses: List[str],
+    processed_data_by_ip: Dict[str, List[Dict[str, Any]]],
+    failed_ips: Dict[str, str],
+    no_record: str = NO_RECORD,
 ) -> Dict[str, str]:
-    """The reason each address in ``ip_addresses`` has no row, in input order."""
+    """
+    The reason each address in ``ip_addresses`` has no row, in input order: the failure of its lookup,
+    else ``no_record`` (which names the requested network view when there is one).
+    """
     return {
-        ip: failed_ips.get(ip, NO_RECORD)
+        ip: failed_ips.get(ip, no_record)
         for ip in ip_addresses
         if ip not in processed_data_by_ip
     }
@@ -70,10 +130,13 @@ def _publish_stats(
     ctx: ScriptContext,
     input_count: int,
     ip_addresses: List[str],
-    processed_data_by_ip: Dict[str, Dict[str, Any]],
+    processed_data_by_ip: Dict[str, List[Dict[str, Any]]],
     print_data_all: List[Dict[str, Any]],
 ) -> None:
-    """Report the run to the usage statistics: the same event from the menu and the command line."""
+    """
+    Report the run to the usage statistics: the same event from the menu and the command line.
+    ``result_count`` counts rows (one per address and network view); the other counts are addresses.
+    """
     ctx.event_bus.publish(
         "stats:module_detail",
         {
@@ -117,6 +180,15 @@ class IPRequestModule(BaseModule):
 
         ensure_infoblox_auth(ctx)
 
+        # A configured view is checked before any input is read, so a wrong setting is not found out after
+        # fifty addresses have been typed in.
+        scope = view_scope(ctx, None, request_result)
+        view_problem = scope.problem()
+        if view_problem:
+            console.print(f"[{colors['error']}]{escape(view_problem.message)}[/]")
+            press_any_key(ctx)
+            return
+
         console.print(
             "\n"
             f"[{colors['description']}]Please provide an IPv4 address or a list of IPv4 addresses, one per line.[/]\n"
@@ -126,6 +198,9 @@ class IPRequestModule(BaseModule):
             f"[{colors['success']} {colors['bold']}]134.162.104.110[/]\n"
             f"[{colors['success']} {colors['bold']}]8.8.8.8[/]\n"
         )
+        banner = scope.banner()
+        if banner:
+            console.print(f"[{colors['warning']}]{escape(banner)}[/]\n")
 
         # --- User Input Gathering ---
         ip_addresses_input: List[str] = []
@@ -146,14 +221,15 @@ class IPRequestModule(BaseModule):
         ip_addresses = list(dict.fromkeys(ip_addresses_input))
 
         # --- API Call and Data Processing ---
-        processed_data_by_ip, failed_ips = self._fetch_ips(ctx, ip_addresses)
+        processed_data_by_ip, failed_ips = self._fetch_ips(ctx, ip_addresses, scope.requested)
         ptr_names, ptr_failures = self._fetch_ptr_names(ctx, _ptr_addresses(ip_addresses, processed_data_by_ip))
 
         # --- Display and Save Results ---
-        for ip, reason in _explain_misses(ip_addresses, processed_data_by_ip, failed_ips).items():
+        no_record = scope.scoped(NO_RECORD)
+        for ip, reason in _explain_misses(ip_addresses, processed_data_by_ip, failed_ips, no_record).items():
             console.print(f"[{colors['success']} {colors['bold']}]{ip}[/] - [{colors['error']}]{reason}[/]")
 
-        save_rows, print_data_all = self._build_rows(ctx, ip_addresses, processed_data_by_ip, ptr_names)
+        save_rows, print_data_all = self._rows_for(ctx, scope, ip_addresses, processed_data_by_ip, ptr_names)
 
         if print_data_all:
             # The print_table_data utility is designed to handle a list of dictionaries.
@@ -173,10 +249,14 @@ class IPRequestModule(BaseModule):
         """
         ``cn ip``: look up the addresses named on the command line, in ``--file`` and/or on stdin.
 
-        Returns the sections ``IP Information`` (one row per address with a record, an unused
-        address inside a managed network included), ``not_found`` (every other object and why) and
-        ``warnings`` (``object``/``warning`` for each address whose PTR lookup failed); every key is
-        always present and the caller renders them. Never prompts.
+        Returns the sections ``IP Information`` (one row per address and network view with a record, an
+        unused address inside a managed network included; led by ``Network view`` when ``view_scope``
+        says it shows, which a JSON run does for every labelled row), ``not_found`` (every other object
+        and why) and ``warnings`` (``object``/``warning`` for each address whose PTR lookup failed);
+        every key is always present and the caller renders them. Never prompts.
+
+        A requested view (``--view``, or ``[api] network_view``) that is not on the grid returns exit 2,
+        one whose list cannot be read exit 3, both with the message on the console and no sections.
         """
         logger = ctx.logger
         colors = get_global_color_scheme(ctx.cfg)
@@ -203,18 +283,23 @@ class IPRequestModule(BaseModule):
                 ip_addresses.append(obj)
         invalid = bool(reasons)
 
-        processed_data_by_ip: Dict[str, Dict[str, Any]] = {}
+        processed_data_by_ip: Dict[str, List[Dict[str, Any]]] = {}
         failed_ips: Dict[str, str] = {}
         ptr_failures: Dict[str, str] = {}
         print_data_all: List[Dict[str, Any]] = []
         if ip_addresses:
             ensure_infoblox_auth(ctx)
-            processed_data_by_ip, failed_ips = self._fetch_ips(ctx, ip_addresses)
+            scope = view_scope(ctx, args, request_result)
+            view_problem = scope.problem()
+            if view_problem:  # a view that is not on the grid, or a grid that will not say: nothing is looked up
+                console.print(f"cn ip: {view_problem.message}", markup=False)
+                return CliResult(view_problem.exit_code, {})
+            processed_data_by_ip, failed_ips = self._fetch_ips(ctx, ip_addresses, scope.requested)
             ptr_names, ptr_failures = self._fetch_ptr_names(ctx, _ptr_addresses(ip_addresses, processed_data_by_ip))
-            save_rows, print_data_all = self._build_rows(ctx, ip_addresses, processed_data_by_ip, ptr_names)
+            save_rows, print_data_all = self._rows_for(ctx, scope, ip_addresses, processed_data_by_ip, ptr_names)
             self._save_report(ctx, ip_addresses, processed_data_by_ip, save_rows)
             _publish_stats(ctx, len(ip_addresses), ip_addresses, processed_data_by_ip, print_data_all)
-            reasons.update(_explain_misses(ip_addresses, processed_data_by_ip, failed_ips))
+            reasons.update(_explain_misses(ip_addresses, processed_data_by_ip, failed_ips, scope.scoped(NO_RECORD)))
 
         data = {
             "IP Information": print_data_all,
@@ -225,36 +310,39 @@ class IPRequestModule(BaseModule):
         return CliResult(cli_exit_code(found=bool(print_data_all), invalid=invalid, failed=failed), data)
 
     def _fetch_ips(
-        self, ctx: ScriptContext, ip_addresses: List[str]
-    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+        self, ctx: ScriptContext, ip_addresses: List[str], network_view: str = ""
+    ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str]]:
         """
-        Ask Infoblox about each address and run the ``process_data`` hook on every answer.
+        Ask Infoblox about each address (in ``network_view`` only, or in every view when it is "") and
+        run the ``process_data`` hook on every address-view of every answer, one at a time.
 
-        Returns the processed data of the addresses that have a record, and the failure
-        message of each address whose lookup failed (an address with no record is in neither).
+        Returns the processed data of the addresses that have a record (one entry per network view
+        that holds the address, in view-name order), and the failure message of each address whose
+        lookup failed (an address with no record is in neither).
         """
         logger = ctx.logger
         colors = get_global_color_scheme(ctx.cfg)
         logger.info(f"User input - IPs: {', '.join(ip_addresses)}")
 
         start = perf_counter()
-        req_urls = {ip: f"ipv4address?ip_address={ip}&_return_fields=network,names,status,types,lease_state,mac_address" for ip in ip_addresses}
+        req_urls = {ip: scope_network(ADDRESS_URI.format(ip=ip), network_view) for ip in ip_addresses}
 
         with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(req_urls))) as executor, console.status(f"[{colors['description']}]Fetching IP information...[/]"):
             future_to_ip = {executor.submit(request_result, ctx, uri, ensure_auth=False): ip for ip, uri in req_urls.items()}
             results = {future_to_ip[future]: future.result() for future in future_to_ip}
 
-        processed_data_by_ip: Dict[str, Dict[str, Any]] = {}
+        processed_data_by_ip: Dict[str, List[Dict[str, Any]]] = {}
         failed_ips: Dict[str, str] = {}
         for ip, response in results.items():
             if response.ok:
-                data = process_data(ctx, type="ip", content=response.content)
+                for payload in _item_payloads(response.content):
+                    data = process_data(ctx, type="ip", content=payload)
 
-                # --- HOOK: Allows plugins to modify the processed data ---
-                data = self.execute_hook('process_data', ctx, data)
+                    # --- HOOK: Allows plugins to modify the processed data (once per address and view) ---
+                    data = self.execute_hook('process_data', ctx, data)
 
-                if data and data.get("general"):
-                    processed_data_by_ip[ip] = data
+                    if data and data.get("general"):
+                        processed_data_by_ip.setdefault(ip, []).append(data)
             elif response.failed:
                 failed_ips[ip] = describe_infoblox_failure(response)
 
@@ -263,47 +351,96 @@ class IPRequestModule(BaseModule):
         console.print(f"[{colors['description']}]Request Type - IP Information (IPv4) - Search took [{colors['success']}]{round(end-start, 3)}[/] seconds![/]")
         return processed_data_by_ip, failed_ips
 
-    def _fetch_ptr_names(self, ctx: ScriptContext, ips: List[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    def _fetch_ptr_names(
+        self, ctx: ScriptContext, ips: List[str]
+    ) -> Tuple[Dict[str, List[Tuple[str, str]]], Dict[str, str]]:
         """
         Ask Infoblox for the PTR records at each address of ``ips``: one ``record:ptr`` request per
-        address, in parallel, none when ``ips`` is empty.
+        address (never scoped to a view), in parallel, none when ``ips`` is empty.
 
-        Returns ``(names, failures)``: the ptrdnames of each address that has any (comma-joined,
-        a name held in several views once), and the failure message of each address whose
-        lookup failed. An address with no PTR record is in neither.
+        Returns ``(pairs, failures)``: the ``(DNS view, ptrdname)`` pairs of each address that has any
+        (a pair listed once; the DNS view is "" when the record names none), and the failure message of
+        each address whose lookup failed. An address with no PTR record is in neither. ``_ptr_name``
+        turns the pairs into the ``PTR name`` of a row.
         """
         if not ips:
             return {}, {}
 
         colors = get_global_color_scheme(ctx.cfg)
-        req_urls = {ip: f"record:ptr?ipv4addr={ip}&_return_fields=ptrdname" for ip in ips}
+        req_urls = {ip: PTR_URI.format(ip=ip) for ip in ips}
 
         with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(req_urls))) as executor, console.status(f"[{colors['description']}]Fetching PTR records...[/]"):
             futures = {ip: executor.submit(request_result, ctx, uri, ensure_auth=False) for ip, uri in req_urls.items()}
             results = {ip: future.result() for ip, future in futures.items()}
 
-        names: Dict[str, str] = {}
+        pairs: Dict[str, List[Tuple[str, str]]] = {}
         failures: Dict[str, str] = {}
         for ip, response in results.items():
             if response.failed:
                 failures[ip] = describe_infoblox_failure(response)
                 continue
-            found = list(dict.fromkeys(item["ptrdname"] for item in response.items if item.get("ptrdname")))
+            found = list(dict.fromkeys(
+                (str(item.get("view") or ""), item["ptrdname"]) for item in response.items if item.get("ptrdname")
+            ))
             if found:
-                names[ip] = ",".join(found)
-        return names, failures
+                pairs[ip] = found
+        return pairs, failures
+
+    def _rows_for(
+        self,
+        ctx: ScriptContext,
+        scope: ViewScope,
+        ip_addresses: List[str],
+        processed_data_by_ip: Dict[str, List[Dict[str, Any]]],
+        ptr_pairs: Dict[str, List[Tuple[str, str]]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        The ``(save_rows, print_rows)`` of a run, with the ``Network view`` column where ``scope`` says it
+        belongs: the rows handed back to the caller follow ``result_column`` (JSON always carries the
+        view), the saved sheet follows ``column``. In the menu both are the same decision.
+
+        When the rows carry a view and a PTR record names its DNS view, and the grid's views could be
+        listed, each PTR name goes to the row of the network view that holds its DNS view; otherwise
+        every row shows every PTR name. The grid is asked for its views only when one of these decisions
+        needs them: unlabelled rows never do, and a JSON run that saves nothing needs them for the PTR
+        pairing alone.
+        """
+        labels = [
+            str(data.get("general", [{}])[0].get(NETWORK_VIEW) or "")
+            for datas in processed_data_by_ip.values() for data in datas
+        ]
+        owner: Optional[OwnerFn] = None
+        pairs_name_a_dns_view = any(dns_view for pairs in ptr_pairs.values() for dns_view, _ in pairs)
+        if pairs_name_a_dns_view and any(label.strip() for label in labels):
+            grid = scope.grid()
+            owner = None if grid.error else grid.owner
+        row_view = scope.result_column(labels)
+        # The sheet is decided only when a report is saved; otherwise the hook sees the same row as pre_render.
+        save_view = scope.column(labels) if ctx.cfg["report_auto_save"] else row_view
+        return self._build_rows(
+            ctx, ip_addresses, processed_data_by_ip, ptr_pairs,
+            row_view=row_view, save_view=save_view, owner=owner, fallback_view=scope.requested,
+        )
 
     def _build_rows(
         self,
         ctx: ScriptContext,
         ip_addresses: List[str],
-        processed_data_by_ip: Dict[str, Dict[str, Any]],
-        ptr_names: Dict[str, str],
+        processed_data_by_ip: Dict[str, List[Dict[str, Any]]],
+        ptr_pairs: Dict[str, List[Tuple[str, str]]],
+        *,
+        row_view: bool = False,
+        save_view: bool = False,
+        owner: Optional[OwnerFn] = None,
+        fallback_view: str = "",
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
-        One row per address that has a record, in input order, passed through the ``pre_save``
-        and ``pre_render`` hooks. Both hooks receive their own dict of the row, keyed by ``COLUMNS``;
-        ``PTR name`` is ``ptr_names[ip]``, empty for an address without one (or whose lookup failed).
+        One row per address and network view that has a record, in input order then view order, passed
+        through the ``pre_save`` and ``pre_render`` hooks. Both hooks receive their own dict of the row,
+        keyed by ``COLUMNS``, led by ``Network view`` when it is shown (``row_view`` for the printed row,
+        ``save_view`` for the saved one; ``fallback_view`` names a row the answer did not label).
+        ``PTR name`` comes from ``ptr_pairs[ip]`` through ``_ptr_name`` (``owner`` pairs the DNS views with
+        the network views), empty for an address without one (or whose lookup failed).
 
         Returns ``(save_rows, print_rows)``. A save row is what ``pre_save`` returned (it may add,
         drop or reorder fields; an empty row is left out of the report) plus every column that
@@ -313,25 +450,36 @@ class IPRequestModule(BaseModule):
         print_rows: List[Dict[str, Any]] = []
 
         for ip in ip_addresses:
-            if ip in processed_data_by_ip:
-                general_data = processed_data_by_ip[ip].get("general", [{}])[0]
-                extra_data = processed_data_by_ip[ip].get("extra", [{}])[0]
+            for data in processed_data_by_ip.get(ip, []):
+                general_data = data.get("general", [{}])[0]
+                extra_data = data.get("extra", [{}])[0]
+                view = str(general_data.get(NETWORK_VIEW) or "")
 
                 row = dict(zip(COLUMNS, [
                     general_data.get("network"), general_data.get("ip"), general_data.get("name"),
                     general_data.get("status"), extra_data.get("lease state"),
-                    extra_data.get("record type"), extra_data.get("mac"), ptr_names.get(ip, ""),
+                    extra_data.get("record type"), extra_data.get("mac"),
+                    _ptr_name(ptr_pairs.get(ip, []), view or fallback_view, owner),
                 ]))
+                if NETWORK_VIEW in general_data:
+                    row = {NETWORK_VIEW_TITLE: view, **row}
 
                 # HOOK: Allows plugins to modify data just before saving.
-                save_row = self.execute_hook('pre_save', ctx, dict(row))
+                save_row = self.execute_hook(
+                    'pre_save', ctx, present_rows([row], NETWORK_VIEW_TITLE, save_view, fallback=fallback_view)[0]
+                )
 
                 # HOOK: Allows plugins to modify data just before rendering.
-                print_row = self.execute_hook('pre_render', ctx, dict(row))
+                print_row = self.execute_hook(
+                    'pre_render', ctx, present_rows([row], NETWORK_VIEW_TITLE, row_view, fallback=fallback_view)[0]
+                )
                 print_rows.append(print_row)
 
                 if save_row:
-                    added = {name: value for name, value in print_row.items() if name not in COLUMNS and name not in save_row}
+                    added = {
+                        name: value for name, value in print_row.items()
+                        if name not in COLUMNS and name != NETWORK_VIEW_TITLE and name not in save_row
+                    }
                     save_rows.append({**save_row, **added})
 
         return save_rows, print_rows
@@ -340,7 +488,7 @@ class IPRequestModule(BaseModule):
         self,
         ctx: ScriptContext,
         ip_addresses: List[str],
-        processed_data_by_ip: Dict[str, Dict[str, Any]],
+        processed_data_by_ip: Dict[str, List[Dict[str, Any]]],
         save_rows: List[Dict[str, Any]],
     ) -> None:
         """Queue the "IP Data" sheet rows (misses, then hits) when ``report_auto_save`` is on."""

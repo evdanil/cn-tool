@@ -12,6 +12,7 @@ from typing import Dict, List, Any, Optional, Union
 from core.base import ScriptContext
 from utils.dhcp_options import decode_dhcp_option_value
 from utils.infoblox_safety import infoblox_debug_payloads_enabled
+from utils.network_views import DNS_VIEW, NETWORK_VIEW
 from utils.validation import site_comment_regex
 
 
@@ -104,20 +105,30 @@ def _normalize_dhcp_option_row_order(row: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def _view_label(item: Dict[str, Any]) -> Dict[str, str]:
+    """``{"network view": view}`` when the item carries the field, else ``{}``: no label, no change."""
+    return {NETWORK_VIEW: str(item["network_view"] or "")} if "network_view" in item else {}
+
+
 def _parse_ip_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """Parses data for the 'ip' type."""
+    """
+    Parses data for the 'ip' type: the first item only, as each address in each network view is
+    parsed on its own. The general row names the network view when the item has the field.
+    """
     processed_data = defaultdict(list)
     if not raw_data:
         return processed_data
 
     data = raw_data[0]
-    # The ref ends in "<address>/<network view>"; only the address is the IP.
+    # The ref ends in "<address>/<network view>"; only the address is the IP, and the view is
+    # never read from it (the ``network_view`` field is).
     ref_address = str(data.get("_ref", "")).split(":")[-1].split("/")[0]
     processed_data["general"].append({
         "network": data.get("network", ""),
         "ip": data.get("ip_address") or ref_address,
         "name": ",".join(data.get("names", [])),
         "status": data.get("status", ""),
+        **_view_label(data),
     })
 
     extra_info = {
@@ -132,10 +143,10 @@ def _parse_ip_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, A
 
 
 def _parse_supernet_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """Parses data for the 'supernet' type."""
+    """Parses data for the 'supernet' type; a row names its network view when the item has the field."""
     processed_data = defaultdict(list)
     processed_data["subnets"] = [
-        {"network": net["network"]} for net in raw_data if "network" in net
+        {"network": net["network"], **_view_label(net)} for net in raw_data if "network" in net
     ]
     return processed_data
 
@@ -148,11 +159,13 @@ def _parse_location_data(
     """
     Parses location data. If a sitecode is provided, it keeps only the subnets whose
     comment matches the site (``[site] comment_pattern``, default: the code as a whole
-    word anywhere in the comment). Otherwise, it returns all locations.
+    word anywhere in the comment). Otherwise, it returns all locations. A row leads with its
+    network view when the item has the field.
     """
     processed_data = defaultdict(list)
     all_locations = [
         {
+            **_view_label(loc),
             "network": loc["network"],
             "comment": loc.get("comment", ""),
             "DHCP utilization %": dhcp_percent(loc.get("dhcp_utilization")),
@@ -184,13 +197,15 @@ def _parse_fqdn_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str,
     its target in ``canonical``. ``TTL`` is empty unless the record sets its own (the zone's
     default applies). A host row also carries ``configure_for_dns``: False for a record that
     publishes no DNS (DHCP/IPAM only), True otherwise, also when the grid does not return the
-    field. Items of any other type are skipped.
+    field. A row names the record's DNS view (before ``zone``) when the record's ``view`` is not
+    blank. Items of any other type are skipped.
     """
     rows: List[Dict[str, Any]] = []
     for record in raw_data:
         record_type = FQDN_RECORD_TYPES.get(str(record.get("_ref", "")).split("/", 1)[0])
         if not record_type:
             continue
+        dns_view = str(record.get("view") or "").strip()
         if record_type == "HOST":
             addresses = [
                 entry.get("ipv4addr") or entry.get("ipv6addr", "")
@@ -204,6 +219,7 @@ def _parse_fqdn_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str,
                 "name": record.get("name", ""),
                 "type": record_type,
                 "canonical": record.get("canonical", ""),
+                **({DNS_VIEW: dns_view} if dns_view else {}),
                 "zone": record.get("zone", ""),
                 "TTL": record.get("ttl", "") if record.get("use_ttl") else "",
                 **({"configure_for_dns": bool(record.get("configure_for_dns", True))} if record_type == "HOST" else {}),

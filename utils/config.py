@@ -15,6 +15,7 @@ BASE_CONFIG_SCHEMA = {
     "api_timeout":           {"section": "api", "ini_key": "timeout", "type": "int", "fallback": 10},
     "api_max_workers":       {"section": "api", "ini_key": "max_workers", "type": "int", "fallback": 8},
     "api_debug_payloads":    {"section": "api", "ini_key": "debug_payloads", "type": "bool", "fallback": False},
+    "api_network_view":      {"section": "api", "ini_key": "network_view", "type": "str", "fallback": ""},
     "ssh_config_file":       {"section": "ssh", "ini_key": "config_file", "type": "str", "fallback": "~/.ssh/config"},
     "logging_file":          {"section": "logging", "ini_key": "logfile", "type": "path", "fallback": "~/cn.log"},
     "logging_level":         {"section": "logging", "ini_key": "level", "type": "str", "fallback": "INFO"},

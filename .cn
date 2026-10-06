@@ -2,6 +2,8 @@
 endpoint = https://infoblox.example.com
 verify_ssl = true
 timeout = 10
+# Infoblox network view the lookups search (empty: every view; cn --view / --all-views override it)
+#network_view = default
 
 [logging]
 logfile = ~/cn.log

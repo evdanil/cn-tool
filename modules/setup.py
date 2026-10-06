@@ -10,6 +10,7 @@ from modules.config_analyzer_module import resolve_repo_roots
 from utils.auth import credential_source, credentials_hint, ensure_infoblox_auth
 from utils.config import BASE_CONFIG_SCHEMA, coerce_bool, coerce_config_value, write_config_value
 from utils.file_io import check_dir_accessibility
+from utils.network_views import ViewScope, configured_view, scope_network, view_scope
 from utils.user_input import press_any_key, read_user_input
 
 
@@ -55,16 +56,32 @@ def _config_repo_check(ctx: ScriptContext) -> HealthCheck:
     return HealthCheck("Config Repo", status, "Enabled", f"{roots.source}: {', '.join(shown)}")
 
 
+_NETWORK_VIEW_CHECK = "Network view"
+_NETWORK_VIEW_KEY = "[api] network_view"
+
+
+def _network_view_setting(ctx: ScriptContext) -> HealthCheck:
+    """The menu's ``Network view`` row: what ``[api] network_view`` says, with no question to the grid."""
+    configured = configured_view(ctx)
+    if configured:
+        return HealthCheck(_NETWORK_VIEW_CHECK, "info", configured, _NETWORK_VIEW_KEY)
+    return HealthCheck(_NETWORK_VIEW_CHECK, "info", "every view", f"{_NETWORK_VIEW_KEY} not set")
+
+
 def health_checks(ctx: ScriptContext, live: Sequence[HealthCheck] = ()) -> List[HealthCheck]:
     """
     The status rows of the menu and of ``cn doctor``, in their fixed order.
 
     They are read from the configuration alone, so the menu can show them at any time. ``cn doctor``
-    passes the ``live`` rows (credentials, WAPI, site attribute), which follow the Infoblox row.
+    passes the ``live`` rows (credentials, WAPI, site attribute, network view), which follow the
+    Infoblox row; without them a configured Infoblox is followed by the offline network view row.
     """
     cfg = ctx.cfg
+    offline: List[HealthCheck] = []
     if cfg.get("infoblox_enabled"):
         infoblox = HealthCheck("Infoblox API", "ok", "Configured", str(cfg.get("api_endpoint", "")))
+        if not live:
+            offline.append(_network_view_setting(ctx))
     else:
         infoblox = HealthCheck("Infoblox API", "off", "Not configured")
 
@@ -76,6 +93,7 @@ def health_checks(ctx: ScriptContext, live: Sequence[HealthCheck] = ()) -> List[
 
     return [
         infoblox,
+        *offline,
         *live,
         _config_repo_check(ctx),
         active_dir,
@@ -168,15 +186,80 @@ def _site_attribute_check(ctx: ScriptContext, logged_in: bool) -> _Live:
     return _Live(HealthCheck("Site attribute", "ok", name, attribute_type))
 
 
-def _live_checks(ctx: ScriptContext) -> Tuple[List[HealthCheck], bool, bool]:
-    """Credentials, WAPI version and site attribute, in that order; then "a setting is wrong" and "a check failed"."""
+def _probe_every_view(ctx: ScriptContext, scope: ViewScope) -> str:
+    """
+    The first network view a search without a view did not reach, or "" (nothing was missed, or the probe
+    could not tell). Two requests: one network of the first non-default view, then the same CIDR asked for
+    in no view. A search that spans every view must return the copy in the first view too.
+    """
+    from utils.api import request_result
+
+    grid = scope.grid()  # more than one view, so the first or the second is not the default
+    other = grid.names[1] if grid.names[0] == grid.default else grid.names[0]
+    uri = scope_network("network?_max_results=1&_return_fields=network,network_view", other)
+    first = request_result(ctx, uri, ensure_auth=False)
+    cidr = str(first.items[0].get("network") or "") if first.ok and first.items else ""
+    if not cidr:
+        return ""
+    second = request_result(ctx, f"network?network={cidr}&_return_fields=network,network_view", ensure_auth=False)
+    if not second.ok:
+        return ""
+    return "" if any(item.get("network_view") == other for item in second.items) else other
+
+
+def _network_view_check(ctx: ScriptContext, args: Optional[argparse.Namespace], logged_in: bool) -> _Live:
+    """
+    The network views of the grid, and whether the one the lookups search exists (``--view`` or
+    ``[api] network_view``; ``--all-views`` and an empty setting search every view). An unknown view is a
+    wrong setting (exit 2); an unreadable list is a failure (exit 3) when a view is requested and a warning
+    when none is. With several views and none requested, the every-view probe checks that a search without
+    a view really spans them.
+    """
+    if not logged_in:
+        return _Live(HealthCheck(_NETWORK_VIEW_CHECK, "skipped", "needs a working WAPI connection"))
+    scope = view_scope(ctx, args)
+    problem = scope.problem(for_doctor=True)
+    if problem:
+        row = HealthCheck(_NETWORK_VIEW_CHECK, "error", problem.message)
+        return _Live(row, invalid=problem.exit_code == 2, failed=problem.exit_code == 3)
+
+    grid = scope.grid()
+    listing = f"network views: {', '.join(grid.names)}"
+    if scope.requested:
+        dns_views = scope.dns_views()
+        dns = f"DNS views: {', '.join(dns_views)}" if dns_views else "no DNS view: cn fqdn finds only its host records"
+        return _Live(HealthCheck(_NETWORK_VIEW_CHECK, "ok", scope.requested, "; ".join((scope.source, dns, listing))))
+
+    lead = [scope.source] if scope.source else []  # "--all-views", or nothing when the setting is empty
+    if grid.error:
+        reason = f"could not list the network views: {grid.error.rstrip('.')}"
+        return _Live(HealthCheck(_NETWORK_VIEW_CHECK, "warning", "every view", "; ".join((*lead, reason))))
+    if len(grid.names) == 1:
+        return _Live(HealthCheck(_NETWORK_VIEW_CHECK, "ok", grid.names[0], "the grid's only network view"))
+    count = f"{len(grid.names)} {listing}"
+    missed = _probe_every_view(ctx, scope)
+    if missed:
+        miss = f"a search without a view did not reach '{missed}': use --view {missed}, or set {_NETWORK_VIEW_KEY}"
+        return _Live(HealthCheck(_NETWORK_VIEW_CHECK, "warning", "every view", "; ".join((*lead, count, miss))))
+    return _Live(HealthCheck(_NETWORK_VIEW_CHECK, "ok", "every view", "; ".join((*lead, count))))
+
+
+def _live_checks(
+    ctx: ScriptContext, args: Optional[argparse.Namespace] = None
+) -> Tuple[List[HealthCheck], bool, bool]:
+    """
+    The four live checks (credentials, WAPI version, site attribute, network view), in that order; then
+    "a setting is wrong" and "a check failed". ``args`` carry ``--view`` / ``--all-views`` for the last one.
+    """
     credentials = _credentials_check(ctx)
     if credentials.row.status == "ok":
         wapi = _wapi_check(ctx)
     else:
         wapi = _Live(HealthCheck("Infoblox WAPI", "skipped", "needs credentials"))
-    site = _site_attribute_check(ctx, logged_in=wapi.row.status == "ok")
-    checks = (credentials, wapi, site)
+    logged_in = wapi.row.status == "ok"
+    site = _site_attribute_check(ctx, logged_in=logged_in)
+    view = _network_view_check(ctx, args, logged_in=logged_in)
+    checks = (credentials, wapi, site, view)
     return [check.row for check in checks], any(check.invalid for check in checks), any(check.failed for check in checks)
 
 
@@ -229,15 +312,15 @@ class SetupModule(BaseModule):
 
     def run_cli(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
         """
-        ``cn doctor``: the rows of the menu's status block and, when Infoblox is configured, three
-        live checks (credentials, WAPI version, site attribute). Nothing is changed.
+        ``cn doctor``: the rows of the menu's status block and, when Infoblox is configured, four
+        live checks (credentials, WAPI version, site attribute, network view). Nothing is changed.
 
         One section, ``checks`` (``check``, ``status``, ``detail``). Never prompts without a
         terminal. Exit status: 0 when no check failed (warnings, "off" and skipped rows are fine),
         2 when a setting is wrong, 3 when the credentials or Infoblox failed; never 1.
         """
         ctx.logger.info("Request Type - Application Setup (doctor, command line)")
-        live, invalid, failed = _live_checks(ctx) if ctx.cfg.get("infoblox_enabled") else ([], False, False)
+        live, invalid, failed = _live_checks(ctx, args) if ctx.cfg.get("infoblox_enabled") else ([], False, False)
         checks = health_checks(ctx, live)
         invalid = invalid or any(row.check == "Config Repo" and row.status == "error" for row in checks)
         rows = [{"check": row.check, "status": row.status, "detail": row.text} for row in checks]

@@ -62,6 +62,7 @@ from utils.cache_status import build_cache_status_line
 from utils.cli_input import read_objects
 from utils.render import FORMATS, emit
 from utils.config_history import parse_since
+from utils.network_views import parse_view_name
 from utils.validation import is_fqdn, parse_tcp_ports, validate_and_normalize_mac_address
 from core.background import start_background_tasks
 
@@ -139,6 +140,21 @@ def bootstrap_logging(args: argparse.Namespace) -> logging.Logger:
 
 
 # --- Command line ---------------------------------------------------------------------------------
+T = TypeVar("T")
+
+
+def _arg_type(parse: Callable[[str], T]) -> Callable[[str], T]:
+    """argparse ``type=`` for a utils parser: its ValueError becomes ``argument --opt: <message>``."""
+
+    def convert(text: str) -> T:
+        try:
+            return parse(text)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from None
+
+    return convert
+
+
 # One spec per global option. It feeds the root parser, the copy accepted after the command
 # (defaults suppressed, so an option that is not repeated keeps the root's value) and
 # _infer_command, which derives the options that take a value from it.
@@ -165,6 +181,16 @@ _COMMAND_OPTIONS: tuple[dict[str, Any], ...] = (
         "flags": ("--report",), "action": "store_true", "needs": "report",
         "help": "also append to the xlsx report (-r FILE chooses it); the menu saves automatically, the command line only with --report",
     },
+    # Both write ``args.view``: None = not given, "" = every view, a name = that view. They are command
+    # options, not a command's own ``options``, so that no command owns them: ``cn 10.1.2.3 --view prod``.
+    {
+        "flags": ("--view",), "metavar": "NAME", "type": _arg_type(parse_view_name), "default": None, "needs": "views",
+        "help": "search only this network view (cn doctor lists them); default: [api] network_view, else every view",
+    },
+    {
+        "flags": ("--all-views",), "action": "store_const", "dest": "view", "const": "", "needs": "views",
+        "help": "search every network view (overrides [api] network_view)",
+    },
 )
 
 # Registered in one place so a command never needs another edit of main.py; dispatch is by the
@@ -179,20 +205,6 @@ CLI_COMMANDS: tuple[tuple[str, str], ...] = (
     ("doctor", "configuration, credential and Infoblox checks (menu s)"),
 )
 
-T = TypeVar("T")
-
-
-def _arg_type(parse: Callable[[str], T]) -> Callable[[str], T]:
-    """argparse ``type=`` for a utils parser: its ValueError becomes ``argument --opt: <message>``."""
-
-    def convert(text: str) -> T:
-        try:
-            return parse(text)
-        except ValueError as exc:
-            raise argparse.ArgumentTypeError(str(exc)) from None
-
-    return convert
-
 
 def _nonempty_text(text: str) -> str:
     """The text itself; an empty one matches every line, which is never what was meant."""
@@ -205,6 +217,7 @@ def _nonempty_text(text: str) -> str:
 # menu title) of the module behind the command; a test compares it with the real modules. Optional:
 #   objects    None for a command that takes no objects (no OBJECT, no --file, nothing is read)
 #   report     False for a command that writes no report (no --report, -r is refused)
+#   views      True for a command that takes --view and --all-views (the Infoblox lookups and doctor)
 #   options    option specs of this command alone, in the _GLOBAL_OPTIONS format
 #   exit       the whole exit line, when the codes are not found / none / invalid / Infoblox
 #   menu_line  replaces "Same lookup as menu item ..."
@@ -213,6 +226,7 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
         "menu": ("1", "IP Information (IPv4)"),
         "about": "Infoblox details for IPv4 addresses: subnet, DNS name, status, lease state, record type, MAC and PTR name.",
         "objects": "IPv4 address, e.g. 10.1.2.3; '-' reads objects from stdin",
+        "views": True,
         "examples": ("cn ip 10.1.2.3 --format md", "cn ip --file ips.txt --format csv > ips.csv"),
         "found": "data for at least one address",
     },
@@ -232,15 +246,18 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "cn subnet --file change-4711.txt --report",
             "cn subnet 10.1.2.0/24 --format json | jq -r '.dns_records[].a_record'",
         ),
+        "views": True,
         "found": "data for at least one subnet",
     },
     "fqdn": {
         "menu": ("3", "FQDN Prefix Lookup"),
         "about": (
             "A, AAAA, host and CNAME records whose name contains the text (at least 3 characters), with a PTR "
-            "check; paged up to 10,000 records per type."
+            "check; paged up to 10,000 records per type. With a network view (--view or [api] network_view), "
+            "only its DNS views and host records are searched."
         ),
         "objects": "a name or part of one, e.g. branchsw or branchsw010.example.net; '-' reads objects from stdin",
+        "views": True,
         "examples": ("cn fqdn branchsw", "cn host.example.com --format json"),
         "found": "data for at least one name",
     },
@@ -251,6 +268,7 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "comment when no subnet carries it), or those whose description contains a keyword."
         ),
         "objects": "site code; with -k a keyword (3+ chars); '-' reads objects from stdin",
+        "views": True,
         "options": (
             {
                 "flags": ("-k", "--keyword"), "action": "store_true",
@@ -327,16 +345,19 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
         "menu": ("s", "Application Setup"),
         "about": (
             "Checks the configuration and, when Infoblox is configured, the credentials: it logs in, reads "
-            "the WAPI version the endpoint serves and checks the site attribute ([site] ea_name). Nothing is "
+            "the WAPI version the endpoint serves, checks the site attribute ([site] ea_name), lists the "
+            "network views and checks the one the lookups search ([api] network_view or --view). Nothing is "
             "changed."
         ),
         "menu_line": 'Menu item s, "Application Setup", shows the offline part of these checks.',
         "objects": None,
         "report": False,
+        "views": True,
         "examples": ("cn doctor", """cn doctor --format json | jq '.checks[] | select(.status == "error")'"""),
         "exit": (
-            "exit: 0 no check failed (warnings allowed), 2 a setting is wrong (for example [site] ea_name or "
-            "the [api] endpoint path), 3 the credentials or Infoblox failed a live check, 130 interrupted."
+            "exit: 0 no check failed (warnings allowed), 2 a setting is wrong (for example [site] ea_name, "
+            "[api] network_view or the [api] endpoint path) or --view names no network view, 3 the "
+            "credentials or Infoblox failed a live check, 130 interrupted."
         ),
     },
 }
@@ -365,7 +386,7 @@ Without a terminal cn never prompts. More: cn <command> --help.
 Global options also work after the command (not -v).
 """
 
-_NO_VALUE_ACTIONS = ("store_true", "version")
+_NO_VALUE_ACTIONS = ("store_true", "store_const", "version")
 _GLOBAL_FLAGS = {flag for spec in _GLOBAL_OPTIONS for flag in spec["flags"]}
 _OWN_OPTIONS = tuple(spec for detail in _COMMAND_DETAILS.values() for spec in detail.get("options", ()))
 _VALUE_FLAGS = {
@@ -440,7 +461,11 @@ def _build_parser() -> argparse.ArgumentParser:
             allow_abbrev=False,
             parents=[after_command],
         )
-        takes = {"objects": detail["objects"] is not None, "report": detail.get("report", True)}
+        takes = {
+            "objects": detail["objects"] is not None,
+            "report": detail.get("report", True),
+            "views": detail.get("views", False),
+        }
         _add_options(command, [spec for spec in _COMMAND_OPTIONS if takes.get(spec.get("needs"), True)])
         if takes["objects"]:
             command.add_argument("objects", nargs="*", metavar="OBJECT", help=detail["objects"])
