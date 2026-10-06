@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 import gzip
 import hashlib
 import json
-import logging
 import os
 from pathlib import Path
 import re
@@ -35,6 +34,10 @@ MODULE_BASELINE_CONFIG_KEYS = {
     "9": "stats_device_query_baseline_seconds",
     "o": "stats_e911_info_baseline_seconds",
 }
+
+# Menu item 1 took IPv6 and lost "(IPv4)" from its title. Runs saved under the old title still count
+# as the same module: both reports read the runs through ``_normalized_runs``.
+_RENAMED_TITLES = {"IP Information (IPv4)": "IP Information"}
 
 SAFE_DETAIL_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 STAT_FILE_RE = re.compile(
@@ -798,10 +801,11 @@ class StatsManager:
             if not isinstance(metrics, dict):
                 metrics = {}
 
+            title = str(raw_run.get("module_title") or "Unknown Module")
             normalized_runs.append(
                 {
                     "module_key": str(raw_run.get("module_key") or ""),
-                    "module_title": str(raw_run.get("module_title") or "Unknown Module"),
+                    "module_title": _RENAMED_TITLES.get(title, title),
                     "started_at": raw_run.get("started_at"),
                     "ended_at": raw_run.get("ended_at"),
                     "duration_seconds": float(raw_run.get("duration_seconds") or 0.0),

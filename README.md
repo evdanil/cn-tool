@@ -3,25 +3,29 @@
 `cn-tool` is a modular network utility for Infoblox lookups, bulk network
 checks, configuration repository searches, and device inventory collection.
 
-## What's new in 0.4.1
+## What's new in 0.5.0
 
-Faster start. A command loads only the libraries it uses: pandas and openpyxl when it saves a
-report, netmiko when it queries a device, ldap3 when Active Directory connects. On a shared dev host
-`cn --help` took 0.53 s and now takes 0.15 s, and `cn ip` reached its credentials check in 0.87 s
-and now does it in 0.28 s. Two report changes come with it: a new report is always created with
-openpyxl, and Bulk Trace saves now take the report lock like every other save. The details are in
-the release notes of 0.4.1 on the Releases page of this repository. Version 0.4.0 added Infoblox
-network views, and version 0.3.0 the command line, `cn diff`, `cn doctor` and Config Analyzer
-0.2.0; their notes are on the same page.
+IPv6 in the Infoblox lookups and the bulk tools. `cn ip`, `cn subnet`, `cn ping`, menu items 1, 2, 6
+and 7 (Bulk DNS Lookup) and bare objects take IPv6 addresses and prefixes: `cn 2001:db8::5` runs
+`ip` and `cn 2001:db8:20::/64` runs `subnet`. A run that looks up an IPv6 object gains a `DUID`
+column. Infoblox keeps no DHCP utilization or failover for IPv6 subnets, so those cells are empty.
+A ping of an IPv6 address from a host with no IPv6 route reads `NO ROUTE`, which is not a failure.
+An IPv4-only run sends the same requests and prints the same output as 0.4.1. Menu item 1 is now
+called "IP Information". The release also starts faster (a run that sends no Infoblox request loads
+`requests` later and saves about 70 ms), drops three unused packages from `requirements.txt`, and
+sets Python 3.10 as the minimum, tested in CI on 3.10, 3.12, 3.13 and 3.14. The details are in the
+release notes of 0.5.0 on the Releases page of this repository. Version 0.4.1 made a command load
+only the libraries it uses, version 0.4.0 added Infoblox network views, and version 0.3.0 the
+command line, `cn diff`, `cn doctor` and Config Analyzer 0.2.0; their notes are on the same page.
 
 ## Included Features
 
-- IP, subnet, FQDN, and location lookups using the Infoblox API; a site is found by an Infoblox
-  extensible attribute (`[site] ea_name`) or by subnet comment; an object held in several network
-  views is listed once per view, and `--view NAME` limits a lookup to one
+- IPv4 and IPv6 address, subnet, FQDN, and location lookups using the Infoblox API; a site is found
+  by an Infoblox extensible attribute (`[site] ea_name`) or by subnet comment; an object held in
+  several network views is listed once per view, and `--view NAME` limits a lookup to one
 - Command line (`cn subnet|ip|fqdn|site|ping|diff|doctor`) with table, JSON, Markdown and CSV
   output and exit codes for scripts
-- Bulk ping with an optional TCP port check, resolve, and traceroute operations
+- Bulk ping (IPv4 and IPv6) with an optional TCP port check, resolve, and traceroute operations
 - `cn diff`: which snapshot of a device added or removed a configuration line, and who made it
 - `cn doctor`: configuration, credential and Infoblox WAPI checks
 - Configuration repository search with optional SD-WAN YAML enrichment
@@ -32,6 +36,8 @@ network views, and version 0.3.0 the command line, `cn diff`, `cn doctor` and Co
 - Disk-backed cache for faster repeated lookups
 
 ## Installation
+
+cn-tool needs Python 3.10 or newer.
 
 1. Clone the repository.
 2. Create and activate a virtual environment.
@@ -57,7 +63,7 @@ On a shared server where users cannot write to the install directory, run
 `python -m compileall -q /path/to/cn-tool` after each install or update, with the Python that runs
 `cn`. Python cannot cache compiled modules in a read-only directory, so without this step it
 compiles every cn module on every start: about 0.14 s more for a lookup (0.42 s instead of 0.28 s
-on a shared dev host).
+on a shared dev host, measured with 0.4.1).
 
 ## Command line
 
@@ -77,11 +83,11 @@ ln -s /path/to/main.py ~/bin/cn
 
 | Command  | Objects | Returns |
 | -------- | ------- | ------- |
-| `subnet` | `10.1.2.0/24`, `10.1.2.0/255.255.255.0` or an IP address (its subnet); a container prefix expands to its subnets and lists its child containers, not expanded | subnet summary with DHCP utilization %, DHCP ranges, DNS records, fixed addresses, extensible attributes; a `child containers` table for a container prefix; one summary row and one set of details per network view that holds the subnet |
-| `ip`     | IPv4 addresses | network view (on a grid with several), subnet, DNS name, status, MAC and PTR name, one row per network view that holds the address; an unused address is reported as `UNUSED` |
+| `subnet` | `10.1.2.0/24`, `10.1.2.0/255.255.255.0`, `2001:db8:20::/64` or an IP address (its subnet); a container prefix expands to its subnets and lists its child containers, not expanded | subnet summary with DHCP utilization %, DHCP ranges, DNS records, fixed addresses, extensible attributes (an IPv6 subnet has no DHCP utilization or failover); a `child containers` table for a container prefix; one summary row and one set of details per network view that holds the subnet |
+| `ip`     | IPv4 and IPv6 addresses | network view (on a grid with several), subnet, DNS name, status, MAC (IPv4), DUID (IPv6) and PTR name, one row per network view that holds the address; an unused IPv4 address is reported as `UNUSED` |
 | `fqdn`   | names or name prefixes (at least three characters) | A, AAAA, host and CNAME records whose name contains the text, with type, DNS view (on a grid with several), zone, TTL and a PTR check |
 | `site`   | site codes; with `-k/--keyword`, keywords | the subnets of each site code, or matching each keyword, with DHCP utilization % and, on a grid with several network views, the network view |
-| `ping`   | IPv4 addresses, host names, `10.1.2.0/24` networks | ICMP result per host and, with `--tcp 22,443`, the state of each port |
+| `ping`   | IPv4 and IPv6 addresses, host names, `10.1.2.0/24` and `2001:db8::/120` networks | ICMP result per host and, with `--tcp 22,443`, the state of each port |
 | `diff`   | device names, as in `<name>.cfg` in the configuration repositories | configuration lines added or removed since the last change or `--since`, with the snapshot, author and time |
 | `doctor` | none | one row per configuration, credential and Infoblox check |
 
@@ -106,10 +112,12 @@ the SD-WAN YAML search and diskcache for the cache. On a shared dev host (2 core
 `cn --help` starts in about 0.15 s and `cn ip` reaches its credentials check in about 0.28 s;
 before 0.4.1 they took about 0.5 s and 0.9 s. The menu starts faster for the same reason.
 
-A bare object is routed by its shape: `cn 10.1.2.3` runs `ip`, `cn 10.0.0.0/24` runs `subnet`,
-`cn host.example.com` runs `fqdn`. Only a CIDR network, an IPv4 address or an FQDN is recognised;
-a MAC address, an IPv6 address, a partial address such as `10.1.2` and a mix of kinds exit 2.
-`ping`, `diff` and `doctor` are never inferred: use `cn ping 10.1.2.3 --tcp 443`.
+A bare object is routed by its shape: `cn 10.1.2.3` or `cn 2001:db8::5` runs `ip`, `cn 10.0.0.0/24`
+or `cn 2001:db8:20::/64` runs `subnet`, `cn host.example.com` runs `fqdn`. Only an IPv4 or IPv6
+address, a network of either family or an FQDN is recognised, and the two families mix inside one
+kind (`cn 10.1.2.3 2001:db8::5` is `ip`). A MAC address, a partial address such as `10.1.2`, a
+bracketed address (`[2001:db8::1]`) and a mix of kinds exit 2. `ping`, `diff` and `doctor` are
+never inferred: use `cn ping 10.1.2.3 --tcp 443`.
 
 ### PTR, DHCP utilization and child containers
 
@@ -136,8 +144,10 @@ records of its own network view.
 so divided by 10, with one decimal. `subnet` leaves it empty for a subnet without a DHCP range and
 adds `utilization %`, `utilization status`, `leases`, `static` and `total` to each DHCP range;
 `site` does not read ranges, so a subnet without one shows `0.0` there and IPv6 rows are empty.
-An input shorter than /30 also lists its child containers (`container`, `child container`,
-`comment`, `utilization %`); they are not expanded, so query one to see its subnets.
+Infoblox has no DHCP utilization for an IPv6 network or range, so those cells are empty for an IPv6
+subnet too, and it has no `DHCP failover` rows. An input shorter than /30 (IPv6: /126) also lists
+its child containers (`container`, `child container`, `comment`, `utilization %`); they are not
+expanded, so query one to see its subnets.
 
 ### Network views
 
@@ -161,6 +171,7 @@ wins), then `[api] network_view`, then every view. `--view ""` is refused (exit 
 
 ```bash
 cn ip 10.20.0.5 --view lab
+cn ip 2001:db8:20::5 --view lab
 cn subnet 10.20.0.0/24 --all-views --format json
 cn site syd --view prod --format md
 cn fqdn web01 --view lab
@@ -218,25 +229,75 @@ The list of views is one small request, read at most once per lookup and only wh
 is set and the answer needs it. `ip` and `site` send the requests they sent before, `subnet` four
 per CIDR, `fqdn` five per name.
 
+### IPv6
+
+`ip`, `subnet`, `ping` and Bulk DNS Lookup take IPv6 addresses and prefixes, in the menu and on the
+command line, and so do bare objects. `fqdn` and `site` always did. Network views work unchanged.
+
+```bash
+cn 2001:db8:20::5 2001:db8:20::1:a --format md
+cn subnet 10.20.0.0/24 2001:db8:20::/64 --format json
+cn ping 2001:db8:20::5 web06.example.net --tcp 443
+cn ping fe80::1%eth0
+```
+
+An IPv4-only run sends the same requests and prints the same output as 0.4.x.
+
+- **Forms.** Any spelling Python's `ipaddress` accepts works, and cn sends the compressed
+  lower-case form, so two spellings of one address are one lookup and one row. Rows show the
+  address as the grid returns it: to join them to your own list, compare addresses, not text.
+  `not_found` keeps each object as typed.
+- **Refused before any lookup,** with the form to type instead: an IPv4-mapped address
+  (`::ffff:10.20.0.5`: `IPv4-mapped IPv6 address; use 10.20.0.5`; also in Bulk DNS Lookup and
+  `ping`) and a zone ID in `ip`, `subnet` and Bulk DNS Lookup (`2001:db8::5%eth0`: `Infoblox
+  stores no zone ID (%eth0); use 2001:db8::5`). `ip` refuses `::`, `::1` and link-local addresses
+  as reserved, as for IPv4.
+- **Columns.** There is no family column; the address says which family a row is. IPv6 rows share
+  each section and sheet with the IPv4 rows, and a field IPv6 lacks is an empty cell: `MAC`,
+  `DHCP utilization %`, the range counts and `DHCP failover`. `DUID` (JSON `duid`) is the DHCPv6
+  identity. It appears in `ip` and in the `fixed addresses` of `subnet` whenever the run looks up
+  an IPv6 object, empty for an IPv4 row, and an IPv4-only run has none. Like `tcp_<port>`, it
+  follows the input, not the data: read it with `.duid // ""`. DHCPv6 options are shown as
+  returned, not decoded.
+- **Unused addresses and PTR names.** `ip` shows a row for each IPv6 address for which the grid
+  returns an object (whatever its status) and a `not_found` line `No matching IPv6 record found`
+  when it returns none. `PTR name` comes from `record:ptr?ipv6addr=`, asked for each IPv6 address
+  whose record types include `PTR`. These behaviours follow the WAPI reference and have not been
+  compared with a live grid.
+- **Containers.** An input shorter than /126 can be a container; the request counts are IPv4's.
+  A container with more than 1,000 direct child networks fails with `more than 1,000 records
+  match` (status 3), as in IPv4.
+- **`ping`** expands an IPv6 prefix up to a /112, and with `--tcp` up to a /118. A name resolves to
+  its IPv4 address first, and to an IPv6 address only when it has no IPv4 one. A link-local
+  address needs its interface (`fe80::1%eth0`). `NO ROUTE` means that this host has no route to
+  the address, or no IPv6: it is neither an answer nor a failure.
+- **Bulk DNS Lookup** takes IPv6 addresses and prefixes up to a /112.
+
 ### Bulk ping (`cn ping`)
 
 ```bash
 cn ping 10.1.2.3 web01.example.net
 cn ping 10.1.2.0/28 --tcp 22,443 --format md
 cn ping db01 --tcp 5432 && echo '5432 is open'
+cn ping 2001:db8:20::5 --format md
 ```
 
-Targets are IPv4 addresses, host names and IPv4 networks (at most a /16). A single address is
-pinged as given, `127.0.0.1` too. Names are resolved once to IPv4, and ICMP and TCP use that
-address; a name that does not resolve is listed in `not_found` as `no such host`. `--tcp PORTS`
-also connects to up to 5 TCP ports (1-65535) and allows at most 1,024 hosts (a /22). Every probe
-gives up after 3 seconds.
+Targets are IP addresses of either family, host names and networks (IPv4 up to a /16, IPv6 up to a
+/112). A single address is pinged as given, `127.0.0.1` and `::1` too. Names are resolved once, to
+an IPv4 address or, only when the name has none, to an IPv6 address, and ICMP and TCP use that
+address; a name that does not resolve is listed in `not_found` as `no such host`. A link-local
+IPv6 address needs its interface (`cn ping fe80::1%eth0`), and an IPv4-mapped one is refused with
+the IPv4 address to use. `--tcp PORTS` also connects to up to 5 TCP ports (1-65535) and allows at
+most 1,024 hosts (a /22, or an IPv6 /118). Every probe gives up after 3 seconds. ICMP runs the same
+`ping -n -w3 -c2` for both families, so `ping` must take IPv6 literals (current iputils does).
 
-Columns: `host`, `address`, `result` (`OK`, `OK (1/2 replies)`, `NO RESPONSE`, `ERROR`, or `not run`
-when ICMP was skipped) and one `tcp_<port>` column per port: `open`, `closed` (refused or reset;
-a firewall that rejects connections looks the same), `timeout`, `unreachable` or `error`. The
-columns follow the arguments: `--tcp 22,443` always gives `tcp_22` and `tcp_443`. Without a
-`ping` command `cn ping` exits 2; with `--tcp` it skips ICMP and the ports decide the status.
+Columns: `host`, `address`, `result` (`OK`, `OK (1/2 replies)`, `NO RESPONSE`, `NO ROUTE`, `ERROR`,
+or `not run` when ICMP was skipped) and one `tcp_<port>` column per port: `open`, `closed` (refused
+or reset; a firewall that rejects connections looks the same), `timeout`, `unreachable` or
+`error`. `NO ROUTE` is an IPv6 ping from a host that has no route to the address or no IPv6; it is
+the ICMP side of `unreachable`, so a run in which nothing else answered exits 1, not 3. The columns
+follow the arguments: `--tcp 22,443` always gives `tcp_22` and `tcp_443`. Without a `ping` command
+`cn ping` exits 2; with `--tcp` it skips ICMP and the ports decide the status.
 
 ### Configuration changes (`cn diff`)
 
@@ -295,11 +356,12 @@ Setup status block in the menu shows the same rows without the live checks.
 | ------ | ------- | -------- |
 | 0 | at least one object returned data | misses are listed in `not_found` |
 | 1 | no object returned data | an IP outside every managed network |
-| 2 | usage or configuration error | unknown command, no or invalid objects, MAC or IPv6 address, Infoblox not configured, a network view that is not on the grid, an empty `--view`, unreadable `--file`, no command and no terminal for the menu |
+| 2 | usage or configuration error | unknown command, no or invalid objects, MAC address, an IPv4-mapped or zoned IPv6 address, Infoblox not configured, a network view that is not on the grid, an empty `--view`, unreadable `--file`, no command and no terminal for the menu |
 | 3 | incomplete or not saved | no credentials without a terminal, authentication failure, timeout or server error, rejected or too-large query, the network views could not be listed while one was selected, report not written |
 | 130 | interrupted | Ctrl-C |
 
-Status 1 means "no record", not "the IP is free": an unused IP returns `UNUSED` with status 0.
+Status 1 means "no record", not "the IP is free": an unused IPv4 address returns `UNUSED` with
+status 0.
 With status 3, stdout still holds what was found.
 
 `ping`, `diff` and `doctor` use the same statuses with their own meaning of "data":
@@ -307,8 +369,8 @@ With status 3, stdout still holds what was found.
 | Status | `cn ping` | `cn diff` | `cn doctor` |
 | ------ | --------- | --------- | ----------- |
 | 0 | a host answered ICMP; with `--tcp`, a port was `open` | at least one row in `changes` | no check failed (`warning`, `off`, `info` and `skipped` are allowed) |
-| 1 | no host answered, or no port was open | no change in the window, or no such device or snapshot | never |
-| 2 | no targets, a target that is not an IPv4 address, network or name, IPv6, more than a /16 (1,024 hosts with `--tcp`), bad `--tcp`, no `ping` command without `--tcp` | no devices, bad `--since` or `--line`, `-r FILE`, `[config_repo]` off | the endpoint serves no WAPI schema, `[site] ea_name` is not defined or not allowed on networks, `[api] network_view` (or `--view`) names no network view on the grid, no configuration repository directory can be read, `-r FILE` |
+| 1 | no host answered (`NO ROUTE` is no answer), or no port was open | no change in the window, or no such device or snapshot | never |
+| 2 | no targets, a target that is not an IP address, network or name, an IPv4-mapped IPv6 address, a link-local address without an interface, more than a /16 (IPv6: a /112; 1,024 hosts with `--tcp`), bad `--tcp`, no `ping` command without `--tcp` | no devices, bad `--since` or `--line`, `-r FILE`, `[config_repo]` off | the endpoint serves no WAPI schema, `[site] ea_name` is not defined or not allowed on networks, `[api] network_view` (or `--view`) names no network view on the grid, no configuration repository directory can be read, `-r FILE` |
 | 3 | a probe could not run (`ERROR`, `error`), report not written | a repository directory, history folder or snapshot could not be read | no credentials without a terminal, login rejected, timeout or server error, the network views could not be listed while one is selected |
 
 `--report` appends the result to the xlsx report (`[report] filename`, or `-r FILE`, which implies
@@ -321,6 +383,11 @@ the Python that runs `cn` (status 3 on the command line); lookups and `cn doctor
 report is created with openpyxl on every machine, as every append already was. Before 0.4.1 a
 machine that had xlsxwriter installed created it with that library instead, and URL-like text in
 the first rows became a link; it is plain text now, as in every later row.
+
+`requests` and `urllib3` load at the first Infoblox request, not at start-up, so `cn ping`,
+`cn diff` and `cn doctor` without Infoblox never load them. If `requests` cannot be loaded, the
+first Infoblox request ends the run with `cn: unexpected error. Check logs.` (status 3 on the
+command line) and the log has the `ImportError`; reinstall the requirements.
 
 ### JSON for scripts
 
@@ -341,19 +408,23 @@ be read.
 | `doctor` | `checks` |
 
 New columns: `fqdn` has `type`, `canonical`, `dns_view`, `zone`, `ttl` and `ptr`; `ip_information`
-has `network_view` and `ptr_name`; `subnets`, `general` and `location` have `dhcp_utilization`;
+has `network_view`, `ptr_name` and, in runs that look up an IPv6 object, `duid`; the
+`fixed_addresses` of `subnet` have `duid` in the same runs; `subnets`, `general` and `location`
+have `dhcp_utilization`;
 `dhcp_range` has `utilization`, `utilization_status`, `leases`, `static` and `total`;
 `child_containers` has `container`, `child_container`, `comment` and `utilization`. Utilization
 values are numbers when known and `""` when not. `network_view` is in every row of
 `ip_information`, `subnets`, `location`, the detail sections of `subnet`, `child_containers` and the
 `warnings` of `subnet`, and `dns_view` in every row of `fqdn`, on every grid; an object held in
-several views is a row for each.
+several views is a row for each. A `ping` `result` can be `NO ROUTE`. `duid` follows the input, not
+the data, so read it with `.duid // ""` (jq) or `row.get("duid", "")` (Python).
 
 ```bash
 set -o pipefail
 cn subnet 10.1.2.0/24 --format json | jq -r '.dns_records[].a_record'
 cn ip --file ips.txt --format json | jq -r '.not_found[].object'
 cn ip 10.20.0.5 --format json | jq -r '.ip_information[] | "\(.network_view) \(.subnet)"'
+cn ip 10.20.0.5 2001:db8:20::5 --format json | jq -r '.ip_information[] | "\(.ip) \(.duid // "")"'
 cn ping web01 --tcp 443 --format json | jq -r '.ping[] | select(.tcp_443 == "open") | .host'
 ```
 

@@ -371,7 +371,7 @@ class ConfigSearchModule(BaseModule):
         # silently disabling stop-word filtering and diverging from cached
         # search. This label is for display/fallback; per-file vendor is
         # resolved authoritatively in _matched_lines via parse_repo_metadata.
-        vendor, device_type, region = 'vendor', 'type', 'region'
+        vendor, device_type = 'vendor', 'type'
         base_dir = ctx.cfg.get("config_repo_directory")
         regions = bool(ctx.cfg.get("config_repo_regions", []))
         try:
@@ -381,8 +381,6 @@ class ConfigSearchModule(BaseModule):
         if len(rel_parts) >= (3 if regions else 2):
             vendor = str(rel_parts[0]).lower()
             device_type = str(rel_parts[1]).upper()
-            if regions:
-                region = str(rel_parts[2]).upper()
         else:
             ctx.logger.warning('Repository has non-expected directory path(missing vendor/type/region)')
 

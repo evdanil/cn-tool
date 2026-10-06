@@ -207,7 +207,6 @@ class SDWANYamlSearchPlugin(BasePlugin):
             ctx.logger.info(f"SD-WAN YAML Search: Skipped {len(all_duplicates)} duplicate files across repositories")
 
         # Log repository statistics
-        successful_repos = sum(1 for stats in repo_statistics.values() if stats["status"] == "success")
         failed_repos = sum(1 for stats in repo_statistics.values() if stats["status"] in ["invalid", "error"])
 
         if failed_repos > 0:

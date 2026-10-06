@@ -72,7 +72,9 @@ def _dedupe_dhcp_option_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return deduped_rows
 
 
-def _build_dhcp_option_row(option: Dict[str, Any], inherited: bool) -> Dict[str, Any]:
+def _build_dhcp_option_row(option: Dict[str, Any], inherited: bool, *, decode: bool = True) -> Dict[str, Any]:
+    """One DHCP option row. ``decode=False`` shows the option as returned: ``decode_dhcp_option_value``
+    reads the DHCPv4 options 43 and 120, and DHCPv6 option codes mean something else."""
     row = {
         "name": option.get("name", ""),
         "num": str(option.get("num", "")),
@@ -80,7 +82,7 @@ def _build_dhcp_option_row(option: Dict[str, Any], inherited: bool) -> Dict[str,
         "vendor class": option.get("vendor_class", ""),
         "use option": str(option.get("use_option", "")),
     }
-    decoded_value = decode_dhcp_option_value(option.get("num", ""), option.get("value", ""))
+    decoded_value = decode_dhcp_option_value(option.get("num", ""), option.get("value", "")) if decode else ""
     if decoded_value:
         row["decoded value"] = decoded_value
     if inherited:
@@ -120,9 +122,10 @@ def _parse_ip_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, A
         return processed_data
 
     data = raw_data[0]
-    # The ref ends in "<address>/<network view>"; only the address is the IP, and the view is
-    # never read from it (the ``network_view`` field is).
-    ref_address = str(data.get("_ref", "")).split(":")[-1].split("/")[0]
+    # The ref ends in "<address>/<network view>" after the object id (which has no colon); only
+    # the address is the IP, and the view is never read from it (the ``network_view`` field is).
+    # An IPv6 address holds colons itself, so the ref is split at the first one only.
+    ref_address = str(data.get("_ref", "")).split(":", 1)[-1].split("/")[0]
     processed_data["general"].append({
         "network": data.get("network", ""),
         "ip": data.get("ip_address") or ref_address,
@@ -136,6 +139,8 @@ def _parse_ip_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, A
         "record type": ",".join(data.get("types", [])),
         "mac": data.get("mac_address", ""),
     }
+    if "duid" in data:  # ipv6address only; an IPv4 item has no DUID and no key
+        extra_info["duid"] = data["duid"] or ""
     if any(extra_info.values()):
         processed_data["extra"].append(extra_info)
 
@@ -276,13 +281,15 @@ def _parse_network_options_data(raw_data: List[Dict[str, Any]]) -> Dict[str, Lis
         return processed_data
 
     data = raw_data[0]
+    ipv6 = ":" in str(data.get("network", ""))
     inheritance = data.get("_inheritance", {})
     member_meta = inheritance.get("members", [])
     option_meta = inheritance.get("options", [])
     if "members" in data:
         member_rows = [
             {
-                "IP Address": mem.get("ipv4addr", ""),
+                # ``dhcpmember`` has both addresses; an IPv6 network shows the IPv6 one when it has it.
+                "IP Address": (mem.get("ipv6addr") or mem.get("ipv4addr", "")) if ipv6 else mem.get("ipv4addr", ""),
                 "name": mem.get("name", ""),
                 **({"inherited": "Yes"} if _is_inherited_entry(member_meta[idx] if idx < len(member_meta) else {}, mem) else {}),
             }
@@ -294,6 +301,7 @@ def _parse_network_options_data(raw_data: List[Dict[str, Any]]) -> Dict[str, Lis
             _build_dhcp_option_row(
                 opt,
                 _is_inherited_entry(option_meta[idx] if idx < len(option_meta) else {}, opt),
+                decode=not ipv6,
             )
             for idx, opt in enumerate(data.get("options", []))
         ]
@@ -337,7 +345,13 @@ def _parse_fixed_addresses_data(raw_data: List[Dict[str, Any]]) -> Dict[str, Lis
     """Parses data for the 'fixed addresses' type."""
     processed_data = defaultdict(list)
     processed_data["fixed addresses"] = [
-        {"IP address": addr.get("ipv4addr", ""), "name": addr.get("name", ""), "MAC": addr.get("mac", "")}
+        {
+            "IP address": addr["ipv4addr"] if "ipv4addr" in addr else addr.get("ipv6addr", ""),
+            "name": addr.get("name", ""),
+            "MAC": addr["mac"] if "mac" in addr else addr.get("mac_address", ""),
+            # An IPv6 fixed address always has the key, also when it matches by MAC and has no DUID.
+            **({"DUID": addr.get("duid") or ""} if "ipv6addr" in addr else {}),
+        }
         for addr in raw_data
     ]
     return processed_data

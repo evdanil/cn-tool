@@ -107,7 +107,6 @@ def _wait_for_indexing_and_recheck(ctx: ScriptContext) -> None:
     STALE_SECONDS = 180
     POLL_SECONDS = 5
 
-    start_seen = int(cache.dc.get("indexing_started", 0) or 0)
     while True:
         try:
             # If an error was recorded during indexing, stop waiting and surface it

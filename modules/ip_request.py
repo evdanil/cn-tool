@@ -16,25 +16,53 @@ from utils.file_io import queue_save
 from utils.network_views import NETWORK_VIEW, NETWORK_VIEW_TITLE, ViewScope, present_rows, scope_network, view_scope
 from utils.process_data import process_data
 from utils.user_input import press_any_key, read_user_input
+from utils.validation import ipv6_form_problem
 
 RESERVED_ADDRESS = "Invalid IP: Broadcast, unspecified, and reserved IPs are excluded."
-IPV6_UNSUPPORTED = "IPv6 lookups are not supported in this module yet. Please enter an IPv4 address."
-INVALID_FORMAT = "Invalid IP format. Please enter a valid IPv4 address."
+INVALID_FORMAT = "Invalid IP format. Please enter a valid IPv4 or IPv6 address."
 NO_RECORD = "No matching IPv4 record found"
+NO_RECORD_V6 = "No matching IPv6 record found"
 
 COLUMNS = ["Subnet", "IP", "Name", "Status", "Lease State", "Record Type", "MAC", "PTR name"]
+DUID = "DUID"
+# A run that looks up an IPv6 address shows the DUID column (empty for an IPv4 row); an IPv4-only run never does.
+COLUMNS_WITH_DUID = [*COLUMNS[:-1], DUID, COLUMNS[-1]]
 
 # The address lookup answers once per network view that holds the address; the PTR lookup is never scoped,
-# because a PTR record belongs to a DNS view.
+# because a PTR record belongs to a DNS view. ``ipv6address`` has no MAC, and asks for the address back (the IPv4
+# object's ``_ref`` carries it).
 ADDRESS_URI = "ipv4address?ip_address={ip}&_return_fields=network,names,status,types,lease_state,mac_address,network_view"
+ADDRESS_URI_V6 = "ipv6address?ip_address={ip}&_return_fields=ip_address,network,names,status,types,lease_state,duid,network_view"
 PTR_URI = "record:ptr?ipv4addr={ip}&_return_fields=ptrdname,view"
+PTR_URI_V6 = "record:ptr?ipv6addr={ip}&_return_fields=ptrdname,view"
+
+# An IPv6 row never shows None: an answer without extra data (an unused address) gives empty cells.
+_NO_EXTRA = {"lease state": "", "record type": "", "mac": "", "duid": ""}
 
 OwnerFn = Callable[[str], str]  # the network view that holds a DNS view ("" when no network view lists it)
 
 
+def _is_ipv6(ip: str) -> bool:
+    """True for an IPv6 address (or a lookup key), by its colons: the family never comes from a setting."""
+    return ":" in ip
+
+
+def _lookup_key(text: str) -> str:
+    """
+    The address as it is sent and compared: the compressed lower-case form for IPv6, so that two
+    spellings of one address are one lookup. IPv4 text is already canonical and is kept as typed.
+    ``text`` has passed ``_validate_ip``.
+    """
+    return ipaddress.ip_address(text).compressed if _is_ipv6(text) else text
+
+
 def _validate_ip(ctx: ScriptContext, text: str) -> Optional[str]:
     """
-    Why ``text`` cannot be looked up (the message the menu shows), or None for a usable IPv4 address.
+    Why ``text`` cannot be looked up (the message the menu shows), or None for a usable IPv4 or IPv6 address.
+
+    The order matters for IPv6: an IPv4-mapped address gets its hint first (Python versions disagree on
+    whether it is "reserved"), then an unspecified, reserved or link-local address is refused (so a
+    zoned ``fe80::1%eth0`` is refused once, as reserved), and only then does a zone ID get its hint.
 
     ``ctx`` is not used yet; it keeps the call shape every module's validator shares.
     """
@@ -42,11 +70,12 @@ def _validate_ip(ctx: ScriptContext, text: str) -> Optional[str]:
         ip = ipaddress.ip_address(text)
     except ValueError:
         return INVALID_FORMAT
+    mapped = ipv6_form_problem(text, zone_ok=True)
+    if mapped:
+        return mapped
     if ip.is_unspecified or ip.is_reserved or ip.is_link_local:
         return RESERVED_ADDRESS
-    if ip.version != 4:
-        return IPV6_UNSUPPORTED
-    return None
+    return ipv6_form_problem(text) or None
 
 
 def _publishes_ptr(data: Dict[str, Any]) -> bool:
@@ -114,13 +143,15 @@ def _explain_misses(
     processed_data_by_ip: Dict[str, List[Dict[str, Any]]],
     failed_ips: Dict[str, str],
     no_record: str = NO_RECORD,
+    no_record_v6: str = NO_RECORD_V6,
 ) -> Dict[str, str]:
     """
-    The reason each address in ``ip_addresses`` has no row, in input order: the failure of its lookup,
-    else ``no_record`` (which names the requested network view when there is one).
+    The reason each address in ``ip_addresses`` (lookup keys) has no row, in input order: the failure of
+    its lookup, else ``no_record`` for an IPv4 address and ``no_record_v6`` for an IPv6 one (both name the
+    requested network view when there is one).
     """
     return {
-        ip: failed_ips.get(ip, no_record)
+        ip: failed_ips.get(ip, no_record_v6 if _is_ipv6(ip) else no_record)
         for ip in ip_addresses
         if ip not in processed_data_by_ip
     }
@@ -152,7 +183,7 @@ def _publish_stats(
 
 class IPRequestModule(BaseModule):
     """
-    Module to fetch detailed information about one or more IP addresses from the API.
+    Module to fetch detailed information about one or more IPv4 or IPv6 addresses from the API.
     """
     cli_name = "ip"
 
@@ -162,7 +193,7 @@ class IPRequestModule(BaseModule):
 
     @property
     def menu_title(self) -> str:
-        return "IP Information (IPv4)"
+        return "IP Information"
 
     @property
     def visibility_config_key(self) -> Optional[str]:
@@ -171,12 +202,15 @@ class IPRequestModule(BaseModule):
 
     def run(self, ctx: ScriptContext) -> None:
         """
-        Requests user to provide IPv4 address(es), validates the input, calls the API,
+        Requests user to provide IPv4 or IPv6 address(es), validates the input, calls the API,
         processes the data, and then prints and/or saves it.
+
+        An address is looked up in its compressed form, so two spellings of one IPv6 address are one
+        lookup and one row, and the miss line prints that form.
         """
         logger = ctx.logger
         colors = get_global_color_scheme(ctx.cfg)
-        logger.info("Request Type - IP Information (IPv4)")
+        logger.info("Request Type - IP Information")
 
         ensure_infoblox_auth(ctx)
 
@@ -191,12 +225,13 @@ class IPRequestModule(BaseModule):
 
         console.print(
             "\n"
-            f"[{colors['description']}]Please provide an IPv4 address or a list of IPv4 addresses, one per line.[/]\n"
-            f"[{colors['description']}]This module is IPv4-only and will request hostname, location, and network configuration details.[/]\n"
+            f"[{colors['description']}]Please provide an IP address (IPv4 or IPv6) or a list of addresses, one per line.[/]\n"
+            f"[{colors['description']}]This module will request hostname, location, and network configuration details.[/]\n"
             f"[{colors['description']}]Empty input line starts the process.[/]\n"
             f"[{colors['header']}]Example:[/]\n"
             f"[{colors['success']} {colors['bold']}]134.162.104.110[/]\n"
             f"[{colors['success']} {colors['bold']}]8.8.8.8[/]\n"
+            f"[{colors['success']} {colors['bold']}]2001:db8:20::5[/]\n"
         )
         banner = scope.banner()
         if banner:
@@ -212,12 +247,12 @@ class IPRequestModule(BaseModule):
             if problem:
                 console.print(f"[{colors['error']}]{problem}[/]")
             else:
-                ip_addresses_input.append(search_input)
+                ip_addresses_input.append(_lookup_key(search_input))
 
         if not ip_addresses_input:
             return
 
-        # Remove duplicates while preserving order
+        # Remove duplicates while preserving order (the keys: two spellings of one IPv6 address are one)
         ip_addresses = list(dict.fromkeys(ip_addresses_input))
 
         # --- API Call and Data Processing ---
@@ -225,8 +260,10 @@ class IPRequestModule(BaseModule):
         ptr_names, ptr_failures = self._fetch_ptr_names(ctx, _ptr_addresses(ip_addresses, processed_data_by_ip))
 
         # --- Display and Save Results ---
-        no_record = scope.scoped(NO_RECORD)
-        for ip, reason in _explain_misses(ip_addresses, processed_data_by_ip, failed_ips, no_record).items():
+        misses = _explain_misses(
+            ip_addresses, processed_data_by_ip, failed_ips, scope.scoped(NO_RECORD), scope.scoped(NO_RECORD_V6)
+        )
+        for ip, reason in misses.items():
             console.print(f"[{colors['success']} {colors['bold']}]{ip}[/] - [{colors['error']}]{reason}[/]")
 
         save_rows, print_data_all = self._rows_for(ctx, scope, ip_addresses, processed_data_by_ip, ptr_names)
@@ -247,20 +284,23 @@ class IPRequestModule(BaseModule):
 
     def run_cli(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
         """
-        ``cn ip``: look up the addresses named on the command line, in ``--file`` and/or on stdin.
+        ``cn ip``: look up the IPv4 and IPv6 addresses named on the command line, in ``--file`` and/or on
+        stdin.
 
         Returns the sections ``IP Information`` (one row per address and network view with a record, an
         unused address inside a managed network included; led by ``Network view`` when ``view_scope``
-        says it shows, which a JSON run does for every labelled row), ``not_found`` (every other object
-        and why) and ``warnings`` (``object``/``warning`` for each address whose PTR lookup failed);
-        every key is always present and the caller renders them. Never prompts.
+        says it shows, which a JSON run does for every labelled row; with a ``DUID`` column, empty for an
+        IPv4 row, when the run looks up an IPv6 address), ``not_found`` (every other object and why: a
+        miss keeps the object as typed) and ``warnings`` (``object``/``warning`` for each address whose
+        PTR lookup failed); every key is always present and the caller renders them. Never prompts.
+        Two spellings of one IPv6 address are one lookup and one row.
 
         A requested view (``--view``, or ``[api] network_view``) that is not on the grid returns exit 2,
         one whose list cannot be read exit 3, both with the message on the console and no sections.
         """
         logger = ctx.logger
         colors = get_global_color_scheme(ctx.cfg)
-        logger.info("Request Type - IP Information (IPv4)")
+        logger.info("Request Type - IP Information")
 
         try:
             objects = read_objects(args.objects, args.file)
@@ -270,18 +310,19 @@ class IPRequestModule(BaseModule):
             console.print(f"[{colors['error']}]cn ip: cannot read {escape(str(source))}: {escape(str(reason))}[/]")
             return CliResult(2, {})
         if not objects:
-            console.print(f"[{colors['error']}]cn ip: no IPv4 addresses given; see cn ip --help[/]")
+            console.print(f"[{colors['error']}]cn ip: no addresses given; see cn ip --help[/]")
             return CliResult(2, {})
 
         reasons: Dict[str, str] = {}
-        ip_addresses: List[str] = []
+        keys: Dict[str, str] = {}  # each usable object -> its lookup key
         for obj in objects:
             problem = _validate_ip(ctx, obj)
             if problem:
                 reasons[obj] = problem
             else:
-                ip_addresses.append(obj)
+                keys[obj] = _lookup_key(obj)
         invalid = bool(reasons)
+        ip_addresses = list(dict.fromkeys(keys.values()))
 
         processed_data_by_ip: Dict[str, List[Dict[str, Any]]] = {}
         failed_ips: Dict[str, str] = {}
@@ -298,8 +339,11 @@ class IPRequestModule(BaseModule):
             ptr_names, ptr_failures = self._fetch_ptr_names(ctx, _ptr_addresses(ip_addresses, processed_data_by_ip))
             save_rows, print_data_all = self._rows_for(ctx, scope, ip_addresses, processed_data_by_ip, ptr_names)
             self._save_report(ctx, ip_addresses, processed_data_by_ip, save_rows)
-            _publish_stats(ctx, len(ip_addresses), ip_addresses, processed_data_by_ip, print_data_all)
-            reasons.update(_explain_misses(ip_addresses, processed_data_by_ip, failed_ips, scope.scoped(NO_RECORD)))
+            _publish_stats(ctx, len(keys), ip_addresses, processed_data_by_ip, print_data_all)
+            misses = _explain_misses(
+                ip_addresses, processed_data_by_ip, failed_ips, scope.scoped(NO_RECORD), scope.scoped(NO_RECORD_V6)
+            )
+            reasons.update({obj: misses[key] for obj, key in keys.items() if key in misses})
 
         data = {
             "IP Information": print_data_all,
@@ -313,8 +357,9 @@ class IPRequestModule(BaseModule):
         self, ctx: ScriptContext, ip_addresses: List[str], network_view: str = ""
     ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str]]:
         """
-        Ask Infoblox about each address (in ``network_view`` only, or in every view when it is "") and
-        run the ``process_data`` hook on every address-view of every answer, one at a time.
+        Ask Infoblox about each address (``ipv4address`` or ``ipv6address`` by its family; in
+        ``network_view`` only, or in every view when it is "") and run the ``process_data`` hook on
+        every address-view of every answer, one at a time.
 
         Returns the processed data of the addresses that have a record (one entry per network view
         that holds the address, in view-name order), and the failure message of each address whose
@@ -325,7 +370,10 @@ class IPRequestModule(BaseModule):
         logger.info(f"User input - IPs: {', '.join(ip_addresses)}")
 
         start = perf_counter()
-        req_urls = {ip: scope_network(ADDRESS_URI.format(ip=ip), network_view) for ip in ip_addresses}
+        req_urls = {
+            ip: scope_network((ADDRESS_URI_V6 if _is_ipv6(ip) else ADDRESS_URI).format(ip=ip), network_view)
+            for ip in ip_addresses
+        }
 
         with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(req_urls))) as executor, console.status(f"[{colors['description']}]Fetching IP information...[/]"):
             future_to_ip = {executor.submit(request_result, ctx, uri, ensure_auth=False): ip for ip, uri in req_urls.items()}
@@ -348,7 +396,7 @@ class IPRequestModule(BaseModule):
 
         end = perf_counter()
         logger.info(f"IP Information search took {round(end - start, 3)} seconds!")
-        console.print(f"[{colors['description']}]Request Type - IP Information (IPv4) - Search took [{colors['success']}]{round(end-start, 3)}[/] seconds![/]")
+        console.print(f"[{colors['description']}]Request Type - IP Information - Search took [{colors['success']}]{round(end-start, 3)}[/] seconds![/]")
         return processed_data_by_ip, failed_ips
 
     def _fetch_ptr_names(
@@ -356,7 +404,8 @@ class IPRequestModule(BaseModule):
     ) -> Tuple[Dict[str, List[Tuple[str, str]]], Dict[str, str]]:
         """
         Ask Infoblox for the PTR records at each address of ``ips``: one ``record:ptr`` request per
-        address (never scoped to a view), in parallel, none when ``ips`` is empty.
+        address (by ``ipv4addr`` or ``ipv6addr``, never scoped to a view), in parallel, none when ``ips``
+        is empty.
 
         Returns ``(pairs, failures)``: the ``(DNS view, ptrdname)`` pairs of each address that has any
         (a pair listed once; the DNS view is "" when the record names none), and the failure message of
@@ -367,7 +416,7 @@ class IPRequestModule(BaseModule):
             return {}, {}
 
         colors = get_global_color_scheme(ctx.cfg)
-        req_urls = {ip: PTR_URI.format(ip=ip) for ip in ips}
+        req_urls = {ip: (PTR_URI_V6 if _is_ipv6(ip) else PTR_URI).format(ip=ip) for ip in ips}
 
         with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(req_urls))) as executor, console.status(f"[{colors['description']}]Fetching PTR records...[/]"):
             futures = {ip: executor.submit(request_result, ctx, uri, ensure_auth=False) for ip, uri in req_urls.items()}
@@ -420,6 +469,7 @@ class IPRequestModule(BaseModule):
         return self._build_rows(
             ctx, ip_addresses, processed_data_by_ip, ptr_pairs,
             row_view=row_view, save_view=save_view, owner=owner, fallback_view=scope.requested,
+            duid=any(_is_ipv6(ip) for ip in ip_addresses),  # decided by the addresses looked up, not by the answers
         )
 
     def _build_rows(
@@ -433,14 +483,17 @@ class IPRequestModule(BaseModule):
         save_view: bool = False,
         owner: Optional[OwnerFn] = None,
         fallback_view: str = "",
+        duid: bool = False,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         One row per address and network view that has a record, in input order then view order, passed
         through the ``pre_save`` and ``pre_render`` hooks. Both hooks receive their own dict of the row,
-        keyed by ``COLUMNS``, led by ``Network view`` when it is shown (``row_view`` for the printed row,
-        ``save_view`` for the saved one; ``fallback_view`` names a row the answer did not label).
+        keyed by ``COLUMNS`` (``COLUMNS_WITH_DUID`` when ``duid``: the run looks up an IPv6 address, and an
+        IPv4 row has an empty ``DUID``), led by ``Network view`` when it is shown (``row_view`` for the
+        printed row, ``save_view`` for the saved one; ``fallback_view`` names a row the answer did not label).
         ``PTR name`` comes from ``ptr_pairs[ip]`` through ``_ptr_name`` (``owner`` pairs the DNS views with
-        the network views), empty for an address without one (or whose lookup failed).
+        the network views), empty for an address without one (or whose lookup failed). An IPv6 row has no
+        MAC (Infoblox keeps none for ``ipv6address``) and never a ``None`` cell: what its answer lacks is "".
 
         Returns ``(save_rows, print_rows)``. A save row is what ``pre_save`` returned (it may add,
         drop or reorder fields; an empty row is left out of the report) plus every column that
@@ -448,19 +501,25 @@ class IPRequestModule(BaseModule):
         """
         save_rows: List[Dict[str, Any]] = []
         print_rows: List[Dict[str, Any]] = []
+        columns = COLUMNS_WITH_DUID if duid else COLUMNS
 
         for ip in ip_addresses:
             for data in processed_data_by_ip.get(ip, []):
                 general_data = data.get("general", [{}])[0]
                 extra_data = data.get("extra", [{}])[0]
+                if _is_ipv6(ip):
+                    extra_data = {**_NO_EXTRA, **extra_data}
                 view = str(general_data.get(NETWORK_VIEW) or "")
 
-                row = dict(zip(COLUMNS, [
+                values = [
                     general_data.get("network"), general_data.get("ip"), general_data.get("name"),
                     general_data.get("status"), extra_data.get("lease state"),
                     extra_data.get("record type"), extra_data.get("mac"),
-                    _ptr_name(ptr_pairs.get(ip, []), view or fallback_view, owner),
-                ]))
+                ]
+                if duid:
+                    values.append(extra_data.get("duid") or "")
+                values.append(_ptr_name(ptr_pairs.get(ip, []), view or fallback_view, owner))
+                row = dict(zip(columns, values))
                 if NETWORK_VIEW in general_data:
                     row = {NETWORK_VIEW_TITLE: view, **row}
 
@@ -478,7 +537,7 @@ class IPRequestModule(BaseModule):
                 if save_row:
                     added = {
                         name: value for name, value in print_row.items()
-                        if name not in COLUMNS and name != NETWORK_VIEW_TITLE and name not in save_row
+                        if name not in columns and name != NETWORK_VIEW_TITLE and name not in save_row
                     }
                     save_rows.append({**save_row, **added})
 

@@ -36,9 +36,11 @@ from utils.network_views import (
 )
 from utils.process_data import CONTAINER_UTILIZATION_SCALE, process_data, utilization_percent
 from utils.user_input import press_any_key, read_user_input
+from utils.validation import ipv6_form_problem
 
-# Type alias for clarity
-NetworkObject = Union[ipaddress.IPv4Network, ipaddress.IPv4Address]
+# Type aliases for clarity: a network of either family, and what a lookup may start from.
+Network = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+NetworkObject = Union[ipaddress.IPv4Network, ipaddress.IPv6Network, ipaddress.IPv4Address, ipaddress.IPv6Address]
 RowDict = Dict[str, Any]
 
 #: Tables of one subnet's details, in the order the menu shows them (the rest follow alphabetically).
@@ -51,29 +53,89 @@ TRUNCATION_NOTICE = f"showing the first {WAPI_MAX_ROWS:,} only (paging limit); q
 #: The paging notice when the truncated list holds several network views: the cap is shared by all of them.
 _SHARED_CAP_HEAD = f"showing the first {WAPI_MAX_ROWS:,} only (paging limit), shared by network views "
 _SHARED_CAP_TAIL = "; query a smaller subnet or use --view"
-MALFORMED_MESSAGE = "Not an IPv4 address or network."
+MALFORMED_MESSAGE = "Not an IP address or network."
+
+#: Every WAPI lookup of ``cn subnet``, by address family and purpose. ``{address}`` is the network address
+#: and ``{cidr}`` the network as ``str(network)``; every URI then goes through ``scope_network``. The IPv4
+#: entries are the strings the requests were always built from. IPv6 asks only for the fields its objects
+#: have: ``ipv6network`` has no ``dhcp_utilization`` (WAPI answers 400 to it), ``ipv6range`` has no
+#: ``failover_association`` and no utilisation or host counts, and ``ipv6fixedaddress`` has the DUID.
+WAPI_URIS: Dict[int, Dict[str, str]] = {
+    4: {
+        "contains": "network?contains_address={address}",
+        "children": "network?network_container={cidr}",
+        "child containers": "networkcontainer?network_container={cidr}&_return_fields=network,comment,utilization,network_view",
+        "exact": "network?network={cidr}&_return_fields=network,network_view",
+        "network bundle": "network?network={cidr}&_return_fields=network,comment,extattrs,options,members,dhcp_utilization,network_view",
+        "DNS records": "ipv4address?network={cidr}&usage=DNS&_return_fields=ip_address,names,network_view",
+        "range bundle": (
+            "range?network={cidr}&_return_fields=network,start_addr,end_addr,member,failover_association,"
+            "dhcp_utilization,dhcp_utilization_status,dynamic_hosts,static_hosts,total_hosts,network_view"
+        ),
+        "fixed addresses": "fixedaddress?network={cidr}&_return_fields=ipv4addr,mac,name,network_view",
+    },
+    6: {
+        "contains": "ipv6network?contains_address={address}",
+        "children": "ipv6network?network_container={cidr}",
+        "child containers": "ipv6networkcontainer?network_container={cidr}&_return_fields=network,comment,utilization,network_view",
+        "exact": "ipv6network?network={cidr}&_return_fields=network,network_view",
+        "network bundle": "ipv6network?network={cidr}&_return_fields=network,comment,extattrs,options,members,network_view",
+        "DNS records": "ipv6address?network={cidr}&usage=DNS&_return_fields=ip_address,names,network_view",
+        "range bundle": "ipv6range?network={cidr}&_return_fields=network,start_addr,end_addr,member,network_view",
+        "fixed addresses": "ipv6fixedaddress?network={cidr}&_return_fields=ipv6addr,duid,mac_address,name,network_view",
+    },
+}
+#: The sections the range answer feeds, which are also its warning labels; IPv6 has no failover section.
+RANGE_SECTIONS: Dict[int, Tuple[str, ...]] = {4: ("DHCP range", "DHCP failover"), 6: ("DHCP range",)}
+#: The column of a fixed address's DHCPv6 identity (JSON ``duid``), shown whenever the run has an IPv6 object.
+DUID = "DUID"
 
 
-def _view_of(network: ipaddress.IPv4Network) -> str:
+def _view_of(network: Network) -> str:
     """The network view a target network belongs to; "" for a plain network (no view known)."""
     return getattr(network, "network_view", "")
 
 
-def _in_view(network: ipaddress.IPv4Network) -> str:
+def _in_view(network: Network) -> str:
     """" in network view lab" for a network of a view, else "": the words a menu line adds after the network."""
     view = _view_of(network)
     return f" in network view {view}" if view else ""
 
 
-def _cache_key(network: ipaddress.IPv4Network) -> str:
+def _cache_key(network: Network) -> str:
     """The key of a network's data and warnings: its CIDR, and ``(view)`` after it for a network of a view."""
     view = _view_of(network)
     return f"{network} ({view})" if view else str(network)
 
 
-def _network_order(network: ipaddress.IPv4Network) -> Tuple[int, int, str]:
-    """Sort key: address, then prefix length, then view. Plain and view networks are never compared with ``<``."""
-    return int(network.network_address), network.prefixlen, _view_of(network)
+def _network_order(network: Network) -> Tuple[int, int, int, str]:
+    """
+    Sort key: address family, address, prefix length, then view. IPv4 sorts before IPv6, so a mixed run
+    never compares an IPv4 object with an IPv6 one using ``<`` (that raises TypeError), and an IPv4 run
+    sorts as it always did. Plain and view networks are never compared with ``<`` either.
+    """
+    return network.version, int(network.network_address), network.prefixlen, _view_of(network)
+
+
+def _host_mask(address: str) -> str:
+    """The mask of a single address in the report: ``/128`` for an IPv6 address, else ``/32``."""
+    return "/128" if ":" in (address or "") else "/32"
+
+
+def _with_duid(rows: List[RowDict], duid: bool) -> List[RowDict]:
+    """
+    ``rows`` with the ``DUID`` column on every row when ``duid`` is set (the run has an IPv6 object): a row
+    that has none gets it empty, after its other keys. Without ``duid`` the rows are handed back as they are.
+    """
+    if not duid:
+        return rows
+    return [{**row, DUID: row.get(DUID, "")} for row in rows]
+
+
+def _wapi_uri(purpose: str, network: Network, network_view: str = "") -> str:
+    """The lookup ``purpose`` (a key of ``WAPI_URIS``) for ``network``, in the table of its family, limited to one view."""
+    template = WAPI_URIS[network.version][purpose]
+    return scope_network(template.format(address=str(network.network_address), cidr=str(network)), network_view)
 
 
 def _is_truncation(warning: str) -> bool:
@@ -116,52 +178,68 @@ def _content_partitions(content: Optional[bytes]) -> Dict[str, Optional[bytes]]:
     return {view: json.dumps(group).encode() for view, group in groups.items()}
 
 
-class ViewNetwork(ipaddress.IPv4Network):
+class _InView:
     """
-    A network of one Infoblox network view. It prints and behaves as its CIDR, and carries the view.
+    What a network of one Infoblox network view shares in both address families: it prints and behaves
+    as its CIDR, and carries the view.
 
-    Equality and hash include the view, so the same CIDR in two views makes two dictionary keys. A
-    plain ``IPv4Network`` (no view known) never equals a ViewNetwork; Python tries this class's
-    ``__eq__`` first for the reflected comparison, so that holds both ways. Build one only for a
-    non-empty view.
+    Equality and hash include the view, so the same CIDR in two views makes two dictionary keys. A plain
+    network (no view known) never equals a view network; Python tries the subclass's ``__eq__`` first for
+    the reflected comparison, so that holds both ways, and networks of the two families never compare
+    equal (``ipaddress`` compares the version first). Build one only for a non-empty view.
     """
 
     network_view: str
 
     def __init__(self, address: Any, network_view: str) -> None:
         if not network_view:
-            raise ValueError("A ViewNetwork needs a network view; use a plain IPv4Network for none.")
-        super().__init__(str(address))
+            raise ValueError(f"A {type(self).__name__} needs a network view; use a plain network for none.")
+        super().__init__(str(address))  # type: ignore[call-arg]
         self.network_view = network_view
 
     def __eq__(self, other: object) -> bool:
-        return ipaddress.IPv4Network.__eq__(self, other) is True and self.network_view == _view_of(other)  # type: ignore[arg-type]
+        return super().__eq__(other) is True and self.network_view == _view_of(other)  # type: ignore[arg-type]
 
     def __hash__(self) -> int:
-        return hash((ipaddress.IPv4Network.__hash__(self), self.network_view))
+        return hash((super().__hash__(), self.network_view))
 
     def __repr__(self) -> str:
-        return f"ViewNetwork({str(self)!r}, {self.network_view!r})"
+        return f"{type(self).__name__}({str(self)!r}, {self.network_view!r})"
 
     def __reduce__(self) -> Tuple[Any, Tuple[str, str]]:
-        return ViewNetwork, (str(self), self.network_view)
+        return type(self), (str(self), self.network_view)
 
 
-def _make_network(address: str, network_view: str = "") -> ipaddress.IPv4Network:
-    """The network of one answer item: a ViewNetwork when the item names a view, else a plain network."""
-    return ViewNetwork(address, network_view) if network_view else ipaddress.IPv4Network(address)
+class ViewNetwork(_InView, ipaddress.IPv4Network):
+    """An IPv4 network of one network view (see ``_InView``)."""
+
+
+class ViewNetwork6(_InView, ipaddress.IPv6Network):
+    """An IPv6 network of one network view (see ``_InView``)."""
+
+
+def _make_network(address: Any, network_view: str = "") -> Network:
+    """
+    The one place that builds a target network: a ViewNetwork or ViewNetwork6 (by family) when the
+    answer item names a view, else a plain network. ``address`` must be a canonical network, as the
+    grid answers it.
+    """
+    network = ipaddress.ip_network(str(address))
+    if not network_view:
+        return network
+    return (ViewNetwork6 if network.version == 6 else ViewNetwork)(network, network_view)
 
 
 @dataclass(frozen=True, eq=True)
 class QueryTarget:
     """Represents a single query, linking an original input to a resolved network."""
     original_input: str
-    resolved_network: ipaddress.IPv4Network
+    resolved_network: Network
 
 
 @dataclass(frozen=True)
 class InputResolutionResult:
-    networks: Set[ipaddress.IPv4Network]
+    networks: Set[Network]
     failure_message: str = ""
     containers: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -187,8 +265,9 @@ class SubnetSummaryState:
 class SubnetRequestModule(BaseModule):
     """
     Module to fetch detailed information for one or more subnets from an API.
-    It accepts input as plain IPs, CIDR notation (e.g., 1.2.3.0/24), or
-    IP/subnet mask (e.g., 1.2.3.0/255.255.255.0).
+    It accepts input as plain IPs, CIDR notation (e.g., 1.2.3.0/24, 2001:db8:20::/64), or
+    IPv4 address/subnet mask (e.g., 1.2.3.0/255.255.255.0), of either address family; a mixed
+    run keeps the order of the inputs, whatever their family.
     It preserves the original input and its order in the final results.
     """
     cli_name = "subnet"
@@ -240,6 +319,7 @@ class SubnetRequestModule(BaseModule):
                 return
 
             logger.info(f"User provided inputs: {', '.join(user_inputs)}")
+            duid = self._has_ipv6_object(user_inputs)  # the report's DUID column follows the input, never the answers
             start = perf_counter()
 
             # --- 2. Resolve all inputs into an ordered list of query targets ---
@@ -279,7 +359,7 @@ class SubnetRequestModule(BaseModule):
             self._display_results(ctx, query_targets, subnet_data_cache, grouped_by_network, subnet_warning_cache)
 
             if ctx.cfg["report_auto_save"] and all_data_to_save:
-                self._save_subnet_data(ctx, query_targets, all_data_to_save)
+                self._save_subnet_data(ctx, query_targets, all_data_to_save, duid=duid)
 
             self._publish_stats(ctx, len(user_inputs), query_targets, list(grouped_by_network), subnet_data_cache)
         finally:
@@ -291,12 +371,17 @@ class SubnetRequestModule(BaseModule):
         """
         ``cn subnet``: the menu's lookup for the objects named on the command line, as sections.
 
-        Nothing is asked of the user. An object that is not an IPv4 address or network, and one whose
-        lookup failed, are reported on the console (stderr) with the reason. A well-formed address or
-        network that is in no managed network is a "No data" row in ``subnets``. A container prefix also
-        lists its child containers in ``child containers`` (not expanded); they count as data. The exit
-        status follows ``cli_exit_code``: a failed lookup (even a partial one) 3, a malformed object 2,
-        data 0, else 1.
+        Nothing is asked of the user. An object that is not an IP address or network (IPv4 or IPv6), and
+        one whose lookup failed, are reported on the console (stderr) with the reason; an IPv6 spelling
+        Infoblox cannot store (IPv4-mapped, zone ID) is refused before any login, with the form to type
+        instead. A well-formed address or network that is in no managed network is a "No data" row in
+        ``subnets``. A container prefix also lists its child containers in ``child containers`` (not
+        expanded); they count as data. The exit status follows ``cli_exit_code``: a failed lookup (even a
+        partial one) 3, a malformed or refused object 2, data 0, else 1.
+
+        IPv6 subnets have no DHCP utilisation and no failover in Infoblox, so those cells are empty. When
+        the run has an IPv6 object (an address or a prefix), every ``fixed addresses`` row has a ``DUID``
+        column (JSON ``duid``), empty for an IPv4 address; an IPv4 run has none.
 
         A network that exists in several views has a row for each of them (``Network view``, JSON
         ``network_view``); ``--view`` / ``[api] network_view`` limit the search to one view. A view that
@@ -310,9 +395,14 @@ class SubnetRequestModule(BaseModule):
             if not inputs:
                 return CliResult(cli_exit_code(found=False, invalid=True, failed=False), {})
 
-            # Syntax is checked locally first: nobody is asked for credentials to reject "bogus".
-            malformed = {item for item in inputs if not self._is_ipv4_network(item)}
+            # Syntax is checked locally first: nobody is asked for credentials to reject "bogus" or a
+            # spelling Infoblox cannot store (IPv4-mapped, zone ID), and each object gets its own reason.
+            problems = {item: self._network_problem(item) for item in inputs}
+            malformed = {item for item, problem in problems.items() if problem}
             candidates = [item for item in inputs if item not in malformed]
+            # DUID shows in the fixed addresses and in the saved report whenever the run has an IPv6 object:
+            # a column rule taken from the input, never from which rows came back (the rule ``cn ip`` follows too).
+            duid = self._has_ipv6_object(candidates)
             scope = view_scope(ctx, args, request_result)
             query_targets, resolution_errors, containers = [], {}, []
             if candidates:
@@ -330,14 +420,14 @@ class SubnetRequestModule(BaseModule):
             ]
             self._print_resolution_errors(
                 ctx,
-                {item: resolution_errors.get(item, MALFORMED_MESSAGE) for item in inputs if item in resolution_errors or item in malformed},
+                {item: resolution_errors.get(item) or problems[item] for item in inputs if item in resolution_errors or item in malformed},
             )
             invalid = bool(malformed)
             failed = bool(resolution_errors)
             if not query_targets:
                 *_, containers, _ = self._settle_views(ctx, scope, [], {}, {}, {}, containers)
                 no_sections = self._build_cli_sections(
-                    ctx, [], {}, {}, {}, misses, containers, fallback_view=scope.requested,
+                    ctx, [], {}, {}, {}, misses, containers, fallback_view=scope.requested, duid=duid,
                 )
                 return CliResult(cli_exit_code(found=bool(containers), invalid=invalid, failed=failed), no_sections)
 
@@ -352,10 +442,10 @@ class SubnetRequestModule(BaseModule):
             all_data_to_save = self._collect_save_data(ctx, grouped_by_network, subnet_data_cache, save_view=save_view)
             sections = self._build_cli_sections(
                 ctx, list(grouped_by_network), grouped_by_network, subnet_data_cache, subnet_warning_cache, misses, containers,
-                fallback_view=scope.requested,
+                fallback_view=scope.requested, duid=duid,
             )
             if ctx.cfg["report_auto_save"] and all_data_to_save:
-                self._save_subnet_data(ctx, query_targets, all_data_to_save)
+                self._save_subnet_data(ctx, query_targets, all_data_to_save, duid=duid)
             self._publish_stats(ctx, len(inputs), query_targets, list(grouped_by_network), subnet_data_cache)
 
             failed = failed or self._has_failed_lookup(subnet_warning_cache)
@@ -364,18 +454,18 @@ class SubnetRequestModule(BaseModule):
             self.execute_hook('post_run', ctx, None)
 
     @staticmethod
-    def _unique_networks(query_targets: List[QueryTarget]) -> List[ipaddress.IPv4Network]:
+    def _unique_networks(query_targets: List[QueryTarget]) -> List[Network]:
         """
         The distinct CIDRs to query, as plain networks sorted by address then prefix length. One fetch
         serves a CIDR in every view (the answers carry their view), so the view is dropped here.
         """
-        cidrs = {ipaddress.IPv4Network(str(target.resolved_network)) for target in query_targets}
+        cidrs = {ipaddress.ip_network(str(target.resolved_network)) for target in query_targets}
         return sorted(cidrs, key=_network_order)
 
     @staticmethod
-    def _group_by_network(query_targets: List[QueryTarget]) -> Dict[ipaddress.IPv4Network, List[str]]:
+    def _group_by_network(query_targets: List[QueryTarget]) -> Dict[Network, List[str]]:
         """Original inputs per resolved network; the networks keep the order the user gave them."""
-        grouped_by_network: Dict[ipaddress.IPv4Network, List[str]] = defaultdict(list)
+        grouped_by_network: Dict[Network, List[str]] = defaultdict(list)
         for target in query_targets:
             grouped_by_network[target.resolved_network].append(target.original_input)
         return grouped_by_network
@@ -431,16 +521,16 @@ class SubnetRequestModule(BaseModule):
         The returned data and warnings hold only the keys of the settled targets (``_cache_key``).
         """
         settled: List[QueryTarget] = []
-        seen: Set[Tuple[str, ipaddress.IPv4Network]] = set()
+        seen: Set[Tuple[str, Network]] = set()
         for target in query_targets:
             network = target.resolved_network
-            cidr = ipaddress.IPv4Network(str(network))
+            cidr = ipaddress.ip_network(str(network))
             if not label_targets:
                 networks = [cidr]
             elif _view_of(network):
                 networks = [network]
             else:
-                networks = [ViewNetwork(cidr, view) for view in views_by_network.get(str(cidr), ())] or [network]
+                networks = [_make_network(cidr, view) for view in views_by_network.get(str(cidr), ())] or [network]
             for settled_network in networks:
                 if (target.original_input, settled_network) not in seen:
                     seen.add((target.original_input, settled_network))
@@ -483,13 +573,13 @@ class SubnetRequestModule(BaseModule):
             ctx.console.print(f"[{colors['description']}]{prefix}: {note}[/]")
 
     def _fetch_subnets(
-        self, ctx: ScriptContext, networks: List[ipaddress.IPv4Network], network_view: str = ""
+        self, ctx: ScriptContext, networks: List[Network], network_view: str = ""
     ) -> tuple[Dict[str, Dict], Dict[str, List[str]], Dict[str, Tuple[str, ...]]]:
         """
         Fetch every CIDR in parallel (``network_view`` limits the lookups to one view, "" searches every
         view): (data, warnings, views). Data and warnings are keyed by the CIDR's text, only when
         non-empty. The part of a CIDR's answers that names no view is its data under the plain CIDR;
-        the part of each view it names is under ``_cache_key(ViewNetwork(cidr, view))``. ``views`` lists,
+        the part of each view it names is under ``_cache_key(_make_network(cidr, view))``. ``views`` lists,
         for each CIDR whose answers named any, those views (sorted).
         """
         colors = get_global_color_scheme(ctx.cfg)
@@ -512,7 +602,7 @@ class SubnetRequestModule(BaseModule):
                         subnet_data_cache[net_str] = outcome.data
                     for view, view_data in outcome.by_view.items():
                         if view_data:
-                            subnet_data_cache[_cache_key(ViewNetwork(network, view))] = view_data
+                            subnet_data_cache[_cache_key(_make_network(network, view))] = view_data
                     if outcome.by_view:
                         views_by_network[net_str] = tuple(sorted(outcome.by_view))
                     if outcome.warnings:
@@ -522,7 +612,7 @@ class SubnetRequestModule(BaseModule):
     def _collect_save_data(
         self,
         ctx: ScriptContext,
-        grouped_by_network: Dict[ipaddress.IPv4Network, List[str]],
+        grouped_by_network: Dict[Network, List[str]],
         subnet_data_cache: Dict[str, Dict],
         *,
         save_view: bool = False,
@@ -550,7 +640,7 @@ class SubnetRequestModule(BaseModule):
         ctx: ScriptContext,
         input_count: int,
         query_targets: List[QueryTarget],
-        unique_networks: List[ipaddress.IPv4Network],
+        unique_networks: List[Network],
         subnet_data_cache: Dict[str, Dict],
     ) -> None:
         ctx.event_bus.publish(
@@ -583,7 +673,8 @@ class SubnetRequestModule(BaseModule):
         colors = get_global_color_scheme(ctx.cfg)
         ctx.console.print(
             "\n" f"[{colors['description']}]Enter network addresses and press Enter twice to start.[/]\n"
-            f"[{colors['description']}]Formats: '1.2.3.0/24', '1.2.3.0/255.255.255.0', or just '1.2.3.4'[/]\n"
+            f"[{colors['description']}]Formats: '1.2.3.0/24', '1.2.3.0/255.255.255.0', '2001:db8:20::/64', "
+            f"or just an address ('1.2.3.4', '2001:db8:20::5')[/]\n"
         )
         if banner:
             ctx.console.print(f"[{colors['warning']}]{escape(banner)}[/]\n")
@@ -628,24 +719,48 @@ class SubnetRequestModule(BaseModule):
 
     def _resolve_single_input(
         self, ctx: ScriptContext, an_input: str, network_view: str = ""
-    ) -> Set[ipaddress.IPv4Network]:
+    ) -> Set[Network]:
         return self._resolve_single_input_detailed(ctx, an_input, network_view).networks
 
     @staticmethod
-    def _parse_ipv4_network(text: str) -> ipaddress.IPv4Network:
-        """What the resolver accepts: an IPv4 address (a /32), CIDR or address/mask; ValueError otherwise."""
-        net = ipaddress.ip_network(text, strict=False)
-        if not isinstance(net, ipaddress.IPv4Network):
-            raise ValueError("Only IPv4 is supported.")
-        return net
+    def _parse_network(text: str) -> Network:
+        """
+        What the resolver accepts: an address (a /32 or /128), a CIDR or an IPv4 address/mask, of either
+        family. ValueError carries the reason otherwise: the form to type instead for an IPv6 spelling
+        Infoblox cannot store (IPv4-mapped, zone ID), ``MALFORMED_MESSAGE`` for any other text.
+        """
+        refused = ipv6_form_problem(text)
+        if refused:
+            raise ValueError(refused)
+        try:
+            return ipaddress.ip_network(text, strict=False)
+        except ValueError:
+            raise ValueError(MALFORMED_MESSAGE) from None
 
     @classmethod
-    def _is_ipv4_network(cls, text: str) -> bool:
+    def _network_problem(cls, text: str) -> str:
+        """Why ``text`` cannot be looked up, as ``_parse_network`` words it; "" when it can."""
         try:
-            cls._parse_ipv4_network(text)
-        except ValueError:
-            return False
-        return True
+            cls._parse_network(text)
+        except ValueError as error:
+            return str(error)
+        return ""
+
+    @classmethod
+    def _has_ipv6_object(cls, inputs: Iterable[str]) -> bool:
+        """
+        True when any of ``inputs`` is an IPv6 address or prefix the resolver accepts: the run-level
+        decision behind every ``DUID`` column (the table, the JSON and the saved report). It is taken
+        from what was typed, before any lookup, so a miss still counts; a malformed or refused object
+        (``_parse_network`` raises) counts for nothing.
+        """
+        for item in inputs:
+            try:
+                if cls._parse_network(item).version == 6:
+                    return True
+            except ValueError:
+                continue
+        return False
 
     def _resolve_single_input_detailed(
         self, ctx: ScriptContext, an_input: str, network_view: str = ""
@@ -654,38 +769,40 @@ class SubnetRequestModule(BaseModule):
         Worker function to resolve a single input string into one or more network objects.
 
         Every lookup is limited to ``network_view`` when one is given. An answer item that names its
-        view gives a ``ViewNetwork``: an address found in two views resolves to a target for each, and
-        a container's children are targets per (network, view). An item without a view gives a plain
-        network, as it always did (an address: the first item). A network without a lookup (/30 and
-        longer, or a container prefix without children) belongs to the requested view, if any. Unscoped,
-        children that name a view are followed by one lookup of the prefix itself: it is a target in
-        every view where it is an ordinary network, even when another view holds children for it.
+        view gives a ``ViewNetwork`` (``ViewNetwork6`` for IPv6): an address found in two views resolves
+        to a target for each, and a container's children are targets per (network, view). An item without
+        a view gives a plain network, as it always did (an address: the first item). A network without a
+        lookup (a /30 or longer, a /126 or longer for IPv6, or a container prefix without children)
+        belongs to the requested view, if any. Unscoped, children that name a view are followed by one
+        lookup of the prefix itself: it is a target in every view where it is an ordinary network, even
+        when another view holds children for it.
+
+        An address (a /32, a /128) goes through ``contains_address``; a prefix shorter than
+        ``max_prefixlen - 2`` asks for its child networks and child containers, in the table of its
+        family. An IPv6 spelling Infoblox cannot store (IPv4-mapped, zone ID) comes back as the failure
+        message, with the form to type instead; any other malformed text resolves to nothing, silently.
         """
         try:
-            net = self._parse_ipv4_network(an_input)
-            if net.prefixlen == 32:
-                result = request_result(
-                    ctx, scope_network(f'network?contains_address={net.network_address}', network_view), ensure_auth=False
-                )
+            net = self._parse_network(an_input)
+            if net.prefixlen == net.max_prefixlen:
+                result = request_result(ctx, _wapi_uri("contains", net, network_view), ensure_auth=False)
                 if result.ok and result.has_items:
                     labelled = {
-                        ViewNetwork(item["network"], item["network_view"])
+                        _make_network(item["network"], item["network_view"])
                         for item in result.items
                         if item.get("network") and item.get("network_view")
                     }
                     if labelled:
                         return InputResolutionResult(networks=labelled)
                     if 'network' in result.items[0]:
-                        return InputResolutionResult(networks={ipaddress.IPv4Network(result.items[0]['network'])})
+                        return InputResolutionResult(networks={_make_network(result.items[0]['network'])})
                 if result.failed:
                     return InputResolutionResult(networks=set(), failure_message=describe_infoblox_failure(result))
                 return InputResolutionResult(networks=set())
-            own_network = ViewNetwork(net, network_view) if network_view else net
-            if net.prefixlen < 30:
-                result = request_result(
-                    ctx, scope_network(f'network?network_container={net.compressed}', network_view), ensure_auth=False
-                )
-                found_subnets: Set[ipaddress.IPv4Network] = set()
+            own_network = _make_network(net, network_view)
+            if net.prefixlen < net.max_prefixlen - 2:
+                result = request_result(ctx, _wapi_uri("children", net, network_view), ensure_auth=False)
+                found_subnets: Set[Network] = set()
                 if result.ok:
                     supernet_data = process_data(ctx, type='supernet', content=result.content)
                     found_subnets = {
@@ -696,12 +813,7 @@ class SubnetRequestModule(BaseModule):
                 # The child containers are listed, not expanded. A failed lookup is reported next to what
                 # the first one found, so a grid that refuses it still answers for a plain /24.
                 container_result = request_result(
-                    ctx,
-                    scope_network(
-                        f'networkcontainer?network_container={net.compressed}&_return_fields=network,comment,utilization,network_view',
-                        network_view,
-                    ),
-                    ensure_auth=False,
+                    ctx, _wapi_uri("child containers", net, network_view), ensure_auth=False
                 )
                 containers = self._child_container_rows(an_input, container_result.items) if container_result.ok else []
                 failure = describe_infoblox_failure(container_result) if container_result.failed else ""
@@ -712,18 +824,16 @@ class SubnetRequestModule(BaseModule):
                 if not network_view and (
                     any(_view_of(child) for child in found_subnets) or any(row.get(NETWORK_VIEW) for row in containers)
                 ):
-                    exact_result = request_result(
-                        ctx, f'network?network={net.compressed}&_return_fields=network,network_view', ensure_auth=False
-                    )
+                    exact_result = request_result(ctx, _wapi_uri("exact", net), ensure_auth=False)
                     networks = networks | {
-                        ViewNetwork(net, item["network_view"]) for item in exact_result.items if item.get("network_view")
+                        _make_network(net, item["network_view"]) for item in exact_result.items if item.get("network_view")
                     }
                     failure = failure or (describe_infoblox_failure(exact_result) if exact_result.failed else "")
                 return InputResolutionResult(networks=networks, failure_message=failure, containers=containers)
             return InputResolutionResult(networks={own_network})
         except ValueError:
             ctx.logger.warning(f"Invalid IP/Subnet format for input: '{an_input}'")
-            return InputResolutionResult(networks=set())
+            return InputResolutionResult(networks=set(), failure_message=ipv6_form_problem(an_input))
         except Exception as e:
             ctx.logger.error(f"Error resolving input '{an_input}': {e}")
             return InputResolutionResult(networks=set(), failure_message="Subnet resolution failed.")
@@ -731,17 +841,18 @@ class SubnetRequestModule(BaseModule):
     @staticmethod
     def _child_container_rows(container: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        ``networkcontainer`` records as ``child containers`` rows, sorted by address, prefix length and
-        view. A container that exists in two views is listed once for each (a row names its view in a
-        leading ``network view`` column when the record does); within one view the first of a repeated
-        network wins.
+        ``networkcontainer`` and ``ipv6networkcontainer`` records as ``child containers`` rows, sorted by
+        address family, address, prefix length and view (a container prefix's children are all of one
+        family, so IPv4 lists sort as they always did). A container that exists in two views is listed
+        once for each (a row names its view in a leading ``network view`` column when the record does);
+        within one view the first of a repeated network wins.
         """
-        children: Dict[Tuple[ipaddress.IPv4Network, str], Dict[str, Any]] = {}
+        children: Dict[Tuple[Network, str], Dict[str, Any]] = {}
         for item in items:
             if "network" in item:
-                children.setdefault((ipaddress.IPv4Network(item["network"]), str(item.get("network_view") or "")), item)
+                children.setdefault((ipaddress.ip_network(item["network"]), str(item.get("network_view") or "")), item)
         rows: List[Dict[str, Any]] = []
-        for child, view in sorted(children, key=lambda key: (int(key[0].network_address), key[0].prefixlen, key[1])):
+        for child, view in sorted(children, key=lambda key: (key[0].version, int(key[0].network_address), key[0].prefixlen, key[1])):
             item = children[(child, view)]
             row = {
                 "container": container,
@@ -753,7 +864,7 @@ class SubnetRequestModule(BaseModule):
         return rows
 
     def _fetch_and_process_subnet_data(
-        self, ctx: ScriptContext, network: ipaddress.IPv4Network, network_view: str = ""
+        self, ctx: ScriptContext, network: Network, network_view: str = ""
     ) -> SubnetFetchOutcome:
         """
         Fetches all data for a single subnet, processes it, and prepares it for display.
@@ -770,11 +881,14 @@ class SubnetRequestModule(BaseModule):
         return SubnetFetchOutcome(data=processed_data, warnings=outcome.warnings, by_view=by_view)
 
     def _fetch_all_data_for_subnet(
-        self, ctx: ScriptContext, network: NetworkObject, network_view: str = ""
+        self, ctx: ScriptContext, network: Network, network_view: str = ""
     ) -> SubnetFetchOutcome:
         """
         Fetches all related data points for a single subnet in parallel: four requests, each one asking
         for the ``network_view`` field (``network_view`` limits them to that view; "" searches every view).
+        The URIs come from ``WAPI_URIS`` by the subnet's family: an IPv6 subnet asks the IPv6 objects only
+        for the fields they have, and its range answer feeds the ``DHCP range`` section alone (Infoblox
+        holds no failover association for it), so IPv6 has no utilisation figures and no failover.
 
         Every answer is split by the view its items name. The part that names none is ``data``; each
         view gets its own entry in ``by_view`` and is parsed on its own, so one view's description or
@@ -782,38 +896,28 @@ class SubnetRequestModule(BaseModule):
         """
         net_str = str(network)
         paged_request = partial(request_result, paged=True)  # these lists can outgrow one WAPI page
+        range_sections = RANGE_SECTIONS[network.version]
         request_specs = {
             "network bundle": {
-                "uri": scope_network(
-                    f"network?network={net_str}&_return_fields=network,comment,extattrs,options,members,dhcp_utilization,network_view",
-                    network_view,
-                ),
+                "uri": _wapi_uri("network bundle", network, network_view),
                 "parser_types": ("general", "network options"),
                 "warning_labels": ("general", "network options"),
                 "request_fn": request_result_with_inheritance,
             },
             "DNS records": {
-                "uri": scope_network(
-                    f"ipv4address?network={net_str}&usage=DNS&_return_fields=ip_address,names,network_view", network_view
-                ),
+                "uri": _wapi_uri("DNS records", network, network_view),
                 "parser_types": ("DNS records",),
                 "warning_labels": ("DNS records",),
                 "request_fn": paged_request,
             },
             "range bundle": {
-                "uri": scope_network(
-                    f"range?network={net_str}&_return_fields=network,start_addr,end_addr,member,failover_association,"
-                    "dhcp_utilization,dhcp_utilization_status,dynamic_hosts,static_hosts,total_hosts,network_view",
-                    network_view,
-                ),
-                "parser_types": ("DHCP range", "DHCP failover"),
-                "warning_labels": ("DHCP range", "DHCP failover"),
+                "uri": _wapi_uri("range bundle", network, network_view),
+                "parser_types": range_sections,
+                "warning_labels": range_sections,
                 "request_fn": paged_request,
             },
             "fixed addresses": {
-                "uri": scope_network(
-                    f"fixedaddress?network={net_str}&_return_fields=ipv4addr,mac,name,network_view", network_view
-                ),
+                "uri": _wapi_uri("fixed addresses", network, network_view),
                 "parser_types": ("fixed addresses",),
                 "warning_labels": ("fixed addresses",),
                 "request_fn": paged_request,
@@ -874,10 +978,8 @@ class SubnetRequestModule(BaseModule):
             by_view={view: partitions[view] for view in sorted(partitions)},
         )
 
-    def _display_results(self, ctx: ScriptContext, query_targets: List[QueryTarget], subnet_data_cache: Dict[str, Dict], grouped_by_network: Dict[ipaddress.IPv4Network, List[str]], subnet_warning_cache: Optional[Dict[str, List[str]]] = None) -> None:
+    def _display_results(self, ctx: ScriptContext, query_targets: List[QueryTarget], subnet_data_cache: Dict[str, Dict], grouped_by_network: Dict[Network, List[str]], subnet_warning_cache: Optional[Dict[str, List[str]]] = None) -> None:
         """Handles the logic for displaying summary and/or detailed views in order."""
-        colors = get_global_color_scheme(ctx.cfg)
-        console = ctx.console
         subnet_warning_cache = subnet_warning_cache or {}
 
         # Preserve insertion order so summary and details use the user-provided sequence.
@@ -914,8 +1016,8 @@ class SubnetRequestModule(BaseModule):
     def _build_summary_rows(
         self,
         ctx: ScriptContext,
-        networks: List[ipaddress.IPv4Network],
-        grouped_by_network: Dict[ipaddress.IPv4Network, List[str]],
+        networks: List[Network],
+        grouped_by_network: Dict[Network, List[str]],
         subnet_data_cache: Dict[str, Dict],
         subnet_warning_cache: Dict[str, List[str]],
     ) -> List[Dict[str, str]]:
@@ -969,13 +1071,14 @@ class SubnetRequestModule(BaseModule):
     def _build_cli_sections(
         self,
         ctx: ScriptContext,
-        networks: List[ipaddress.IPv4Network],
-        grouped_by_network: Dict[ipaddress.IPv4Network, List[str]],
+        networks: List[Network],
+        grouped_by_network: Dict[Network, List[str]],
         subnet_data_cache: Dict[str, Dict],
         subnet_warning_cache: Dict[str, List[str]],
         misses: Sequence[str] = (),
         containers: Sequence[Dict[str, Any]] = (),
         fallback_view: str = "",
+        duid: bool = False,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         The sections of a ``cn subnet`` result: ``subnets`` (the summary, then a "No data" row with no
@@ -991,6 +1094,9 @@ class SubnetRequestModule(BaseModule):
         ``fallback_view`` is the requested view (``ViewScope.requested``). A requested view always shows
         the column, even when no network is left to carry it (every input missed), and it is the view a
         miss row names; without one a miss row's view is blank.
+
+        ``duid`` (the run has an IPv6 object) gives every ``fixed addresses`` row a ``DUID`` column, empty for
+        an IPv4 address; without it an IPv4 run has no such column.
         """
         show_view = bool(fallback_view) or any(_view_of(network) for network in networks)
         details: Dict[str, List[Dict[str, Any]]] = {name: [] for name in CLI_DETAIL_SECTIONS}
@@ -1003,6 +1109,8 @@ class SubnetRequestModule(BaseModule):
                 )
 
         no_data = self._build_summary_state({}, [])
+        details["fixed addresses"] = _with_duid(details["fixed addresses"], duid)
+
         miss_rows = [
             {
                 "Original Input(s)": item,
@@ -1036,11 +1144,11 @@ class SubnetRequestModule(BaseModule):
     def _prompt_for_detail_selection(
         self,
         ctx: ScriptContext,
-        networks: List[ipaddress.IPv4Network],
-        grouped_by_network: Dict[ipaddress.IPv4Network, List[str]],
+        networks: List[Network],
+        grouped_by_network: Dict[Network, List[str]],
         subnet_data_cache: Dict[str, Dict],
         subnet_warning_cache: Dict[str, List[str]],
-    ) -> tuple[List[ipaddress.IPv4Network], bool]:
+    ) -> tuple[List[Network], bool]:
         colors = get_global_color_scheme(ctx.cfg)
         summary_rows = self._build_summary_rows(ctx, networks, grouped_by_network, subnet_data_cache, subnet_warning_cache)
         summary_data = [{"#": str(index), **row} for index, row in enumerate(summary_rows, start=1)]
@@ -1069,8 +1177,8 @@ class SubnetRequestModule(BaseModule):
     def _print_selected_subnet_details(
         self,
         ctx: ScriptContext,
-        selected_networks: List[ipaddress.IPv4Network],
-        grouped_by_network: Dict[ipaddress.IPv4Network, List[str]],
+        selected_networks: List[Network],
+        grouped_by_network: Dict[Network, List[str]],
         subnet_data_cache: Dict[str, Dict],
         subnet_warning_cache: Dict[str, List[str]],
     ) -> None:
@@ -1093,7 +1201,7 @@ class SubnetRequestModule(BaseModule):
     def _print_subnet_details(
         self,
         ctx: ScriptContext,
-        network: ipaddress.IPv4Network,
+        network: Network,
         original_inputs: List[str],
         data: Dict[str, Any],
         warnings: List[str],
@@ -1162,7 +1270,9 @@ class SubnetRequestModule(BaseModule):
         Prepares data for saving. The Original Input is only added to the main 'Subnet' row
         for improved report readability. A ``network_view`` is named in the ``Network view`` column of
         every row of the subnet (before ``IP``, so right after ``Original Input``), which keeps a filter
-        on that column from splitting a subnet.
+        on that column from splitting a subnet. A DNS-record or fixed-address row has the mask of its
+        address (``/32``, or ``/128`` for an IPv6 address), and an IPv6 fixed address row also carries
+        its ``DUID`` (the sheet puts that column after ``MAC``).
         """
         data_rows: List[RowDict] = []
         general_info = processed_data.get("general", [{}])[0]
@@ -1208,13 +1318,15 @@ class SubnetRequestModule(BaseModule):
             })
         for rec in dns_records:
             data_rows.append({
-                "IP": rec.get("IP address"), "Mask": "/32",
+                "IP": rec.get("IP address"), "Mask": _host_mask(rec.get("IP address")),
                 "Name": rec.get("A Record"), "Notes": "DNS record"
             })
         for fa in fixed_addrs:
             data_rows.append({
-                "IP": fa.get("IP address"), "Mask": "/32",
-                "Name": fa.get("name"), "MAC": fa.get("MAC"), "Notes": "Fixed IP"
+                "IP": fa.get("IP address"), "Mask": _host_mask(fa.get("IP address")),
+                "Name": fa.get("name"), "MAC": fa.get("MAC"),
+                **({DUID: fa[DUID]} if DUID in fa else {}),  # an IPv6 fixed address; an IPv4 row has no key
+                "Notes": "Fixed IP"
             })
         if network_view:
             data_rows = present_rows(data_rows, NETWORK_VIEW_TITLE, True, fallback=network_view, before="IP")
@@ -1243,10 +1355,20 @@ class SubnetRequestModule(BaseModule):
 
         return list(dict.fromkeys(inherited_fields))
 
-    def _save_subnet_data(self, ctx: ScriptContext, query_targets: List[QueryTarget], all_data_to_save: List[List[RowDict]]) -> None:
+    def _save_subnet_data(
+        self,
+        ctx: ScriptContext,
+        query_targets: List[QueryTarget],
+        all_data_to_save: List[List[RowDict]],
+        duid: bool = False,
+    ) -> None:
         """
         Saves collected data, ensuring no pandas index is added to the output file.
         NOTE: Requires the `queue_save` utility to handle the `index=False` parameter.
+
+        ``duid`` (the run has an IPv6 object, see ``_has_ipv6_object``) puts a ``DUID`` column after ``MAC`` in
+        "Subnet Data Detail", empty for every row that has no identity to show: the column follows the
+        input, not the rows, so a run whose IPv6 object missed still has it next to an IPv4 fixed address.
         """
         # --- Save Summary Sheet ---
         summary_results: List[List[str]] = []
@@ -1277,6 +1399,8 @@ class SubnetRequestModule(BaseModule):
             for row in all_row_dicts:
                 for key in row.keys():
                     discovered_headers[key] = True
+            if duid:
+                base_columns.insert(base_columns.index("MAC") + 1, DUID)  # next to the MAC it stands beside
             if any(NETWORK_VIEW_TITLE in row for row in all_row_dicts):
                 base_columns.insert(1, NETWORK_VIEW_TITLE)  # right after Original Input
             final_columns = list(base_columns)

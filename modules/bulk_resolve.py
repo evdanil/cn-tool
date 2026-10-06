@@ -6,13 +6,17 @@ from core.base import BaseModule, ScriptContext
 from utils.user_input import press_any_key, read_user_input
 from utils.display import console, get_global_color_scheme, print_table_data
 from utils.file_io import queue_save
-from utils.validation import is_fqdn
+from utils.validation import ipv6_form_problem, is_fqdn
+
+# The most addresses an IPv6 prefix may hold: a /112, the same bound as ``ping``. IPv4 subnets are not capped.
+MAX_IPV6_ADDRESSES = 65536
 
 
 class BulkResolveModule(BaseModule):
     """
-    Module to perform a bulk DNS lookup for a list of user-supplied IP addresses,
-    hostnames, and subnets, preserving the user's input order.
+    Module to perform a bulk DNS lookup for a list of user-supplied IPv4 and IPv6 addresses,
+    hostnames, and subnets, preserving the user's input order. An IPv6 prefix is expanded up
+    to a /112; a larger one is refused with a reason.
     """
     @property
     def menu_key(self) -> str:
@@ -65,7 +69,7 @@ class BulkResolveModule(BaseModule):
         console.print(
             "\n"
             f"[{colors['description']}]Enter FQDNs/IPs/Subnets, one per line. Invalid entries are ignored.[/]\n"
-            f"[{colors['warning']}]Subnets will be expanded and every host IP will be resolved.[/]\n"
+            f"[{colors['warning']}]Subnets will be expanded and every host IP will be resolved (IPv6: at most a /112).[/]\n"
             f"[{colors['description']}]Empty input line starts the lookup process.[/]\n"
         )
 
@@ -186,6 +190,12 @@ class BulkResolveModule(BaseModule):
         """
         Parses user input into separate lists for IPs and names, preserving order.
         Checks for IP/Subnet format FIRST, then falls back to FQDN.
+
+        An IPv6 address is one entry (in its compressed form) and an IPv6 prefix of at most a /112
+        expands to its hosts; a larger one is reported as ``<object>: <reason>`` and skipped. So is an
+        IPv4-mapped or zoned IPv6 object (``::ffff:10.20.0.5``, ``2001:db8::5%eth0``), with the reason
+        of ``ipv6_form_problem`` and the form to type instead: it never reaches a lookup.
+        An IPv4 subnet is expanded whatever its size.
         """
         ips_ordered_set = {}
         names_ordered_set = {}
@@ -195,12 +205,19 @@ class BulkResolveModule(BaseModule):
             if not raw_input:
                 break
 
+            # An IPv4-mapped or zoned IPv6 object is refused before anything is parsed or expanded.
+            form_problem = ipv6_form_problem(raw_input)
+            if form_problem:
+                ctx.console.print(f"{raw_input}: {form_problem}", markup=False)
+                continue
+
             # Try to parse as an IP/Subnet FIRST.
             is_ip_or_subnet = False
             try:
                 net = ipaddress.ip_network(raw_input, strict=False)
-                if isinstance(net, ipaddress.IPv6Network):
-                    ctx.console.print('IPv6 subnets are not supported')
+                if isinstance(net, ipaddress.IPv6Network) and net.num_addresses > MAX_IPV6_ADDRESSES:
+                    reason = f"more than {MAX_IPV6_ADDRESSES - 1:,} hosts; resolve at most a /112"
+                    ctx.console.print(f"{raw_input}: {reason}", markup=False)
                     continue
                 # If this succeeds, it's a valid IP/Subnet.
                 is_ip_or_subnet = True

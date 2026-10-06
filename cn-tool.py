@@ -63,7 +63,7 @@ from utils.cli_input import read_objects
 from utils.render import FORMATS, emit
 from utils.config_history import parse_since
 from utils.network_views import parse_view_name
-from utils.validation import is_fqdn, parse_tcp_ports, validate_and_normalize_mac_address
+from utils.validation import ipv6_form_problem, is_fqdn, parse_tcp_ports, validate_and_normalize_mac_address
 from core.background import start_background_tasks
 
 # Fix MAC address emoji issue
@@ -196,7 +196,7 @@ _COMMAND_OPTIONS: tuple[dict[str, Any], ...] = (
 # Registered in one place so a command never needs another edit of main.py; dispatch is by the
 # module's ``cli_name``.
 CLI_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("ip", "IPv4 address: subnet, DNS name, status, MAC (menu 1)"),
+    ("ip", "IPv4/IPv6 address: subnet, DNS name, status (menu 1)"),
     ("subnet", "subnet: DHCP, DNS, fixed IPs, attributes (menu 2)"),
     ("fqdn", "DNS records containing TEXT, 3+ chars (menu 3)"),
     ("site", "subnets of a site code, or a keyword with -k (menu 4)"),
@@ -223,11 +223,14 @@ def _nonempty_text(text: str) -> str:
 #   menu_line  replaces "Same lookup as menu item ..."
 _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
     "ip": {
-        "menu": ("1", "IP Information (IPv4)"),
-        "about": "Infoblox details for IPv4 addresses: subnet, DNS name, status, lease state, record type, MAC and PTR name.",
-        "objects": "IPv4 address, e.g. 10.1.2.3; '-' reads objects from stdin",
+        "menu": ("1", "IP Information"),
+        "about": (
+            "Infoblox details for IPv4 and IPv6 addresses: subnet, DNS name, status, lease state, record type, "
+            "MAC (IPv4), DUID (IPv6) and PTR name."
+        ),
+        "objects": "IPv4 or IPv6 address, e.g. 10.1.2.3 or 2001:db8::5; '-' reads objects from stdin",
         "views": True,
-        "examples": ("cn ip 10.1.2.3 --format md", "cn ip --file ips.txt --format csv > ips.csv"),
+        "examples": ("cn ip 10.1.2.3 2001:db8::5 --format md", "cn ip --file ips.txt --format csv > ips.csv"),
         "found": "data for at least one address",
     },
     "subnet": {
@@ -235,14 +238,17 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
         "about": (
             "Subnet details from Infoblox: general data and extensible attributes, DHCP ranges with "
             "utilisation, options, members and failover, DNS records and fixed addresses. Lists are paged up "
-            "to 10,000 rows per subnet."
+            "to 10,000 rows per subnet. For IPv6 subnets Infoblox reports no DHCP utilisation and no failover, "
+            "so those cells are empty."
         ),
         "objects": (
-            "10.1.2.0/24, 10.1.2.0/255.255.255.0 or 10.1.2.3 (its subnet); a container prefix expands to "
-            "its subnets (child containers are listed, not expanded); '-' reads objects from stdin"
+            "10.1.2.0/24, 10.1.2.0/255.255.255.0, 2001:db8:20::/64, or an address (its subnet); a container "
+            "prefix expands to its subnets (child containers are listed, not expanded); '-' reads objects "
+            "from stdin"
         ),
         "examples": (
             "cn subnet 10.1.2.3 --format md",
+            "cn subnet 2001:db8:20::/64 --format md",
             "cn subnet --file change-4711.txt --report",
             "cn subnet 10.1.2.0/24 --format json | jq -r '.dns_records[].a_record'",
         ),
@@ -281,12 +287,12 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
     "ping": {
         "menu": ("6", "Bulk PING"),
         "about": (
-            "ICMP ping of IPv4 addresses, host names and subnets, and with --tcp a TCP connection test of up "
-            "to 5 ports. A subnet is expanded to its hosts (at most a /16; with --tcp at most 1,024 hosts). "
-            "Every probe gives up after 3 seconds."
+            "ICMP ping of IPv4 and IPv6 addresses, host names and subnets, and with --tcp a TCP connection "
+            "test of up to 5 ports. A subnet is expanded to its hosts (at most a /16, for IPv6 a /112; with "
+            "--tcp at most 1,024 hosts). Every probe gives up after 3 seconds."
         ),
         "menu_line": 'Same check as menu item 6, "Bulk PING".',
-        "objects": "10.1.2.3, a host name, or 10.1.2.0/24; '-' reads objects from stdin",
+        "objects": "10.1.2.3, 2001:db8::5, a host name, or 10.1.2.0/24; '-' reads objects from stdin",
         "options": (
             {
                 "flags": ("--tcp",), "metavar": "PORTS", "type": _arg_type(parse_tcp_ports), "default": None,
@@ -372,6 +378,7 @@ _EPILOG = """\
 examples:
   cn 10.1.2.3                           same as: cn ip 10.1.2.3
   cn 10.1.2.0/24 --format md            paste into a ticket
+  cn 2001:db8::5                        same as: cn ip 2001:db8::5
   cn ip --file ips.txt --format csv > ips.csv
   cn subnet - --format json < scope.txt | jq '.dns_records'
   cn ping web01 --tcp 443               is TCP 443 open?
@@ -489,15 +496,25 @@ _DIGITS_AND_DOTS = re.compile(r"[\d.]+")
 _ADDRESS_LIKE = re.compile(r"[./:]")  # a token with one of these was meant as an address, not as a word
 
 
-def _classify_object(text: str) -> Optional[str]:
-    """What a bare argument is: "subnet", "ip", "mac", "ipv6", "fqdn", or None for anything else."""
+def _is_ip_object(text: str) -> bool:
+    """
+    An IPv4 or IPv6 address or prefix, however spelled.
+
+    An IPv4-mapped or zoned IPv6 spelling counts: the module behind the command refuses it with the
+    form to type instead. Whether ``ipaddress`` keeps a zone ID inside ``ip_network`` depends on
+    the Python version, so those spellings are told by ``ipv6_form_problem``, which reads the zone
+    from the text.
+    """
     try:
-        network = ipaddress.ip_network(text, strict=False)
+        ipaddress.ip_network(text, strict=False)
     except ValueError:
-        pass
-    else:
-        if network.version == 6:
-            return "ipv6"
+        return bool(ipv6_form_problem(text))
+    return True
+
+
+def _classify_object(text: str) -> Optional[str]:
+    """What a bare argument is: "subnet" (a prefix) or "ip" (an address), of either family, "mac", "fqdn", or None."""
+    if _is_ip_object(text):
         return "subnet" if "/" in text else "ip"
     if validate_and_normalize_mac_address(text):
         return "mac"
@@ -507,10 +524,7 @@ def _classify_object(text: str) -> Optional[str]:
     return None
 
 
-_UNSUPPORTED_OBJECTS = {
-    "mac": "is a MAC address; MAC lookups are not supported",
-    "ipv6": "is an IPv6 address; IPv6 lookups are not supported",
-}
+_UNSUPPORTED_OBJECTS = {"mac": "is a MAC address; MAC lookups are not supported"}
 
 
 def _infer_command(argv: list[str]) -> list[str]:
@@ -518,11 +532,12 @@ def _infer_command(argv: list[str]) -> list[str]:
     Insert the command a bare object asks for (``cn 10.1.2.3`` is ``cn ip 10.1.2.3``).
 
     Global options and their values are skipped; the command goes in front of the first other
-    token, so ``cn --format json 10.1.2.3`` works. Every positional is classified (CIDR, IPv4
-    address, MAC, FQDN) and must agree. Words that are not addresses, such as a command name or a
-    typo, are left to argparse; a MAC address, an IPv6 address, a malformed address, mixed
-    object types or an option that another command owns (``cn 10.1.2.3 --tcp 443``: say
-    ``cn ping``) exit with status 2 and a one-line reason.
+    token, so ``cn --format json 10.1.2.3`` works. Every positional is classified (an IPv4 or
+    IPv6 prefix or address, MAC, FQDN) and must agree; the two families mix inside one kind
+    (``cn 10.1.2.3 2001:db8::5`` is ``ip``). Words that are not addresses, such as a command name
+    or a typo, are left to argparse; a MAC address, a malformed address, mixed object types or an
+    option that another command owns (``cn 10.1.2.3 --tcp 443``: say ``cn ping``) exit with status
+    2 and a one-line reason.
     """
     start = 0
     while start < len(argv):
@@ -554,7 +569,7 @@ def _infer_command(argv: list[str]) -> list[str]:
         if kind is None:
             if position == 0 and not _ADDRESS_LIKE.search(token):
                 return list(argv)  # a plain word: argparse accepts a command name and rejects the rest
-            _usage_error(f"'{token}' is not an IPv4 address, network or FQDN")
+            _usage_error(f"'{token}' is not an IP address, network or FQDN")
         if kind in _UNSUPPORTED_OBJECTS:
             _usage_error(f"'{token}' {_UNSUPPORTED_OBJECTS[kind]}")
         kinds.append(kind)

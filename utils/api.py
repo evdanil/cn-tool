@@ -1,16 +1,12 @@
+from __future__ import annotations
+
 import json
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
-
-import requests
-from requests.adapters import HTTPAdapter
-from requests.exceptions import ConnectionError as RequestsConnectionError, HTTPError, RequestException, SSLError, Timeout
-from urllib3.exceptions import InsecureRequestWarning
-from urllib3.util.retry import Retry
 
 from core.base import ScriptContext
 from utils.display import get_global_color_scheme
@@ -22,13 +18,12 @@ from utils.infoblox_safety import (
 from utils.network_views import NETWORK_VIEW, configured_view, scope_network
 from utils.process_data import process_data
 
-
-retries = Retry(
-    total=3,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["HEAD", "GET", "OPTIONS"],
-    backoff_factor=2,
-)
+# requests and urllib3 load on the first Infoblox request, not at start: every other command (ping, diff,
+# doctor without Infoblox, the menu's start) never pays for them. See "Start-up Budget" in
+# docs/ARCHITECTURE.md. The names below are for annotations only.
+if TYPE_CHECKING:
+    import requests
+    from requests.adapters import HTTPAdapter
 
 # WAPI paging: one page holds WAPI_PAGE_SIZE rows and a paged request follows at most
 # WAPI_MAX_PAGES pages, so a paged result never exceeds WAPI_MAX_ROWS rows.
@@ -39,7 +34,9 @@ WAPI_MAX_ROWS = WAPI_PAGE_SIZE * WAPI_MAX_PAGES
 _WAPI_TEXT_LIMIT = 120  # characters of a WAPI error text quoted back to the user
 _DEFAULT_INFOBLOX_MAX_WORKERS = 8
 _MAX_INFOBLOX_MAX_WORKERS = 32
-_adapter_lock = threading.Lock()
+# Guards the pool size, the https adapter and the building of the session. Re-entrant: the session proxy
+# takes it to build, and configure_infoblox_session holds it while it asks the proxy to remount.
+_adapter_lock = threading.RLock()
 _session_pool_size = _DEFAULT_INFOBLOX_MAX_WORKERS
 _inheritance_support_by_endpoint: Dict[str, bool] = {}
 _inheritance_support_lock = threading.Lock()
@@ -70,26 +67,100 @@ def bound_infoblox_workers(ctx_or_cfg: Any, task_count: int) -> int:
 
 
 def _build_http_adapter(pool_size: int) -> HTTPAdapter:
+    """An https adapter with a connection pool of ``pool_size`` that retries idempotent requests on transient errors."""
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    retries = Retry(
+        total=3,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+        backoff_factor=2,
+    )
     return HTTPAdapter(max_retries=retries, pool_connections=pool_size, pool_maxsize=pool_size)
 
 
+def _session_is_built() -> bool:
+    """False while the shared session is still the lazy stand-in that has not built the real one."""
+    return not isinstance(session, _LazySession) or session.built
+
+
 def configure_infoblox_session(ctx_or_cfg: Any) -> int:
-    """Resize the shared requests adapter to the configured Infoblox pool size."""
+    """
+    Size the shared requests adapter to the configured Infoblox pool size.
+
+    It imports nothing: until the first request builds the session, the size is only recorded and the
+    builder uses it; afterwards the https adapter is replaced.
+    """
     global adapter, _session_pool_size
     pool_size = get_infoblox_max_workers(ctx_or_cfg)
     with _adapter_lock:
         if pool_size == _session_pool_size:
             return pool_size
-        adapter = _build_http_adapter(pool_size)
-        session.mount("https://", adapter)
+        if _session_is_built():
+            adapter = _build_http_adapter(pool_size)
+            session.mount("https://", adapter)
         _session_pool_size = pool_size
     return pool_size
 
 
-adapter = _build_http_adapter(_session_pool_size)
-session = requests.Session()
-session.mount("https://", adapter)
-session.headers.update({"Content-Type": "application/json"})
+def _build_session() -> requests.Session:
+    """Create the shared HTTP session, with the https adapter sized for the Infoblox workers."""
+    global adapter
+    import requests
+
+    adapter = _build_http_adapter(_session_pool_size)
+    built = requests.Session()
+    built.mount("https://", adapter)
+    built.headers.update({"Content-Type": "application/json"})
+    return built
+
+
+class _LazySession:
+    """
+    Stands in for the shared ``requests.Session`` until something first touches it.
+
+    Reading, setting or deleting any attribute (``get``, ``auth``, ``mount``, ``headers``) builds the
+    real session once, under ``_adapter_lock``, and passes the access on to it. So ``utils.api.session``
+    stays one patchable module attribute that ``utils.auth`` and the tests use as they always did, while
+    ``requests`` and ``urllib3`` load only when a request, or the credentials for one, need them.
+    """
+
+    def __init__(self, factory: Callable[[], requests.Session]):
+        object.__setattr__(self, "_factory", factory)
+        object.__setattr__(self, "_real", None)
+
+    @property
+    def built(self) -> bool:
+        """Whether the real session exists yet."""
+        return self._real is not None
+
+    def _resolve(self) -> requests.Session:
+        real = self._real
+        if real is None:
+            with _adapter_lock:
+                real = self._real  # another thread may have built it while this one waited
+                if real is None:
+                    real = self._factory()
+                    object.__setattr__(self, "_real", real)
+        return real
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__") and name.endswith("__"):
+            # copy, pickle, inspect and the like ask for these: they must not load the library.
+            raise AttributeError(name)
+        return getattr(self._resolve(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._resolve(), name, value)
+
+    def __delattr__(self, name: str) -> None:
+        delattr(self._resolve(), name)
+
+
+# The https adapter of the session: None until the session is built.
+adapter: Optional[HTTPAdapter] = None
+session = _LazySession(_build_session)
 
 
 @dataclass(frozen=True)
@@ -148,6 +219,8 @@ class NetworkSearchResult:
 
 
 def _build_response(status_code: int, content: bytes = b"", url: str = "") -> requests.Response:
+    import requests
+
     response = requests.Response()
     response.status_code = status_code
     response._content = content
@@ -343,6 +416,17 @@ class InfobloxClient:
                 error_kind=status,
                 full_url_value=full_url,
             )
+
+        # Resolved before the try block, so that its except clauses always have the classes. Nothing above
+        # this line loads requests: a run that stops at the missing credentials never pays for it.
+        from requests.exceptions import (
+            ConnectionError as RequestsConnectionError,
+            HTTPError,
+            RequestException,
+            SSLError,
+            Timeout,
+        )
+        from urllib3.exceptions import InsecureRequestWarning
 
         verify_ssl = bool(ctx.cfg.get("api_verify_ssl", True))
         timeout = int(ctx.cfg.get("api_timeout", 10))

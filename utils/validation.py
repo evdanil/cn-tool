@@ -1,3 +1,4 @@
+import ipaddress
 import re
 from typing import Optional, Tuple
 
@@ -78,6 +79,50 @@ def validate_ip(ip: str) -> bool:
         return True
 
     return False
+
+
+# Two IPv6 spellings Infoblox has no object for. The hint after "use" is the form to type instead
+# and never the object itself, so a reason fits "<object>: <reason>" lines and a line on its own.
+IPV4_MAPPED = "IPv4-mapped IPv6 address; use {ipv4}"
+ZONE_ID = "Infoblox stores no zone ID ({zone}); use {address}"
+
+
+def ipv6_form_problem(text: str, *, zone_ok: bool = False) -> str:
+    """
+    Names the IPv6 spelling of ``text`` that Infoblox cannot look up, with the form to type instead.
+
+    Two spellings are refused: an IPv4-mapped address or prefix (``::ffff:10.20.0.5``, which
+    gives ``IPV4_MAPPED`` with the IPv4 object) and one with a zone ID (``2001:db8::5%eth0``,
+    which gives ``ZONE_ID`` with the object as typed, without its zone). The mapped form is
+    checked first, so ``is_reserved`` (which Python 3.10 and 3.14 answer differently for it) never
+    decides. A caller that works with the zone, such as ``ping``, passes ``zone_ok=True``.
+
+    The zone is found in the text and the rest is parsed without it, so the outcome does not
+    depend on how a Python version treats a scope ID inside ``IPv6Network``.
+
+    @param text: One object as typed: an address or an ``address/length`` prefix.
+    @param zone_ok: True when a zone ID is acceptable to the caller.
+    @return: The reason, or ``""`` for IPv4 text, a plain IPv6 object and malformed text (the
+             caller reports that with its own reason).
+    """
+    bare, has_zone, rest = text.partition("%")
+    zone, slash, length = rest.partition("/")
+    if has_zone and ("/" in bare or not zone or "%" in zone):  # fe80::/64%eth0, 2001:db8::5%, fe80::1%a%b
+        return ""
+    bare_text = bare + ("/" + length if slash else "")
+    try:
+        network = ipaddress.ip_network(bare_text, strict=False)
+    except ValueError:
+        return ""
+    if network.version != 6:
+        return ""
+    mapped = network.network_address.ipv4_mapped
+    if mapped is not None:
+        ipv4 = str(mapped) if network.prefixlen == 128 else f"{mapped}/{network.prefixlen - 96}"
+        return IPV4_MAPPED.format(ipv4=ipv4)
+    if has_zone and not zone_ok:
+        return ZONE_ID.format(zone=f"%{zone}", address=bare_text)
+    return ""
 
 
 def _compile_or_default(pattern: Optional[str], default: str) -> "re.Pattern[str]":

@@ -6,6 +6,7 @@ import functools
 import hashlib
 import ipaddress
 import logging
+import math
 import re
 import queue
 import threading
@@ -290,7 +291,6 @@ def cache_writer(
     # Keep batches configurable to balance throughput and memory.
     BATCH_SIZE = max(1, int(batch_size))
     processed_count = 0
-    last_update_ts = time()
     fatal_error = False
     event_bus = getattr(ctx, "event_bus", None)
     writer_started = perf_counter()
@@ -366,7 +366,7 @@ def cache_writer(
                     # The owner goes first: the error must never be visible without it.
                     ctx.cache.dc.set("indexing_error_run", run_token)
                     ctx.cache.dc.set("indexing_error", f"{err}: {msg}")
-                    ctx.cache.dc.set("indexing_error_time", int(time()))
+                    ctx.cache.dc.set("indexing_error_time", time())  # with its fraction: see _forget_superseded_indexing_error
                     ctx.cache.dc.set("indexing_phase", "error")
                 except Exception:
                     try:
@@ -404,7 +404,6 @@ def cache_writer(
                 ctx.cache.dc.set("indexing_done", int(processed_count))
                 now = time()
                 _heartbeat(ctx.cache, run_token, now)
-                last_update_ts = now
                 if event_bus and not fatal_error:
                     event_bus.publish(
                         "status:update",
@@ -530,6 +529,15 @@ def _forget_superseded_indexing_error(cache: CacheManager, run_token: str) -> bo
     forgotten (never another run's), and ``updated`` is never touched. When the status store cannot say,
     the error stays.
 
+    Both times are kept with their fraction of a second (``time()`` as it is), so that a run which
+    finished later is told from an error recorded earlier in the same whole second, and an error
+    recorded after a success is not taken for older than it. Equal times prove nothing, so the error
+    stays, and so does an error when either time is not finite (+inf is later than every failure time
+    and proves no run succeeded). A whole-second ``updated`` that an older version wrote is the start
+    of its second: it is later than this run's error only when it lies past the second of the error,
+    so it can keep an error but never wrongly forget one. (The error judged here is this run's own,
+    always written with a fraction.)
+
     As in _clear_recorded_indexing_error, the checks and the deletion are one transaction, so that a
     record another run publishes meanwhile is not deleted with this one.
     """
@@ -539,7 +547,10 @@ def _forget_superseded_indexing_error(cache: CacheManager, run_token: str) -> bo
                 return False
             failed_at = cache.dc.get("indexing_error_time")
             updated = cache.dc.get("updated")
-            if failed_at is None or updated is None or int(updated) <= int(failed_at):
+            if failed_at is None or updated is None:
+                return False
+            failed_at, updated = float(failed_at), float(updated)
+            if not (math.isfinite(failed_at) and math.isfinite(updated) and updated > failed_at):
                 return False
             return _delete_indexing_error_records(cache)
     except Exception:
@@ -879,7 +890,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         logger.info("Index Cache - No configuration changes detected.")
         _deregister_run(cache, run_token)
         try:
-            cache.dc.set("updated", int(time()))  # before the error below is judged (see the end of the full run)
+            cache.dc.set("updated", time())  # before the error below is judged (see the end of the full run)
         except Exception:
             pass
         _clear_recorded_indexing_error(ctx, cache)  # a run that failed while this one was checking is over now
@@ -1012,7 +1023,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         logger.info("Index Cache - This run failed, but a later run has succeeded since: its error is obsolete.")
     failed = fatal and not superseded
     if not fatal:
-        cache.dc.set("updated", int(time()))
+        cache.dc.set("updated", time())
         _clear_recorded_indexing_error(ctx, cache)  # a run that failed while this one ran is over now
         if cache.dc.get("version", 0) != ctx.cfg["cache_version"]:
             cache.dc.set("version", ctx.cfg["cache_version"])

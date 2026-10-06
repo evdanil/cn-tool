@@ -17,25 +17,30 @@ from utils.cli_input import read_objects
 from utils.user_input import press_any_key, read_user_input
 from utils.display import console, get_global_color_scheme, print_table_data, table_columns
 from utils.file_io import queue_save
-from utils.validation import is_fqdn, parse_tcp_ports
+from utils.validation import ipv6_form_problem, is_fqdn, parse_tcp_ports
 
 
 BATCH_SIZE = 100  # hosts pinged and probed at once
 TCP_TIMEOUT = 3.0  # seconds a TCP connection attempt may take
-MAX_PING_HOSTS = 65534  # a /16
-MAX_TCP_HOSTS = 1024  # per run, a /22
+MAX_PING_HOSTS = 65534  # a /16; an IPv6 /112 expands to 65,535 hosts and is allowed as well
+MAX_TCP_HOSTS = 1024  # per run, a /22 or an IPv6 /118
 NOT_RUN = "not run"  # the Result of a host whose ICMP check was skipped
+NO_ROUTE = "NO ROUTE"  # the Result of an IPv6 ping from a host with no IPv6 route, or with IPv6 switched off
 
-_NOT_A_TARGET = "not an IPv4 address, network or host name"
-_IPV6 = "IPv6 is not supported"
+_NOT_A_TARGET = "not an IP address, network or host name"
 _TOO_MANY_HOSTS = f"more than {MAX_PING_HOSTS:,} hosts; ping at most a /16"
+_TOO_MANY_HOSTS_V6 = f"more than {MAX_PING_HOSTS + 1:,} hosts; ping at most a /112"
 _TOO_MANY_TCP_HOSTS = f"more than {MAX_TCP_HOSTS:,} hosts with --tcp; test at most a /22"
+_TOO_MANY_TCP_HOSTS_V6 = f"more than {MAX_TCP_HOSTS:,} hosts with --tcp; test at most a /118"
+_LINK_LOCAL = "link-local IPv6 needs an interface: ping one address with %<interface> appended, e.g. %eth0"
 _NO_SUCH_HOST = "no such host"
 _TCP_PROMPT = "TCP ports to test as well, e.g. 22,443 (Enter for ping only): "
 _TCP_SKIPPED = f"TCP test needs at most {MAX_TCP_HOSTS:,} hosts (a /22); pinging only."
 _PING_MISSING = "cn: ping: the 'ping' command is not installed"
 
 _PING_RECEIVED_RE = re.compile(r"(\d+)\s+packets transmitted,\s*(\d+)\s+(?:packets\s+)?received")
+# What iputils prints, with no counts, when an IPv6 ping cannot leave the host: no IPv6 route, or no IPv6 at all.
+_NO_ROUTE_TEXTS = ("Network is unreachable", "Address family not supported")
 _DIGITS_AND_DOTS = re.compile(r"[0-9.]+")  # never a host name, even when it is not an IPv4 address
 
 # (host as typed, address to ping and connect to): a name is resolved once, an address is its own.
@@ -50,8 +55,9 @@ def tcp_probe(address: str, port: int, timeout: float = TCP_TIMEOUT) -> str:
     Try one TCP connection and say how it ended.
 
     @return: ``open`` (connected), ``closed`` (refused or reset; a rejecting firewall looks the
-        same), ``timeout``, ``unreachable`` (no route to the host or network) or ``error`` (any
-        other failure, such as running out of file descriptors).
+        same), ``timeout``, ``unreachable`` (no route to the host or network, or, for an IPv6
+        address, no IPv6 on this host) or ``error`` (any other failure, such as running out of
+        file descriptors).
     """
     try:
         with socket.create_connection((address, port), timeout=timeout):
@@ -61,7 +67,9 @@ def tcp_probe(address: str, port: int, timeout: float = TCP_TIMEOUT) -> str:
     except (TimeoutError, socket.timeout):
         return "timeout"
     except OSError as exc:
-        return "unreachable" if exc.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH) else "error"
+        # EAFNOSUPPORT: the host has IPv6 switched off; it never occurs for an IPv4 address.
+        unreachable = (errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EAFNOSUPPORT)
+        return "unreachable" if exc.errno in unreachable else "error"
 
 
 def _tcp_column(port: int) -> str:
@@ -92,19 +100,51 @@ def _probe_failed(row: Mapping[str, str], tcp_ports: Sequence[int]) -> bool:
     )
 
 
-def _lookup_ipv4(name: str) -> Optional[str]:
-    try:
-        return str(socket.getaddrinfo(name, None, socket.AF_INET)[0][4][0])
-    except (OSError, UnicodeError):  # gaierror, or a name the resolver cannot encode
-        return None
+def _fold_result(hosts: Sequence[str], results_by_host: Mapping[str, Row]) -> str:
+    """What the menu's fold line says: ``NO ROUTE`` when every host it stands for had none, else ``NO RESPONSE``."""
+    no_route = all(results_by_host.get(host, {}).get("Result") == NO_ROUTE for host in hosts)
+    return NO_ROUTE if no_route else "NO RESPONSE"
 
 
-def _is_ipv4(word: str) -> bool:
+def _lookup_address(name: str) -> Optional[str]:
+    """
+    The address to ping for ``name``: its IPv4 address, or, only when it has none, its IPv6 address.
+
+    A dual-stack name is therefore pinged at the same address as before IPv6 was supported, and a
+    name with an AAAA record only is pinged over IPv6. None when neither lookup finds it.
+    """
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            return str(socket.getaddrinfo(name, None, family)[0][4][0])
+        except (OSError, UnicodeError):  # gaierror, or a name the resolver cannot encode
+            continue
+    return None
+
+
+def _is_ip_literal(host: str) -> bool:
+    """An address, never a name: digits and dots (even when no IPv4 address) or an IPv6 spelling (colons)."""
+    return ":" in host or _DIGITS_AND_DOTS.fullmatch(host) is not None
+
+
+def _is_ip(word: str) -> bool:
+    """
+    An address of either family that can be pinged as typed: not a prefix, not an IPv4-mapped
+    IPv6 address, and a link-local IPv6 address only with its interface (``fe80::1%eth0``).
+    """
+    if "/" in word:  # a prefix, or a zone that swallowed one (Python before 3.14 reads fe80::1%eth0/64 as an address)
+        return False
     try:
-        ipaddress.IPv4Address(word)
+        address = ipaddress.ip_address(word)
     except ValueError:
         return False
-    return True
+    if ipv6_form_problem(word, zone_ok=True):
+        return False
+    return "%" in word or not (address.version == 6 and address.is_link_local)
+
+
+def _tcp_limit_reason(text: str) -> str:
+    """Why a line takes the ``--tcp`` run past its host limit; an IPv6 line is told the /118 instead of the /22."""
+    return _TOO_MANY_TCP_HOSTS_V6 if ":" in text else _TOO_MANY_TCP_HOSTS
 
 
 def _typed_lines(ctx: ScriptContext) -> Iterator[str]:
@@ -124,7 +164,10 @@ def _print_rejected(ctx: ScriptContext, target: str, reason: str) -> None:
 class BulkPingModule(BaseModule):
     """
     Module to perform a bulk ping, and optionally a TCP port check, against a list of
-    user-supplied IP addresses, hostnames, and subnets, with smart display logic for large subnets.
+    user-supplied IPv4 and IPv6 addresses, hostnames, and subnets, with smart display logic for
+    large subnets. ``ping`` picks the address family from the address; a host name is pinged at
+    its IPv4 address, or at its IPv6 address when it has no IPv4 one. An IPv6 ping from a host
+    with no IPv6 route (or with IPv6 switched off) reads ``NO ROUTE``, which is not a failure.
     """
     cli_name = "ping"
 
@@ -158,7 +201,7 @@ class BulkPingModule(BaseModule):
         console.print(
             "\n"
             f"[{colors['description']}]Enter IPs/FQDNs/Subnets to ping, one per line.[/]\n"
-            f"[{colors['header']} {colors['bold']}]Example formats[/]: 192.168.0.1, example.com, 192.168.0.0/24\n"
+            f"[{colors['header']} {colors['bold']}]Example formats[/]: 192.168.0.1, 2001:db8::1, example.com, 192.168.0.0/24\n"
             f"[{colors['warning']}]Subnets will be expanded and every host IP will be pinged.[/]\n"
             f"[{colors['description']}]Empty input line starts the ping process.[/]\n"
         )
@@ -210,7 +253,8 @@ class BulkPingModule(BaseModule):
         ``Result`` and a ``TCP <port>`` column for each port, in the order given) and ``not_found``
         (``object``/``reason`` for each target that cannot be used or whose name does not resolve);
         both keys are always present. Exit status: 0 when a host answered ICMP (with ``--tcp``: a
-        port was open), 1 when none did, 2 for an unusable target, 3 when a probe could not run.
+        port was open), 1 when none did (an IPv6 target the host has no route to, ``NO ROUTE``,
+        is no answer and no failure), 2 for an unusable target, 3 when a probe could not run.
         Never prompts.
         """
         ctx.logger.info("Request Type - Bulk PING (command line)")
@@ -302,7 +346,7 @@ class BulkPingModule(BaseModule):
             input_type, hosts, reason = self._parse_target(text)
             new_hosts = [host for host in dict.fromkeys(hosts) if host not in seen]
             if reason is None and host_limit is not None and len(all_hosts) + len(new_hosts) > host_limit:
-                reason = _TOO_MANY_TCP_HOSTS
+                reason = _tcp_limit_reason(text)
             if reason:
                 reject(text, reason)
                 continue
@@ -319,26 +363,36 @@ class BulkPingModule(BaseModule):
         """
         Classify one target line and expand it.
 
-        Tried in order: an IPv4 address or network; digits and dots that are not IPv4 (rejected,
-        although they would pass for a host name); a host name; a comma/space list of addresses.
-        A single address, bare or /32, is used as given; only a subnet loses its loopback,
-        multicast and reserved addresses.
+        Tried in order: an IPv4-mapped IPv6 address or network (refused, with the IPv4 form to
+        use); an IPv4 or IPv6 address or network; digits and dots that are not IPv4 (rejected,
+        although they would pass for a host name); a host name; a comma/space list of addresses
+        (a single one with a zone ID, ``fe80::1%eth0``, is such a list). A single address, bare
+        or /32 or /128, is used as given; only a subnet loses its loopback, multicast and reserved
+        addresses. An IPv4 subnet may hold up to a /16, an IPv6 one up to a /112. A link-local
+        IPv6 address or prefix needs an interface, which only a single address can carry, so the
+        others are refused; a zone ID is used as typed.
 
         Returns:
             (input_type, hosts, reason): ``reason`` is None when the line is usable, otherwise
             ``hosts`` is empty and ``reason`` says why, without repeating the line.
         """
+        mapped = ipv6_form_problem(text, zone_ok=True)
+        if mapped:
+            return "single", [], mapped
+
         try:
-            network = ipaddress.ip_network(text, strict=False)
+            # A zone ID is never parsed as part of a network: Python releases differ on what that gives.
+            network = None if "%" in text else ipaddress.ip_network(text, strict=False)
         except ValueError:
-            pass
-        else:
-            if isinstance(network, ipaddress.IPv6Network):
-                return "single", [], _IPV6
+            network = None
+        if network is not None:
+            ipv6 = network.version == 6
+            if ipv6 and network.network_address.is_link_local:
+                return ("single" if network.num_addresses == 1 else "subnet"), [], _LINK_LOCAL
             if network.num_addresses == 1:
                 return "single", [str(network.network_address)], None
-            if network.num_addresses > MAX_PING_HOSTS + 2:  # network and broadcast address
-                return "subnet", [], _TOO_MANY_HOSTS
+            if network.num_addresses > MAX_PING_HOSTS + 2:  # network and broadcast address; a /112 is as many
+                return "subnet", [], _TOO_MANY_HOSTS_V6 if ipv6 else _TOO_MANY_HOSTS
             usable = [str(ip) for ip in network.hosts() if not (ip.is_loopback or ip.is_multicast or ip.is_reserved)]
             return "subnet", usable, None
 
@@ -347,14 +401,15 @@ class BulkPingModule(BaseModule):
         if is_fqdn(text):
             return "single", [text], None
 
-        addresses = [word for word in text.replace(",", " ").split() if _is_ipv4(word)]
+        addresses = [word for word in text.replace(",", " ").split() if _is_ip(word)]
         if not addresses:
             return "single", [], _NOT_A_TARGET
         return ("list" if len(addresses) > 1 else "single"), addresses, None
 
     def _resolve(self, names: List[str]) -> Tuple[Dict[str, str], List[str]]:
         """
-        Resolve host names to IPv4 addresses, each name once, in a pool of at most a batch of workers.
+        Resolve host names to addresses, each name once, in a pool of at most a batch of workers.
+        A name gets its IPv4 address; only a name with none gets its IPv6 address (``_lookup_address``).
 
         Returns:
             (name -> address for the names that resolve, the names that do not, in input order)
@@ -362,13 +417,13 @@ class BulkPingModule(BaseModule):
         if not names:
             return {}, []
         with ThreadPoolExecutor(max_workers=min(BATCH_SIZE, len(names))) as pool:
-            answers = list(pool.map(_lookup_ipv4, names))
+            answers = list(pool.map(_lookup_address, names))
         addresses = {name: address for name, address in zip(names, answers) if address}
         return addresses, [name for name, address in zip(names, answers) if not address]
 
     def _address_targets(self, hosts: List[str]) -> Tuple[List[Target], List[str]]:
         """Pair every host with the address to test: its own, or the one its name resolves to."""
-        addresses, unresolvable = self._resolve([host for host in hosts if not _DIGITS_AND_DOTS.fullmatch(host)])
+        addresses, unresolvable = self._resolve([host for host in hosts if not _is_ip_literal(host)])
         gone = set(unresolvable)
         return [(host, addresses.get(host, host)) for host in hosts if host not in gone], unresolvable
 
@@ -431,10 +486,11 @@ class BulkPingModule(BaseModule):
                 }
                 outcomes = {key: probe.result() for key, probe in probes.items()}
 
+        address_of = dict(batch)
         statuses: Dict[str, str] = {}
         for host, proc in processes.items():
             output, _ = proc.communicate()
-            statuses[host] = self._classify_ping_result(proc.returncode, output)
+            statuses[host] = self._classify_ping_result(proc.returncode, output, ipv6=":" in address_of[host])
 
         # Without ICMP there is no process, so no status: the check was not run.
         return [_row(host, address, statuses.get(host, NOT_RUN), tcp_ports, outcomes) for host, address in batch]
@@ -445,7 +501,8 @@ class BulkPingModule(BaseModule):
         """
         The rows for the screen: every host of a single address, a list or a small subnet; for a
         large subnet only the hosts that answered (ICMP reply, or a TCP port open or closed), then
-        one line for the rest.
+        one line for the rest. That line reads ``NO ROUTE`` when every host it stands for had no
+        route (an IPv6 subnet pinged from a host without IPv6), else ``NO RESPONSE``.
         """
         results_by_host = {item['Host']: item for item in results}
         display_data: List[Row] = []
@@ -468,14 +525,15 @@ class BulkPingModule(BaseModule):
                 display_data.extend(responsive)
 
                 # Then, add a single summary line for all the non-responsive hosts.
-                num_failures = len(hosts_in_item) - len(responsive)
-                if num_failures > 0:
-                    summary = f"(... and {num_failures} other hosts in {original_value})"
-                    display_data.append(_row(summary, "", "NO RESPONSE", tcp_ports))
+                answered = {row["Host"] for row in responsive}
+                silent = [host for host in hosts_in_item if host not in answered]
+                if silent:
+                    summary = f"(... and {len(silent)} other hosts in {original_value})"
+                    display_data.append(_row(summary, "", _fold_result(silent, results_by_host), tcp_ports))
             else:
                 # If there were ZERO responsive hosts, just show one summary line for the whole subnet.
                 summary = f"All {len(hosts_in_item)} hosts in {original_value}"
-                display_data.append(_row(summary, "", "NO RESPONSE", tcp_ports))
+                display_data.append(_row(summary, "", _fold_result(hosts_in_item, results_by_host), tcp_ports))
 
         return display_data
 
@@ -486,8 +544,14 @@ class BulkPingModule(BaseModule):
             save_data_lol = [[row.get(column, '') for column in columns] for row in rows]
             queue_save(ctx, columns, save_data_lol, sheet_name="Bulk PING", index=False, force_header=True)
 
-    def _classify_ping_result(self, returncode: Optional[int], output: str) -> str:
-        """Classify ping results, keeping any reply as success while reporting probe loss."""
+    def _classify_ping_result(self, returncode: Optional[int], output: str, *, ipv6: bool = False) -> str:
+        """
+        Classify ping results, keeping any reply as success while reporting probe loss.
+
+        An IPv6 ping that printed no counts but says ``Network is unreachable`` or ``Address family
+        not supported`` never left this host: it is ``NO ROUTE``, neither an answer nor a failure.
+        An IPv4 ping with the same output stays ``ERROR``.
+        """
         counts = self._extract_ping_counts(output)
         if counts is not None:
             transmitted, received = counts
@@ -497,6 +561,8 @@ class BulkPingModule(BaseModule):
                 return f"OK ({received}/{transmitted} replies)"
             return "NO RESPONSE"
 
+        if ipv6 and any(text in str(output or "") for text in _NO_ROUTE_TEXTS):
+            return NO_ROUTE
         if returncode == 0:
             return "OK"
         if returncode == 1:

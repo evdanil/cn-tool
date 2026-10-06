@@ -1,8 +1,19 @@
 from pathlib import Path
 from typing import Dict, Optional, Any
 import logging
+import math
 
 from .config import parse_cache_pages, parse_size
+
+
+def whole_seconds(stamp: Any) -> Any:
+    """A time from the status store as whole seconds, the way it is shown.
+
+    The store keeps the ``updated`` time with its fraction of a second (older versions wrote whole
+    seconds); what is displayed or reported has always been whole seconds. Anything that is not a
+    finite float (a whole number, None, text) comes back as it is.
+    """
+    return int(stamp) if isinstance(stamp, float) and math.isfinite(stamp) else stamp
 
 
 class CacheManager:
@@ -78,7 +89,7 @@ class CacheManager:
         self.logger.info(
             f"Cache Stats ({event}) - "
             f"Version: {self.dc.get('version')}, "
-            f"Updated: {self.dc.get('updated', 0)}, "
+            f"Updated: {whole_seconds(self.dc.get('updated', 0))}, "
             f"Devices: {len(self.dev_idx)}, "
             f"IPs: {len(self.ip_idx)}, "
             f"Words: {len(self.kw_idx)}, "
