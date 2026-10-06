@@ -114,7 +114,7 @@ def _wait_for_indexing_and_recheck(ctx: ScriptContext) -> None:
             if cache.dc.get("indexing_error"):
                 logger.error("Index Cache - External indexing signaled an error. Rechecking will not start automatically.")
                 cache.dc.pop("indexing", None)
-                break
+                return
             if not cache.dc.get("indexing"):
                 logger.info("Index Cache - External indexing finished (flag cleared). Rechecking.")
                 break

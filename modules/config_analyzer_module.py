@@ -1,20 +1,85 @@
+import argparse
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 
-from core.base import BaseModule, ScriptContext
+from rich.markup import escape
+
+from core.base import BaseModule, CliResult, ScriptContext, cli_exit_code
+from utils.cli_input import read_objects
+from utils.config import RepoRoots, resolve_config_repo_roots
+from utils.config_history import Since, Window, changed_lines, format_time, select_window, since_label
 from utils.display import get_global_color_scheme
-from utils.file_io import check_dir_accessibility
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def resolve_repo_roots(ctx: ScriptContext) -> RepoRoots:
+    """The configuration repositories ``cn diff``, the repository browser and ``cn doctor`` use (see ``resolve_config_repo_roots``)."""
+    return resolve_config_repo_roots(ctx.cfg, ctx.logger)
+
+
+def configured_repo_roots(ctx: ScriptContext) -> Tuple[List[Tuple[Path, str]], List[Path]]:
+    """``((root, label), ...)`` for the accessible configuration repositories and the inaccessible ones (see ``resolve_repo_roots``)."""
+    roots = resolve_repo_roots(ctx)
+    return roots.accessible, roots.inaccessible
+
+
+def _report_missing_dependency(ctx: ScriptContext, exc: ImportError) -> None:
+    """Tell (and log) that the optional config_analyzer package or one of its dependencies is missing."""
+    colors = get_global_color_scheme(ctx.cfg)
+    ctx.console.print(
+        f"[{colors['warning']}]Config Analyzer code or dependencies missing.[/]\n"
+        f"[{colors['description']}]Install dependencies:[/] pip install textual python-dateutil\n"
+        f"[{colors['error']}]Details:[/] {escape(str(exc))}"
+    )
+    ctx.logger.exception("Config Analyzer import failed")
+
+
+def _unreadable(cfg_path: str, history: Optional[str]) -> List[str]:
+    """What of a device's current config, history folder and snapshots exists but cannot be read."""
+    paths = [cfg_path]
+    if history:
+        try:
+            names = sorted(os.listdir(history))
+            paths.extend(os.path.join(history, name) for name in names if name.lower().endswith(".cfg"))
+        except OSError:
+            return [history]
+    return [path for path in paths if not os.access(path, os.R_OK)]
+
+
+def _mentions(window: Window, text: str) -> bool:
+    """Whether any line of any snapshot in ``window`` contains ``text`` (any case)."""
+    needle = text.lower()
+    return any(needle in line.lower() for step in window.steps for line in step.content_body.splitlines())
+
+
+def _unchanged_reason(window: Window, since: Optional[Since], text: Optional[str]) -> str:
+    """Why a compared window has no rows to show."""
+    name, when = window.start.original_filename, format_time(window.start.timestamp)
+    if text is None:
+        return f"no change since {name} ({when})"
+    if not _mentions(window, text):
+        return f"no line contains '{text}'"
+    if since is not None:
+        return f"'{text}' is unchanged since {name} ({when}); widen --since"
+    return f"'{text}' is unchanged in the whole history (since {name}, {when})"
 
 
 class ConfigAnalyzerModule(BaseModule):
     """
-    Integrates the external Config Analyzer TUI (in external/config-analyzer)
+    Integrates the Config Analyzer TUI (the ``config_analyzer`` package, one ``ConfigAnalyzerApp``)
     to browse the configuration repository and diff device snapshots.
 
     Appears in the Info menu under key 'c'. Visibility is gated by
-    'config_repo_enabled'.
+    'config_analyzer_enabled', which follows the directories the module reads (``resolve_repo_roots``),
+    not ``[config_repo] directory`` alone. ``cn diff`` (``run_cli``) answers "what changed, and who changed it"
+    from the same snapshots, without the TUI.
     """
+    cli_name = "diff"
 
     @property
     def menu_key(self) -> str:
@@ -27,82 +92,23 @@ class ConfigAnalyzerModule(BaseModule):
 
     @property
     def visibility_config_key(self) -> Optional[str]:
-        return "config_repo_enabled"
+        return "config_analyzer_enabled"
 
     def run(self, ctx: ScriptContext) -> None:
         colors = get_global_color_scheme(ctx.cfg)
         logger = ctx.logger
 
         # Pre-flight: gather repository paths (multi-root aware)
-        def _coerce_repo_inputs(value) -> List[Path]:
-            if not value:
-                return []
-            if isinstance(value, (list, tuple, set)):
-                items = list(value)
-            else:
-                items = [value]
-
-            paths: List[Path] = []
-            for item in items:
-                if item is None:
-                    continue
-                if isinstance(item, Path):
-                    candidates = [item]
-                else:
-                    text = str(item)
-                    if not text:
-                        continue
-                    fragments = [frag.strip() for frag in text.split(',')] if ',' in text else [text.strip()]
-                    candidates = [Path(fragment).expanduser() for fragment in fragments if fragment]
-                for candidate in candidates:
-                    try:
-                        resolved = candidate.expanduser().resolve(strict=False)
-                    except Exception:
-                        resolved = candidate.expanduser()
-                    paths.append(resolved)
-            return paths
-
-        repo_candidates: List[Path] = []
-        repo_candidates.extend(_coerce_repo_inputs(ctx.cfg.get("config_analyzer_repo_directories")))
-        if not repo_candidates:
-            repo_candidates.extend(_coerce_repo_inputs(ctx.cfg.get("config_analyzer_repo_directory")))
-        if not repo_candidates:
-            repo_candidates.extend(_coerce_repo_inputs(ctx.cfg.get("config_repo_directory")))
-
-        seen: set[str] = set()
-        repo_roots: List[Path] = []
-        for candidate in repo_candidates:
-            key = candidate.as_posix()
-            if key in seen:
-                continue
-            if check_dir_accessibility(logger, candidate):
-                repo_roots.append(candidate)
-                seen.add(key)
-            else:
-                ctx.console.print(
-                    f"[{colors['warning']}]Configuration repository directory is not accessible: {candidate}[/]"
-                )
-
-        if not repo_roots:
+        roots, inaccessible = configured_repo_roots(ctx)
+        for path in inaccessible:
+            ctx.console.print(f"[{colors['warning']}]Configuration repository directory is not accessible: {path}[/]")
+        if not roots:
             ctx.console.print(f"[{colors['error']}]No accessible configuration repository directories found.[/]")
             return
 
-        def _normalize_repo_names(value) -> List[str]:
-            if isinstance(value, (list, tuple)):
-                return [str(item).strip() for item in value]
-            if isinstance(value, str):
-                return [segment.strip() for segment in value.split(',')]
-            return []
-
-        repo_name_candidates = _normalize_repo_names(ctx.cfg.get("config_analyzer_repo_names"))
-        repo_label_overrides: List[str] = []
-        for idx, _root in enumerate(repo_roots):
-            label = repo_name_candidates[idx] if idx < len(repo_name_candidates) else ""
-            repo_label_overrides.append(label)
-
         # Read optional settings
-        history_dir = ctx.cfg.get("config_repo_history_dir", "history")
-        layout_pref = ctx.cfg.get("config_analyzer_layout", "right")
+        history_dir = str(ctx.cfg.get("config_repo_history_dir", "history"))
+        layout = ctx.cfg.get("config_analyzer_layout", "right")
         scroll_to_end = bool(ctx.cfg.get("config_analyzer_scroll_to_end", False))
         debug = bool(ctx.cfg.get("config_analyzer_debug", False))
 
@@ -110,141 +116,139 @@ class ConfigAnalyzerModule(BaseModule):
             os.environ["CONFIG_ANALYZER_DEBUG"] = "1"
 
         try:
-            # Lazy imports to keep this optional
-            from config_analyzer.repo_browser import RepoBrowserApp
-            from config_analyzer.tui import CommitSelectorApp
-            from config_analyzer.utils import find_device_history, collect_snapshots
+            # Lazy import to keep this optional
+            from config_analyzer.app import ConfigAnalyzerApp
         except ImportError as e:
-            ctx.console.print(
-                f"[{colors['warning']}]Config Analyzer code or dependencies missing.[/]\n"
-                f"[{colors['description']}]Install dependencies:[/] pip install textual python-dateutil\n"
-                f"[{colors['error']}]Details:[/] {e}"
-            )
-            logger.exception("Config Analyzer import failed")
+            _report_missing_dependency(ctx, e)
             return
 
-        history_dir = str(history_dir)
-        history_dir_l = history_dir.lower()
-
-        repo_root_strings = [str(path) for path in repo_roots]
-
-        def _resolve_repo_root(path: Optional[str]) -> Optional[Path]:
-            if not path:
-                return None
-            try:
-                abs_path = Path(path).expanduser().resolve(strict=False)
-            except Exception:
-                return None
-            for root in repo_roots:
-                try:
-                    abs_path.relative_to(root)
-                    return root
-                except ValueError:
-                    continue
-            return None
-
-        def _locate_device_config(device_name: str) -> tuple[Optional[str], Optional[Path]]:
-            target = f"{device_name}.cfg"
-            for repo_root in repo_roots:
-                for walk_root, dirs, files in os.walk(str(repo_root)):
-                    dirs[:] = [d for d in dirs if d.lower() != history_dir_l]
-                    if target in files:
-                        return os.path.join(walk_root, target), repo_root
-            return None, None
-
-        # Main navigation loop: browse devices, then view snapshots/diff
-        selected_cfg_path: Optional[str] = None
-        device: Optional[str] = None
-        selected_repo_root: Optional[Path] = None
+        # One App hosts the browser and the snapshot view; it returns when the user quits.
         try:
-            while True:
-                if not device:
-                    try:
-                        ctx.console.clear()
-                    except Exception:
-                        pass
-                    browser = RepoBrowserApp(
-                        repo_root_strings,
-                        scroll_to_end=scroll_to_end,
-                        start_path=selected_cfg_path,
-                        start_layout=layout_pref,
-                        history_dir=history_dir,
-                        repo_names=repo_label_overrides,
-                    )
-                    browser.run()
-                    if not getattr(browser, "selected_device_name", None):
-                        return
-                    device = browser.selected_device_name
-                    selected_cfg_path = getattr(browser, "selected_device_cfg_path", None)
-                    repo_hint = getattr(browser, "selected_repo_root", None)
-                    if repo_hint:
-                        try:
-                            selected_repo_root = Path(str(repo_hint)).expanduser().resolve(strict=False)
-                        except Exception:
-                            selected_repo_root = _resolve_repo_root(repo_hint)
-                    else:
-                        selected_repo_root = _resolve_repo_root(selected_cfg_path)
-                    layout_pref = getattr(browser, "layout", layout_pref)
-
-                repo_root_for_device = selected_repo_root or _resolve_repo_root(selected_cfg_path)
-                if not repo_root_for_device:
-                    selected_cfg_path, repo_root_for_device = _locate_device_config(device)
-                    if selected_cfg_path:
-                        selected_repo_root = repo_root_for_device
-                if not repo_root_for_device:
-                    ctx.console.print(
-                        f"[{colors['error']}]Unable to locate configuration repository for device '{device}'.[/]"
-                    )
-                    return
-
-                repo_root_str = str(repo_root_for_device)
-
-                device_history_path = find_device_history(repo_root_str, device, selected_cfg_path, history_dir)
-                if not device_history_path:
-                    ctx.console.print(
-                        f"[{colors['warning']}]No history folder found for device '{device}'.[/]"
-                    )
-
-                # Find current config (outside history)
-                current_config_path = selected_cfg_path
-                if not current_config_path:
-                    for root, dirs, files in os.walk(repo_root_str):
-                        dirs[:] = [d for d in dirs if d.lower() != history_dir_l]
-                        if f"{device}.cfg" in files:
-                            current_config_path = os.path.join(root, f"{device}.cfg")
-                            break
-
-                # Collect, parse, order snapshots (dedupes Current if identical to latest)
-                snapshots = collect_snapshots(repo_root_str, device, selected_cfg_path, history_dir)
-
-                if not snapshots:
-                    ctx.console.print(
-                        f"[{colors['warning']}]No snapshots or current config found for device '{device}'.[/]"
-                    )
-                    return
-
-                try:
-                    try:
-                        ctx.console.clear()
-                    except Exception:
-                        pass
-                    app = CommitSelectorApp(
-                        snapshots_data=snapshots,
-                        scroll_to_end=scroll_to_end,
-                        layout=layout_pref,
-                    )
-                    app.run()
-                except Exception as e:
-                    ctx.console.print(f"[{colors['error']}]TUI error:[/] {e}")
-                    return
-
-                layout_pref = getattr(app, "layout", layout_pref)
-                if getattr(app, "navigate_back", False):
-                    device = None
-                    selected_cfg_path = current_config_path
-                    selected_repo_root = repo_root_for_device if current_config_path else selected_repo_root
-                    continue
-                break
+            ConfigAnalyzerApp(
+                [str(root) for root, _label in roots],
+                repo_names=[label for _root, label in roots],
+                history_dir=history_dir,
+                layout=layout,
+                scroll_to_end=scroll_to_end,
+            ).run()
         except Exception:
             logger.exception("Config Analyzer module failed")
             ctx.console.print(f"[{colors['error']}]Unexpected error in Config Analyzer module.[/]")
+
+    def run_cli(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
+        """
+        ``cn diff DEVICE... [--since WHEN] [--line TEXT]``: the configuration lines added or removed
+        on each device between two of its snapshots, each attributed to the snapshot that made the change.
+
+        Without ``--since`` the window is the last change (the previous snapshot to the newest);
+        with ``--since`` it starts at the newest snapshot at or before WHEN; with ``--line`` and no
+        ``--since`` it starts at the oldest. See ``utils.config_history`` for the rules.
+
+        Sections (every key is always present): ``compared`` (``device``, ``from_snapshot``,
+        ``from_time``, ``to_snapshot``, ``to_time``, ``steps``), ``changes`` (``device``, ``change``,
+        ``parent``, ``line``, ``snapshot``, ``author``, ``time``), ``not_found`` (``object``,
+        ``reason``: a device without a cfg file, with nothing to compare or without a change) and
+        ``warnings`` (``object``, ``warning``: a repository or file that could not be read, or a
+        ``--since`` before the history). Never prompts.
+
+        Exit status: 0 with at least one row in ``changes``, 1 without (see ``not_found``), 2 for
+        unusable input or setup, 3 when a repository, history folder or snapshot could not be read.
+        """
+        ctx.logger.info("Request Type - Config Diff (command line)")
+        since: Optional[Since] = args.since
+        text: Optional[str] = args.line
+
+        try:
+            devices = read_objects(args.objects, args.file)
+        except OSError as exc:
+            ctx.console.print(f"Cannot read the list of devices: {exc}", markup=False)
+            return CliResult(2, {})
+        if not devices:
+            ctx.console.print("Give at least one device name, or a --file listing them.", markup=False)
+            return CliResult(2, {})
+
+        try:
+            from config_analyzer.utils import collect_snapshots, find_device_history, locate_device_config
+        except ImportError as exc:
+            _report_missing_dependency(ctx, exc)
+            return CliResult(2, {})
+
+        roots, inaccessible = configured_repo_roots(ctx)
+        if not roots and not inaccessible:
+            ctx.console.print(
+                "No configuration repository directory is configured: "
+                "set [config_analyzer] repo_directories or [config_repo] directory.",
+                markup=False,
+            )
+            return CliResult(2, {})
+
+        history_dir = str(ctx.cfg.get("config_repo_history_dir", "history"))
+        root_paths = [root for root, _label in roots]
+        now = _utcnow()
+        compared: List[Dict[str, Any]] = []
+        changes: List[Dict[str, Any]] = []
+        not_found: List[Dict[str, str]] = []
+        warnings = [
+            {"object": str(path), "warning": f"{path}: configuration repository not accessible"}
+            for path in inaccessible
+        ]
+        failed = bool(inaccessible)
+
+        for device in sorted(devices):
+            cfg_path, root = locate_device_config(root_paths, device, history_dir)
+            if cfg_path is None:
+                not_found.append({"object": device, "reason": f"no {device}.cfg in the configuration repositories"})
+                continue
+
+            # A snapshot that cannot be read is dropped by collect_snapshots and would shift the attribution.
+            unreadable = _unreadable(cfg_path, find_device_history(root, device, cfg_path, history_dir))
+            if unreadable:
+                failed = True
+                warnings.extend({"object": device, "warning": f"{path}: not readable"} for path in unreadable)
+                continue
+
+            snapshots = collect_snapshots(root, device, cfg_path, history_dir)
+            if not snapshots:
+                not_found.append({"object": device, "reason": f"no snapshots of {device}"})
+                continue
+            if len(snapshots) == 1:
+                reason = f"only one snapshot ({snapshots[0].original_filename}); nothing to compare"
+                not_found.append({"object": device, "reason": reason})
+                continue
+
+            try:
+                window = select_window(snapshots, since, now, whole_history=since is None and text is not None)
+            except ValueError as exc:
+                not_found.append({"object": device, "reason": str(exc)})
+                continue
+            if window.warning:
+                warnings.append({"object": device, "warning": window.warning})
+            if since is not None and len(window.steps) == 1:  # WHEN is not before the newest snapshot
+                newest = window.end
+                reason = (
+                    f"no change since {since_label(since, now)}: the newest snapshot is "
+                    f"{newest.original_filename} ({format_time(newest.timestamp)})"
+                )
+                not_found.append({"object": device, "reason": reason})
+                continue
+
+            compared.append(
+                {
+                    "device": device,
+                    "from_snapshot": window.start.original_filename,
+                    "from_time": format_time(window.start.timestamp),
+                    "to_snapshot": window.end.original_filename,
+                    "to_time": format_time(window.end.timestamp),
+                    "steps": len(window.steps) - 1,
+                }
+            )
+            rows = changed_lines(window)
+            if text is not None:
+                rows = [row for row in rows if text.lower() in row["line"].lower()]
+            if rows:
+                changes.extend({"device": device, **row} for row in rows)
+            else:
+                not_found.append({"object": device, "reason": _unchanged_reason(window, since, text)})
+
+        data = {"compared": compared, "changes": changes, "not_found": not_found, "warnings": warnings}
+        return CliResult(cli_exit_code(found=bool(changes), invalid=False, failed=failed), data)

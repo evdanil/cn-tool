@@ -16,10 +16,15 @@ class Snapshot(NamedTuple):
 
 # Pre-compiled regexes for efficiency.
 _CHANGE_CISCO_RE = re.compile(r"^\!\s*Last configuration change at\s*(.*?)\s*by\s*(\S+)\s*$", re.MULTILINE)
-_AUTHOR_HEADER_RE = re.compile(r"^(?:[#;!%\s]*)(?:Last\s*Updated\s*By|Updated-?by|Author|Owner|User(?:name)?|Changed-?by)\s*[:=-]\s*(.+)$", re.IGNORECASE)
-_DATE_HEADER_RE = re.compile(r"^(?:[#;!%\s]*)(?:Last\s*Updated|Updated|Date|Timestamp)\s*[:=-]\s*(.+)$", re.IGNORECASE)
+_AUTHOR_HEADER_RE = re.compile(r"^(?:[#;!%\s]*)(?:Last\s*Updated\s*By|Updated-?by|Author|Owner|User(?:name)?|Changed-?by)\s*[:=-][ \t]*(\S.*)$", re.IGNORECASE | re.MULTILINE)
+_DATE_HEADER_RE = re.compile(r"^(?:[#;!%\s]*)(?:Last\s*Updated|Updated|Date|Timestamp)\s*[:=-][ \t]*(\S.*)$", re.IGNORECASE | re.MULTILINE)
 _FILENAME_DATE_RE = re.compile(r"(\d{4}[-_]?\d{2}[-_]?\d{2}[ T_]?\d{2}[:-]?\d{2}(?:[:-]?\d{2})?)")
-_FILENAME_USER_RE = re.compile(r"(?:user[-_])([A-Za-z0-9._-]+)|(?:^|__)by[-_]?([A-Za-z0-9._-]+)", re.IGNORECASE)
+# The author hint is lazy and ends before a date suffix, a "__" separator, ".cfg" or the end of the name.
+_AUTHOR_END = r"(?=[_-]\d{4}[-_]?\d{2}[-_]?\d{2}|__|\.cfg|$)"
+_FILENAME_USER_RE = re.compile(
+    r"(?:user[-_])([A-Za-z0-9._-]+?)" + _AUTHOR_END + r"|(?:^|__)by[-_]?([A-Za-z0-9._-]+?)" + _AUTHOR_END,
+    re.IGNORECASE,
+)
 
 _log = get_logger("parser")
 

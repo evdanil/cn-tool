@@ -14,17 +14,28 @@ if TYPE_CHECKING:
 _log = get_logger("diff")
 
 
+def _terminated_lines(body: str) -> List[str]:
+    """Split ``body`` into lines that keep their own endings, ending the last one too.
+
+    ``unified_diff`` joins an unterminated line to whatever follows it, so the last line
+    needs a newline of its own.
+    """
+    lines = body.splitlines(keepends=True)
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] += "\n"
+    return lines
+
+
 def get_diff(snapshot1: "Snapshot", snapshot2: "Snapshot") -> Syntax:
     """Return a unified diff renderable without line wrapping."""
 
-    lines1 = snapshot1.content_body.splitlines(keepends=True)
-    lines2 = snapshot2.content_body.splitlines(keepends=True)
+    lines1 = _terminated_lines(snapshot1.content_body)
+    lines2 = _terminated_lines(snapshot2.content_body)
     diff_lines = difflib.unified_diff(
         lines1,
         lines2,
         fromfile=snapshot1.original_filename,
         tofile=snapshot2.original_filename,
-        lineterm="",
     )
     diff_text = "".join(diff_lines)
     _log.debug(

@@ -6,7 +6,7 @@ from string import printable
 from typing import Optional, Set, Tuple
 
 
-_HEX_TEXT_RE = re.compile(r"^(?:0x)?[0-9A-Fa-f][0-9A-Fa-f\s:.-]*$")
+_HEX_TEXT_RE = re.compile(r"^(?:0[xX])?[0-9A-Fa-f][0-9A-Fa-f\s:.-]*$")
 
 
 def _hex_bytes_from_value(value: object) -> Optional[bytes]:

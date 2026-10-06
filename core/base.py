@@ -1,9 +1,11 @@
 # core/base.py
 from abc import ABC, abstractmethod
+import argparse
 from dataclasses import dataclass
 import logging
+import sys
 from time import perf_counter
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, TYPE_CHECKING
 
 from .event_bus import EventBus
 
@@ -28,8 +30,30 @@ class ScriptContext:
     stats: Optional["StatsManager"] = None
 
 
+class CliResult(NamedTuple):
+    """What ``BaseModule.run_cli`` hands back: the process exit code and the sections to render."""
+    exit_code: int
+    data: Dict[str, List[Dict[str, Any]]]
+
+
+def cli_exit_code(found: bool, invalid: bool, failed: bool) -> int:
+    """Exit status of a command-line run: 3 incomplete, 2 usage error, 0 data, 1 no record.
+
+    Precedence is 3 > 2 > 0 > 1, so an Infoblox failure or unsaved report is never hidden
+    behind "found", and a usage error is never hidden behind data from the valid objects.
+    """
+    if failed:
+        return 3
+    if invalid:
+        return 2
+    return 0 if found else 1
+
+
 class BaseModule(ABC):
     """Abstract Base Class for all main menu modules."""
+
+    #: Command under which ``cn <name>`` dispatches to ``run_cli``; None keeps the module menu-only.
+    cli_name: Optional[str] = None
 
     def __init__(self):
         # Hooks are points where plugins can inject logic.
@@ -73,7 +97,7 @@ class BaseModule(ABC):
         if hook_name in self.hooks:
             self.hooks[hook_name].append(callback)
         else:
-            print(f"Warning: Attempted to register for unknown hook '{hook_name}' in {self.menu_title}")
+            print(f"Warning: Attempted to register for unknown hook '{hook_name}' in {self.menu_title}", file=sys.stderr)
 
     def execute_hook(self, hook_name: str, ctx: ScriptContext, data: Any) -> Any:
         """Executes all registered callbacks for a hook, passing data through them."""
@@ -100,6 +124,11 @@ class BaseModule(ABC):
     def run(self, ctx: ScriptContext) -> None:
         """The main entry point for the module's execution."""
         pass
+
+    def run_cli(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
+        """Run once from ``cn <command>`` with the parsed options; the result is rendered by main."""
+        ctx.console.print(f"{self.menu_title} is not available from the command line.")
+        return CliResult(2, {})
 
 
 class BasePlugin(ABC):

@@ -121,9 +121,8 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
             self.setup_connection(ctx, None)  # Reuse the setup logic
 
     def disconnect(self, ctx: ScriptContext) -> None:
-        """Called by main.py on exit."""
-        # The teardown logic handles closing the connection if it exists
-        self.teardown_connection(ctx, None)
+        """Called by main.py on exit. Closes the connection even if it is globally managed."""
+        self._close_connection(ctx)
 
     def register(self, module: BaseModule) -> None:
         """Registers all necessary hooks for the plugin's lifecycle."""
@@ -233,9 +232,20 @@ class ADSubnetEnrichmentPlugin(BasePlugin):
         if self.is_globally_managed:
             return
 
-        if self.conn:
-            ctx.logger.info("AD Plugin: Closing persistent connection.")
-            self.conn.unbind()
-        # Reset state for the next run
-        self.conn = None
-        self.ad_lock = None
+        self._close_connection(ctx)
+
+    def _close_connection(self, ctx: ScriptContext) -> None:
+        """Unbind the connection if there is one and reset the state for the next run.
+
+        Never raises: a connection that has already failed may refuse to unbind, and
+        shutdown must carry on regardless.
+        """
+        try:
+            if self.conn:
+                ctx.logger.info("AD Plugin: Closing persistent connection.")
+                self.conn.unbind()
+        except Exception as exc:
+            ctx.logger.warning("AD Plugin: Error while unbinding LDAP connection (%s).", exc)
+        finally:
+            self.conn = None
+            self.ad_lock = None

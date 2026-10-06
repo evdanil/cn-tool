@@ -6,11 +6,32 @@ structure into a standardized dictionary format for use in the main application.
 
 from collections import defaultdict
 import json
-from typing import Dict, List, Any, Optional
+import re
+from typing import Dict, List, Any, Optional, Union
 
 from core.base import ScriptContext
 from utils.dhcp_options import decode_dhcp_option_value
 from utils.infoblox_safety import infoblox_debug_payloads_enabled
+from utils.validation import site_comment_regex
+
+
+#: WAPI documents ``dhcp_utilization`` as the percentage "multiplied by 1000": per-mille, so 975 is 97.5 %.
+DHCP_UTILIZATION_SCALE = 10
+#: ``networkcontainer.utilization`` is shown as returned until the grid check says otherwise.
+CONTAINER_UTILIZATION_SCALE = 1
+
+
+def utilization_percent(raw: Any, scale: int) -> Union[float, str]:
+    """A WAPI utilisation figure as a percentage with one decimal; ``""`` when it is absent or unreadable."""
+    try:
+        return round(float(raw) / scale, 1)
+    except (TypeError, ValueError):
+        return ""
+
+
+def dhcp_percent(raw: Any) -> Union[float, str]:
+    """A ``dhcp_utilization`` value (per-mille) as a percentage; ``""`` when the field is absent."""
+    return utilization_percent(raw, DHCP_UTILIZATION_SCALE)
 
 
 def _is_inherited_entry(meta: Dict[str, Any], row: Dict[str, Any]) -> bool:
@@ -90,9 +111,11 @@ def _parse_ip_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, A
         return processed_data
 
     data = raw_data[0]
+    # The ref ends in "<address>/<network view>"; only the address is the IP.
+    ref_address = str(data.get("_ref", "")).split(":")[-1].split("/")[0]
     processed_data["general"].append({
         "network": data.get("network", ""),
-        "ip": str(data.get("_ref", "")).split(":")[-1],
+        "ip": data.get("ip_address") or ref_address,
         "name": ",".join(data.get("names", [])),
         "status": data.get("status", ""),
     })
@@ -117,23 +140,30 @@ def _parse_supernet_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[
     return processed_data
 
 
-def _parse_location_data(raw_data: List[Dict[str, Any]], sitecode: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+def _parse_location_data(
+    raw_data: List[Dict[str, Any]],
+    sitecode: Optional[str] = None,
+    comment_pattern: Optional[str] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Parses location data. If a sitecode is provided, it filters results
-    to match the sitecode in the comment field. Otherwise, it returns all locations.
+    Parses location data. If a sitecode is provided, it keeps only the subnets whose
+    comment matches the site (``[site] comment_pattern``, default: the code as a whole
+    word anywhere in the comment). Otherwise, it returns all locations.
     """
     processed_data = defaultdict(list)
     all_locations = [
-        {"network": loc["network"], "comment": loc.get("comment", "")}
+        {
+            "network": loc["network"],
+            "comment": loc.get("comment", ""),
+            "DHCP utilization %": dhcp_percent(loc.get("dhcp_utilization")),
+        }
         for loc in raw_data if "network" in loc
     ]
 
     if sitecode:
-        # Filter by the provided sitecode
+        matcher = re.compile(site_comment_regex(sitecode, comment_pattern), re.IGNORECASE)
         processed_data["location"] = [
-            loc for loc in all_locations
-            if len(loc.get("comment", "").split(";")) > 1
-            and loc["comment"].split(";")[1].strip().lower() == sitecode
+            loc for loc in all_locations if matcher.search(loc.get("comment", "") or "")
         ]
     else:
         # No sitecode, so it's a keyword search. Return all valid locations.
@@ -142,14 +172,43 @@ def _parse_location_data(raw_data: List[Dict[str, Any]], sitecode: Optional[str]
     return processed_data
 
 
+# The record type of an 'fqdn' item, from the object part of its ``_ref`` ("record:host/ZG5z..." is a host record).
+FQDN_RECORD_TYPES = {"record:a": "A", "record:aaaa": "AAAA", "record:host": "HOST", "record:cname": "CNAME"}
+
+
 def _parse_fqdn_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """Parses data for the 'fqdn' type."""
-    processed_data = defaultdict(list)
-    processed_data["fqdn"] = [
-        {"ip": fqdn.get("ipv4addr") or fqdn.get("ipv6addr", ""), "name": fqdn.get("name", "")}
-        for fqdn in raw_data if fqdn.get("ipv4addr") or fqdn.get("ipv6addr")
-    ]
-    return processed_data
+    """
+    Parses the A, AAAA, host and CNAME records of the 'fqdn' type, one row per address.
+
+    A host record yields a row for each of its addresses, a CNAME row has an empty ``ip`` and
+    its target in ``canonical``. ``TTL`` is empty unless the record sets its own (the zone's
+    default applies). A host row also carries ``configure_for_dns``: False for a record that
+    publishes no DNS (DHCP/IPAM only), True otherwise, also when the grid does not return the
+    field. Items of any other type are skipped.
+    """
+    rows: List[Dict[str, Any]] = []
+    for record in raw_data:
+        record_type = FQDN_RECORD_TYPES.get(str(record.get("_ref", "")).split("/", 1)[0])
+        if not record_type:
+            continue
+        if record_type == "HOST":
+            addresses = [
+                entry.get("ipv4addr") or entry.get("ipv6addr", "")
+                for entry in record.get("ipv4addrs", []) + record.get("ipv6addrs", [])
+            ]
+        else:  # an A or AAAA record holds one address, a CNAME none
+            addresses = [record.get("ipv4addr") or record.get("ipv6addr", "")]
+        for address in addresses:
+            rows.append({
+                "ip": address,
+                "name": record.get("name", ""),
+                "type": record_type,
+                "canonical": record.get("canonical", ""),
+                "zone": record.get("zone", ""),
+                "TTL": record.get("ttl", "") if record.get("use_ttl") else "",
+                **({"configure_for_dns": bool(record.get("configure_for_dns", True))} if record_type == "HOST" else {}),
+            })
+    return {"fqdn": rows}
 
 
 def _parse_general_subnet_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -163,7 +222,11 @@ def _parse_general_subnet_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List
     comment_meta = inheritance.get("comment", {})
     extattrs_meta = inheritance.get("extattrs", {})
 
-    general_row = {"subnet": data.get("network", ""), "description": data.get("comment", "")}
+    general_row = {
+        "subnet": data.get("network", ""),
+        "description": data.get("comment", ""),
+        "DHCP utilization %": dhcp_percent(data.get("dhcp_utilization")),
+    }
     if comment_meta.get("inherited") or comment_meta.get("multisource"):
         general_row["inherited"] = "Description"
     processed_data["general"] = [general_row]
@@ -229,7 +292,16 @@ def _parse_dhcp_range_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dic
     """Parses data for the 'DHCP range' type."""
     processed_data = defaultdict(list)
     processed_data["DHCP range"] = [
-        {"network": r.get("network", ""), "start address": r.get("start_addr", ""), "end address": r.get("end_addr", "")}
+        {
+            "network": r.get("network", ""),
+            "start address": r.get("start_addr", ""),
+            "end address": r.get("end_addr", ""),
+            "utilization %": dhcp_percent(r.get("dhcp_utilization")),
+            "utilization status": r.get("dhcp_utilization_status", ""),
+            "leases": r.get("dynamic_hosts", ""),
+            "static": r.get("static_hosts", ""),
+            "total": r.get("total_hosts", ""),
+        }
         for r in raw_data
     ]
     return processed_data
@@ -303,7 +375,7 @@ def process_data(
         else:
             # This is a sitecode search, so extract the sitecode and pass it for filtering.
             sitecode = type.split("_", 1)[1].lower()
-            return _parse_location_data(raw_data, sitecode)
+            return _parse_location_data(raw_data, sitecode, ctx.cfg.get("site_comment_pattern"))
 
     # --- Dispatch to registered parsers ---
     parser_func = DATA_PARSERS.get(type)

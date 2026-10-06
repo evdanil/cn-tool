@@ -1,7 +1,7 @@
 import ipaddress
 import re
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Callable, Union
+from typing import Dict, Any, List, Optional, Tuple, Callable, Union
 from concurrent.futures import ThreadPoolExecutor
 
 from rich.table import Table
@@ -26,6 +26,21 @@ from utils.parsers import (
     parse_show_license_summary, parse_show_license, parse_nexus_show_version,
     parse_nexus_show_license_all
 )
+
+
+def _failure_reason(device_data: Dict[str, Any], hostname: str) -> Optional[str]:
+    """Return why a device failed, or None when it was queried successfully.
+
+    process_device_commands reports every per-device failure as ``{hostname: "<reason>"}``
+    (a string), whereas a successful result maps command names to parsed data.
+    """
+    reason = device_data.get(hostname)
+    return reason if isinstance(reason, str) else None
+
+
+def _is_skip(reason: str) -> bool:
+    """A device left out on purpose (e.g. by ``[ssh] device_name_filter``), as opposed to one that failed."""
+    return reason.startswith("Skipped")
 
 
 class DeviceQueryModule(BaseModule):
@@ -137,11 +152,18 @@ class DeviceQueryModule(BaseModule):
         final_results = self.execute_hook('process_data', ctx, results)
 
         # --- Display Results ---
+        # Classify every device once: hostname -> reason for the ones that did not yield data.
+        failures: Dict[str, str] = {
+            hostname: reason
+            for hostname, device_data in final_results.items()
+            if (reason := _failure_reason(device_data, hostname)) is not None
+        }
         successful_device_count = 0
         for hostname, device_data in final_results.items():
             tables_to_print: List[Union[Table, Panel]] = []
-            if device_data.get(hostname) == 'Failed to process':
-                error_table = create_device_error_table(hostname, ctx.cfg.get("theme_name", "default"))
+            failure_reason = failures.get(hostname)
+            if failure_reason is not None:
+                error_table = create_device_error_table(hostname, failure_reason, ctx.cfg.get("theme_name", "default"))
                 if error_table:
                     tables_to_print.append(error_table)
             else:
@@ -173,10 +195,13 @@ class DeviceQueryModule(BaseModule):
             failed_devices: List[List[Any]] = []
 
             for hostname, device_data in final_results.items():
-                # Explicitly check for the failure marker.
-                if device_data.get(hostname) == 'Failed to process':
-                    # Add failure info as a simple list of lists for saving.
-                    failed_devices.append([hostname, "Failed to connect or process commands"])
+                if hostname in failures:
+                    # Add failure info as a simple list of lists for saving: the reason, except for the
+                    # generic marker, which keeps the wording existing reports already use.
+                    reason = failures[hostname]
+                    if reason == "Failed to process":
+                        reason = "Failed to connect or process commands"
+                    failed_devices.append([hostname, reason])
                 else:
                     # If successful, process the data. process_device_data returns List[Dict].
                     # Use .extend() to add all dictionaries from the result to our master list.
@@ -227,5 +252,14 @@ class DeviceQueryModule(BaseModule):
                 "miss_count": max(0, len(unique_devices) - successful_device_count),
             },
         )
+
+        skipped_count = sum(_is_skip(reason) for reason in failures.values())
+        failed_count = len(failures) - skipped_count
+        detail = ", ".join(f"{count} {label}" for count, label in ((failed_count, "failed"), (skipped_count, "skipped")) if count)
+        summary = f"Collected {successful_device_count} of {len(unique_devices)} devices"
+        if detail:
+            console.print(f"[{colors['warning']}]{summary}: {detail}[/]")
+        else:
+            console.print(f"[{colors['description']}]{summary}[/]")
 
         press_any_key(ctx)

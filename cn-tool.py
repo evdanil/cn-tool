@@ -13,17 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import configparser
+import ipaddress
 import logging
+import re
+import shlex
 import signal
 import argparse
+import textwrap
 import threading
 import time
 import sys
 from datetime import datetime
 from pathlib import Path
 import warnings
-from typing import Any, Optional
+from typing import Any, Callable, Dict, NoReturn, Optional, TypeVar
 
 # This suppresses the specific CryptographyDeprecationWarning from paramiko
 # which can be noisy on some systems.
@@ -36,18 +39,30 @@ except ImportError:
 
 # --- Core Application Imports ---
 import cn_buildstamp
-from core.base import ScriptContext
+from core.base import BaseModule, ScriptContext
 from core.event_bus import EventBus
 from core.loader import load_modules_and_plugins
 
 # --- Utility Imports ---
-from utils.app_lifecycle import exit_now
-from utils.config import BASE_CONFIG_SCHEMA, normalize_runtime_flags, parse_optional_bool, read_config, setup_from_args
+from utils import file_io
+from utils.app_lifecycle import EXIT_INTERRUPTED, exit_now
+from utils.config import (
+    BASE_CONFIG_SCHEMA,
+    new_parser,
+    normalize_runtime_flags,
+    parse_optional_bool,
+    read_config,
+    setup_from_args,
+)
 from utils.display import console, get_global_color_scheme, set_global_color_scheme
 from utils.file_io import start_worker, check_dir_accessibility
 from utils.logging import configure_logging
 from utils.user_input import read_user_input, read_user_input_live
 from utils.cache_status import build_cache_status_line
+from utils.cli_input import read_objects
+from utils.render import FORMATS, emit
+from utils.config_history import parse_since
+from utils.validation import is_fqdn, parse_tcp_ports, validate_and_normalize_mac_address
 from core.background import start_background_tasks
 
 # Fix MAC address emoji issue
@@ -108,7 +123,7 @@ def bootstrap_logging(args: argparse.Namespace) -> logging.Logger:
     existing_files = [f for f in config_paths if f.is_file()]
 
     if existing_files:
-        parser = configparser.ConfigParser()
+        parser = new_parser()
         parser.read(existing_files)  # Read all found files in order
         if parser.has_section("logging"):
             log_file = parser.get("logging", "logfile", fallback=log_file)
@@ -123,68 +138,430 @@ def bootstrap_logging(args: argparse.Namespace) -> logging.Logger:
     return configure_logging(str(Path(log_file).expanduser()), log_level.upper())
 
 
-def main() -> None:
-    """
-    Main function that orchestrates the execution of the script.
-    """
+# --- Command line ---------------------------------------------------------------------------------
+# One spec per global option. It feeds the root parser, the copy accepted after the command
+# (defaults suppressed, so an option that is not repeated keeps the root's value) and
+# _infer_command, which derives the options that take a value from it.
+_GLOBAL_OPTIONS: tuple[dict[str, Any], ...] = (
+    {"flags": ("-c", "--config"), "default": None, "help": "specify configuration file"},
+    {"flags": ("-nc", "--no-cache"), "action": "store_true", "help": "run without cache use"},
+    {"flags": ("-t", "--theme"), "choices": ["default", "monochrome", "pastel", "dark"], "help": "color theme"},
+    {"flags": ("-l", "--log-file"), "help": "specify logfile"},
+    {"flags": ("-r", "--report-file"), "help": "report filename (with a command it also turns --report on)"},
+    {"flags": ("-g", "--gpg-file"), "help": "GPG credentials file"},
+    {"flags": ("-v", "--version"), "action": "version", "version": f"cn-tool v{VERSION}", "root_only": True},
+    {"flags": ("--log-level",), "choices": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], "help": "Set the logging level."},
+)
 
-    description = """
-cn-tool v{version}
+# The options a command takes unless its spec says otherwise (``needs`` names the spec key that
+# must allow it: no --file without objects, no --report for a command that writes no report).
+_COMMAND_OPTIONS: tuple[dict[str, Any], ...] = (
+    {
+        "flags": ("-f", "--file"), "metavar": "FILE", "default": None, "needs": "objects",
+        "help": "one object per line; '#' comments and blanks ignored; '-' reads stdin",
+    },
+    {"flags": ("--format",), "metavar": "FMT", "choices": FORMATS, "default": "table", "help": "table (default), json, md, csv"},
+    {
+        "flags": ("--report",), "action": "store_true", "needs": "report",
+        "help": "also append to the xlsx report (-r FILE chooses it); the menu saves automatically, the command line only with --report",
+    },
+)
 
-The tool allows to retrieve information from Infoblox and perform network operations.
+# Registered in one place so a command never needs another edit of main.py; dispatch is by the
+# module's ``cli_name``.
+CLI_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("ip", "IPv4 address: subnet, DNS name, status, MAC (menu 1)"),
+    ("subnet", "subnet: DHCP, DNS, fixed IPs, attributes (menu 2)"),
+    ("fqdn", "DNS records containing TEXT, 3+ chars (menu 3)"),
+    ("site", "subnets of a site code, or a keyword with -k (menu 4)"),
+    ("ping", "ICMP/TCP reachability of hosts and subnets (menu 6)"),
+    ("diff", "config changes of devices since a time (menu c)"),
+    ("doctor", "configuration, credential and Infoblox checks (menu s)"),
+)
 
-Features:
+T = TypeVar("T")
 
-- Performs IP/Subnet/DNS/Site information lookups using Infoblox API
-- Performs bulk FQDN/IP ping operations
-- Performs bulk FQDN/IP lookups using system resolver
-- Performs search configuration storage (`/opt/data/configs/`) for obsolete data(cleanups on BGP borders/prefixes/ACLs)
-- Obtains device information (sn, ios version and image, license data) in parallel
-- Saves all requested information for later information processing(by default `report.xlsx` in $HOME directory)
-- Keeps log of requests/responses(by default `cn.log` in $HOME directory)
-- Can be easily configured by creating/changing configuration file(by default `.cn` in $HOME directory)
-- Supports several color themes (default, monochrome, pastel, dark)
 
-Useful tips:
+def _arg_type(parse: Callable[[str], T]) -> Callable[[str], T]:
+    """argparse ``type=`` for a utils parser: its ValueError becomes ``argument --opt: <message>``."""
 
-Prefer a fresh `device-apply.gpg` credentials file when possible. As a convenience fallback, the credential prompt can be skipped if the `TACACS_PW` environment variable is set.
+    def convert(text: str) -> T:
+        try:
+            return parse(text)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from None
 
-- for environmental variable set up - copy lines below(including EOF) and paste in the terminal window:
+    return convert
 
-cat >> ~/.bash_profile <<EOF
-echo -n "Enter current TACACS_PW:"
-read -s TACACS_PW
-export TACACS_PW
-EOF
 
-It will update .bash_profile with the request to read `TACACS_PW` credential during login time. Re-login to the terminal to see it in action. Note that environment variables are inherited by child processes in the same session.
+def _nonempty_text(text: str) -> str:
+    """The text itself; an empty one matches every line, which is never what was meant."""
+    if not text:
+        raise ValueError("TEXT must not be empty")
+    return text
 
-- for device-apply.gpg file creation use commands below, if file is older than 24 hours it won't be used:
 
-device-apply --make-key
-device-apply --make-credentials --overwrite
+# What ``cn <command> --help`` says and which options the command takes. ``menu`` is (menu key,
+# menu title) of the module behind the command; a test compares it with the real modules. Optional:
+#   objects    None for a command that takes no objects (no OBJECT, no --file, nothing is read)
+#   report     False for a command that writes no report (no --report, -r is refused)
+#   options    option specs of this command alone, in the _GLOBAL_OPTIONS format
+#   exit       the whole exit line, when the codes are not found / none / invalid / Infoblox
+#   menu_line  replaces "Same lookup as menu item ..."
+_COMMAND_DETAILS: dict[str, dict[str, Any]] = {
+    "ip": {
+        "menu": ("1", "IP Information (IPv4)"),
+        "about": "Infoblox details for IPv4 addresses: subnet, DNS name, status, lease state, record type, MAC and PTR name.",
+        "objects": "IPv4 address, e.g. 10.1.2.3; '-' reads objects from stdin",
+        "examples": ("cn ip 10.1.2.3 --format md", "cn ip --file ips.txt --format csv > ips.csv"),
+        "found": "data for at least one address",
+    },
+    "subnet": {
+        "menu": ("2", "Subnet Information"),
+        "about": (
+            "Subnet details from Infoblox: general data and extensible attributes, DHCP ranges with "
+            "utilisation, options, members and failover, DNS records and fixed addresses. Lists are paged up "
+            "to 10,000 rows per subnet."
+        ),
+        "objects": (
+            "10.1.2.0/24, 10.1.2.0/255.255.255.0 or 10.1.2.3 (its subnet); a container prefix expands to "
+            "its subnets (child containers are listed, not expanded); '-' reads objects from stdin"
+        ),
+        "examples": (
+            "cn subnet 10.1.2.3 --format md",
+            "cn subnet --file change-4711.txt --report",
+            "cn subnet 10.1.2.0/24 --format json | jq -r '.dns_records[].a_record'",
+        ),
+        "found": "data for at least one subnet",
+    },
+    "fqdn": {
+        "menu": ("3", "FQDN Prefix Lookup"),
+        "about": (
+            "A, AAAA, host and CNAME records whose name contains the text (at least 3 characters), with a PTR "
+            "check; paged up to 10,000 records per type."
+        ),
+        "objects": "a name or part of one, e.g. branchsw or branchsw010.example.net; '-' reads objects from stdin",
+        "examples": ("cn fqdn branchsw", "cn host.example.com --format json"),
+        "found": "data for at least one name",
+    },
+    "site": {
+        "menu": ("4", "Subnet Lookup (by site code or keyword)"),
+        "about": (
+            "Registered subnets of a site code, found by the [site] ea_name attribute when set (by the subnet "
+            "comment when no subnet carries it), or those whose description contains a keyword."
+        ),
+        "objects": "site code; with -k a keyword (3+ chars); '-' reads objects from stdin",
+        "options": (
+            {
+                "flags": ("-k", "--keyword"), "action": "store_true",
+                "help": "treat the objects as keywords to look for in the subnet description, not as site codes",
+            },
+        ),
+        "examples": ("cn site dns", "cn site -k branch --format csv"),
+        "found": "data for at least one search",
+    },
+    "ping": {
+        "menu": ("6", "Bulk PING"),
+        "about": (
+            "ICMP ping of IPv4 addresses, host names and subnets, and with --tcp a TCP connection test of up "
+            "to 5 ports. A subnet is expanded to its hosts (at most a /16; with --tcp at most 1,024 hosts). "
+            "Every probe gives up after 3 seconds."
+        ),
+        "menu_line": 'Same check as menu item 6, "Bulk PING".',
+        "objects": "10.1.2.3, a host name, or 10.1.2.0/24; '-' reads objects from stdin",
+        "options": (
+            {
+                "flags": ("--tcp",), "metavar": "PORTS", "type": _arg_type(parse_tcp_ports), "default": None,
+                "help": (
+                    "also connect to these TCP ports, e.g. 22,443 (up to 5): open = connected, closed = reset, "
+                    "timeout = no answer"
+                ),
+            },
+        ),
+        "examples": (
+            "cn ping 10.1.2.3 web01.example.net",
+            "cn ping 10.1.2.0/28 --tcp 22,443 --format md",
+            "cn ping db01 --tcp 5432 && echo '5432 is open'",
+        ),
+        "exit": (
+            "exit: 0 at least one host answered (with --tcp: at least one port was open), 1 none did, "
+            "2 invalid input or no ping command, 3 a probe could not run or the report could not be written, "
+            "130 interrupted."
+        ),
+    },
+    "diff": {
+        "menu": ("c", "Config Repository Browser (TUI)"),
+        "about": (
+            "Configuration lines added or removed on devices, each attributed to the snapshot (and author) "
+            "that made the change; blank lines and lines that are only '!' are ignored. Without --since: the "
+            "last change; with --line and no --since: the whole history."
+        ),
+        "menu_line": 'Menu item c, "Config Repository Browser (TUI)", shows the same history interactively.',
+        "objects": "device name, as in <name>.cfg in the configuration repositories; '-' reads objects from stdin",
+        "report": False,
+        "options": (
+            {
+                "flags": ("--since",), "metavar": "WHEN", "type": _arg_type(parse_since), "default": None,
+                "help": (
+                    "compare from the newest snapshot at or before WHEN: 30m, 24h, 7d, 2w, 2026-10-01, "
+                    "2026-10-01T14:00 (UTC unless an offset is given) or a snapshot file name"
+                ),
+            },
+            {
+                "flags": ("--line",), "metavar": "TEXT", "type": _arg_type(_nonempty_text), "default": None,
+                "help": "only changed lines that contain TEXT (any case)",
+            },
+        ),
+        "examples": (
+            "cn diff r1 --since 24h",
+            "cn diff r1 r2 --since 2026-10-01 --format md",
+            "cn diff r1 --line 'ip route 0.0.0.0'",
+        ),
+        "exit": (
+            "exit: 0 at least one changed line, 1 none (no change in the window, or no such device), "
+            "2 invalid input or no configuration repository, 3 a repository or snapshot could not be read, "
+            "130 interrupted."
+        ),
+    },
+    "doctor": {
+        "menu": ("s", "Application Setup"),
+        "about": (
+            "Checks the configuration and, when Infoblox is configured, the credentials: it logs in, reads "
+            "the WAPI version the endpoint serves and checks the site attribute ([site] ea_name). Nothing is "
+            "changed."
+        ),
+        "menu_line": 'Menu item s, "Application Setup", shows the offline part of these checks.',
+        "objects": None,
+        "report": False,
+        "examples": ("cn doctor", """cn doctor --format json | jq '.checks[] | select(.status == "error")'"""),
+        "exit": (
+            "exit: 0 no check failed (warnings allowed), 2 a setting is wrong (for example [site] ea_name or "
+            "the [api] endpoint path), 3 the credentials or Infoblox failed a live check, 130 interrupted."
+        ),
+    },
+}
 
-Create an alias for convenience by adding line to `.bash_profile`:
+_USAGE = (
+    "cn [global options] <command> [objects ...] [options]\n"
+    "       cn IP|CIDR|FQDN ...        shortcut for ip / subnet / fqdn\n"
+    "       cn                         interactive menu"
+)
 
-cat >> ~/.bash_profile <<EOF
-alias cn="{exec_file}"
-EOF
+_EPILOG = """\
+examples:
+  cn 10.1.2.3                           same as: cn ip 10.1.2.3
+  cn 10.1.2.0/24 --format md            paste into a ticket
+  cn ip --file ips.txt --format csv > ips.csv
+  cn subnet - --format json < scope.txt | jq '.dns_records'
+  cn ping web01 --tcp 443               is TCP 443 open?
 
-Re-login and start using cn-tool by running:
-cn
-
-Please send any feedback/feature requests to =EMAIL=
+Results go to stdout; progress, warnings and errors go to stderr.
+Colour is off when stdout is not a terminal or NO_COLOR is set.
+Exit status: 0 found, 1 nothing found, 2 usage error, 3 Infoblox,
+credential, repository or report failure, 130 interrupted.
+Credentials: $USER and $TACACS_PW, or a GPG credentials file (-g FILE or
+[gpg] credentials; ignored when older than 24 h).
+Without a terminal cn never prompts. More: cn <command> --help.
+Global options also work after the command (not -v).
 """
-    parser = argparse.ArgumentParser(description=description.format(version=VERSION, exec_file=Path(__file__).name), formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("-c", "--config", default=None, help="specify configuration file")
-    parser.add_argument("-nc", "--no-cache", action="store_true", help="run without cache use")
-    parser.add_argument("-t", "--theme", choices=['default', 'monochrome', 'pastel', 'dark'], help="color theme")
-    parser.add_argument("-l", "--log-file", help="specify logfile")
-    parser.add_argument("-r", "--report-file", help="report filename")
-    parser.add_argument("-g", "--gpg-file", help="GPG credentials file")
-    parser.add_argument("-v", "--version", action="version", version=f"cn-tool v{VERSION}")
-    parser.add_argument("--log-level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], help="Set the logging level.")
-    args = parser.parse_args()
+
+_NO_VALUE_ACTIONS = ("store_true", "version")
+_GLOBAL_FLAGS = {flag for spec in _GLOBAL_OPTIONS for flag in spec["flags"]}
+_OWN_OPTIONS = tuple(spec for detail in _COMMAND_DETAILS.values() for spec in detail.get("options", ()))
+_VALUE_FLAGS = {
+    flag
+    for spec in (*_GLOBAL_OPTIONS, *_COMMAND_OPTIONS, *_OWN_OPTIONS)
+    if spec.get("action") not in _NO_VALUE_ACTIONS
+    for flag in spec["flags"]
+}
+# flag -> the command that takes it, for the options that belong to one command (``cn 10.1.2.3 --tcp 443``)
+_OPTION_OWNERS = {
+    flag: name for name, detail in _COMMAND_DETAILS.items() for spec in detail.get("options", ()) for flag in spec["flags"]
+}
+
+
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Raw descriptions, and the commands listed flush with the options rather than nested under "<command>"."""
+
+    def _format_action(self, action: argparse.Action) -> str:
+        format_action = super()._format_action
+        if isinstance(action, argparse._SubParsersAction):
+            return "".join(format_action(choice) for choice in action._get_subactions())
+        return format_action(action)
+
+
+def _add_options(target: Any, specs: Any, **overrides: Any) -> None:
+    """Add the options of ``specs`` to a parser or group; ``overrides`` replace spec keys such as ``default``."""
+    for spec in specs:
+        kwargs = {key: value for key, value in spec.items() if key not in ("flags", "root_only", "needs")}
+        target.add_argument(*spec["flags"], **{**kwargs, **overrides})
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """The ``cn`` parser: global options, then one sub-parser per entry of CLI_COMMANDS."""
+    parser = argparse.ArgumentParser(
+        prog="cn",
+        usage=_USAGE,
+        description=f"cn-tool v{VERSION}: Infoblox lookups and network checks.",
+        epilog=_EPILOG,
+        formatter_class=_HelpFormatter,
+        add_help=False,
+        allow_abbrev=False,  # "--report" must not mean the hidden "--report-file" of a command with no report
+    )
+    subparsers = parser.add_subparsers(dest="command", title="commands", metavar="<command>", prog="cn")
+
+    # Built apart from the root's own actions: with the defaults suppressed, an option that is not
+    # repeated after the command leaves the root's value (e.g. -c given before it) alone.
+    after_command = argparse.ArgumentParser(add_help=False)
+    _add_options(
+        after_command,
+        [spec for spec in _GLOBAL_OPTIONS if not spec.get("root_only")],
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+
+    for name, summary in CLI_COMMANDS:
+        detail = _COMMAND_DETAILS[name]
+        key, title = detail["menu"]
+        menu_line = detail.get("menu_line") or f'Same lookup as menu item {key}, "{title}".'
+        exit_line = detail.get("exit") or (
+            f"exit: 0 {detail['found']}, 1 none, 2 invalid input, 3 Infoblox, credential or report failure "
+            "(stdout still holds what was found), 130 interrupted."
+        )
+        command = subparsers.add_parser(
+            name,
+            help=summary,
+            description=textwrap.fill(detail["about"], width=78) + "\n\n" + textwrap.fill(menu_line, width=78),
+            epilog="examples:\n"
+            + "".join(f"  {example}\n" for example in detail["examples"])
+            + "\n"
+            + textwrap.fill(exit_line, width=78),
+            formatter_class=_HelpFormatter,
+            allow_abbrev=False,
+            parents=[after_command],
+        )
+        takes = {"objects": detail["objects"] is not None, "report": detail.get("report", True)}
+        _add_options(command, [spec for spec in _COMMAND_OPTIONS if takes.get(spec.get("needs"), True)])
+        if takes["objects"]:
+            command.add_argument("objects", nargs="*", metavar="OBJECT", help=detail["objects"])
+        _add_options(command, detail.get("options", ()))
+        if not takes["report"]:
+            command.set_defaults(report=False)  # nothing to save: _run_cli still reads args.report
+
+    global_options = parser.add_argument_group("global options")
+    global_options.add_argument("-h", "--help", action="help", help="show this help message and exit")
+    _add_options(global_options, _GLOBAL_OPTIONS)
+    return parser
+
+
+def _usage_error(message: str) -> NoReturn:
+    """A mistake in what was typed, found before anything is started: one line on stderr, exit status 2."""
+    print(f"cn: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
+_DIGITS_AND_DOTS = re.compile(r"[\d.]+")
+_ADDRESS_LIKE = re.compile(r"[./:]")  # a token with one of these was meant as an address, not as a word
+
+
+def _classify_object(text: str) -> Optional[str]:
+    """What a bare argument is: "subnet", "ip", "mac", "ipv6", "fqdn", or None for anything else."""
+    try:
+        network = ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        pass
+    else:
+        if network.version == 6:
+            return "ipv6"
+        return "subnet" if "/" in text else "ip"
+    if validate_and_normalize_mac_address(text):
+        return "mac"
+    # is_fqdn() accepts "10.1.2" and "aabb.ccdd.eeff" (labels of digits); neither is a name
+    if "." in text and not _DIGITS_AND_DOTS.fullmatch(text) and is_fqdn(text):
+        return "fqdn"
+    return None
+
+
+_UNSUPPORTED_OBJECTS = {
+    "mac": "is a MAC address; MAC lookups are not supported",
+    "ipv6": "is an IPv6 address; IPv6 lookups are not supported",
+}
+
+
+def _infer_command(argv: list[str]) -> list[str]:
+    """
+    Insert the command a bare object asks for (``cn 10.1.2.3`` is ``cn ip 10.1.2.3``).
+
+    Global options and their values are skipped; the command goes in front of the first other
+    token, so ``cn --format json 10.1.2.3`` works. Every positional is classified (CIDR, IPv4
+    address, MAC, FQDN) and must agree. Words that are not addresses, such as a command name or a
+    typo, are left to argparse; a MAC address, an IPv6 address, a malformed address, mixed
+    object types or an option that another command owns (``cn 10.1.2.3 --tcp 443``: say
+    ``cn ping``) exit with status 2 and a one-line reason.
+    """
+    start = 0
+    while start < len(argv):
+        flag = argv[start].split("=", 1)[0] if argv[start].startswith("--") else argv[start]
+        if flag not in _GLOBAL_FLAGS:
+            break
+        start += 2 if flag in _VALUE_FLAGS and "=" not in argv[start] else 1
+
+    positionals: list[str] = []
+    flags: list[str] = []
+    index = start
+    while index < len(argv):
+        token = argv[index]
+        if token.startswith("-") and token != "-":
+            flag = token.split("=", 1)[0] if token.startswith("--") else token
+            flags.append(flag)
+            index += 2 if flag in _VALUE_FLAGS and "=" not in token else 1
+        else:
+            positionals.append(token)
+            index += 1
+
+    objects = [token for token in positionals if token != "-"]
+    if not objects:
+        return list(argv)
+
+    kinds: list[str] = []
+    for position, token in enumerate(objects):
+        kind = _classify_object(token)
+        if kind is None:
+            if position == 0 and not _ADDRESS_LIKE.search(token):
+                return list(argv)  # a plain word: argparse accepts a command name and rejects the rest
+            _usage_error(f"'{token}' is not an IPv4 address, network or FQDN")
+        if kind in _UNSUPPORTED_OBJECTS:
+            _usage_error(f"'{token}' {_UNSUPPORTED_OBJECTS[kind]}")
+        kinds.append(kind)
+
+    found = list(dict.fromkeys(kinds))
+    if len(found) > 1:
+        _usage_error(f"mixed object types ({', '.join(found)}); use one command per type")
+    command = found[0]
+    for flag in flags:
+        owner = _OPTION_OWNERS.get(flag)
+        if owner not in (None, command):
+            _usage_error(f"{flag} is an option of 'cn {owner}': cn {owner} {shlex.join(argv[start:])}")
+    return [*argv[:start], command, *argv[start:]]
+
+
+def _writes_report(command: Optional[str]) -> bool:
+    """The menu and most commands write a report; ``diff`` and ``doctor`` do not."""
+    return command is None or _COMMAND_DETAILS[command].get("report", True)
+
+
+def _has_terminal() -> bool:
+    """The menu needs a terminal to read from and to draw on."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+# --- Start-up shared by the menu and the command line ---------------------------------------------
+def _startup(args: argparse.Namespace) -> tuple[ScriptContext, Dict[str, BaseModule]]:
+    """
+    Logging, modules, plugins, configuration and the context: everything the menu and the command
+    line have in common. The menu adds the cache, the writer thread, its status line and signals.
+    """
+    cli_mode = args.command is not None  # main() has already moved the console to stderr in this mode
 
     logger = bootstrap_logging(args)
 
@@ -216,15 +593,20 @@ Please send any feedback/feature requests to =EMAIL=
 
     # Rebuild the user-visible banner from the normalized bools so the
     # interactive UI still shows the startup warning with the sleep delay.
-    if not cfg['infoblox_enabled']:
+    if not cfg['infoblox_enabled'] and not cli_mode:  # a command says why it is unavailable by itself
         log_msg = "Infoblox API URL is not set. Infoblox-related modules will be disabled."
         final_message += log_msg + '\n'
     if _repo_explicit_true and not cfg['config_repo_enabled']:
         log_msg = "Configuration repository directory is not accessible. Config search modules will be disabled."
         final_message += log_msg + '\n'
 
-    # 3. Check report file accessibility
-    if not check_dir_accessibility(logger, cfg["report_file"].parent):
+    # 3. Check report file accessibility (a command that writes no report has nothing to check)
+    report_dir = cfg["report_file"].parent
+    if _writes_report(args.command) and not check_dir_accessibility(logger, report_dir):
+        if cli_mode and args.report_file:
+            # Automation asked for this very path: never save somewhere else and report success.
+            reason = "not accessible" if report_dir.exists() else "No such file or directory"
+            _input_error(f"cn: cannot write the report to {report_dir}: {reason}")
         log_msg = "Report directory not accessible, using current directory."
         logger.warning(log_msg)
         final_message += log_msg + '\n'
@@ -232,7 +614,8 @@ Please send any feedback/feature requests to =EMAIL=
 
     if final_message:
         console.print(f"[bold]{final_message}[/]")
-        time.sleep(5)
+        if not cli_mode:
+            time.sleep(5)
     event_bus = EventBus(logger)
     ctx = ScriptContext(
         cfg=cfg,
@@ -245,12 +628,170 @@ Please send any feedback/feature requests to =EMAIL=
         plugins=all_plugins,
     )
 
-    # Connect global plugins
+    if cli_mode:
+        # The menu connects AD early to hide latency; a one-shot command connects on first use (the
+        # plugin's hook), so malformed input never asks for credentials or opens LDAP.
+        ctx.cfg["ad_connect_on_startup"] = False
+
+    # Connect global plugins. A one-shot command skips plugins that serve another module only (the
+    # SD-WAN YAML loader targets config_search and reads a whole repository on connect); plugins
+    # without a target (statistics, email) and the command's own plugin connect as in the menu.
+    wanted = _cli_module_name(loaded_modules, args.command) if cli_mode else None
     for plugin in ctx.plugins:
-        if plugin.manages_global_connection:
-            plugin.connect(ctx)
+        if not plugin.manages_global_connection:
+            continue
+        target = getattr(plugin, "target_module_name", "")
+        if cli_mode and target and target != wanted:
+            continue
+        plugin.connect(ctx)
 
     set_global_color_scheme(ctx)
+    return ctx, loaded_modules
+
+
+def _cli_module_name(modules: Dict[str, BaseModule], command: Optional[str]) -> Optional[str]:
+    """The file name of the module behind ``command`` (how plugins name their target), or None."""
+    module = next((m for m in modules.values() if getattr(m, "cli_name", None) == command), None)
+    return type(module).__module__.rsplit(".", 1)[-1] if module is not None else None
+
+
+def _tracked_stats(ctx: ScriptContext, module: BaseModule) -> Any:
+    """The statistics collector when this module's runs are recorded, else None."""
+    stats = getattr(ctx, "stats", None)
+    return stats if stats and getattr(module, "track_in_stats", True) else None
+
+
+def _run_tracked(
+    ctx: ScriptContext,
+    module: BaseModule,
+    call: Callable[[], T],
+    *,
+    outcome: Optional[Callable[[T], str]] = lambda _result: "completed",
+) -> T:
+    """
+    Run ``call`` (a module's menu or command-line entry point), recording the run in the statistics.
+    ``outcome`` names the recorded status of a run that returned (the menu's always completed);
+    None leaves the run open for the caller to finish once it knows the real outcome.
+    """
+    stats = _tracked_stats(ctx, module)
+    tracked = stats is not None
+    if tracked:
+        stats.start_module_run(module)
+    try:
+        result = call()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        if tracked:
+            stats.prepare_for_shutdown("interrupted")
+        raise
+    except Exception:
+        ctx.logger.exception("Unhandled exception while running module '%s'", module.menu_title)
+        if tracked:
+            stats.prepare_for_shutdown("failed")
+        raise
+    if tracked and outcome is not None:
+        stats.finish_module_run(outcome(result))
+    return result
+
+
+# --- Command line mode ----------------------------------------------------------------------------
+def _stop(ctx: ScriptContext, code: int, message: str) -> NoReturn:
+    """End the run with ``message`` on the console (stderr in command line mode) and exit status ``code``."""
+    exit_now(ctx, code, message)
+    raise AssertionError("exit_now returned")  # pragma: no cover
+
+
+def _read_cli_objects(args: argparse.Namespace) -> None:
+    """
+    Resolve the objects named on the command line (positionals, ``--file``, ``-``) into
+    ``args.objects`` before anything else starts: a ``-`` must consume stdin before any plugin or
+    module can prompt, and a bad file or an empty list must fail before cn logs in anywhere.
+    """
+    try:
+        objects = read_objects(args.objects, args.file)
+    except (OSError, UnicodeDecodeError) as exc:
+        source = args.file if args.file and args.file != "-" else "stdin"
+        reason = getattr(exc, "strerror", None) or exc
+        _input_error(f"cn: cannot read {source}: {reason}")
+    if not objects:
+        piped = not (sys.stdin.isatty() or "-" in args.objects or args.file == "-")
+        hint = f"did you mean 'cn {args.command} -'?" if piped else f"see cn {args.command} --help"
+        _input_error(f"cn: no objects given; {hint}")
+    # The module reads the objects again (it is testable on its own); handing it the resolved
+    # list makes that a pass-through that never touches stdin.
+    args.objects, args.file = objects, None
+
+
+def _input_error(message: str) -> NoReturn:
+    """Bad command-line input, found before start-up: one line on the (stderr) console, exit status 2."""
+    console.print(message, markup=False, soft_wrap=True)
+    sys.exit(2)
+
+
+def _run_cli(ctx: ScriptContext, modules: Dict[str, BaseModule], args: argparse.Namespace) -> int:
+    """
+    Run ``cn <command>`` once and return its exit status: dispatch to the module with that
+    ``cli_name``, write its result to stdout, wait for the report and check it was written.
+    """
+    saving = bool(args.report or args.report_file)
+    ctx.cfg["report_auto_save"] = saving  # the menu saves every run; the command line only when asked
+    signal.signal(signal.SIGINT, lambda s, f: exit_now(ctx, EXIT_INTERRUPTED, "cn: interrupted"))
+
+    module = next((m for m in modules.values() if getattr(m, "cli_name", None) == args.command), None)
+    if module is None:
+        _stop(ctx, 2, f"cn: '{args.command}' is not available (no module provides it)")
+    key = module.visibility_config_key
+    if key and not ctx.cfg.get(key, False):
+        _stop(ctx, 2, f"cn: '{args.command}' is not available: {module.menu_title} needs {key}, which is off in this configuration")
+
+    try:
+        # The run's outcome is only known once the report has been written (or not): finished below.
+        result = _run_tracked(ctx, module, lambda: module.run_cli(ctx, args), outcome=None)
+    except Exception:
+        _stop(ctx, 3, "cn: unexpected error. Check logs.")
+
+    emit(ctx, result.data, args.format)  # stdout first: a slow or failing report must not delay it
+    file_io.wait_for_all_saves()
+    code = result.exit_code
+    if saving:
+        if file_io.save_failures():
+            code = 3
+        elif file_io.saves_completed():  # a run with nothing to save appends nothing
+            ctx.console.print(f"cn: report: appended to {ctx.cfg['report_file']}", markup=False, soft_wrap=True)
+    stats = _tracked_stats(ctx, module)
+    if stats:
+        stats.finish_module_run("failed" if code == 3 else "completed")  # 3: lookup or report incomplete
+    return code
+
+
+def main() -> None:
+    """
+    Main function that orchestrates the execution of the script: parse the command line, then
+    either run one command (``cn <command> ...``) or open the interactive menu.
+    """
+    args = _build_parser().parse_args(_infer_command(sys.argv[1:]))
+    if args.command is None and not _has_terminal():
+        _usage_error("no command given and no terminal for the menu; see cn --help")
+    if args.command is not None:
+        if args.report_file and not _writes_report(args.command):
+            _usage_error(f"{args.command} does not write a report; drop -r")
+        console.set_stderr(True)  # from here on stdout carries results only
+        if _COMMAND_DETAILS[args.command]["objects"] is not None:
+            _read_cli_objects(args)  # before any plugin connects: '-' is consumed, bad input never logs in
+
+    ctx, modules = _startup(args)
+    if args.command is None:
+        _run_menu(ctx, modules)
+    else:
+        exit_now(ctx, _run_cli(ctx, modules, args), "", quiet=True)
+
+
+# --- Interactive menu -----------------------------------------------------------------------------
+def _run_menu(ctx: ScriptContext, loaded_modules: Dict[str, BaseModule]) -> None:
+    """The interactive menu: start the cache and the writer, then loop until the user exits."""
+    cfg = ctx.cfg
+    logger = ctx.logger
     signal.signal(signal.SIGINT, lambda s, f: exit_now(ctx, 1, "Interrupted... Exiting..."))
 
     start_background_tasks(ctx)
@@ -427,25 +968,7 @@ Please send any feedback/feature requests to =EMAIL=
                         proceed = read_user_input(ctx, f"[{colors['warning']}]Proceed anyway? (y/N): [/] ").strip().lower()
                         if proceed != 'y':
                             continue
-                    stats = getattr(ctx, "stats", None)
-                    if stats and getattr(module_to_run, "track_in_stats", True):
-                        stats.start_module_run(module_to_run)
-                    try:
-                        module_to_run.run(ctx)
-                    except SystemExit:
-                        raise
-                    except KeyboardInterrupt:
-                        if stats and getattr(module_to_run, "track_in_stats", True):
-                            stats.prepare_for_shutdown("interrupted")
-                        raise
-                    except Exception:
-                        ctx.logger.exception("Unhandled exception while running module '%s'", module_to_run.menu_title)
-                        if stats and getattr(module_to_run, "track_in_stats", True):
-                            stats.prepare_for_shutdown("failed")
-                        raise
-                    else:
-                        if stats and getattr(module_to_run, "track_in_stats", True):
-                            stats.finish_module_run("completed")
+                    _run_tracked(ctx, module_to_run, lambda: module_to_run.run(ctx))
             else:
                 ctx.console.print(f"[{colors['error']}]Invalid choice. Please try again.[/]")
                 time.sleep(1)

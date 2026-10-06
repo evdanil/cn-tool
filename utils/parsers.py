@@ -332,16 +332,24 @@ def process_device_commands(
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # interrogate device and get serial/mac/license data
-    # check for reverse DNS entry
 
-    dns_name: Optional[str] = None
-    try:
-        dns_name = gethostbyaddr(device)[0]
-    except Exception:
-        pass
-    if dns_name and not re.search(r'(es|mp|vi|bl|sp|lf)\d{3}', dns_name):
-        logger.info(f'{device} - Not supported device type!')
-        return {device: 'Not supported device type'}
+    # Optional [ssh] device_name_filter: skip hosts whose reverse-DNS name does not match,
+    # e.g. to keep a bulk run to network devices. No filter means every host is tried.
+    name_filter = str((cfg or {}).get("device_name_filter") or "").strip()
+    if name_filter:
+        try:
+            filter_re = re.compile(name_filter, re.IGNORECASE)
+        except re.error as exc:
+            logger.warning(f"Ignoring invalid [ssh] device_name_filter {name_filter!r}: {exc}")
+        else:
+            dns_name: Optional[str] = None
+            try:
+                dns_name = gethostbyaddr(device)[0]
+            except Exception:
+                pass
+            if dns_name and not filter_re.search(dns_name):
+                logger.info(f"{device} - reverse DNS name {dns_name!r} does not match device_name_filter; skipped")
+                return {device: 'Skipped by device_name_filter'}
 
     output: Dict[str, Any] = {}
 

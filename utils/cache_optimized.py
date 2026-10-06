@@ -212,13 +212,17 @@ def get_config_lines_cached(filepath: str) -> Tuple[str, ...]:
     Args:
         filepath: Absolute path to the config file.
 
+    Decodes as UTF-8 with undecodable bytes dropped (``errors="ignore"``), the same policy
+    the indexer applies, so a line number stored in the index addresses the same line here
+    and a stray non-UTF-8 byte never raises.
+
     Returns:
         Tuple of lines (with newlines preserved).
 
     Raises:
         IOError: If file cannot be read.
     """
-    with open(filepath, "r", encoding="utf-8") as f:
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         return tuple(f.readlines())
 
 

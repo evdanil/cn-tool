@@ -23,6 +23,24 @@ worker_thread: Optional[threading.Thread] = None
 _pending_lock = threading.Lock()
 _pending_saves: int = 0
 
+# Save tasks that failed for good (unrepaired corrupt report, lock timeout or
+# any other error). Only the worker thread writes it; the CLI reads it for its
+# exit code once wait_for_all_saves() has returned.
+_save_failures: int = 0
+# Save tasks that did write the report (first try or after an auto-repair); the
+# CLI announces the report file only when this moved.
+_saves_completed: int = 0
+
+
+def save_failures() -> int:
+    """Return how many save tasks have failed since the process started."""
+    return _save_failures
+
+
+def saves_completed() -> int:
+    """Return how many save tasks have written the report since the process started."""
+    return _saves_completed
+
 # openpyxl rejects these control chars in cell text:
 # 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
 _ILLEGAL_XLSX_CHARS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
@@ -185,7 +203,7 @@ def worker() -> None:
     """
     Thread waiting for data to get saved in a report file.
     """
-    global _pending_saves
+    global _pending_saves, _save_failures, _saves_completed
     file_is_corrupt = False
 
     while True:
@@ -207,7 +225,12 @@ def worker() -> None:
             finally:
                 with _pending_lock:
                     _pending_saves = max(0, _pending_saves - 1)
+                    pending_now = _pending_saves
                 save_queue.task_done()
+            if pending_now == 0:
+                # The corrupt state covers one batch only: the next report operation tries again.
+                file_is_corrupt = False
+            continue
 
         ctx = None  # Initialize ctx to None
         lock_fd: Optional[int] = None
@@ -242,6 +265,7 @@ def worker() -> None:
 
             with save_lock:
                 append_df_to_excel(*save_task['args'], **save_task['kwargs'])
+            _saves_completed += 1
 
         except zipfile.BadZipFile as e:
             # Try to auto-repair by deleting the corrupted report and retrying once
@@ -269,12 +293,14 @@ def worker() -> None:
                         with save_lock:
                             append_df_to_excel(*save_task['args'], **save_task['kwargs'])
                         repaired = True
+                        _saves_completed += 1
                         ctx.console.print("[yellow]Report file was corrupted and has been recreated automatically.[/yellow]")
                         ctx.logger.info("Auto-repair successful: report recreated")
                     except Exception as e2:
                         ctx.logger.error(f"Auto-repair failed: {e2}")
 
             if not repaired:
+                _save_failures += 1
                 if ctx:
                     ctx.console.print(
                         "\n[bold red]Error:[/bold red] Could not update the report file. "
@@ -288,6 +314,7 @@ def worker() -> None:
                 file_is_corrupt = True
 
         except TimeoutError as e:
+            _save_failures += 1
             if ctx:
                 ctx.logger.error(f"Report save skipped due to lock timeout: {e}")
                 ctx.console.print(
@@ -300,6 +327,7 @@ def worker() -> None:
                     )
 
         except Exception as e:
+            _save_failures += 1
             if ctx:
                 ctx.logger.error(f"An unexpected error occurred during the file save operation: {e}", exc_info=True)
                 ctx.console.print(f"\n[bold red]Error:[/bold red] An unexpected error occurred while saving the file: {e}")
@@ -322,6 +350,9 @@ def worker() -> None:
                         "status:report_done",
                         {"path": str(Path(report_path).expanduser())},
                     )
+            if pending_now == 0:
+                # Same scoping as above: a corrupt batch must not swallow the saves queued after it.
+                file_is_corrupt = False
 
 
 def start_worker() -> None:

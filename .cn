@@ -15,7 +15,7 @@ auto_save = true
 # max_config_tab_kb = 512
 
 [config_repo]
-directory = /opt/data/configs
+# directory = /opt/data/configs
 vendors = cisco,aruba,f5,bluecoat,viptela
 regions =
 excluded_dirs = old,history
@@ -37,6 +37,31 @@ version = 6
 
 [theme]
 # theme = default
+
+[ssh]
+# OpenSSH config used for host aliases and ProxyJump bastions; set blank to disable.
+config_file = ~/.ssh/config
+# Only query devices whose reverse-DNS name matches this regex (empty = query every host).
+# device_name_filter = (sw|rtr|core)\d+
+
+[site]
+# Site-code conventions are organisation-specific; everything here is optional.
+# code_pattern: regex a site code must match (case-insensitive). Default: 2-64 letters,
+#   digits, '.', '_' or '-'.
+# code_pattern = ^[A-Za-z0-9]{3}(?:-[A-Za-z0-9]{1,4})?$
+# ea_name: Infoblox extensible attribute that holds the site code; when set, site search uses it
+#   and searches subnet comments only when no subnet carries it. Default: empty (subnet
+#   comments only). "cn doctor" checks that the attribute exists on the grid.
+# ea_name = Site
+# comment_pattern: regex template matched against Infoblox subnet comments, {site} is the
+#   escaped site code. Default: the code as a whole word anywhere in the comment. Example
+#   for comments laid out as "COUNTRY;SITE;description":
+# comment_pattern = ^[^;]+;\s*{site}\s*(;|$)
+# hostname_pattern: regex template used by the demobilisation check to find a site's devices
+#   in configuration files. Placeholders: {site}, {site_compact} (hyphens removed) and
+#   {country} (first two letters of the first subnet comment). Default: names starting with
+#   the site code.
+# hostname_pattern = \b{country}{site_compact}[-_\w]*\b
 
 [ad]
 # enabled = true
@@ -65,6 +90,8 @@ enabled = false
 # repository_paths = /path/to/repo1,/path/to/repo2
 
 [config_analyzer]
+# repo_directories: where the repository browser (menu c) and "cn diff" read configurations.
+#   Unset, [config_repo] directory is used.
 # repo_directories = /path/to/repoA,/path/to/repoB
 # repo_names = repoA,repoB
 # layout = right

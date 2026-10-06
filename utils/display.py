@@ -1,6 +1,8 @@
+import sys
 from itertools import cycle
-from typing import Dict, List, Union, Any, Optional
+from typing import Dict, List, Sequence, Union, Any, Optional
 from rich.console import Console, Group
+from rich.markup import escape
 from rich.style import Style
 from rich.theme import Theme
 from rich.table import Table
@@ -11,17 +13,30 @@ from .color_schemes import COLOR_SCHEMES
 from core.base import ScriptContext
 
 
+def _is_tty(stream: Any) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):  # a replaced or already closed stream is not a terminal
+        return False
+
+
 class ThemedConsole:
     def __init__(self, color_scheme: str = "default") -> None:
         self.console: Console
         self.theme: Theme
         self.color_scheme: str
         self.colors: Dict[str, str]
+        self._stderr = False
         self.set_color_scheme(color_scheme)
+
+    def set_stderr(self, enabled: bool) -> None:
+        """Send everything this console prints (prompts, spinners, warnings) to stderr instead of stdout."""
+        self._stderr = enabled
+        self.set_color_scheme(self.color_scheme)
 
     def set_color_scheme(self, color_scheme: str) -> None:
         if color_scheme not in COLOR_SCHEMES:
-            print(f"Warning: Unknown color scheme '{color_scheme}'. Using default.")
+            print(f"Warning: Unknown color scheme '{color_scheme}'. Using default.", file=sys.stderr)
             color_scheme = "default"
 
         self.color_scheme = color_scheme
@@ -36,7 +51,14 @@ class ThemedConsole:
         theme_styles["bold"] = Style(bold=True)
 
         self.theme = Theme(theme_styles)
-        self.console = Console(theme=self.theme, emoji=False)
+        # Spinners animate only when both streams are terminals; a pipe or a cron log gets no frames.
+        both_are_terminals = _is_tty(sys.stdout) and _is_tty(sys.stderr)
+        self.console = Console(
+            theme=self.theme,
+            emoji=False,
+            stderr=self._stderr,
+            force_interactive=None if both_are_terminals else False,
+        )
 
     def print(self, *objects: Any, sep: str = " ", end: str = "\n", style: Optional[Union[str, Style]] = None, **kwargs: Any) -> None:
         if isinstance(style, str):
@@ -77,7 +99,7 @@ def print_search_config_data(ctx: ScriptContext, data: List[List[Any]]) -> None:
     color_scheme = ctx.cfg.get("theme_name", "default")
 
     colors = COLOR_SCHEMES.get(color_scheme, COLOR_SCHEMES["default"])
-    data.sort(key=lambda x: (x[1], x[2]))
+    data.sort(key=lambda x: (x[1], int(x[2])))
 
     current_device = ""
     current_line = 0
@@ -87,18 +109,18 @@ def print_search_config_data(ctx: ScriptContext, data: List[List[Any]]) -> None:
         if device != current_device:
             current_device = device
             current_line = line_number
-            console.print(f"\n[{colors['title']}]Device {current_device}[/]:", highlight=False)
+            console.print(f"\n[{colors['title']}]Device {escape(current_device)}[/]:", highlight=False)
             console.print(f"[{colors['header']}]Line {current_line}:[/]", highlight=False)
         elif line_number - current_line >= 100:
             current_line = line_number
 
             console.print(f"\n[{colors['header']}]Line {current_line}:[/]", highlight=False)
 
-        console.print(f"[{colors['value']}]{line}[/]", highlight=False)
+        console.print(f"[{colors['value']}]{escape(str(line))}[/]", highlight=False)
     console.print("\n")
 
 
-def print_multi_table_panel(ctx: ScriptContext, tables: List[Union[Table, Panel]], title: str) -> None:
+def print_multi_table_panel(ctx: ScriptContext, tables: Sequence[Union[Table, Panel]], title: str) -> None:
 
     color_scheme = ctx.cfg.get("theme_name", "default")
     colors = COLOR_SCHEMES.get(color_scheme, COLOR_SCHEMES["default"])
@@ -144,9 +166,9 @@ def create_device_error_table(hostname: str, reason: str, color_scheme: str = "d
     table.add_column("Reason", style=colors["sn"])
 
     table.add_row(
-        hostname.upper(),
-        "Unable to access device",
-        reason
+        escape(hostname.upper()),
+        "Skipped" if reason.startswith("Skipped") else "Unable to access device",
+        escape(reason),  # exception text may contain brackets Rich would parse as markup
     )
     return table
 
@@ -332,9 +354,72 @@ def create_table(
         )
 
     for row in display_data:
-        table.add_row(*[str(item) for item in row])
+        table.add_row(*[escape(str(item)) for item in row])
 
     return table
+
+
+def table_columns(records: List[Dict[str, Any]]) -> List[str]:
+    """Union of the records' keys, in first-seen order."""
+    return list(dict.fromkeys(column for record in records for column in record))
+
+
+def build_tables(
+    ctx: ScriptContext,
+    data: Dict[str, List[Dict[str, Any]]],
+    prefix: Optional[Dict[str, str]] = None,
+    suffix: Optional[Dict[str, str]] = None,
+    table_order: Optional[List[str]] = None,
+) -> List[Table]:
+    """
+    Builds one table per non-empty section of `data`, using the record keys as column names.
+
+    Args:
+        ctx (ScriptContext): The script context, used for styling.
+        data (Dict[str, List[Dict[str, Any]]]): The data to display, where each key is a table title.
+        prefix (Dict[str, str], optional): Prefixes for table titles, keyed like `data`.
+        suffix (Dict[str, str], optional): Suffixes for table titles, keyed like `data`.
+        table_order (Optional[List[str]], optional): A list of keys from `data` to specify the
+            table order. Tables with keys in this list come first, in the specified order.
+            Remaining tables follow, in alphabetical order.
+            If None or empty, tables follow the dictionary order.
+    """
+    prefix = prefix or {}
+    suffix = suffix or {}
+
+    if table_order:
+        # Start with keys that are in both table_order and data, preserving the order
+        ordered_keys = [key for key in table_order if key in data]
+
+        # Get the remaining keys from data that were not in table_order
+        # Sort them alphabetically for a consistent, predictable output
+        remaining_keys = sorted([key for key in data if key not in ordered_keys])
+
+        # Combine the lists: user-specified order first, then the rest
+        sorted_keys = ordered_keys + remaining_keys
+    else:
+        # Fallback to the default order if table_order is not provided
+        sorted_keys = list(data.keys())
+
+    tables: List[Table] = []
+
+    for key in sorted_keys:
+        value_list = data[key]
+        if not value_list:
+            continue
+
+        section_title = key
+        prefix_text = prefix.get(key, "")
+        suffix_text = suffix.get(key, "")
+        section_title = f"{prefix_text} {section_title} {suffix_text}".strip()
+        section_title = section_title.upper()
+
+        columns = table_columns(value_list)
+        table_data = [[record.get(column, "") for column in columns] for record in value_list]
+
+        tables.append(create_table(ctx, section_title, columns, table_data, title_justify="left"))
+
+    return tables
 
 
 def print_table_data(
@@ -360,41 +445,7 @@ def print_table_data(
 
     # ctx.logger.debug(f'Dumping data {data}')
 
-    if table_order:
-        # Start with keys that are in both table_order and data, preserving the order
-        ordered_keys = [key for key in table_order if key in data]
-
-        # Get the remaining keys from data that were not in table_order
-        # Sort them alphabetically for a consistent, predictable output
-        remaining_keys = sorted([key for key in data if key not in ordered_keys])
-
-        # Combine the lists: user-specified order first, then the rest
-        sorted_keys = ordered_keys + remaining_keys
-    else:
-        # Fallback to the default order if table_order is not provided
-        sorted_keys = list(data.keys())
-
-    tables: List[Union[Table, Panel]] = []
-
-    for key in sorted_keys:
-        value_list = data[key]
-        if not value_list:
-            continue
-
-        section_title = key
-        prefix_text = prefix.get(key, "")
-        suffix_text = suffix.get(key, "")
-        section_title = f"{prefix_text} {section_title} {suffix_text}".strip()
-        section_title = section_title.upper()
-
-        columns = list(value_list[0].keys())
-        for record in value_list[1:]:
-            for column in record.keys():
-                if column not in columns:
-                    columns.append(column)
-        table_data = [[record.get(column, "") for column in columns] for record in value_list]
-
-        tables.append(create_table(ctx, section_title, columns, table_data, title_justify="left"))
+    tables = build_tables(ctx, data, prefix, suffix, table_order)
 
     if tables:
         print_multi_table_panel(ctx, tables, '')

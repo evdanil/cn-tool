@@ -2,8 +2,9 @@ import json
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from dataclasses import dataclass, field, replace
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -13,6 +14,7 @@ from urllib3.util.retry import Retry
 
 from core.base import ScriptContext
 from utils.display import get_global_color_scheme
+from utils.validation import site_comment_regex
 from utils.infoblox_safety import (
     infoblox_debug_payloads_enabled,
     redact_infoblox_uri,
@@ -27,6 +29,13 @@ retries = Retry(
     backoff_factor=2,
 )
 
+# WAPI paging: one page holds WAPI_PAGE_SIZE rows and a paged request follows at most
+# WAPI_MAX_PAGES pages, so a paged result never exceeds WAPI_MAX_ROWS rows.
+WAPI_PAGE_SIZE = 1000
+WAPI_MAX_PAGES = 10
+WAPI_MAX_ROWS = WAPI_PAGE_SIZE * WAPI_MAX_PAGES
+
+_WAPI_TEXT_LIMIT = 120  # characters of a WAPI error text quoted back to the user
 _DEFAULT_INFOBLOX_MAX_WORKERS = 8
 _MAX_INFOBLOX_MAX_WORKERS = 32
 _adapter_lock = threading.Lock()
@@ -95,6 +104,8 @@ class InfobloxResult:
     error_kind: str = ""
     uri: str = ""
     full_url: str = ""
+    truncated: bool = False
+    next_page_id: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -118,10 +129,21 @@ class NetworkSearchResult:
     message: str = ""
     error_kind: str = ""
     failures: List[InfobloxResult] = field(default_factory=list)
+    truncated: bool = False
+    # Something the user should read although the search worked (menu and stderr only, not JSON):
+    # the site code was found in subnet comments because no subnet carries the attribute ...
+    note: str = ""
+    # ... and an address family the attribute search could not cover (a grid capability, not a failure).
+    skipped: str = ""
 
     @property
     def has_data(self) -> bool:
         return any(bool(items) for items in self.data.values())
+
+    @property
+    def notices(self) -> List[str]:
+        """What a menu should print as warnings next to a working search: ``skipped``, then ``note``."""
+        return [text for text in (self.skipped, self.note) if text]
 
 
 def _build_response(status_code: int, content: bytes = b"", url: str = "") -> requests.Response:
@@ -136,8 +158,33 @@ def _normalize_items(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
     if isinstance(payload, dict):
-        return [payload]
+        result = payload.get("result")
+        # a ``_return_as_object=1`` answer wraps the rows; any other object is one record
+        return _normalize_items(result) if isinstance(result, list) else [payload]
     return []
+
+
+def _wapi_error_text(content: bytes) -> str:
+    """The ``text`` field of a WAPI error body on a single line ("" when there is none)."""
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return ""
+    text = payload.get("text") if isinstance(payload, dict) else None
+    return " ".join(text.split()) if isinstance(text, str) else ""
+
+
+def _classify_http_status(status_code: int, body_text: str) -> str:
+    """Map an HTTP error status (and the response body) to an ``InfobloxResult.status``."""
+    if status_code in (401, 403):
+        return "auth_error"
+    if 500 <= status_code < 600:
+        return "server_error"
+    if status_code == 404:
+        return "not_found"
+    if status_code == 400 and "result set too large" in body_text.lower():
+        return "too_many_results"
+    return "invalid_query"
 
 
 def describe_infoblox_failure(result: InfobloxResult) -> str:
@@ -155,8 +202,12 @@ def describe_infoblox_failure(result: InfobloxResult) -> str:
         return f"Infoblox server error ({result.status_code})."
     if result.status == "invalid_json":
         return "Infoblox returned an invalid JSON response."
+    if result.status == "too_many_results":
+        return "Infoblox: more than 1,000 records match. Narrow the search (longer prefix or smaller subnet)."
     if result.status == "invalid_query":
-        return f"Infoblox rejected the request ({result.status_code})."
+        message = f"Infoblox rejected the request ({result.status_code})"
+        detail = _wapi_error_text(result.content)
+        return f"{message}: {detail[:_WAPI_TEXT_LIMIT]}" if detail else f"{message}."
     if result.status == "not_found":
         return "No matching Infoblox records were found."
     return "Infoblox request failed."
@@ -168,7 +219,41 @@ class InfobloxClient:
     def __init__(self, http_session: requests.Session):
         self._session = http_session
 
-    def request(self, ctx: ScriptContext, uri: str, *, ensure_auth: bool = True) -> InfobloxResult:
+    def request(
+        self,
+        ctx: ScriptContext,
+        uri: str,
+        *,
+        ensure_auth: bool = True,
+        paged: bool = False,
+        max_pages: int = WAPI_MAX_PAGES,
+    ) -> InfobloxResult:
+        """
+        Run one WAPI GET. With ``paged=True`` the pages are followed (WAPI_PAGE_SIZE rows each,
+        at most ``max_pages`` of them) and merged into one result; ``truncated`` says that more
+        rows were left behind. A failing page is returned as it is.
+        """
+        if not paged:
+            return self._request_once(ctx, uri, ensure_auth=ensure_auth)
+
+        first_page_uri = uri
+        for key, value in (("_paging", "1"), ("_return_as_object", "1"), ("_max_results", str(WAPI_PAGE_SIZE))):
+            first_page_uri = _append_query_arg(first_page_uri, key, value)
+
+        items: List[Dict[str, Any]] = []
+        next_page_id: Optional[str] = None
+        for _ in range(max(1, max_pages)):
+            page_uri = first_page_uri if next_page_id is None else f"{first_page_uri}&_page_id={quote(next_page_id, safe='')}"
+            page = self._request_once(ctx, page_uri, ensure_auth=ensure_auth)
+            if not page.ok:
+                return page
+            items.extend(page.items)
+            next_page_id = page.next_page_id
+            if next_page_id is None:
+                break
+        return replace(page, items=items, content=json.dumps(items).encode(), truncated=next_page_id is not None)
+
+    def _request_once(self, ctx: ScriptContext, uri: str, *, ensure_auth: bool = True) -> InfobloxResult:
         configure_infoblox_session(ctx)
         endpoint = str(ctx.cfg.get("api_endpoint") or "").strip()
         debug_payloads = infoblox_debug_payloads_enabled(ctx)
@@ -184,6 +269,7 @@ class InfobloxClient:
             message: str = "",
             error_kind: str = "",
             full_url_value: str = "",
+            next_page_id: Optional[str] = None,
         ) -> InfobloxResult:
             result = InfobloxResult(
                 status=status,
@@ -195,6 +281,7 @@ class InfobloxClient:
                 error_kind=error_kind,
                 uri=uri,
                 full_url=full_url_value,
+                next_page_id=next_page_id,
             )
             if debug_payloads:
                 ctx.logger.debug(
@@ -232,6 +319,30 @@ class InfobloxClient:
             ensure_infoblox_auth(ctx)
 
         full_url = f"{endpoint}{uri}"
+
+        def build_http_failure(error_response: requests.Response, status_code: int) -> InfobloxResult:
+            content = error_response.content or b""
+            status = _classify_http_status(status_code, content.decode("utf-8", errors="replace"))
+            message = describe_infoblox_failure(
+                InfobloxResult(
+                    status=status,
+                    status_code=status_code,
+                    response=error_response,
+                    content=content,
+                    uri=uri,
+                    full_url=full_url,
+                )
+            )
+            return build_result(
+                status=status,
+                status_code=status_code,
+                response_obj=error_response,
+                content=content,
+                message=message,
+                error_kind=status,
+                full_url_value=full_url,
+            )
+
         verify_ssl = bool(ctx.cfg.get("api_verify_ssl", True))
         timeout = int(ctx.cfg.get("api_timeout", 10))
         response = _build_response(500, url=full_url)
@@ -241,36 +352,6 @@ class InfobloxClient:
                 if not verify_ssl:
                     warnings.simplefilter("ignore", InsecureRequestWarning)
                 response = self._session.get(full_url, verify=verify_ssl, timeout=timeout)
-
-            if response.status_code in (400, 404):
-                return build_result(
-                    status="not_found",
-                    status_code=response.status_code,
-                    response_obj=response,
-                    content=response.content,
-                    message=describe_infoblox_failure(
-                        InfobloxResult(
-                            status="not_found",
-                            status_code=response.status_code,
-                            response=response,
-                            uri=uri,
-                            full_url=full_url,
-                        )
-                    ),
-                    error_kind="not_found",
-                    full_url_value=full_url,
-                )
-
-            if response.status_code in (401, 403):
-                return build_result(
-                    status="auth_error",
-                    status_code=response.status_code,
-                    response_obj=response,
-                    content=response.content,
-                    message="Authentication failed against Infoblox.",
-                    error_kind="auth_error",
-                    full_url_value=full_url,
-                )
 
             response.raise_for_status()
         except Timeout:
@@ -314,52 +395,13 @@ class InfobloxClient:
                 full_url_value=full_url,
             )
         except HTTPError as exc:
-            error_response = exc.response or response
-            status_code = error_response.status_code or 500
-            if status_code in (401, 403):
-                status = "auth_error"
-            elif 500 <= status_code < 600:
-                status = "server_error"
-            elif status_code in (400, 404):
-                status = "not_found"
-            else:
-                status = "invalid_query"
-            message = describe_infoblox_failure(
-                InfobloxResult(status=status, status_code=status_code, response=error_response, uri=uri, full_url=full_url)
-            )
-            return build_result(
-                status=status,
-                status_code=status_code,
-                response_obj=error_response,
-                content=error_response.content,
-                message=message,
-                error_kind=status,
-                full_url_value=full_url,
-            )
+            # requests.Response.__bool__ is ``.ok``, so every 4xx/5xx response is falsy: test for None
+            error_response = exc.response if exc.response is not None else response
+            return build_http_failure(error_response, error_response.status_code or 500)
         except RequestException as exc:
             error_response = getattr(exc, "response", None)
             if error_response is not None:
-                status_code = error_response.status_code or response.status_code or 500
-                if status_code in (401, 403):
-                    status = "auth_error"
-                elif 500 <= status_code < 600:
-                    status = "server_error"
-                elif status_code in (400, 404):
-                    status = "not_found"
-                else:
-                    status = "invalid_query"
-                message = describe_infoblox_failure(
-                    InfobloxResult(status=status, status_code=status_code, response=error_response, uri=uri, full_url=full_url)
-                )
-                return build_result(
-                    status=status,
-                    status_code=status_code,
-                    response_obj=error_response,
-                    content=error_response.content,
-                    message=message,
-                    error_kind=status,
-                    full_url_value=full_url,
-                )
+                return build_http_failure(error_response, error_response.status_code or response.status_code or 500)
             return build_result(
                 status="request_error",
                 status_code=response.status_code or 500,
@@ -392,6 +434,7 @@ class InfobloxClient:
             message="",
             error_kind="",
             full_url_value=full_url,
+            next_page_id=(payload.get("next_page_id") or None) if isinstance(payload, dict) else None,
         )
 
 
@@ -402,8 +445,15 @@ def get_infoblox_client() -> InfobloxClient:
     return _INFOBLOX_CLIENT
 
 
-def request_result(ctx: ScriptContext, uri: str, *, ensure_auth: bool = True) -> InfobloxResult:
-    return get_infoblox_client().request(ctx, uri, ensure_auth=ensure_auth)
+def request_result(
+    ctx: ScriptContext,
+    uri: str,
+    *,
+    ensure_auth: bool = True,
+    paged: bool = False,
+    max_pages: int = WAPI_MAX_PAGES,
+) -> InfobloxResult:
+    return get_infoblox_client().request(ctx, uri, ensure_auth=ensure_auth, paged=paged, max_pages=max_pages)
 
 
 def _append_query_arg(uri: str, key: str, value: str) -> str:
@@ -451,17 +501,21 @@ def request_result_with_inheritance(ctx: ScriptContext, uri: str, *, ensure_auth
     try:
         result = request_result(ctx, inherited_uri, ensure_auth=ensure_auth)
 
-        if result.status_code == 400:
+        # Only a 400 says anything about _inheritance (other codes are classified invalid_query too,
+        # e.g. 429); and only a plain retry that succeeds proves the grid rejected the option.
+        if result.status == "invalid_query" and result.status_code == 400:
             fallback_result = request_result(ctx, uri, ensure_auth=ensure_auth)
-            if fallback_result.status_code != 400:
+            if fallback_result.status_code == 400:
+                return result  # the query itself is bad; inheritance is not the problem
+            if fallback_result.ok:
                 if endpoint_key:
                     with _inheritance_support_lock:
                         _inheritance_support_by_endpoint[endpoint_key] = False
                 ctx.logger.info("Infoblox endpoint rejected _inheritance; falling back to plain subnet lookups for this session.")
-                return fallback_result
-            return result
+            return fallback_result
 
-        if endpoint_key and result.status_code and result.status_code != 400:
+        # Only an answer that accepted the option proves support: a 400 of either kind is ambiguous.
+        if endpoint_key and (result.ok or result.status == "not_found"):
             with _inheritance_support_lock:
                 _inheritance_support_by_endpoint[endpoint_key] = True
         return result
@@ -515,48 +569,41 @@ def selective_url_encode(pattern: str) -> str:
     return encoded_pattern
 
 
-def fetch_network_data(
+def site_ea_name(ctx: ScriptContext) -> str:
+    """The extensible attribute that holds the site code (``[site] ea_name``); "" when none is configured."""
+    return str(ctx.cfg.get("site_ea_name") or "").strip()
+
+
+def site_attribute_filter(ea_name: str, code: str) -> str:
+    """The WAPI search term matching the extensible attribute ``ea_name`` to ``code`` (``:=``: case-insensitive)."""
+    return f"*{quote(ea_name, safe='')}:={quote(code, safe='')}"
+
+
+# dhcp_utilization is an IPv4 ``network`` field: ``ipv6network`` answers 400 to it.
+_NETWORK_FIELDS_IPV4 = "_return_fields=network,comment,dhcp_utilization"
+_NETWORK_FIELDS_IPV6 = "_return_fields=network,comment"
+
+
+def _query_families(
+    ctx: ScriptContext, uri_ipv4: str, uri_ipv6: str, ensure_auth: bool
+) -> Tuple[InfobloxResult, InfobloxResult]:
+    """Run the paged IPv4 and IPv6 network queries in parallel; returns (IPv4 result, IPv6 result)."""
+    with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, 2)) as executor:
+        future_to_family = {
+            executor.submit(request_result, ctx, uri_ipv4, ensure_auth=ensure_auth, paged=True): "ipv4",
+            executor.submit(request_result, ctx, uri_ipv6, ensure_auth=ensure_auth, paged=True): "ipv6",
+        }
+        family_results = {future_to_family[future]: future.result() for future in future_to_family}
+    return family_results["ipv4"], family_results["ipv6"]
+
+
+def _network_result(
     ctx: ScriptContext,
-    search_term: str,
-    keyword: bool = False,
-    ensure_auth: bool = True,
+    search_type: str,
+    result_ipv4: InfobloxResult,
+    result_ipv6: InfobloxResult,
 ) -> NetworkSearchResult:
-    """
-    Fetches and processes IPv4 and IPv6 network data based on a search term.
-    Merges results, removes duplicates, and returns the processed data.
-    """
-
-    colors = get_global_color_scheme(ctx.cfg)
-    search_type = ''
-
-    if not keyword:
-        # Build regex pattern for site code search
-        padded_search_term = rf'^[^;]+;\s*{search_term}\s*(;|$)'
-        encoded_pattern = selective_url_encode(padded_search_term)
-        search_type = f"location_{search_term}"
-    else:
-        encoded_pattern = selective_url_encode(search_term)
-        search_type = "location_keyword"
-
-    fields = "_return_fields=network,comment"
-    uri_ipv4 = f"network?comment:~={encoded_pattern}&_max_results=1000&{fields}"
-    uri_ipv6 = f"ipv6network?comment:~={encoded_pattern}&_max_results=1000&{fields}"
-
-    with ctx.console.status(
-        status=f"[{colors['description']}]Fetching subnet data for [{colors['header']}]{search_term.upper()}[/]...[/]",
-        spinner="dots12",
-    ):
-        with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, 2)) as executor:
-            future_to_family = {
-                executor.submit(request_result, ctx, uri_ipv4, ensure_auth=ensure_auth): "ipv4",
-                executor.submit(request_result, ctx, uri_ipv6, ensure_auth=ensure_auth): "ipv6",
-            }
-            family_results = {future_to_family[future]: future.result() for future in future_to_family}
-
-    result_ipv4 = family_results["ipv4"]
-    result_ipv6 = family_results["ipv6"]
-
-    # Process data
+    """Parse both families' answers as ``search_type``, merge them and judge the outcome."""
     processed_data_ipv4: Dict[str, Any] = process_data(ctx, type=search_type, content=result_ipv4.content) if result_ipv4.ok else {}
     processed_data_ipv6: Dict[str, Any] = process_data(ctx, type=search_type, content=result_ipv6.content) if result_ipv6.ok else {}
 
@@ -572,6 +619,7 @@ def fetch_network_data(
             merged_locations.append(item)
 
     failures = [lookup_result for lookup_result in (result_ipv4, result_ipv6) if lookup_result.failed]
+    truncated = result_ipv4.truncated or result_ipv6.truncated
 
     if failures and not merged_locations:
         first_failure = failures[0]
@@ -581,6 +629,7 @@ def fetch_network_data(
             message=describe_infoblox_failure(first_failure),
             error_kind=first_failure.error_kind,
             failures=failures,
+            truncated=truncated,
         )
 
     if failures:
@@ -591,6 +640,99 @@ def fetch_network_data(
             message=describe_infoblox_failure(first_failure),
             error_kind=first_failure.error_kind,
             failures=failures,
+            truncated=truncated,
         )
 
-    return NetworkSearchResult(data={"location": merged_locations}, status="ok")
+    return NetworkSearchResult(data={"location": merged_locations}, status="ok", truncated=truncated)
+
+
+def _search_comments(
+    ctx: ScriptContext, search_term: str, keyword: bool, ensure_auth: bool
+) -> NetworkSearchResult:
+    """Subnets whose comment names the site code (``[site] comment_pattern``) or, for a keyword, contains it."""
+    if not keyword:
+        # Match the site code in the subnet comment the way [site] comment_pattern defines it.
+        comment_regex = site_comment_regex(search_term, ctx.cfg.get("site_comment_pattern"))
+        encoded_pattern = selective_url_encode(comment_regex)
+        search_type = f"location_{search_term}"
+    else:
+        encoded_pattern = selective_url_encode(search_term)
+        search_type = "location_keyword"
+
+    uri_ipv4 = f"network?comment:~={encoded_pattern}&_max_results=1000&{_NETWORK_FIELDS_IPV4}"
+    uri_ipv6 = f"ipv6network?comment:~={encoded_pattern}&_max_results=1000&{_NETWORK_FIELDS_IPV6}"
+    result_ipv4, result_ipv6 = _query_families(ctx, uri_ipv4, uri_ipv6, ensure_auth)
+    return _network_result(ctx, search_type, result_ipv4, result_ipv6)
+
+
+def _search_attribute_then_comments(
+    ctx: ScriptContext, ea_name: str, code: str, ensure_auth: bool
+) -> NetworkSearchResult:
+    """
+    Subnets that carry the site code in the extensible attribute ``ea_name``; when none does, the
+    subnets whose comment names it (the result then carries a ``note``). A failed attribute query
+    never falls back: a mistyped ``[site] ea_name`` must not look like a site without subnets.
+    """
+    attribute_filter = site_attribute_filter(ea_name, code)
+    result_ipv4, result_ipv6 = _query_families(
+        ctx,
+        f"network?{attribute_filter}&{_NETWORK_FIELDS_IPV4}",
+        f"ipv6network?{attribute_filter}&{_NETWORK_FIELDS_IPV6}",
+        ensure_auth,
+    )
+
+    skipped = ""
+    if not result_ipv4.failed and result_ipv6.status == "invalid_query":
+        # The attribute may be defined for IPv4 objects only: that is a grid capability, not a failure.
+        skipped = f"IPv6 subnets not searched: {describe_infoblox_failure(result_ipv6)}"
+        result_ipv6 = replace(result_ipv6, status="ok", items=[], content=b"[]")
+
+    # The grid matched the attribute, and the comment need not name the site: no local comment filter.
+    found = _network_result(ctx, "location_keyword", result_ipv4, result_ipv6)
+
+    if found.status == "error":
+        reason = found.message.rstrip(".")
+        return replace(
+            found,
+            message=f"Site search by extensible attribute '{ea_name}' ([site] ea_name) failed: {reason}; check with: cn doctor",
+        )
+
+    if found.status == "ok" and not found.has_data:
+        # Both answers came back empty. The comment search covers IPv6 as well, so nothing stays "skipped".
+        by_comment = _search_comments(ctx, code, keyword=False, ensure_auth=ensure_auth)
+        if by_comment.has_data:
+            note = (
+                f"No subnet has the extensible attribute {ea_name} = {code.upper()}; "
+                f"matched {code.upper()} in subnet comments instead."
+            )
+            return replace(by_comment, note=note)
+        return by_comment
+
+    return replace(found, skipped=skipped)
+
+
+def fetch_network_data(
+    ctx: ScriptContext,
+    search_term: str,
+    keyword: bool = False,
+    ensure_auth: bool = True,
+) -> NetworkSearchResult:
+    """
+    Fetches and processes IPv4 and IPv6 network data based on a search term.
+    Merges results, removes duplicates, and returns the processed data.
+
+    A site code is looked up in the extensible attribute ``[site] ea_name`` when one is configured
+    (and in subnet comments when no subnet carries it), otherwise in subnet comments only; a keyword
+    is always searched in subnet comments.
+    """
+
+    colors = get_global_color_scheme(ctx.cfg)
+    ea_name = "" if keyword else site_ea_name(ctx)
+
+    with ctx.console.status(
+        status=f"[{colors['description']}]Fetching subnet data for [{colors['header']}]{search_term.upper()}[/]...[/]",
+        spinner="dots12",
+    ):
+        if ea_name:
+            return _search_attribute_then_comments(ctx, ea_name, search_term, ensure_auth)
+        return _search_comments(ctx, search_term, keyword, ensure_auth)

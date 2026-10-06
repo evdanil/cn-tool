@@ -6,6 +6,7 @@ import logging
 import re
 import queue
 import threading
+import uuid
 from time import time
 from pathlib import Path
 from time import perf_counter
@@ -255,10 +256,17 @@ def cache_writer(
     rev_idx: Index,
     total_files: int,
     batch_size: int,
+    run_token: Optional[str] = None,
+    write_failed: Optional[threading.Event] = None,
 ):
     """
     Consumer thread function. Pulls parsed data from a queue and writes it
     to diskcache in batches to keep memory usage low.
+
+    A write failure is recorded as ``indexing_error``, tagged (``indexing_error_run``) with the
+    *run_token* of the indexing run it belongs to, so that other runs can tell whose it is. That
+    record is one shared slot that a concurrent run's failure may overwrite, so the failure is also
+    reported to the run itself by setting *write_failed*, which only this writer and its run share.
     """
     logger = ctx.logger
     # Keep batches configurable to balance throughput and memory.
@@ -330,11 +338,15 @@ def cache_writer(
                 write_seconds += perf_counter() - write_started
             except Exception as e:
                 fatal_error = True
+                if write_failed is not None:
+                    write_failed.set()  # before the status store is touched: it may be the thing that failed
                 logger.error(f"FATAL error during cache batch write: {e}")
                 # Signal the error to the UI via cache (and cfg as fallback)
                 try:
                     msg = str(e)
                     err = "disk_full" if 'No space left' in msg or 'ENOSPC' in msg else "io_error"
+                    # The owner goes first: the error must never be visible without it.
+                    ctx.cache.dc.set("indexing_error_run", run_token)
                     ctx.cache.dc.set("indexing_error", f"{err}: {msg}")
                     ctx.cache.dc.set("indexing_error_time", int(time()))
                     ctx.cache.dc.set("indexing_phase", "error")
@@ -373,7 +385,7 @@ def cache_writer(
                 ctx.cache.dc.set("indexing_total", int(total_files))
                 ctx.cache.dc.set("indexing_done", int(processed_count))
                 now = time()
-                ctx.cache.dc.set("indexing_last_update", int(now))
+                _heartbeat(ctx.cache, run_token, now)
                 last_update_ts = now
                 if event_bus and not fatal_error:
                     event_bus.publish(
@@ -400,6 +412,122 @@ def cache_writer(
     )
 
 
+# An indexing run that has not been heard from for this long is taken to be gone (same limit as
+# core.background uses for an "indexing" flag nobody refreshes).
+_RUN_STALE_SECONDS = 180
+
+
+def _run_marker(token: str) -> str:
+    return f"indexing_run:{token}"
+
+
+def _register_run(cache: CacheManager, token: str) -> None:
+    """Announce an indexing run in the status store for as long as it lasts.
+
+    The marker's value is the time the run was last heard from: registration, then every heartbeat.
+    """
+    try:
+        cache.dc.set(_run_marker(token), int(time()))
+    except Exception:
+        pass
+
+
+def _deregister_run(cache: CacheManager, token: str) -> None:
+    try:
+        cache.dc.pop(_run_marker(token), None)
+    except Exception:
+        pass
+
+
+def _heartbeat(cache: CacheManager, run_token: Optional[str], now: float) -> None:
+    """Record that indexing is making progress: the shared status heartbeat, and the run's own marker.
+
+    The shared ``indexing_last_update`` is what the status line and other processes watch; every run
+    writes it, so it cannot say which run is alive. The run's own marker can.
+    """
+    cache.dc.set("indexing_last_update", int(now))
+    if run_token is not None:
+        cache.dc.set(_run_marker(run_token), int(now))
+
+
+def _run_is_active(cache: CacheManager, token: str) -> bool:
+    """True while the run is registered and its own marker was refreshed within the stale limit.
+
+    Only the run's own marker counts: the shared progress heartbeat is refreshed by whichever run is
+    indexing, so it would keep a dead run looking alive for as long as a later run goes on.
+    """
+    last_heard = cache.dc.get(_run_marker(token))
+    if last_heard is None:
+        return False
+    return (int(time()) - int(last_heard)) <= _RUN_STALE_SECONDS
+
+
+def _clear_recorded_indexing_error(ctx: ScriptContext, cache: CacheManager) -> None:
+    """Forget a recorded indexing error, but only one that belongs to a run that is over.
+
+    A failed writer records the error and goes on draining its queue, and another process that sees
+    the error drops the shared "indexing" flag meanwhile, so a missing flag does not show that the
+    run which recorded the error has finished. The error is therefore tagged with its run, and
+    it is cleared only when that run is no longer registered (it finished) or its own marker has not been
+    refreshed for too long (it died). Another run's progress does not vouch for it.
+    An untagged error (older versions) belongs to no running run. When the status store cannot say
+    whether the run is over, the error is left alone.
+
+    The owner is read and the records are deleted in one transaction on the status store. Otherwise
+    another process's failing writer could publish its own owner and error in between, and its record
+    (which lives nowhere else once its writer has reported to its own run) would be deleted as the
+    finished run's. The writer's ``set`` simply waits for the transaction and then replaces what is left.
+    """
+    try:
+        ctx.cfg.pop("indexing_error", None)  # the cfg copy is process-local, so it can only be this process's own error
+    except Exception:
+        pass
+    try:
+        with cache.dc.transact():
+            owner = cache.dc.get("indexing_error_run")
+            if owner is not None and _run_is_active(cache, owner):
+                return
+            _delete_indexing_error_records(cache)
+    except Exception:
+        pass
+
+
+def _delete_indexing_error_records(cache: CacheManager) -> bool:
+    """Delete the records of a recorded indexing error, each on its own, and say whether all are gone."""
+    deleted = True
+    for key in ("indexing_error", "indexing_error_time", "indexing_error_run"):
+        try:
+            cache.dc.pop(key, None)
+        except Exception:
+            deleted = False
+    return deleted
+
+
+def _forget_superseded_indexing_error(cache: CacheManager, run_token: str) -> bool:
+    """A run that has failed forgets its own error when a later run has succeeded, and says whether it is gone.
+
+    Another run that succeeded while this one was still draining its queue left the error alone, since
+    the run looked active, and it will not look again: this is the only chance to forget it. "Later"
+    means ``updated`` is newer than the moment the error was recorded. Only the run's own error is
+    forgotten (never another run's), and ``updated`` is never touched. When the status store cannot say,
+    the error stays.
+
+    As in _clear_recorded_indexing_error, the checks and the deletion are one transaction, so that a
+    record another run publishes meanwhile is not deleted with this one.
+    """
+    try:
+        with cache.dc.transact():
+            if cache.dc.get("indexing_error_run") != run_token:
+                return False
+            failed_at = cache.dc.get("indexing_error_time")
+            updated = cache.dc.get("updated")
+            if failed_at is None or updated is None or int(updated) <= int(failed_at):
+                return False
+            return _delete_indexing_error_records(cache)
+    except Exception:
+        return False
+
+
 def mt_index_configurations(ctx: ScriptContext) -> None:
     """
     Multithreaded, memory-optimized version to index configuration files
@@ -414,8 +542,15 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         return
 
     start = perf_counter()
-    # Keep indexing marker persistent for long runs; liveness is tracked via indexing_last_update.
+    run_token = uuid.uuid4().hex
+    # Forget the failure of an earlier run that is over before this one becomes visible as "indexing":
+    # whether this run failed is read back from its writer's own report (or an indexing_error tagged
+    # with run_token) afterwards.
+    _clear_recorded_indexing_error(ctx, cache)
+    # Keep indexing marker persistent for long runs; liveness is tracked via indexing_last_update
+    # (shared, for the status line and other processes) and the run's own marker (for its error's fate).
     cache.dc.set("indexing", True)
+    _register_run(cache, run_token)
     try:
         cache.dc.set("indexing_started", int(time()))
         cache.dc.set("indexing_phase", "checking")
@@ -511,7 +646,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     try:
         cache.dc.set("checking_total", int(len(potentially_updated_files)))
         cache.dc.set("checking_done", 0)
-        cache.dc.set("indexing_last_update", int(time()))
+        _heartbeat(cache, run_token, time())
     except Exception:
         pass
 
@@ -568,7 +703,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
                 if idx % 100 == 0 or (now - last_checking_heartbeat) >= 5:
                     try:
                         cache.dc.set("checking_done", int(done_count))
-                        cache.dc.set("indexing_last_update", int(now))
+                        _heartbeat(cache, run_token, now)
                         last_checking_heartbeat = now
                     except Exception:
                         pass
@@ -576,7 +711,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     logger.info(f"Finished checking files. Found {files_reindexed_count} files that need re-indexing.")
     try:
         cache.dc.set("checking_done", int(len(potentially_updated_files)))
-        cache.dc.set("indexing_last_update", int(time()))
+        _heartbeat(cache, run_token, time())
     except Exception:
         pass
 
@@ -596,7 +731,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             cache.dc.set("indexing_phase", "cleaning")
             cache.dc.set("cleaning_total", int(len(hosts_to_clean)))
             cache.dc.set("cleaning_done", 0)
-            cache.dc.set("indexing_last_update", int(time()))
+            _heartbeat(cache, run_token, time())
         except Exception:
             pass
         if event_bus:
@@ -622,7 +757,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             now = time()
             if (now - last_cleaning_heartbeat) >= 5:
                 try:
-                    cache.dc.set("indexing_last_update", int(now))
+                    _heartbeat(cache, run_token, now)
                     last_cleaning_heartbeat = now
                 except Exception:
                     pass
@@ -654,7 +789,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             if clean_idx % 100 == 0 or (now - last_cleaning_heartbeat) >= 5:
                 try:
                     cache.dc.set("cleaning_done", int(clean_idx))
-                    cache.dc.set("indexing_last_update", int(now))
+                    _heartbeat(cache, run_token, now)
                     last_cleaning_heartbeat = now
                 except Exception:
                     pass
@@ -690,7 +825,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         logger.info("Cleaning complete.")
         try:
             cache.dc.set("cleaning_done", int(len(hosts_to_clean)))
-            cache.dc.set("indexing_last_update", int(time()))
+            _heartbeat(cache, run_token, time())
         except Exception:
             pass
         if event_bus:
@@ -724,6 +859,12 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     logger.info(f"Index Cache - Found {len(index_inputs)} new or updated files. Indexing...")
     if not index_inputs:
         logger.info("Index Cache - No configuration changes detected.")
+        _deregister_run(cache, run_token)
+        try:
+            cache.dc.set("updated", int(time()))  # before the error below is judged (see the end of the full run)
+        except Exception:
+            pass
+        _clear_recorded_indexing_error(ctx, cache)  # a run that failed while this one was checking is over now
         try:
             cache.dc.pop("indexing", None)
             cache.dc.pop("indexing_phase", None)
@@ -734,7 +875,6 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             cache.dc.pop("indexing_total", None)
             cache.dc.pop("indexing_done", None)
             cache.dc.pop("indexing_last_update", None)
-            cache.dc.set("updated", int(time()))
         except Exception:
             pass
         if event_bus:
@@ -766,10 +906,11 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         cache.dc.set("indexing_phase", "indexing")
         cache.dc.set("indexing_total", int(len(index_inputs)))
         cache.dc.set("indexing_done", 0)
-        cache.dc.set("indexing_last_update", int(time()))
+        _heartbeat(cache, run_token, time())
     except Exception:
         pass
 
+    write_failed = threading.Event()
     writer_thread = threading.Thread(
         target=cache_writer,
         args=(
@@ -782,6 +923,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
             len(index_inputs),
             batch_size,
         ),
+        kwargs={"run_token": run_token, "write_failed": write_failed},
     )
     writer_thread.start()
 
@@ -806,7 +948,7 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
                 write_queue.put(result)
                 if idx % 100 == 0:
                     try:
-                        cache.dc.set("indexing_last_update", int(time()))
+                        _heartbeat(cache, run_token, time())
                     except Exception:
                         pass
     else:
@@ -818,12 +960,17 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     # Wait for the writer thread to finish processing all items from the queue
     writer_thread.join()
 
-    # If a fatal error occurred, mark indexing as finished with error and avoid marking cache updated
-    fatal = False
-    try:
-        fatal = bool(cache.dc.get("indexing_error"))
-    except Exception:
-        fatal = bool(ctx.cfg.get("indexing_error", False))
+    # If a fatal error occurred, mark indexing as finished with error and avoid marking cache updated.
+    # The writer's own report comes first: the shared error slot may since have been overwritten by a
+    # concurrent run's failure. Failing that, only this run's error counts (or one nobody tagged):
+    # another run's is not this run's failure.
+    fatal = write_failed.is_set()
+    if not fatal:
+        try:
+            owner = cache.dc.get("indexing_error_run")
+            fatal = bool(cache.dc.get("indexing_error")) and owner in (None, run_token)
+        except Exception:
+            fatal = bool(ctx.cfg.get("indexing_error", False))
 
     logger.info("Disk cache update complete.")
 
@@ -834,14 +981,24 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
     _release_post_indexing_memory(cache, logger)
 
     end = perf_counter()
+    _deregister_run(cache, run_token)
+    # A failed run's error may be obsolete by now: a run that succeeded meanwhile left it alone because
+    # this run looked active (it has just stopped being so), so this run must look at it again. Both
+    # sides need the other's step to have happened: "updated" goes up before the successful run judges
+    # an error, and a failed run deregisters before it looks at "updated".
+    superseded = fatal and _forget_superseded_indexing_error(cache, run_token)
+    if superseded:
+        logger.info("Index Cache - This run failed, but a later run has succeeded since: its error is obsolete.")
+    failed = fatal and not superseded
     if not fatal:
         cache.dc.set("updated", int(time()))
+        _clear_recorded_indexing_error(ctx, cache)  # a run that failed while this one ran is over now
         if cache.dc.get("version", 0) != ctx.cfg["cache_version"]:
             cache.dc.set("version", ctx.cfg["cache_version"])
 
     try:
         cache.dc.pop("indexing", None)
-        if not fatal:
+        if not failed:
             cache.dc.pop("indexing_phase", None)
         cache.dc.pop("checking_total", None)
         cache.dc.pop("checking_done", None)
@@ -850,12 +1007,12 @@ def mt_index_configurations(ctx: ScriptContext) -> None:
         cache.dc.pop("indexing_total", None)
         cache.dc.pop("indexing_done", None)
         cache.dc.pop("indexing_last_update", None)
-        if fatal:
+        if failed:
             cache.dc.set("indexing_phase", "error")
     except Exception:
         pass
     if event_bus:
-        if fatal:
+        if failed:
             event_bus.publish(
                 "status:update",
                 {"component": "cache", "state": "error"},

@@ -7,12 +7,135 @@ from typing import Any, List, Optional
 from rich.console import Console
 from rich.text import Text
 from textual import events
+from textual.binding import Binding
 from textual.geometry import Size
+from textual.message import Message
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
+from textual.widgets import DataTable, Input
 
 from .debug import get_logger
 from .search import SearchController, TextDocument
+
+FILTER_PLACEHOLDER = "Type to filter (/ focuses, Esc clears)"
+
+
+class FilterInput(Input):
+    """One-row quick filter above a list; the list forwards printable keys into it.
+
+    It never selects its text on focus (``select_on_focus=False``): the first character
+    arrives just before the focus does and a selection would be overtyped by the second.
+    It is not a Tab stop (the screens toggle the panes explicitly) and keeps the list in step:
+
+    - Up/Down/PageUp/PageDown move the list cursor (``Input`` binds none of them);
+    - Enter posts ``Accepted`` and focuses the list, unless no row is visible;
+    - Esc clears the filter and focuses the list;
+    - Ctrl+H deletes like Backspace.
+
+    The filter text itself is the ``Input`` value: hosts watch ``Input.Changed``.
+    """
+
+    HELP = """
+    ## Filter
+
+    Type to narrow the list; a filter that starts with z, / or ? needs / first.
+
+    - Up/Down, PageUp/PageDown move the list cursor.
+    - Enter acts on the highlighted row and goes back to the list.
+    - Esc clears the filter and goes back to the list.
+    - Backspace or Ctrl+H deletes a character.
+    """
+
+    BINDINGS = [
+        Binding("up", "list_up", "Previous Row", show=False),
+        Binding("down", "list_down", "Next Row", show=False),
+        Binding("pageup", "list_page_up", "Previous Page", show=False),
+        Binding("pagedown", "list_page_down", "Next Page", show=False),
+        Binding("enter", "accept", "Use Highlighted Row", show=False),
+        Binding("escape", "clear_filter", "Clear Filter"),
+        Binding("ctrl+h", "delete_left", "Delete Character", show=False),
+    ]
+
+    class Accepted(Message):
+        """Enter was pressed with a visible row: act on the highlighted one."""
+
+    def __init__(self, table: DataTable, *, id: Optional[str] = None, placeholder: str = FILTER_PLACEHOLDER) -> None:
+        super().__init__(placeholder=placeholder, select_on_focus=False, compact=True, id=id)
+        self.table = table
+
+    def action_list_up(self) -> None:
+        self.table.action_cursor_up()
+
+    def action_list_down(self) -> None:
+        self.table.action_cursor_down()
+
+    def action_list_page_up(self) -> None:
+        self.table.action_page_up()
+
+    def action_list_page_down(self) -> None:
+        self.table.action_page_down()
+
+    def action_accept(self) -> None:
+        if not self.table.row_count:
+            return
+        self.post_message(self.Accepted())
+        self.table.focus()
+
+    def action_clear_filter(self) -> None:
+        self.value = ""
+        self.table.focus()
+
+
+class FindInput(Input):
+    """One-row find line that takes the filter's row while a document is searched.
+
+    Typing edits the query (hosts watch ``Input.Changed``). Enter/Down post ``Next``, Up posts
+    ``Previous`` and Esc posts ``Closed``; the host moves the matches and closes the line.
+    """
+
+    HELP = """
+    ## Find
+
+    Type to search the document; every match is highlighted.
+
+    - Enter or Down jumps to the next match, Up to the previous one.
+    - Esc closes the find line and clears the query.
+    - Backspace or Ctrl+H deletes a character.
+    """
+
+    BINDINGS = [
+        Binding("enter", "next", "Next Match", show=False),
+        Binding("down", "next", "Next Match", show=False),
+        Binding("up", "previous", "Previous Match", show=False),
+        Binding("escape", "close", "Close Find"),
+        Binding("ctrl+h", "delete_left", "Delete Character", show=False),
+    ]
+
+    class Next(Message):
+        """Jump to the next match."""
+
+    class Previous(Message):
+        """Jump to the previous match."""
+
+    class Closed(Message):
+        """Close the find line."""
+
+    def __init__(self, what: str = "diff", *, id: Optional[str] = None) -> None:
+        super().__init__(
+            placeholder=f"Find in {what}: Enter/Down=next, Up=prev, Esc=close",
+            select_on_focus=False,
+            compact=True,
+            id=id,
+        )
+
+    def action_next(self) -> None:
+        self.post_message(self.Next())
+
+    def action_previous(self) -> None:
+        self.post_message(self.Previous())
+
+    def action_close(self) -> None:
+        self.post_message(self.Closed())
 
 
 class SearchableTextPane(ScrollView, can_focus=True):

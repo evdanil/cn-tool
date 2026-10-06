@@ -1,9 +1,11 @@
 from typing import Optional
 
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, DataTable, Static
-from textual.containers import Container, Horizontal, Vertical
+from textual.screen import Screen
+from textual.widgets import Header, Footer, DataTable, Input, Static
+from textual.containers import Container
 from textual.binding import Binding
+from textual.message import Message
 from textual.reactive import reactive
 from textual import events
 
@@ -12,29 +14,49 @@ from .filter_mixin import FilterMixin
 from .debug import get_logger
 from .version import __version__
 from .differ import get_diff, get_diff_side_by_side
-from .keymap import snapshot_bindings
+from .keymap import forward_printable, snapshot_bindings
 from .tips import snapshot_tips
 from rich.syntax import Syntax
 from .formatting import format_timestamp
 from rich.text import Text
 from .search import SearchController
-from .widgets import SearchableTextPane
+from .widgets import FilterInput, FindInput, SearchableTextPane
 import os
 
 
+# Panel layouts in Ctrl+L order. Each is a class on the main panel (``layout-<name>``): the
+# widgets are composed once and only the class and the child order change.
+_LAYOUTS = ("right", "bottom", "left", "top")
+
+
 class DiffViewPane(SearchableTextPane):
+    HELP = """
+    ## Document
+
+    Shows the selected snapshot, or the diff of two.
+
+    - Up/Down, PageUp/PageDown, Space, `j`/`k`, Home/End scroll.
+    - `d` switches unified and side-by-side; `h` hides unchanged lines (side-by-side).
+    - Ctrl+F or Alt+F finds in the document: type, Enter/Down next, Up previous, Esc closes.
+    - `z` maximises this pane; Esc restores it.
+    - `/` goes to the filter; Tab goes back to the list.
+    """
+
     BINDINGS = [
         Binding("up", "scroll_up", "Scroll Up", show=False),
         Binding("down", "scroll_down", "Scroll Down", show=False),
         Binding("pageup", "page_up", "Page Up", show=False),
         Binding("pagedown", "page_down", "Page Down", show=False),
         Binding("space", "page_down", "Page Down", show=False),
+        # j, k and space are bound here, not on the screen: from the list they type into the filter
+        Binding("j", "scroll_down", "Scroll Down", show=False),
+        Binding("k", "scroll_up", "Scroll Up", show=False),
         Binding("home", "go_home", "Go Home", show=False),
         Binding("end", "go_end", "Go End", show=False),
         Binding("d", "toggle_diff_mode", "Toggle Diff View"),
         Binding("h", "toggle_hide_unchanged", "Hide Unchanged"),
         Binding("tab", "focus_next_panel", "Switch Panel", show=False),
-        Binding("ctrl+d", "dump_debug", "", show=False),
+        Binding("ctrl+d", "dump_debug", "Dump Pane Debug", show=False),
     ]
 
     _search_identity = "diff"
@@ -48,32 +70,24 @@ class DiffViewPane(SearchableTextPane):
 
     def action_toggle_diff_mode(self) -> None:
         try:
-            self.app.action_toggle_diff_mode()  # type: ignore[attr-defined]
+            self.screen.action_toggle_diff_mode()  # type: ignore[attr-defined]
         except Exception:
             pass
 
     def action_toggle_hide_unchanged(self) -> None:
         try:
-            self.app.action_toggle_hide_unchanged()  # type: ignore[attr-defined]
+            self.screen.action_toggle_hide_unchanged()  # type: ignore[attr-defined]
         except Exception:
             pass
 
     def action_focus_next_panel(self) -> None:
         try:
-            self.app.action_focus_next()  # type: ignore[attr-defined]
+            self.screen.action_focus_next()  # type: ignore[attr-defined]
         except Exception:
             pass
 
     def on_key(self, event: events.Key) -> None:  # type: ignore[override]
-        from .utils import handle_search_key
-
-        # In-place search when active
-        app = getattr(self, "app", None)
-        if app is not None and bool(getattr(app, "_search_active", False)):
-            if handle_search_key(app, event, "diff"):
-                return
-        # Tab switches panel when NOT in search mode
-        elif event.key == "tab":
+        if event.key == "tab":
             self.action_focus_next_panel()
             event.stop()
             return
@@ -82,7 +96,7 @@ class DiffViewPane(SearchableTextPane):
 
     def action_start_find(self) -> None:
         try:
-            self.app.action_start_find()  # type: ignore[attr-defined]
+            self.screen.action_start_find()  # type: ignore[attr-defined]
         except Exception:
             pass
 
@@ -138,14 +152,29 @@ class DiffViewPane(SearchableTextPane):
 
 
 class SelectionDataTable(DataTable):
+    HELP = """
+    ## Snapshots
+
+    Newest first. Select one snapshot to see it, two to see their diff.
+
+    - Enter selects or deselects the row under the cursor.
+    - Typing filters the list by name, author or time, in the filter line above. A filter
+      that starts with z, / or ? needs / first.
+    - `/` goes to the filter line; Up/Down move this list from there and Enter selects.
+    - Esc clears the filter, then hides the document, then goes back to the repositories.
+    - Tab switches to the document pane.
+    """
+
     BINDINGS = [
         Binding("home", "goto_first_row", "First", show=False),
         Binding("end", "goto_last_row", "Last", show=False),
-        Binding("enter", "select_row", "Select", show=False),
-        Binding("backspace", "filter_backspace", "", show=False),
-        Binding("ctrl+h", "filter_backspace", "", show=False),
+        # shown: this one shadows the screen's Enter binding while the list has the focus
+        Binding("enter", "select_row", "Toggle Select"),
         Binding("tab", "focus_next_panel", "Switch Panel", show=False),
     ]
+
+    # The filter line printable keys are forwarded to; the screen sets it, a bare list has none.
+    filter_input: Optional[FilterInput] = None
 
     def action_goto_first_row(self) -> None:
         try:
@@ -163,32 +192,24 @@ class SelectionDataTable(DataTable):
             pass
 
     def action_select_row(self) -> None:
-        """Delegate row selection to the App's selection action."""
+        """Delegate row selection to the screen's selection action."""
         try:
-            # Toggle selection at the app level to keep logic DRY
-            self.app.action_toggle_row()  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-    def action_filter_backspace(self) -> None:
-        try:
-            fb = getattr(self.app, "filter_backspace", None)
-            if fb:
-                fb()
+            # Toggle selection at the screen level to keep logic DRY
+            self.screen.action_toggle_row()  # type: ignore[attr-defined]
         except Exception:
             pass
 
     def action_focus_next_panel(self) -> None:
         try:
-            self.app.action_focus_next()  # type: ignore[attr-defined]
+            self.screen.action_focus_next()  # type: ignore[attr-defined]
         except Exception:
             pass
 
     def on_key(self, event: events.Key) -> None:  # type: ignore
-        """Delegate filter keys to the App-level mixin; consume if handled.
+        """Tab switches panels; a printable key starts (or continues) the filter.
 
-        Handling at the widget level ensures Backspace/Enter work reliably
-        since Textual delivers keys to the focused widget first.
+        Handling at the widget level ensures they work reliably since Textual delivers keys
+        to the focused widget first. ``z``, ``/`` and ``?`` stay with the screen's bindings.
         """
         # Force Tab to switch panel (DataTable may consume it otherwise)
         if event.key == "tab":
@@ -198,42 +219,32 @@ class SelectionDataTable(DataTable):
             except Exception:
                 pass
             return
-        try:
-            from .utils import handle_search_key
-
-            if bool(getattr(self.app, "_search_active", False)) and handle_search_key(self.app, event, "diff"):
-                try:
-                    event.stop()
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
-        try:
-            handler = getattr(self.app, "process_filter_key", None)
-            if handler and handler(event, require_table_focus=False):
-                try:
-                    event.stop()
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
-        # Not handled by filter -> allow normal bindings/defaults to run
-        try:
-            super().on_key(event)
-        except Exception:
-            pass
+        if self.filter_input is not None:
+            forward_printable(event, self.filter_input)
 
 
-class CommitSelectorApp(FilterMixin, App):
+class SnapshotScreen(FilterMixin, Screen):
+    """The snapshot list and its document pane: select one snapshot to read it, two to diff them.
+
+    The host App provides ``layout`` (the panel layout preference, one of ``_LAYOUTS``): the screen
+    reads ``app.layout`` when it is composed and when it resumes, and Ctrl+L writes it back. The
+    screen's own ``layout`` attribute is ``Widget.layout``, Textual's child arrangement: not touched.
+
+    The screen never exits the app. It posts ``Closed`` (back to the repository browser, or quit)
+    and the host decides what happens to the screen stack.
+    """
+
     TITLE = "ConfigAnalyzer"
     SUB_TITLE = f"v{__version__} — Snapshot History"
+
+    # The list takes the first focus; the filter line is reached with / or by typing.
+    AUTO_FOCUS = "#commit_table"
 
     DEFAULT_CSS = """
     #table-container, #diff_view {
         background: $surface;
         width: 1fr;
+        height: 1fr;
     }
 
     #table-container {
@@ -245,6 +256,13 @@ class CommitSelectorApp(FilterMixin, App):
         padding: 0 1;
     }
 
+    #input-row { height: auto; }
+    #input-row FilterInput, #input-row FindInput { width: 1fr; }
+
+    #main-panel { height: 1fr; width: 1fr; }
+    #main-panel.layout-right, #main-panel.layout-left { layout: horizontal; }
+    #main-panel.layout-bottom, #main-panel.layout-top { layout: vertical; }
+
     .layout-right #diff_view { border-left: solid steelblue; }
     .layout-right #diff_view:focus-within { border-left: thick yellow; }
     .layout-left #diff_view { border-right: solid steelblue; }
@@ -254,73 +272,94 @@ class CommitSelectorApp(FilterMixin, App):
     .layout-top #diff_view { border-bottom: solid steelblue; }
     .layout-top #diff_view:focus-within { border-bottom: thick yellow; }
 
-    #main-panel { height: 1fr; width: 1fr; }
+    #main-panel.-maximized #table-container { display: none; }
+    #main-panel.-maximized #diff_view { border: none; }
     """
 
-    show_hide_diff_key = reactive(False, layout=True)
-    # Dynamic footer hint visibility
-    show_select_key = reactive(True)
-    show_diff_controls_key = reactive(False)
+    # Footer/help state. ``bindings=True`` refreshes the footer when a flag changes, and
+    # ``check_action`` reads them to hide the bindings that do not apply right now.
+    show_hide_diff_key = reactive(False, bindings=True)  # a document is shown
+    show_select_key = reactive(True, bindings=True)  # the list has the focus
+    show_diff_controls_key = reactive(False, bindings=True)  # the document pane has the focus
 
-    BINDINGS = snapshot_bindings(show_hide_diff_key, show_select_key, show_diff_controls_key)
-    # Add App-level nav bindings to route to the diff pane when it has focus
+    BINDINGS = snapshot_bindings()
+    # Shift+Tab is bound here because ``Screen`` binds it to ``app.focus_previous``, which would
+    # cycle through the filter and find lines: with two panes it is the same toggle as Tab.
     BINDINGS += [
-        Binding("up", "pane_up", "", show=False),
-        Binding("down", "pane_down", "", show=False),
-        Binding("pageup", "pane_page_up", "", show=False),
-        Binding("pagedown", "pane_page_down", "", show=False),
-        Binding("home", "pane_home", "", show=False),
-        Binding("end", "pane_end", "", show=False),
-        Binding("space", "pane_page_down", "", show=False),
-        Binding("j", "pane_down", "", show=False),
-        Binding("k", "pane_up", "", show=False),
-        # Arrow key bindings for search navigation (handled in on_key when in search mode)
-        # No explicit bindings needed as they're handled dynamically
+        Binding("shift+tab", "focus_previous", "Switch Panel", show=False),
+    ]
+    # Screen-level nav bindings route to the diff pane when it has focus
+    BINDINGS += [
+        Binding("up", "pane_up", "Scroll Up", show=False),
+        Binding("down", "pane_down", "Scroll Down", show=False),
+        Binding("pageup", "pane_page_up", "Page Up", show=False),
+        Binding("pagedown", "pane_page_down", "Page Down", show=False),
+        Binding("home", "pane_home", "Go Home", show=False),
+        Binding("end", "pane_end", "Go End", show=False),
     ]
 
-    def __init__(self, snapshots_data: list[Snapshot], scroll_to_end: bool = False, layout: str = "right"):
+    class Closed(Message):
+        """The user is done with the snapshots: ``back`` returns to the repository browser, else quit."""
+
+        def __init__(self, back: bool) -> None:
+            super().__init__()
+            self.back = back
+
+    def __init__(self, snapshots_data: list[Snapshot], scroll_to_end: bool = False) -> None:
         super().__init__()
         self.logr = get_logger("tui")
         self._debug_keys = bool(os.environ.get("CN_TUI_DEBUG_KEYS"))
         self.snapshots_data = snapshots_data
         self.scroll_to_end = scroll_to_end
-        self.layout = layout
         self.selected_keys: list[str] = []
         self.ordered_keys: list[str] = []
         self.diff_mode: str = "unified"
         self.hide_unchanged_sbs: bool = False
-        self.navigate_back: bool = False
         # Find-in-text state for diff/single preview
         self._search_active: bool = False
         self._search: SearchController = SearchController()
         self._diff_has_content: bool = False
         self._pending_diff_scroll: Optional[int] = None
-        self._pending_diff_focus: bool = False
-        self._diff_maximized: bool = False
         self._current_diff_document_id: str = ""
+
+    @property
+    def _diff_maximized(self) -> bool:
+        """Whether the document fills the panel; read-only view of the ``-maximized`` class."""
+        panel = getattr(self, "main_panel", None)
+        return panel is not None and panel.has_class("-maximized")
+
+    def _shown_layout(self) -> str:
+        """The layout on screen: an unknown name is shown as the vertical split (``bottom``)."""
+        layout = self.app.layout  # type: ignore[attr-defined]
+        return layout if layout in _LAYOUTS else "bottom"
 
     def compose(self) -> ComposeResult:
         yield Header()
-        # Placeholders; actual layout is mounted in _apply_layout
         self.diff_view = DiffViewPane(id="diff_view", wrap=False)
         self.diff_view.can_focus = False
-        try:
-            self.diff_view.search = self._search
-        except Exception:
-            pass
+        self.diff_view.search = self._search
         self.table = SelectionDataTable(id="commit_table")
         self.table_container = Container(self.table, id="table-container")
-        self.main_panel = Container(id="main-panel")
+        # One row above the panels: the filter, or the find line while find is open.
+        self.filter_input = FilterInput(self.table, id="filter")
+        self.find_input = FindInput("diff", id="find")
+        self.find_input.display = False
+        self.table.filter_input = self.filter_input
+        yield Container(self.filter_input, self.find_input, id="input-row")
+        # Composed once, in the order the starting layout needs; Ctrl+L and maximise only
+        # change classes (and the child order) afterwards.
+        shown = self._shown_layout()
+        ordered = (self.diff_view, self.table_container) if shown in ("left", "top") else (self.table_container, self.diff_view)
+        self.main_panel = Container(*ordered, id="main-panel", classes=f"layout-{shown}")
         yield self.main_panel
         self.tips = Static("", id="tips")
         yield self.tips
         yield Footer()
 
     def on_mount(self) -> None:
-        self.logr.debug("on_mount: layout=%s", self.layout)
-        self._apply_layout()
+        self.logr.debug("on_mount: layout=%s", self.app.layout)  # type: ignore[attr-defined]
+        self.setup_table()
         self._filter_text: str = ""
-        # Initialize footer hint flags
         self._update_focus_flags()
 
         def _focus_table() -> None:
@@ -335,84 +374,22 @@ class CommitSelectorApp(FilterMixin, App):
         except Exception:
             _focus_table()
 
+    def on_screen_resume(self) -> None:
+        """Another screen was on top and may have changed the layout preference: show the current one."""
+        self._apply_layout()
+
     def _apply_layout(self) -> None:
-        """Rebuild widgets to avoid reparent timing issues on Textual 0.61."""
-        self.logr.debug("apply_layout: rebuild layout=%s", self.layout)
-        # Clear container
-        prev_scroll: Optional[int] = None
-        prev_focus = False
-        if hasattr(self, "diff_view") and getattr(self, "_diff_has_content", False):
-            try:
-                prev_scroll = self.diff_view.get_scroll_y()
-            except Exception:
-                prev_scroll = None
-            prev_focus = bool(getattr(self.diff_view, "has_focus", False))
-        self._pending_diff_scroll = prev_scroll
-        self._pending_diff_focus = prev_focus and bool(self.show_hide_diff_key)
-        try:
-            for child in list(self.main_panel.children):
-                child.remove()
-        except Exception:
-            pass
+        """Point the main panel at the app's layout: one class, and the document before or after the list.
 
-        # Fresh widgets each time
-        self.diff_view = DiffViewPane(id="diff_view", wrap=False)
-        try:
-            self.diff_view.search = self._search
-        except Exception:
-            pass
-        if not self.show_hide_diff_key:
-            self.diff_view.styles.visibility = "hidden"
-            self.diff_view.can_focus = False
+        Nothing is re-created, so focus, scroll offsets, the cursor and the selection stay as they are.
+        """
+        shown = self._shown_layout()
+        for name in _LAYOUTS:
+            self.main_panel.set_class(name == shown, f"layout-{name}")
+        if shown in ("left", "top"):
+            self.main_panel.move_child(self.diff_view, before=self.table_container)
         else:
-            self.diff_view.styles.visibility = "visible"
-            self.diff_view.can_focus = True
-
-        self.table = SelectionDataTable(id="commit_table")
-        self.table_container = Container(self.table, id="table-container")
-
-        if self._diff_maximized and self.show_hide_diff_key:
-            container = Container(self.diff_view, id="diff-maximized")
-        else:
-            if self.layout in ("right", "left"):
-                ordered = (self.diff_view, self.table_container) if self.layout == "left" else (self.table_container, self.diff_view)
-                container = Horizontal(*ordered, classes=f"layout-{self.layout}")
-            else:
-                ordered = (self.diff_view, self.table_container) if self.layout == "top" else (self.table_container, self.diff_view)
-                container = Vertical(*ordered, classes=f"layout-{self.layout}")
-        self.main_panel.mount(container)
-
-        # Populate table and reapply state
-        self.setup_table()
-        self._update_tips()
-        for key in self.selected_keys:
-            try:
-                self.table.update_cell(key, "selected_col", Text("x", style="green"))
-            except Exception:
-                pass
-
-        if self.show_hide_diff_key and len(self.selected_keys) == 2:
-            self.show_diff()
-        elif self.show_hide_diff_key and len(self.selected_keys) == 1:
-            self.show_single()
-        else:
-            self._pending_diff_scroll = None
-
-        # Restore focus preference (diff pane if previously focused)
-        focused_diff = False
-        if self._pending_diff_focus and self.diff_view.styles.visibility == "visible":
-            try:
-                self.diff_view.focus()
-                focused_diff = True
-            except Exception:
-                focused_diff = False
-        if not focused_diff and not self._diff_maximized:
-            try:
-                self.table.focus()
-            except Exception:
-                pass
-        self._pending_diff_focus = False
-        self._update_focus_flags()
+            self.main_panel.move_child(self.table_container, before=self.diff_view)
 
     def setup_table(self) -> None:
         self.logr.debug("setup_table: %d snapshots", len(self.snapshots_data))
@@ -431,23 +408,76 @@ class CommitSelectorApp(FilterMixin, App):
         self._render_rows()
 
     def _update_tips(self) -> None:
-        filter_hint = self.get_filter_hint()
         show_diff_controls = bool(self.show_diff_controls_key)
         show_tab = True
         if self._search_active and self._search.has_query():
-            search_hint = f" | Find: '{self._search.query}' {self._search.counter_text()} (↓/Enter=next, ↑=prev, Esc=exit)"
-        elif self._search_active:
-            search_hint = " | Find: _ (type to search, Esc=cancel)"
+            # the filter text is not repeated here: the filter line shows it
+            search_hint = f" | Find: '{self._search.query}' {self._search.counter_text()}"
         else:
             search_hint = ""
-        self.tips.update(snapshot_tips(filter_hint, show_diff_controls=show_diff_controls, show_tab=show_tab, search_hint=search_hint))
+        find_focused = self._search_active and self.focused is self.find_input
+        filter_focused = self.focused is self.filter_input
+        self.tips.update(
+            snapshot_tips(
+                show_diff_controls=show_diff_controls,
+                show_tab=show_tab,
+                find_focused=find_focused,
+                search_hint=search_hint,
+                filter_focused=filter_focused,
+            )
+        )
 
-    def action_focus_next(self) -> None:
-        """Ensure footer hint flags are updated after focus changes."""
+    def _sync_input_row(self) -> None:
+        """Show the find line in place of the filter while find is open; no filter for a lone document.
+
+        The row keeps its height, so the panels below do not move. The footer follows, because
+        ``check_action`` hides Filter (/) while the row belongs to find or the list is hidden.
+        """
+        self.find_input.display = self._search_active
+        self.filter_input.display = not self._search_active and not self._diff_maximized
+        self.refresh_bindings()
+
+    def _set_maximized(self, maximized: bool) -> None:
+        """The document fills the panel (``-maximized`` on the main panel) or the split is back."""
+        self.main_panel.set_class(maximized, "-maximized")
+        self._sync_input_row()
+
+    def _toggle_panes(self) -> None:
+        """Tab and Shift+Tab: list and filter on one side, document and find line on the other.
+
+        Explicit, not ``screen.focus_next()``: the inputs would become Tab stops and make it a
+        three-stop cycle. Neither input is ever one; ``/`` and typing are the ways into the
+        filter. With the document maximised the list is hidden, so the document keeps the focus.
+        """
+        focused = self.focused
+        if self._diff_maximized:
+            target = self.diff_view
+        elif focused is self.diff_view or focused is self.find_input:
+            target = self.table
+        elif self.diff_view.can_focus:
+            target = self.diff_view
+        else:
+            target = self.table
         try:
-            self.screen.focus_next()
+            target.focus()
         except Exception:
             pass
+        self._update_tips()
+
+    def action_focus_next(self) -> None:
+        """Move focus on; the footer flags follow in ``on_descendant_focus``, once the focus has moved."""
+        self._toggle_panes()
+
+    def action_focus_previous(self) -> None:
+        """Shift+Tab: with two panes it is the same toggle as Tab."""
+        self._toggle_panes()
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        """Refresh the focus-dependent flags (footer keys, tips) after any focus change.
+
+        Reading ``has_focus`` right after ``focus_next()`` sees the old state, because Textual
+        applies the change when the widget handles its Focus event; this message arrives after.
+        """
         self._update_focus_flags()
         self._update_tips()
 
@@ -456,14 +486,38 @@ class CommitSelectorApp(FilterMixin, App):
             diff_visible = self.diff_view.styles.visibility == "visible"
         except Exception:
             diff_visible = False
-        # Enter hint when table focused
-        self.show_select_key = bool(getattr(self.table, "has_focus", False))
-        # D/H hints when diff visible and focused
-        self.show_diff_controls_key = bool(diff_visible and getattr(self.diff_view, "has_focus", False))
+        focused = self.focused
+        # Enter hint when the list is focused
+        self.show_select_key = focused is self.table
+        # d/h hints when the document is visible and focused
+        self.show_diff_controls_key = bool(diff_visible and focused is self.diff_view)
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide the bindings that do not apply right now (``False`` removes them from the footer).
+
+        - Maximize and Find need a document on screen.
+        - Toggle Select (Enter) is for the list.
+        - Filter (/) needs the filter on screen: not while find has its row or the list is hidden.
+        """
+        if action in ("toggle_maximize_pane", "start_find"):
+            return bool(self.show_hide_diff_key)
+        if action == "toggle_row":
+            return bool(self.show_select_key)
+        if action == "focus_filter":
+            return not self._search_active and not self._diff_maximized
+        return super().check_action(action, parameters)
+
+    def action_toggle_help(self) -> None:
+        """Show or hide Textual's help panel: the focused widget's help and the active keys."""
+        if self.query("HelpPanel"):
+            self.app.action_hide_help_panel()
+        else:
+            self.app.action_show_help_panel()
 
     def _activate_diff_document(self, document_id: str) -> str:
         if document_id != self._current_diff_document_id:
             self._search.reset()
+            self.find_input.value = ""  # a different document starts a fresh search
             self._current_diff_document_id = document_id
         return document_id
 
@@ -504,39 +558,18 @@ class CommitSelectorApp(FilterMixin, App):
         self._update_tips()
 
     def on_key(self, event: events.Key) -> None:  # type: ignore
-        from .utils import handle_search_key
-
-        # Delegate to mixin; consume if handled (only when table focused)
+        """Key tracing for ``CN_TUI_DEBUG_KEYS``; the keys themselves are bindings and ``Input`` widgets."""
         if self._debug_keys:
             try:
                 self.logr.debug(
                     "app.on_key(snapshot): key=%s focus=%s pane_focus=%s table_focus=%s",
                     getattr(event, 'key', None),
-                    getattr(self.screen.focused, 'id', None),
+                    getattr(self.focused, 'id', None),
                     getattr(self.diff_view, 'has_focus', None),
                     getattr(self.table, 'has_focus', None),
                 )
             except Exception:
                 pass
-        if self._search_active and handle_search_key(self, event, "diff"):
-            return
-        if self._diff_maximized and not self._search_active and event.key == "escape":
-            self.action_toggle_maximize_pane()
-            try:
-                event.stop()
-            except Exception:
-                pass
-            return
-        if self.process_filter_key(event, require_table_focus=True):
-            try:
-                event.stop()
-            except Exception:
-                pass
-            return
-        # Route navigation keys to diff pane when it has focus
-        if event.key in ("up", "down", "pageup", "pagedown", "home", "end") and getattr(self.diff_view, "has_focus", False):
-            # Let App-level Binding handle; no-op here
-            return
 
     def show_diff(self) -> None:
         self.show_hide_diff_key = True
@@ -600,16 +633,10 @@ class CommitSelectorApp(FilterMixin, App):
         self.diff_view.styles.visibility = "hidden"
         self.diff_view.can_focus = False
         self.show_hide_diff_key = False
-        self._diff_maximized = False
+        self._set_maximized(False)
         self._diff_has_content = False
         self._current_diff_document_id = ""
-        if self._search_active:
-            self._search_active = False
-            self._search.reset()
-            try:
-                self.diff_view.apply_search()
-            except Exception:
-                pass
+        self._close_find()
         try:
             self.table.focus()
         except Exception:
@@ -631,24 +658,68 @@ class CommitSelectorApp(FilterMixin, App):
         else:
             self.action_go_back()
 
+    def action_back_out(self) -> None:
+        """Esc, in one order: close find, restore a maximised document, clear the filter, hide the
+        document and its selection, then go back to the repositories.
+
+        A focused filter line has already cleared itself and handed the focus to the list
+        (its own Esc binding), so that step never gets here.
+        """
+        if self._search_active:
+            self.action_cancel_find()
+        elif self._diff_maximized:
+            self._set_maximized(False)
+        elif not self.clear_filter():
+            self.action_hide_diff()
+
     def action_go_back(self) -> None:
         # Clear filter on leaving the snapshot view
         self.clear_filter()
-        self.navigate_back = True
-        self.exit()
+        self.post_message(self.Closed(back=True))
 
     def _on_filter_changed(self) -> None:
         self._render_rows()
+        if self.filter_input.value != self._filter_text:
+            # cleared from outside (Esc on the list, leaving the view): the line follows
+            self.filter_input.value = self._filter_text
+
+    def action_focus_filter(self) -> None:
+        """/ : into the filter line, cursor at the end of what is there."""
+        self.filter_input.cursor_position = len(self.filter_input.value)
+        self.filter_input.focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """A character typed (or deleted) in the filter or the find line.
+
+        The current value is read, not the event's: a burst of keys queues several events and
+        an old one must not write an old value back.
+        """
+        event.stop()
+        if event.input is self.filter_input:
+            self.set_filter_text(self.filter_input.value)
+        elif event.input is self.find_input:
+            self._find_query_changed()
+
+    def on_filter_input_accepted(self, event: FilterInput.Accepted) -> None:
+        event.stop()
+        self._toggle_highlighted_row()
+
+    def on_find_input_next(self, event: FindInput.Next) -> None:
+        event.stop()
+        self.action_find_next()
+
+    def on_find_input_previous(self, event: FindInput.Previous) -> None:
+        event.stop()
+        self.action_find_prev()
+
+    def on_find_input_closed(self, event: FindInput.Closed) -> None:
+        event.stop()
+        self.action_cancel_find()
 
     def action_quit(self) -> None:
-        # Clear filter first when active; else quit
-        if getattr(self, "_filter_text", ""):
-            self._filter_text = ""
-            self._render_rows()
-            return
-        self.exit()
+        self.post_message(self.Closed(back=False))
 
-    # App-level pane navigation actions (guaranteed routing)
+    # Screen-level pane navigation actions (guaranteed routing)
     def action_pane_up(self) -> None:
         try:
             if getattr(self.diff_view, "has_focus", False):
@@ -704,10 +775,14 @@ class CommitSelectorApp(FilterMixin, App):
             pass
 
     def action_toggle_row(self) -> None:
-        table = self.table
-        if not table.has_focus:
+        if not self.table.has_focus:
             self.logr.debug("toggle_row: table not focused; ignoring")
             return
+        self._toggle_highlighted_row()
+
+    def _toggle_highlighted_row(self) -> None:
+        """Select or deselect the row under the cursor (what Enter does on the list or in the filter)."""
+        table = self.table
         try:
             row_key = self.ordered_keys[table.cursor_row]
         except IndexError:
@@ -783,73 +858,64 @@ class CommitSelectorApp(FilterMixin, App):
             self.show_diff()
 
     def action_toggle_layout(self) -> None:
-        order = ["right", "bottom", "left", "top"]
         try:
-            idx = order.index(self.layout)
+            idx = _LAYOUTS.index(self.app.layout)  # type: ignore[attr-defined]
         except ValueError:
             idx = 0
-        self.layout = order[(idx + 1) % len(order)]
-
-        def _remount() -> None:
-            self._apply_layout()
-
-        try:
-            self.call_after_refresh(_remount)
-        except Exception:
-            _remount()
+        self.app.layout = _LAYOUTS[(idx + 1) % len(_LAYOUTS)]  # type: ignore[attr-defined]
+        self._apply_layout()
 
     def action_toggle_maximize_pane(self) -> None:
         if not self._diff_has_content:
             return
-        self._diff_maximized = not self._diff_maximized
-
-        def _remount() -> None:
-            self._apply_layout()
-
-        try:
-            self.call_after_refresh(_remount)
-        except Exception:
-            _remount()
+        self._set_maximized(not self._diff_maximized)
+        if self._diff_maximized:
+            # the list is hidden: the focus has to be on the document
+            self.diff_view.focus()
 
     # ---- Find support ----
     def action_start_find(self) -> None:
+        """Open the find line in the filter's row and focus it; starting again clears the query."""
         if not self._diff_has_content:
             return
         self._search_active = True
         self._search.reset()
+        self.find_input.value = ""
         try:
             self.diff_view.apply_search()
         except Exception:
             pass
+        self._sync_input_row()
+        self.find_input.focus()
         self._update_tips()
 
-    def action_cancel_find(self) -> None:
+    def _close_find(self) -> None:
+        """Leave find: no query, no highlights, the filter row is back. The focus is the caller's."""
         if not self._search_active:
             return
         self._search_active = False
         self._search.reset()
+        self.find_input.value = ""
         try:
             self.diff_view.apply_search()
         except Exception:
             pass
-        self._update_tips()
+        self._sync_input_row()
 
-    def action_find_backspace(self) -> None:
+    def action_cancel_find(self) -> None:
+        """Esc in find: close it and give the focus back to the searched document."""
         if not self._search_active:
             return
-        self._search.backspace()
-        try:
-            self.diff_view.apply_search()
-            if self._search.has_matches():
-                self.diff_view.scroll_match_into_view(center=False)
-        except Exception:
-            pass
+        self._close_find()
+        (self.diff_view if self.diff_view.can_focus else self.table).focus()
         self._update_tips()
 
-    def action_find_append_char(self, ch: str) -> None:
-        if not self._search_active or not ch:
+    def _find_query_changed(self) -> None:
+        """The find line was edited: search for what it holds and show the first hit."""
+        query = self.find_input.value
+        if not self._search_active or query == self._search.query:
             return
-        self._search.append_char(ch)
+        self._search.set_query(query)
         try:
             self.diff_view.apply_search()
             if self._search.has_matches():
@@ -906,3 +972,29 @@ class CommitSelectorApp(FilterMixin, App):
                 self.table.cursor_coordinate = (rc - 1, 0)
         except Exception:
             pass
+
+
+class CommitSelectorApp(App):
+    """Single-screen App around ``SnapshotScreen``; the upstream public name and constructor survive.
+
+    - ``view`` is the screen, pushed when the app mounts;
+    - ``layout`` is the layout preference the screen reads and writes (``app.layout``);
+    - ``navigate_back`` is set when the user asked to go back to the repository browser.
+    """
+
+    TITLE = "ConfigAnalyzer"
+    SUB_TITLE = f"v{__version__} — Snapshot History"
+
+    def __init__(self, snapshots_data: list[Snapshot], scroll_to_end: bool = False, layout: str = "right"):
+        super().__init__()
+        self.layout = layout
+        self.navigate_back: bool = False
+        self.view = SnapshotScreen(snapshots_data, scroll_to_end)
+
+    async def on_mount(self) -> None:
+        await self.push_screen(self.view)
+
+    def on_snapshot_screen_closed(self, event: SnapshotScreen.Closed) -> None:
+        event.stop()
+        self.navigate_back = event.back
+        self.exit()

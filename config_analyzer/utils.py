@@ -1,5 +1,5 @@
 import os
-from typing import Optional, List
+from typing import List, Optional, Sequence, Tuple, Union
 
 from .parser import parse_snapshot, Snapshot
 
@@ -13,49 +13,23 @@ def safe_call(func, *args, **kwargs):
     return None
 
 
-def handle_search_key(app, event, search_target):
-    """Common search key handling logic.
+def locate_device_config(
+    repo_roots: Sequence[Union[str, os.PathLike]], device: str, history_dir: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """Find ``<device>.cfg`` outside any history folder.
 
-    Returns True if the key was handled, False otherwise.
+    Returns ``(path of the file, the repository root holding it as text)`` for the first of
+    ``repo_roots`` that has it, else ``(None, None)``. A folder named ``history_dir`` (any case,
+    at any depth) is not searched: it holds the snapshots, not the current config.
     """
-    k = event.key
-    ch = getattr(event, "character", "") or ""
-
-    # Map keys to their corresponding actions
-    actions = {
-        "escape": "action_cancel_find",
-        "down": "action_find_next",
-        "up": "action_find_prev",
-        "enter": "action_find_next",
-        "return": "action_find_next",
-        "backspace": "action_find_backspace",
-        "ctrl+h": "action_find_backspace",
-        "\b": "action_find_backspace",
-    }
-
-    # Check if we can handle this key
-    if k in actions:
-        safe_call(getattr(app, actions[k]))
-        safe_call(event.stop)
-        return True
-
-    if (
-        isinstance(ch, str)
-        and ch.lower() == "z"
-        and not any(getattr(event, mod, False) for mod in ["ctrl", "alt", "meta"])
-    ):
-        safe_call(getattr(app, "action_toggle_maximize_pane", None))
-        safe_call(event.stop)
-        return True
-
-    # Handle printable characters
-    if (isinstance(ch, str) and len(ch) == 1 and ch.isprintable() and
-        not any(getattr(event, mod, False) for mod in ["ctrl", "alt", "meta"])):
-        safe_call(app.action_find_append_char, ch)
-        safe_call(event.stop)
-        return True
-
-    return False
+    target = f"{device}.cfg"
+    history_dir_l = str(history_dir).lower()
+    for root in repo_roots:
+        for walk_root, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d.lower() != history_dir_l]
+            if target in files:
+                return os.path.join(walk_root, target), str(root)
+    return None, None
 
 
 def find_device_history(repo_root: str, device: str, cfg_path: Optional[str], history_dir: str) -> Optional[str]:

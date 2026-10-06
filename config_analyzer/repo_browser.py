@@ -2,34 +2,52 @@ import os
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, DataTable, Static
-from textual.containers import Horizontal, Vertical, Container
+from textual.widgets import Header, Footer, DataTable, Input, Static
+from textual.containers import Container
 from textual.binding import Binding
 from textual import events
+from textual.message import Message
+from textual.reactive import reactive
+from textual.screen import Screen
 from textual.timer import Timer
+from textual.widget import Widget
 from rich.console import Group, RenderableType
 
 from .parser import parse_snapshot, parse_snapshot_meta
 from .formatting import format_timestamp
 from .filter_mixin import FilterMixin
-from .keymap import browser_bindings
 from .tips import browser_tips
 from .debug import get_logger
 from .version import __version__
 from .search import SearchController
-from .widgets import SearchableTextPane
+from .keymap import browser_bindings, forward_printable
+from .widgets import FilterInput, FindInput, SearchableTextPane
+
 
 class BrowserDataTable(DataTable):
+    HELP = """\
+    **Device list**
+
+    - Enter or Right opens the folder or device; Left or Alt+Up goes up.
+    - Typing filters the list by name, user or time, in the filter line above. A filter
+      that starts with z, / or ? needs / first.
+    - `/` goes to the filter line; Up/Down move this list from there and Enter opens.
+    - Esc clears the filter.
+    - Tab switches to the preview, Ctrl+L changes the layout, Ctrl+Q quits.
+    - ? closes this help.
+    """
+
     BINDINGS = [
         Binding("home", "goto_first_row", "First", show=False),
         Binding("end", "goto_last_row", "Last", show=False),
-        Binding("backspace", "filter_backspace", "", show=False),
-        Binding("ctrl+h", "filter_backspace", "", show=False),
         Binding("left", "go_up", "Up", show=True),
         Binding("alt+up", "go_up", "Up", show=False),
         Binding("right", "enter_selected", "Open", show=True),
     ]
-    
+
+    # The filter line printable keys are forwarded to; the screen sets it, a bare list has none.
+    filter_input: Optional[FilterInput] = None
+
     def action_goto_first_row(self) -> None:
         try:
             if self.row_count:
@@ -49,7 +67,7 @@ class BrowserDataTable(DataTable):
 
     def _notify_viewport_change(self) -> None:
         try:
-            hydrate = getattr(self.app, "_hydrate_viewport", None)
+            hydrate = getattr(self.screen, "_hydrate_viewport", None)
             if hydrate:
                 center = getattr(self, "cursor_row", 0) or 0
                 hydrate(center_row=center)
@@ -76,61 +94,41 @@ class BrowserDataTable(DataTable):
         return handled
 
     def on_key(self, event: events.Key) -> None:  # type: ignore
-        """Delegate filter keys to the App-level mixin; consume if handled.
+        """A printable key starts (or continues) the filter; the other keys keep their bindings.
 
-        Handling at the widget level ensures Backspace works reliably
-        since Textual delivers keys to the focused widget first.
+        Handling at the widget level ensures it works reliably since Textual delivers keys to the
+        focused widget first. ``z``, ``/`` and ``?`` stay with the screen's bindings.
         """
-        try:
-            from .utils import handle_search_key
-
-            if getattr(self.app, "_search_target", "") == "preview" and handle_search_key(self.app, event, "preview"):
-                try:
-                    event.stop()
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
-        try:
-            handler = getattr(self.app, "process_filter_key", None)
-            if handler and handler(event, require_table_focus=False):
-                try:
-                    event.stop()
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
-        # Not handled by filter -> allow normal bindings/defaults to run
-        try:
-            super().on_key(event)
-        except Exception:
-            pass
+        if self.filter_input is not None and forward_printable(event, self.filter_input):
+            return
         self._notify_viewport_change()
-
-    def action_filter_backspace(self) -> None:
-        try:
-            fb = getattr(self.app, "filter_backspace", None)
-            if fb:
-                fb()
-        except Exception:
-            pass
 
     def action_go_up(self) -> None:
         try:
-            self.app.action_go_up()  # type: ignore[attr-defined]
+            self.screen.action_go_up()  # type: ignore[attr-defined]
         except Exception:
             pass
 
     def action_enter_selected(self) -> None:
         try:
-            self.app.action_enter_selected()  # type: ignore[attr-defined]
+            self.screen.action_enter_selected()  # type: ignore[attr-defined]
         except Exception:
             pass
 
 class PreviewPane(SearchableTextPane):
     """Preview pane backed by :class:`SearchableTextPane` with key handling tweaks."""
+
+    HELP = """\
+    **Preview**
+
+    - Up, Down, PageUp, PageDown, Home, End, Space and `j`/`k` scroll.
+    - Ctrl+F or Alt+F finds text in the find line: type, Enter or Down for the next match,
+      Up for the previous, Esc closes.
+    - `z` maximises the preview, and again or Esc restores the list.
+    - `/` goes to the filter line; Tab goes back to the list.
+    - Ctrl+L changes the layout, Ctrl+Q quits.
+    - ? closes this help.
+    """
 
     BINDINGS = [
         Binding("up", "scroll_up", "Scroll Up", show=False),
@@ -138,6 +136,9 @@ class PreviewPane(SearchableTextPane):
         Binding("pageup", "page_up", "Page Up", show=False),
         Binding("pagedown", "page_down", "Page Down", show=False),
         Binding("space", "page_down", "Page Down", show=False),
+        # j, k and space are bound here, not on the screen: from the list they type into the filter
+        Binding("j", "scroll_down", "Scroll Down", show=False),
+        Binding("k", "scroll_up", "Scroll Up", show=False),
         Binding("home", "go_home", "Go Home", show=False),
         Binding("end", "go_end", "Go End", show=False),
     ]
@@ -158,7 +159,7 @@ class PreviewPane(SearchableTextPane):
 
     def action_start_find(self) -> None:
         try:
-            self.app.action_start_find_preview()  # type: ignore[attr-defined]
+            self.screen.action_start_find_preview()  # type: ignore[attr-defined]
         except Exception:
             pass
 
@@ -192,33 +193,54 @@ class PreviewPane(SearchableTextPane):
         super().set_text(text, document_id=document_id)
         self._auto_scroll_if_needed()
 
-    def on_key(self, event: events.Key) -> None:  # type: ignore[override]
-        # Handle search mode keys
-        from .utils import handle_search_key
 
-        app = getattr(self, "app", None)
-        if app is not None and getattr(app, "_search_target", "") == "preview":
-            if handle_search_key(app, event, "preview"):
-                return
-
-        super().on_key(event)
-
-class RepoBrowserApp(FilterMixin, App):
-    TITLE = "ConfigAnalyzer"
-    SUB_TITLE = f"v{__version__} - Device Browser"
-    FILTER_DEBOUNCE_SECONDS = 0.35
-    CONFIG_EXTS: Tuple[str, ...] = (".cfg", ".yml", ".yaml")
-    MAX_PREVIEW_BYTES: int = 2_000_000  # 2 MB cap to avoid TUI stall on huge files
-    """Simple repository browser.
+class BrowserScreen(FilterMixin, Screen):
+    """Simple repository browser, as a screen any App can host.
 
     - Lists folders (excluding any named 'history').
     - Lists .cfg files as devices in the current folder.
     - Shows user (author) and timestamp if available.
     - Previews device configuration on selection.
     - Enter to open; Left/Alt+Up to go up.
+
+    The host App owns the layout preference (``app.layout``) and decides what a selected
+    device means: the screen only posts :class:`DeviceSelected`. A screen's own ``layout`` is
+    Textual's child arranger, so the preference is always read and written through the app
+    (see ``_layout_name``).
+
+    The screen never exits the app. Quitting posts :class:`Closed` and the host decides what
+    happens next, as with ``SnapshotScreen.Closed``.
     """
 
-    CSS = """
+    TITLE = "ConfigAnalyzer"
+    SUB_TITLE = f"v{__version__} - Device Browser"
+    FILTER_DEBOUNCE_SECONDS = 0.35
+    # The list takes the first focus; the filter line is reached with / or by typing.
+    AUTO_FOCUS = "#left"
+    CONFIG_EXTS: Tuple[str, ...] = (".cfg", ".yml", ".yaml")
+    MAX_PREVIEW_BYTES: int = 2_000_000  # 2 MB cap to avoid TUI stall on huge files
+
+    class DeviceSelected(Message):
+        """A device file (``.cfg``) was opened: the host decides what to show for it."""
+
+        def __init__(self, name: str, cfg_path: str, repo_root: Optional[str]) -> None:
+            super().__init__()
+            self.name = name
+            self.cfg_path = cfg_path
+            self.repo_root = repo_root
+
+    class Closed(Message):
+        """The user asked to quit: the host decides what ends.
+
+        Unlike ``SnapshotScreen.Closed`` there is no ``back``: the browser is the first screen, and
+        there is nowhere to go back to, so the message carries nothing for a host to read wrongly.
+        """
+
+    DEFAULT_CSS = """
+    /* One row above the panes: the filter, or the find line while find is open. */
+    #input-row { height: auto; }
+    #input-row FilterInput, #input-row FindInput { width: 1fr; }
+
     /* Default split for horizontal layouts */
     #left { width: 48%; }
     #right { width: 52%; }
@@ -239,25 +261,36 @@ class RepoBrowserApp(FilterMixin, App):
     .layout-top #left { height: 1fr; width: 1fr; }
     .layout-top #right { height: 1fr; width: 1fr; overflow: auto; }
 
-    /* Ensure main panel expands to fill space so vertical split uses full height */
+    /* The main panel holds both panes for good: Ctrl+L swaps these classes and reorders the children. */
     #browser-main { height: 1fr; width: 1fr; }
+    #browser-main.layout-right, #browser-main.layout-left { layout: horizontal; }
+
+    /* Maximised preview: the list is hidden, never removed, so its cursor, filter and scroll survive. */
+    #browser-main.-fullscreen #left { display: none; }
+    #browser-main.-fullscreen #right { width: 1fr; height: 1fr; border: none; }
     """
 
-    BINDINGS = browser_bindings() + [
-        Binding("up", "pane_up", "", show=False),
-        Binding("down", "pane_down", "", show=False),
-        Binding("pageup", "pane_page_up", "", show=False),
-        Binding("pagedown", "pane_page_down", "", show=False),
-        Binding("home", "pane_home", "", show=False),
-        Binding("end", "pane_end", "", show=False),
-        Binding("space", "pane_page_down", "", show=False),
-        Binding("j", "pane_down", "", show=False),
-        Binding("k", "pane_up", "", show=False),
-        # Arrow key bindings for search navigation (handled in on_key when in search mode)
-        # No explicit bindings needed as they're handled dynamically
+    # The keymap builds the shared keys (every binding has a description, because the help panel
+    # lists them, and "?" comes first so the footer shows it).
+    BINDINGS = browser_bindings()
+    # Tab is explicit (the screen's own default would walk the focus chain, and the inputs are never
+    # Tab stops); the pane navigation is routed to the preview whatever has the focus. j, k and space
+    # are bound on the preview itself: from the list they type into the filter.
+    BINDINGS += [
+        Binding("tab", "focus_next", "Switch Panel", show=False),
+        Binding("shift+tab", "focus_previous", "Switch Panel", show=False),
+        Binding("up", "pane_up", "Scroll preview up", show=False),
+        Binding("down", "pane_down", "Scroll preview down", show=False),
+        Binding("pageup", "pane_page_up", "Preview page up", show=False),
+        Binding("pagedown", "pane_page_down", "Preview page down", show=False),
+        Binding("home", "pane_home", "Preview top", show=False),
+        Binding("end", "pane_end", "Preview bottom", show=False),
     ]
 
-    def __init__(self, repo_paths: Union[str, Sequence[str]], scroll_to_end: bool = False, start_path: Optional[str] = None, start_layout: Optional[str] = None, history_dir: str = 'history', repo_names: Optional[Sequence[str]] = None):
+    # True while the preview shows a document; "z" and Ctrl+F are offered only then (see check_action).
+    document_shown = reactive(False, bindings=True)
+
+    def __init__(self, repo_paths: Union[str, Sequence[str]], scroll_to_end: bool = False, start_path: Optional[str] = None, history_dir: str = 'history', repo_names: Optional[Sequence[str]] = None):
         super().__init__()
         self.logr = get_logger("browser")
         self._debug_keys = bool(os.environ.get("CN_TUI_DEBUG_KEYS"))
@@ -267,7 +300,7 @@ class RepoBrowserApp(FilterMixin, App):
         else:
             raw_paths = [str(p) for p in repo_paths]
         if not raw_paths:
-            raise ValueError("At least one repository path must be provided to RepoBrowserApp")
+            raise ValueError("At least one repository path must be provided to the repository browser")
 
         normalized: List[str] = []
         seen: Set[str] = set()
@@ -284,12 +317,8 @@ class RepoBrowserApp(FilterMixin, App):
         self.current_root: Optional[str] = None
         self.current_rel: str = ""
         self.current_path: Optional[str] = None
-        self.selected_device_name: Optional[str] = None
-        self.selected_device_cfg_path: Optional[str] = None
-        self.selected_repo_root: Optional[str] = None
         self.scroll_to_end = scroll_to_end
         self.start_path = os.path.abspath(start_path) if start_path else None
-        self.layout = start_layout or 'right'
         self.history_dir_l = history_dir.lower()
         self._start_highlight_file: Optional[str] = None
         if self.start_path and os.path.isfile(self.start_path):
@@ -305,7 +334,6 @@ class RepoBrowserApp(FilterMixin, App):
         self._entry_types: Dict[str, str] = {}
         self._display_names: Dict[str, str] = {}
         self._filter_apply_timer: Optional[Timer] = None
-        self.preview_fullscreen: bool = False
         self._last_preview_key: Optional[str] = None
         self._current_preview_document_id: str = ""
         # Find-in-preview state
@@ -348,14 +376,20 @@ class RepoBrowserApp(FilterMixin, App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        # Placeholders; actual widgets are built in _apply_layout
+        # Both panes are built once; _apply_layout only sets classes on the panel and orders its children.
         self.table = BrowserDataTable(id="left")
         self.table.cursor_type = "row"
-        self.preview = PreviewPane(id="right", wrap=False)
+        self.preview = PreviewPane(id="right", wrap=False, auto_scroll=self.scroll_to_end)
         self.preview.search = self._preview_search
-        self.main_panel = Container(id="browser-main")
+        # One row above the panes: the filter, or the find line while find is open.
+        self.filter_input = FilterInput(self.table, id="filter")
+        self.find_input = FindInput("preview", id="find")
+        self.find_input.display = False
+        self.table.filter_input = self.filter_input
+        yield Container(self.filter_input, self.find_input, id="input-row")
+        self.main_panel = Container(*self._ordered_panes(), id="browser-main", classes=f"layout-{self._layout_name}")
         yield self.main_panel
-        # Tips/footer text is updated dynamically to show filter
+        # The tips line follows the focus and the find state
         self.tips = Static("", id="tips")
         yield self.tips
         yield Footer()
@@ -363,6 +397,10 @@ class RepoBrowserApp(FilterMixin, App):
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:  # type: ignore
         """Update tips when focus changes between table and preview."""
         self._update_tips()
+
+    def on_screen_resume(self) -> None:
+        """Shown again: another screen may have changed the app's layout preference meanwhile."""
+        self._apply_layout()
 
     def on_mount(self) -> None:
         self._setup_table()
@@ -503,57 +541,39 @@ class RepoBrowserApp(FilterMixin, App):
             return self.current_path
         return ""
 
+    @property
+    def _layout_name(self) -> str:
+        """The layout preference, which the host App owns (``app.layout``): right, bottom, left or top."""
+        return str(self.app.layout)  # type: ignore[attr-defined]
+
+    @property
+    def preview_fullscreen(self) -> bool:
+        """Whether the preview is maximised: a read-only view of the panel's ``-fullscreen`` class."""
+        panel = getattr(self, "main_panel", None)
+        return bool(panel is not None and panel.has_class("-fullscreen"))
+
     def _apply_layout(self) -> None:
-        """Rebuild widgets and mount according to current layout.
+        """Arrange the existing panes for the app's layout preference.
 
-        Recreating widgets avoids Textual reparenting quirks that can drop
-        content render state when switching containers immediately after start.
+        CSS does the work: a ``layout-<name>`` class on the panel picks horizontal or vertical,
+        and the preview goes first for ``left`` and ``top``. No widget is created or removed, so
+        focus, cursor, scroll offset and the loaded directory survive.
         """
-        try:
-            for child in list(self.main_panel.children):
-                child.remove()
-        except Exception:
-            pass
+        panel = self.main_panel
+        for name in list(panel.classes):
+            if name.startswith("layout-"):
+                panel.remove_class(name)
+        panel.add_class(f"layout-{self._layout_name}")
 
-        # Fresh widgets each time
-        if getattr(self, "preview_fullscreen", False):
-            self.preview = PreviewPane(id="preview_full", wrap=False, highlight=False, auto_scroll=self.scroll_to_end)
-            # Ensure full width/height in fullscreen
-            try:
-                self.preview.styles.width = "100%"
-                self.preview.styles.height = "1fr"
-            except Exception:
-                pass
-        else:
-            self.preview = PreviewPane(id="right", wrap=False, highlight=False, auto_scroll=self.scroll_to_end)
-        self.preview.search = self._preview_search
-        # Attach search controller to pane
-        # RichLog doesn't attach search state; App manages it
-        self.table = BrowserDataTable(id="left")
-        self.table.cursor_type = "row"
+        first, second = self._ordered_panes()
+        if list(panel.children) != [first, second]:
+            panel.move_child(first, before=second)
 
-        # Orientation or fullscreen preview
-        if getattr(self, "preview_fullscreen", False):
-            # Mount only the preview in fullscreen mode
-            self.main_panel.mount(Container(self.preview))
-        else:
-            if self.layout in ("right", "left"):
-                ordered = (self.preview, self.table) if self.layout == "left" else (self.table, self.preview)
-                container = Horizontal(*ordered, classes=f"layout-{self.layout}")
-            else:
-                ordered = (self.preview, self.table) if self.layout == "top" else (self.table, self.preview)
-                container = Vertical(*ordered, classes=f"layout-{self.layout}")
-            self.main_panel.mount(container)
-
-        # Columns for the fresh table
-        self._setup_table()
-        # Refresh tips line
-        self._update_tips()
-        if self._last_preview_key:
-            try:
-                self._update_preview(self._last_preview_key)
-            except Exception:
-                pass
+    def _ordered_panes(self) -> Tuple[Widget, Widget]:
+        """The panes in child order for the layout: the preview first for ``left`` and ``top``."""
+        if self._layout_name in ("left", "top"):
+            return self.preview, self.table
+        return self.table, self.preview
 
     def _setup_table(self) -> None:
         t = self.table
@@ -615,6 +635,8 @@ class RepoBrowserApp(FilterMixin, App):
 
         self._filter_text = ""
         self._cancel_filter_timer()
+        if self.filter_input.value:
+            self.filter_input.value = ""  # a new directory starts with no filter; the line follows
         try:
             self.table.clear()
         except Exception:
@@ -653,18 +675,28 @@ class RepoBrowserApp(FilterMixin, App):
 
         self._pending_cursor_key = pending_key
         self._render_entries()
+        self._sync_document_flag()
 
         self._start_highlight_file = None
         self._highlight_dir_name = None
 
     def _update_preview(self, key: str) -> None:
         """Populate the right pane for a given key (file or directory)."""
+        self._render_preview(key)
+        self._sync_document_flag()
+
+    def _sync_document_flag(self) -> None:
+        """Tell the bindings whether the preview shows a document (``check_action`` reads the flag)."""
+        self.document_shown = bool(self.preview.document_id)
+
+    def _render_preview(self, key: str) -> None:
         self._last_preview_key = key
         self.preview.clear()
 
         def _activate_document(document_id: str) -> str:
             if document_id != self._current_preview_document_id:
                 self._preview_search.reset()
+                self.find_input.value = ""  # a different document starts a fresh search
                 self._current_preview_document_id = document_id
             return document_id
 
@@ -747,58 +779,75 @@ class RepoBrowserApp(FilterMixin, App):
 
     # -------- Filtering / Quick Search --------
     def _update_tips(self) -> None:
-        filter_hint = self.get_filter_hint() or " | Filter: _"
         if self._search_target == 'preview' and self._preview_search.has_query():
-            cnt = self._preview_search.counter_text()
-            q = self._preview_search.query
-            search_hint = f" | Find: '{q}' {cnt} (↓/Enter=next, ↑=prev, Esc=exit)"
-        elif self._search_target == 'preview':
-            search_hint = " | Find: _ (type to search, Esc=cancel)"
+            # the filter text is not repeated here: the filter line shows it
+            search_hint = f" | Find: '{self._preview_search.query}' {self._preview_search.counter_text()}"
         else:
             search_hint = ""
-        preview_focused = bool(getattr(self.preview, "has_focus", False))
-        self.tips.update(browser_tips(filter_hint, search_hint, preview_focused))
+        self.tips.update(
+            browser_tips(
+                search_hint,
+                preview_focused=bool(getattr(self.preview, "has_focus", False)),
+                filter_focused=self.filter_input.has_focus,
+                find_focused=bool(self._search_target) and self.find_input.has_focus,
+            )
+        )
+
+    def _sync_input_row(self) -> None:
+        """Show the find line in place of the filter while find is open; no filter for a lone preview.
+
+        The row keeps its height, so the panes below do not move. The footer follows, because
+        ``check_action`` hides Filter (/) while the row belongs to find or the list is hidden.
+        """
+        self.find_input.display = bool(self._search_target)
+        self.filter_input.display = not self._search_target and not self.preview_fullscreen
+        self.refresh_bindings()
 
     # ---- Find in preview ----
     def action_start_find(self) -> None:
         self.action_start_find_preview()
 
     def action_start_find_preview(self) -> None:
+        """Open the find line in the filter's row and focus it; starting again clears the query."""
         self._search_target = 'preview'
         self._preview_search.reset()
+        self.find_input.value = ""
         try:
             self.preview.apply_search()
         except Exception:
             pass
-        self._update_tips()
-
-    def action_find_backspace(self) -> None:
-        if self._search_target != 'preview':
-            return
-        self._preview_search.backspace()
-        try:
-            self.preview.apply_search()
-        except Exception:
-            pass
-        self._update_tips()
-
-    def action_find_append_char(self, ch: str) -> None:
-        if self._search_target != 'preview' or not ch:
-            return
-        self._preview_search.append_char(ch)
-        try:
-            self.preview.apply_search()
-        except Exception:
-            pass
+        self._sync_input_row()
+        self.find_input.focus()
         self._update_tips()
 
     def action_cancel_find(self) -> None:
+        """Esc in find: close it and give the focus back to the searched preview.
+
+        The query and the highlights are cleared and the filter row is back.
+        """
         if self._search_target != 'preview':
             return
         self._search_target = ''
         self._preview_search.reset()
+        self.find_input.value = ""
         try:
             self.preview.apply_search()
+        except Exception:
+            pass
+        self._sync_input_row()
+        self.preview.focus()
+        self._update_tips()
+
+    def _find_query_changed(self) -> None:
+        """The find line was edited: search for what it holds and show the first hit."""
+        query = self.find_input.value
+        if self._search_target != 'preview' or query == self._preview_search.query:
+            return
+        self._preview_search.set_query(query)
+        try:
+            self.preview.apply_search()
+            if self._preview_search.has_matches():
+                self.preview.scroll_match_into_view(center=False)
         except Exception:
             pass
         self._update_tips()
@@ -1038,46 +1087,22 @@ class RepoBrowserApp(FilterMixin, App):
         return False
 
     def on_key(self, event: events.Key) -> None:  # type: ignore
-        from .utils import handle_search_key
+        """Key tracing for ``CN_TUI_DEBUG_KEYS``, and navigation keys for a focused preview.
 
+        The other keys are bindings and ``Input`` widgets: the list forwards printable keys into
+        the filter line, and the filter and find lines handle their own keys.
+        """
         if self._debug_keys:
             try:
                 self.logr.debug(
                     "app.on_key(repo): key=%s focus=%s pane_focus=%s table_focus=%s",
                     getattr(event, 'key', None),
-                    getattr(self.screen.focused, 'id', None),
+                    getattr(self.focused, 'id', None),
                     getattr(self.preview, 'has_focus', None),
                     getattr(self.table, 'has_focus', None),
                 )
             except Exception:
                 pass
-        if self._search_target == "preview" and handle_search_key(self, event, "preview"):
-            return
-        # When in preview fullscreen, Escape should exit fullscreen
-        if getattr(self, "preview_fullscreen", False) and event.key == "escape":
-            self.preview_fullscreen = False
-            # Try to preserve selection to the last previewed path
-            if getattr(self, "_last_preview_key", None):
-                self._pending_cursor_key = self._last_preview_key
-            self._apply_layout()
-            self._render_entries()
-            try:
-                self.preview.focus()
-            except Exception:
-                pass
-            try:
-                event.stop()
-            except Exception:
-                pass
-            return
-
-        # Delegate to mixin; consume if handled
-        if self.process_filter_key(event, require_table_focus=True):
-            try:
-                event.stop()
-            except Exception:
-                pass
-            return
 
         # Fallback: route navigation keys to preview pane if it has focus
         if event.key in ("up", "down", "pageup", "pagedown", "home", "end"):
@@ -1102,13 +1127,9 @@ class RepoBrowserApp(FilterMixin, App):
                 pass
 
     def action_quit(self) -> None:
-        """Clear filter first when active; otherwise quit."""
-        if self.filter_active():
-            self.clear_filter()
-            return
-        self.exit()
+        self.post_message(self.Closed())
 
-    # App-level pane navigation actions (guaranteed routing)
+    # Pane navigation actions (guaranteed routing to the preview)
     def action_pane_up(self) -> None:
         try:
             self.preview.action_scroll_up()
@@ -1145,12 +1166,62 @@ class RepoBrowserApp(FilterMixin, App):
         except Exception:
             pass
 
-    def action_clear_filter(self) -> None:
-        self.clear_filter()
+    def action_back_out(self) -> None:
+        """Esc, in one order: close find, restore a maximised preview, then clear the filter.
+
+        A focused filter line has already cleared itself and handed the focus to the list (its
+        own Esc binding), so that step never gets here. Esc never leaves the browser.
+        """
+        if self._search_target:
+            self.action_cancel_find()
+        elif self.preview_fullscreen:
+            self._set_fullscreen(False)
+        else:
+            self.clear_filter()
+
+    def action_focus_filter(self) -> None:
+        """/ : into the filter line, cursor at the end of what is there."""
+        self.filter_input.cursor_position = len(self.filter_input.value)
+        self.filter_input.focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """A character typed (or deleted) in the filter or the find line.
+
+        The current value is read, not the event's: a burst of keys queues several events and
+        an old one must not write an old value back.
+        """
+        event.stop()
+        if event.input is self.filter_input:
+            self.set_filter_text(self.filter_input.value)
+        elif event.input is self.find_input:
+            self._find_query_changed()
+
+    def on_filter_input_accepted(self, event: FilterInput.Accepted) -> None:
+        """Enter in the filter line: open the highlighted row, once the pending filter is applied."""
+        event.stop()
+        if self._filter_apply_timer is not None:
+            self._cancel_filter_timer()
+            self._apply_filter_now()
+        self.action_enter_selected()
+
+    def on_find_input_next(self, event: FindInput.Next) -> None:
+        event.stop()
+        self.action_find_next()
+
+    def on_find_input_previous(self, event: FindInput.Previous) -> None:
+        event.stop()
+        self.action_find_prev()
+
+    def on_find_input_closed(self, event: FindInput.Closed) -> None:
+        event.stop()
+        self.action_cancel_find()
 
     def _on_filter_changed(self) -> None:
         self._update_tips()
         current_filter = getattr(self, "_filter_text", "")
+        if self.filter_input.value != current_filter:
+            # cleared from outside (Esc on the list): the line follows
+            self.filter_input.value = current_filter
         if not current_filter:
             self._cancel_filter_timer()
             self._render_entries()
@@ -1218,10 +1289,8 @@ class RepoBrowserApp(FilterMixin, App):
             base = os.path.basename(key)
             lower = base.lower()
             if lower.endswith(".cfg"):
-                self.selected_device_name = os.path.splitext(base)[0]
-                self.selected_device_cfg_path = key
-                self.selected_repo_root = self._entry_repo.get(key) or self._determine_repo_root(key) or self.current_root
-                self.exit()
+                repo_root = self._entry_repo.get(key) or self._determine_repo_root(key) or self.current_root
+                self.post_message(self.DeviceSelected(os.path.splitext(base)[0], key, repo_root))
             elif lower.endswith((".yml", ".yaml")):
                 try:
                     self.preview.focus()
@@ -1286,59 +1355,101 @@ class RepoBrowserApp(FilterMixin, App):
         except Exception:
             pass
 
-    def action_toggle_maximize_pane(self) -> None:
-        target_key = self._last_preview_key or self._selected_row_key()
-        if not target_key:
-            return
+    def check_action(self, action: str, parameters: Tuple[object, ...]) -> Optional[bool]:
+        """Hide the bindings that do not apply right now (``False`` removes them from the footer).
 
-        if self.preview_fullscreen:
-            self.preview_fullscreen = False
-            self._pending_cursor_key = self._last_preview_key
-            self._apply_layout()
-            self._render_entries()
+        - Maximize and Find need a document on screen (a maximised pane can always be restored).
+        - Filter (/) needs the filter on screen: not while find has its row or the list is hidden.
+        """
+        if action == "toggle_maximize_pane":
+            return self.preview_fullscreen or self.document_shown
+        if action == "start_find":
+            return self.document_shown
+        if action == "focus_filter":
+            return not self._search_target and not self.preview_fullscreen
+        return True
+
+    def action_toggle_help(self) -> None:
+        """Show or hide Textual's help panel: the focused widget's help and the active keys."""
+        if self.query("HelpPanel"):
+            self.app.action_hide_help_panel()
         else:
-            self.preview_fullscreen = True
-            self._apply_layout()
-            self._update_preview(target_key)
+            self.app.action_show_help_panel()
 
-        try:
-            self.preview.focus()
-        except Exception:
-            pass
+    def _set_fullscreen(self, fullscreen: bool) -> None:
+        """Show the preview alone, or both panes again; the preview keeps the focus either way."""
+        self.main_panel.set_class(fullscreen, "-fullscreen")
+        self._sync_input_row()
+        self.preview.focus()
+
+    def _toggle_panes(self) -> None:
+        """Tab and Shift+Tab: list and filter on one side, preview and find line on the other.
+
+        Explicit, not ``screen.focus_next()``: the inputs would become Tab stops and make it a
+        three-stop cycle. Neither input is ever one; ``/`` and typing are the ways into the
+        filter. With the preview fullscreen the list is hidden, so the preview keeps the focus.
+        """
+        focused = self.focused
+        if self.preview_fullscreen or not (focused is self.preview or focused is self.find_input):
+            target = self.preview
+        else:
+            target = self.table
+        target.focus()
+        self._update_tips()
+
+    def action_focus_next(self) -> None:
+        """Move focus on; the tips follow in ``on_descendant_focus``, once the focus has moved."""
+        self._toggle_panes()
+
+    def action_focus_previous(self) -> None:
+        """Shift+Tab: with two panes it is the same toggle as Tab."""
+        self._toggle_panes()
+
+    def action_toggle_maximize_pane(self) -> None:
+        if self.preview_fullscreen:
+            self._set_fullscreen(False)
+        elif self.document_shown:
+            self._set_fullscreen(True)
 
     def action_toggle_layout(self) -> None:
-        # Ignore layout changes while in fullscreen preview to avoid losing content
-        if getattr(self, "preview_fullscreen", False):
-            return
         order = ["right", "bottom", "left", "top"]
         try:
-            idx = order.index(getattr(self, 'layout', 'right'))
+            idx = order.index(self._layout_name)
         except ValueError:
             idx = 0
-        self.layout = order[(idx + 1) % len(order)]
+        self.app.layout = order[(idx + 1) % len(order)]  # type: ignore[attr-defined]
+        self._apply_layout()
 
-        # Remember current selection to restore after rebuild
-        saved_key = self._selected_row_key()
 
-        def _remount() -> None:
-            # Rebuild widgets, then reload directory and restore selection
-            target_path = self.current_path
-            target_root = self.current_root
-            self._apply_layout()
-            self._load_directory(target_path, repo_root=target_root)
-            if saved_key and saved_key in getattr(self, '_row_keys', []):
-                try:
-                    i = self._row_keys.index(saved_key)
-                    self.table.cursor_coordinate = (i, 0)
-                    self._update_preview(saved_key)
-                except Exception:
-                    pass
-            try:
-                self.table.focus()
-            except Exception:
-                pass
+class RepoBrowserApp(App):
+    """Single-screen App around :class:`BrowserScreen`, for the launchers and the upstream public name.
 
-        try:
-            self.call_after_refresh(_remount)
-        except Exception:
-            _remount()
+    ``view`` is the screen. The constructor arguments are the screen's, plus ``start_layout``
+    (``layout`` is the app's preference, as in any host). A selected device ends the app with
+    ``selected_device_name``, ``selected_device_cfg_path`` and ``selected_repo_root`` set; quitting
+    (``BrowserScreen.Closed``) ends it with them unset.
+    """
+
+    TITLE = BrowserScreen.TITLE
+    SUB_TITLE = BrowserScreen.SUB_TITLE
+
+    def __init__(self, repo_paths: Union[str, Sequence[str]], scroll_to_end: bool = False, start_path: Optional[str] = None, start_layout: Optional[str] = None, history_dir: str = 'history', repo_names: Optional[Sequence[str]] = None):
+        super().__init__()
+        self.view = BrowserScreen(repo_paths, scroll_to_end, start_path, history_dir, repo_names)
+        self.layout = start_layout or 'right'
+        self.selected_device_name: Optional[str] = None
+        self.selected_device_cfg_path: Optional[str] = None
+        self.selected_repo_root: Optional[str] = None
+
+    def on_mount(self) -> None:
+        self.push_screen(self.view)
+
+    def on_browser_screen_device_selected(self, message: BrowserScreen.DeviceSelected) -> None:
+        self.selected_device_name = message.name
+        self.selected_device_cfg_path = message.cfg_path
+        self.selected_repo_root = message.repo_root
+        self.exit()
+
+    def on_browser_screen_closed(self, message: BrowserScreen.Closed) -> None:
+        message.stop()
+        self.exit()

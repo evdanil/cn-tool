@@ -3,7 +3,7 @@ import argparse
 import logging
 import math
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, NamedTuple, Tuple
 
 from core.base import ScriptContext
 from utils.file_io import check_dir_accessibility
@@ -24,7 +24,7 @@ BASE_CONFIG_SCHEMA = {
     "report_max_config_tab_kb": {"section": "report", "ini_key": "max_config_tab_kb", "type": "int", "fallback": 512},
     "gpg_credentials":       {"section": "gpg", "ini_key": "credentials", "type": "path", "fallback": "~/cn-tool.gpg"},
     "config_repo_enabled":   {"section": "config_repo", "ini_key": "enabled", "type": "str", "fallback": ""},
-    "config_repo_directory": {"section": "config_repo", "ini_key": "directory", "type": "path", "fallback": "/opt/data/configs"},
+    "config_repo_directory": {"section": "config_repo", "ini_key": "directory", "type": "path", "fallback": ""},
     "config_repo_regions":   {"section": "config_repo", "ini_key": "regions", "type": "list[str]", "fallback": "ap,eu,am"},
     "config_repo_vendors":   {"section": "config_repo", "ini_key": "vendors", "type": "list[str]", "fallback": "cisco,aruba,f5,bluecoat,paloalto"},
     "config_repo_excluded_dirs": {"section": "config_repo", "ini_key": "excluded_dirs", "type": "list[str]", "fallback": ""},
@@ -45,7 +45,7 @@ BASE_CONFIG_SCHEMA = {
     "theme_name":            {"section": "theme", "ini_key": "theme", "type": "str", "fallback": "default"},
     # Config Analyzer (external TUI) settings
     "config_repo_history_dir":     {"section": "config_repo", "ini_key": "history_dir", "type": "str", "fallback": "history"},
-    "config_analyzer_repo_directories": {"section": "config_analyzer", "ini_key": "repo_directories", "type": "list[str]", "fallback": "/opt/data/configs"},
+    "config_analyzer_repo_directories": {"section": "config_analyzer", "ini_key": "repo_directories", "type": "list[str]", "fallback": ""},
     "config_analyzer_repo_names": {"section": "config_analyzer", "ini_key": "repo_names", "type": "list[str]", "fallback": ""},
     "config_analyzer_layout":      {"section": "config_analyzer", "ini_key": "layout", "type": "str", "fallback": "right"},
     "config_analyzer_scroll_to_end": {"section": "config_analyzer", "ini_key": "scroll_to_end", "type": "bool", "fallback": False},
@@ -53,6 +53,14 @@ BASE_CONFIG_SCHEMA = {
     # SSH / Device query settings
     "device_ssh_enabled":        {"section": "ssh", "ini_key": "device_ssh_enabled", "type": "bool", "fallback": False},
     "device_query_workers":      {"section": "ssh", "ini_key": "device_query_workers", "type": "int", "fallback": 10},
+    # Only connect to devices whose reverse-DNS name matches this regex (empty = no filtering).
+    "device_name_filter":        {"section": "ssh", "ini_key": "device_name_filter", "type": "str", "fallback": ""},
+    # Site-code conventions (see utils/validation.py for the defaults and placeholders).
+    "site_code_pattern":         {"section": "site", "ini_key": "code_pattern", "type": "str", "fallback": ""},
+    "site_comment_pattern":      {"section": "site", "ini_key": "comment_pattern", "type": "str", "fallback": ""},
+    "site_hostname_pattern":     {"section": "site", "ini_key": "hostname_pattern", "type": "str", "fallback": ""},
+    # Infoblox extensible attribute that holds the site code (empty = search subnet comments only).
+    "site_ea_name":              {"section": "site", "ini_key": "ea_name", "type": "str", "fallback": ""},
 }
 
 # Backward/forward compatibility across section renames.
@@ -145,6 +153,8 @@ def coerce_config_value(raw: str, spec: Dict[str, Any], logger: logging.Logger =
     if t == "bool":
         return coerce_bool(clean)
     if t == "path":
+        if not clean and not spec.get("fallback"):
+            return None  # a path with no default is optional: left blank it is not set (not the current directory)
         return Path(clean).expanduser()
     if t == "list[str]":
         return [
@@ -173,6 +183,11 @@ def _apply_types(cfg: Dict[str, Any], schema: Dict[str, Any], logger: logging.Lo
     return typed_cfg
 
 
+def new_parser() -> configparser.ConfigParser:
+    """The one non-interpolating parser every ini reader uses, so a literal '%' in a value is safe."""
+    return configparser.ConfigParser(interpolation=None)
+
+
 def read_config(config_files: List[Path], schema: Dict[str, Any], logger: logging.Logger) -> Dict[str, Any]:
     """
     Reads configuration from a prioritized list of files using a dynamic schema.
@@ -186,7 +201,7 @@ def read_config(config_files: List[Path], schema: Dict[str, Any], logger: loggin
         return _apply_types(loaded_cfg, schema, logger)
 
     logger.info(f"CONFIG: Reading configuration from files: {existing_files}")
-    config = configparser.ConfigParser()
+    config = new_parser()
     try:
         config.read(existing_files)
     except configparser.Error as e:
@@ -300,6 +315,92 @@ def make_dir_list(ctx: ScriptContext) -> List[Path]:
     return dir_list
 
 
+def _coerce_repo_inputs(value: Any) -> List[Path]:
+    """Directories named by a configuration value (a path, a comma-separated string or a collection of either)."""
+    if not value:
+        return []
+    items = list(value) if isinstance(value, (list, tuple, set)) else [value]
+
+    paths: List[Path] = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, Path):
+            candidates = [item]
+        else:
+            text = str(item)
+            if not text:
+                continue
+            fragments = [frag.strip() for frag in text.split(',')] if ',' in text else [text.strip()]
+            candidates = [Path(fragment).expanduser() for fragment in fragments if fragment]
+        for candidate in candidates:
+            try:
+                resolved = candidate.expanduser().resolve(strict=False)
+            except Exception:
+                resolved = candidate.expanduser()
+            paths.append(resolved)
+    return paths
+
+
+def _normalize_repo_names(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value]
+    if isinstance(value, str):
+        return [segment.strip() for segment in value.split(',')]
+    return []
+
+
+# The keys that name the configuration repository, in the order they are tried, with how the user writes each.
+_REPO_DIRECTORY_KEYS = (
+    ("config_analyzer_repo_directories", "[config_analyzer] repo_directories"),
+    ("config_analyzer_repo_directory", "[config_analyzer] repo_directory"),
+    ("config_repo_directory", "[config_repo] directory"),
+)
+
+
+class RepoRoots(NamedTuple):
+    """Where ``cn diff`` and the repository browser read: the accessible and the inaccessible directories, and the key that named them."""
+
+    accessible: List[Tuple[Path, str]]
+    inaccessible: List[Path]
+    source: str  # "" when no key names a directory
+
+
+def resolve_config_repo_roots(cfg: Dict[str, Any], logger: logging.Logger) -> RepoRoots:
+    """
+    The configuration repositories ``cn diff``, the repository browser and ``cn doctor`` use.
+
+    The directories come from the first of ``[config_analyzer] repo_directories`` (a comma-separated
+    list), the legacy ``[config_analyzer] repo_directory`` and ``[config_repo] directory`` that is
+    set (not empty), and ``source`` names that key. Each directory is paired with the label
+    configured at its position in ``config_analyzer_repo_names`` ("" when there is none) *before*
+    any is dropped, so a rejected directory never shifts the labels of the others. A directory
+    named twice is listed once, under its first label.
+    """
+    candidates: List[Path] = []
+    source = ""
+    for key, written in _REPO_DIRECTORY_KEYS:
+        candidates = _coerce_repo_inputs(cfg.get(key))
+        if candidates:
+            source = written
+            break
+    names = _normalize_repo_names(cfg.get("config_analyzer_repo_names"))
+
+    seen: set[str] = set()
+    accessible: List[Tuple[Path, str]] = []
+    inaccessible: List[Path] = []
+    for index, candidate in enumerate(candidates):
+        key = candidate.as_posix()
+        if key in seen:
+            continue
+        seen.add(key)
+        if check_dir_accessibility(logger, candidate):
+            accessible.append((candidate, names[index] if index < len(names) else ""))
+        else:
+            inaccessible.append(candidate)
+    return RepoRoots(accessible, inaccessible, source)
+
+
 def normalize_runtime_flags(cfg: Dict[str, Any], logger: logging.Logger) -> Dict[str, Any]:
     """Normalize derived runtime flags in *cfg* in-place and return cfg.
 
@@ -319,6 +420,18 @@ def normalize_runtime_flags(cfg: Dict[str, Any], logger: logging.Logger) -> Dict
          ``True`` iff ``config_repo_directory`` is set *and* accessible.
        - Unrecognized non-empty value  →  warning then auto-detect as above.
 
+       This is the gate of config search, which reads ``[config_repo] directory`` only.
+
+    3. ``config_analyzer_enabled`` (bool) — the gate of ``cn diff`` and the repository browser,
+       which read the directories of ``resolve_config_repo_roots``. ``True`` iff
+       ``config_repo_enabled`` is ``True`` or a directory those keys name is accessible; an
+       explicit ``[config_repo] enabled = false`` switches it off too.
+
+    4. ``config_repo_enabled_explicit`` (``True``, ``False`` or ``None``) — what ``[config_repo]
+       enabled`` says, before the two flags above are derived from it. Both flags are also
+       ``False`` when every configured directory is inaccessible, so only this tells "switched
+       off" from "misconfigured" (``cn doctor`` shows the first as ``Disabled``, the second as an error).
+
     Mutates *cfg* directly and also returns it for convenience.
     """
     # 1. Infoblox readiness
@@ -334,6 +447,7 @@ def normalize_runtime_flags(cfg: Dict[str, Any], logger: logging.Logger) -> Dict
     repo_enabled_value = cfg.get("config_repo_enabled", "")
     repo_enabled_raw = str(repo_enabled_value).strip()
     repo_enabled = parse_optional_bool(repo_enabled_value)
+    cfg["config_repo_enabled_explicit"] = repo_enabled
 
     if repo_enabled is False:
         logger.info("Configuration repository explicitly disabled in config.")
@@ -364,6 +478,12 @@ def normalize_runtime_flags(cfg: Dict[str, Any], logger: logging.Logger) -> Dict
             )
             cfg["config_repo_enabled"] = False
 
+    # 3. Analyzer readiness: the same directories, in the same order, as the command reads.
+    analyzer_roots = resolve_config_repo_roots(cfg, logger)
+    cfg["config_analyzer_enabled"] = bool(
+        cfg["config_repo_enabled"] or (repo_enabled is not False and analyzer_roots.accessible)
+    )
+
     return cfg
 
 
@@ -391,7 +511,7 @@ def write_config_value(
     logger.info(
         f"CONFIG_WRITER: Attempting to set [{section}] {key} = {log_display} in {user_config_path}"
     )
-    config = configparser.ConfigParser()
+    config = new_parser()
 
     # Read the existing file to not overwrite other values
     if user_config_path.is_file():

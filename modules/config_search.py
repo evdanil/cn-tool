@@ -5,13 +5,15 @@ from time import perf_counter
 from typing import List, Dict, Set, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 
+from rich.markup import escape
+
 from core.base import BaseModule, ScriptContext
 from utils.user_input import press_any_key, read_user_input
 from utils.auth import ensure_infoblox_auth
 from utils.display import console, get_global_color_scheme, print_search_config_data, print_table_data
 from utils.file_io import check_dir_accessibility, queue_save
 from utils.infoblox_ux import format_no_match_message, format_partial_results_message
-from utils.validation import is_valid_site
+from utils.validation import is_valid_site, site_hostname_regex
 from utils.config import make_dir_list
 from utils.process_data import remove_duplicate_rows_sorted_by_col
 from utils.api import fetch_network_data
@@ -54,7 +56,7 @@ class ConfigSearchModule(BaseModule):
         ctx.console.print(
             "\n"
             f"[{colors['warning']}]Unable to access configuration repository[/]\n"
-            f"[{colors['description']}]Check the [{colors['header']} {colors['bold']}][config_repository][/] section in your configuration file.[/]\n"
+            f"[{colors['description']}]Check the [{colors['header']} {colors['bold']}]{escape('[config_repo]')}[/] section in your configuration file.[/]\n"
             f"[{colors['description']}]Verify that [{colors['success']} {colors['bold']}]directory[/] is set to the correct path.[/]\n"
             f"[{colors['description']}]If the path is correct, verify that you have read access to it.[/]\n"
         )
@@ -108,7 +110,11 @@ class ConfigSearchModule(BaseModule):
                 pass
 
             if not is_network:
-                if len(search_input) < MIN_INPUT_LEN and not is_valid_site(search_input):
+                # Short inputs are refused as keywords unless the deployment defines a site-code
+                # shape ([site] code_pattern) and the input is a site code by that definition.
+                site_pattern = ctx.cfg.get("site_code_pattern")
+                looks_like_site = bool(site_pattern) and is_valid_site(search_input, site_pattern)
+                if len(search_input) < MIN_INPUT_LEN and not looks_like_site:
                     console.print(f"[{colors['error']}]Input keyword is too short: {search_input}[/]")
                     continue
 
@@ -178,7 +184,7 @@ class ConfigSearchModule(BaseModule):
         print_search_config_data(ctx, sorted_data)
 
         if ctx.cfg["report_auto_save"]:
-            self._save_found_data(ctx, data_to_save, missing_nets, matched_nets, "Config Check")
+            self._save_found_data(ctx, data_to_save, missing_nets, matched_nets, "Config Check", site_search=False)
 
         ctx.event_bus.publish(
             "stats:module_detail",
@@ -209,7 +215,7 @@ class ConfigSearchModule(BaseModule):
         console = ctx.console
         colors = get_global_color_scheme(ctx.cfg)
         normalized_sitecode = str(sitecode or "").strip().upper()
-        if not is_valid_site(normalized_sitecode):
+        if not is_valid_site(normalized_sitecode, ctx.cfg.get("site_code_pattern")):
             logger.info(f"Executing demobilization search rejected invalid sitecode: {sitecode}")
             console.print(f"[{colors['error']}]Invalid site code format.[/]")
             press_any_key(ctx)
@@ -226,12 +232,15 @@ class ConfigSearchModule(BaseModule):
         processed_data = lookup_result.data
 
         if lookup_result.status == "error" and not lookup_result.has_data:
-            console.print(f"[{colors['error']}]{lookup_result.message}[/]")
+            console.print(f"[{colors['error']}]{escape(lookup_result.message)}[/]")  # may name "[site]"
             press_any_key(ctx)
             return
 
         if lookup_result.status == "partial_error":
             console.print(f"[{colors['warning']}]{format_partial_results_message(lookup_result.message)}[/]")
+
+        for notice in lookup_result.notices:
+            console.print(f"[{colors['warning']}]{escape(notice)}[/]")
 
         if not processed_data.get("location"):
             console.print(f"[{colors['error']}]{format_no_match_message('subnet records', sitecode)}[/]")
@@ -264,12 +273,11 @@ class ConfigSearchModule(BaseModule):
             except ValueError:
                 logger.warning(f"Skipping invalid network from Infoblox: {location.get('network')}")
 
-        search_terms: List[str] = []
-        if country:
-            pattern = rf'\b(?:{country}{re.escape(sitecode.replace("-", ""))}|{re.escape(sitecode)}[_0-9]+[-\w\d]*)\b'
-        else:
-            pattern = rf'\b(?:[A-Z]{{2}}{re.escape(sitecode.replace("-", ""))}|{re.escape(sitecode)}[_0-9]+[-\w\d]*)\b'
-        search_terms.append(pattern)
+        # Device names are found with [site] hostname_pattern (default: names starting with the
+        # site code); the template may use {site}, {site_compact} and {country}.
+        search_terms: List[str] = [
+            site_hostname_regex(sitecode, ctx.cfg.get("site_hostname_pattern"), country)
+        ]
 
         # Step 3: Execute the search using the internal helper
         data_to_save, matched_nets, core_search_time = self._execute_search(
@@ -296,7 +304,7 @@ class ConfigSearchModule(BaseModule):
         print_search_config_data(ctx, sorted_data)
 
         if ctx.cfg["report_auto_save"]:
-            self._save_found_data(ctx, data_to_save, missing_nets, matched_nets, "Demob Site Check")
+            self._save_found_data(ctx, data_to_save, missing_nets, matched_nets, "Demob Site Check", site_search=True)
 
         ctx.event_bus.publish(
             "stats:module_detail",
@@ -446,8 +454,21 @@ class ConfigSearchModule(BaseModule):
 
         return data_to_save, matched_nets
 
-    def _save_found_data(self, ctx: ScriptContext, data: List, missed_nets: List, matched_nets: Set, sheet: str) -> None:
-        """Private save method, containing the logic from the original `save_found_data`."""
+    def _save_found_data(
+        self,
+        ctx: ScriptContext,
+        data: List,
+        missed_nets: List,
+        matched_nets: Set,
+        sheet: str,
+        *,
+        site_search: bool = False,
+    ) -> None:
+        """Private save method, containing the logic from the original `save_found_data`.
+
+        ``site_search`` names the subnet sheet's first column "Site Code" (demob searches)
+        instead of "Search Terms"; it is decided by the caller, not by the input's shape.
+        """
         logger = ctx.logger
         logger.info(f"Configuration Search - Saving results to sheet: {sheet}")
         if not data:
@@ -459,7 +480,7 @@ class ConfigSearchModule(BaseModule):
             matched_data = [[search_input, str(net), "Used"] for net in matched_nets if net]
             save_nets_data = missed_data + matched_data
 
-            columns = ["Site Code", "Subnet", "Status"] if is_valid_site(search_input) else ["Search Terms", "Subnet", "Status"]
+            columns = ["Site Code", "Subnet", "Status"] if site_search else ["Search Terms", "Subnet", "Status"]
             if save_nets_data:
                 queue_save(ctx, columns, save_nets_data, sheet_name=sheet, index=False, force_header=True)
 

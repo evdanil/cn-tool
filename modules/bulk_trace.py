@@ -97,11 +97,13 @@ class BulkTraceModule(BaseModule):
 
         # Define the column order and discover any additional columns added by plugins.
         base_columns = ['Target', 'Last Hop IP', 'Last Hop Hostname', 'Hop Count', 'Status']
+        # A key is a base column when it only differs in case ("last_hop_ip" is "Last Hop IP", not a new column).
+        base_names = {column.lower() for column in base_columns}
         discovered_columns = set()
         for res in results:
             for key in res.keys():
                 title_case_key = key.replace('_', ' ').title()
-                if title_case_key not in base_columns:
+                if title_case_key.lower() not in base_names:
                     discovered_columns.add(title_case_key)
 
         final_columns = base_columns + sorted(list(discovered_columns))

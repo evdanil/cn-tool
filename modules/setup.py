@@ -1,14 +1,188 @@
+import argparse
 from pathlib import Path
-from typing import Any, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from urllib.parse import quote
 
-from core.base import BaseModule, ScriptContext
+from rich.markup import escape
+
+from core.base import BaseModule, CliResult, ScriptContext, cli_exit_code
+from modules.config_analyzer_module import resolve_repo_roots
+from utils.auth import credential_source, credentials_hint, ensure_infoblox_auth
 from utils.config import BASE_CONFIG_SCHEMA, coerce_bool, coerce_config_value, write_config_value
 from utils.file_io import check_dir_accessibility
 from utils.user_input import press_any_key, read_user_input
 
 
+class HealthCheck(NamedTuple):
+    """One row of the status block and of ``cn doctor``; ``status`` is ok, warning, error, off, info or skipped."""
+
+    check: str
+    status: str
+    label: str
+    detail: str = ""
+
+    @property
+    def text(self) -> str:
+        """``label (detail)``: what ``cn doctor`` prints in its ``detail`` column."""
+        return f"{self.label} ({self.detail})" if self.detail else self.label
+
+
+# How the menu colours a row's label.
+_STATUS_STYLES = {"ok": "green", "warning": "yellow", "error": "red", "off": "dim", "info": "cyan", "skipped": "dim"}
+
+
+def _enabled(check: str, enabled: Any, detail: Any) -> HealthCheck:
+    return HealthCheck(check, "ok", "Enabled", str(detail)) if enabled else HealthCheck(check, "off", "Disabled")
+
+
+def _config_repo_check(ctx: ScriptContext) -> HealthCheck:
+    """
+    The directories ``cn diff`` and the repository browser read, and the key that names them.
+
+    "Disabled" is only an explicit ``[config_repo] enabled = false``: the derived flags are false for a
+    repository whose directories cannot be read too, and that is a wrong setting (``error``) to show.
+    """
+    if ctx.cfg.get("config_repo_enabled_explicit") is False:
+        return HealthCheck("Config Repo", "off", "Disabled")
+    roots = resolve_repo_roots(ctx)
+    if not roots.source:
+        return HealthCheck("Config Repo", "off", "Not configured")
+    shown = [str(root) for root, _label in roots.accessible] + [f"{path} (not accessible)" for path in roots.inaccessible]
+    if not roots.accessible:
+        status = "error"
+    else:
+        status = "warning" if roots.inaccessible else "ok"
+    return HealthCheck("Config Repo", status, "Enabled", f"{roots.source}: {', '.join(shown)}")
+
+
+def health_checks(ctx: ScriptContext, live: Sequence[HealthCheck] = ()) -> List[HealthCheck]:
+    """
+    The status rows of the menu and of ``cn doctor``, in their fixed order.
+
+    They are read from the configuration alone, so the menu can show them at any time. ``cn doctor``
+    passes the ``live`` rows (credentials, WAPI, site attribute), which follow the Infoblox row.
+    """
+    cfg = ctx.cfg
+    if cfg.get("infoblox_enabled"):
+        infoblox = HealthCheck("Infoblox API", "ok", "Configured", str(cfg.get("api_endpoint", "")))
+    else:
+        infoblox = HealthCheck("Infoblox API", "off", "Not configured")
+
+    ad_uri = cfg.get("ad_uri", "")
+    if cfg.get("ad_enabled") and not ad_uri:
+        active_dir = HealthCheck("Active Dir", "warning", "Enabled", "no URI")
+    else:
+        active_dir = _enabled("Active Dir", cfg.get("ad_enabled"), ad_uri)
+
+    return [
+        infoblox,
+        *live,
+        _config_repo_check(ctx),
+        active_dir,
+        _enabled("Cache", cfg.get("cache_enabled"), cfg.get("cache_directory", "")),
+        HealthCheck("Theme", "info", str(cfg.get("theme_name", "default"))),
+    ]
+
+
+class _Live(NamedTuple):
+    """A live check: its row, and whether it found a wrong setting (exit 2) or a failure (exit 3)."""
+
+    row: HealthCheck
+    invalid: bool = False
+    failed: bool = False
+
+
+_CREDENTIAL_ROWS = {"TACACS_PW": ("TACACS_PW is set", ""), "prompt": ("will be asked for", "terminal")}
+_SITE_ATTRIBUTE_OFF = "not set: site codes are matched in subnet comments"
+
+
+def _credentials_check(ctx: ScriptContext) -> _Live:
+    source = credential_source(ctx)
+    if source is None:
+        return _Live(HealthCheck("Credentials", "error", f"none: {credentials_hint(ctx)}"), failed=True)
+    label, detail = _CREDENTIAL_ROWS.get(source, (source, ""))  # a GPG file is named by its path
+    return _Live(HealthCheck("Credentials", "ok", label, detail))
+
+
+def _newest_version(versions: Any) -> str:
+    """The highest of a schema's ``supported_versions``, compared as numbers (2.13.7 is above 2.9); "" if none parse."""
+    numbered: Dict[Tuple[int, ...], str] = {}
+    for version in versions if isinstance(versions, list) else []:
+        try:
+            numbered[tuple(int(part) for part in str(version).split("."))] = str(version)
+        except ValueError:
+            continue
+    return numbered[max(numbered)] if numbered else ""
+
+
+def _wapi_check(ctx: ScriptContext) -> _Live:
+    """Log in, then read the WAPI version the endpoint serves from ``<endpoint>?_schema``."""
+    from utils.api import describe_infoblox_failure, request_result
+
+    user, _ = ensure_infoblox_auth(ctx)
+    result = request_result(ctx, "?_schema", ensure_auth=False)
+    schema = result.items[0] if result.items else {}
+    version = str(schema.get("requested_version") or "")
+    if result.ok and version:
+        newest = _newest_version(schema.get("supported_versions"))
+        detail = f"grid supports up to v{newest}" if newest else ""
+        return _Live(HealthCheck("Infoblox WAPI", "ok", f"v{version}, logged in as {user}", detail))
+    if result.ok or result.status in ("invalid_query", "not_found"):  # an endpoint that is no WAPI: a wrong setting
+        no_schema = f"no WAPI schema at {ctx.cfg.get('api_endpoint')}: check [api] endpoint, e.g. https://gm.example.com/wapi/v2.12/"
+        return _Live(HealthCheck("Infoblox WAPI", "error", no_schema), invalid=True)
+    return _Live(HealthCheck("Infoblox WAPI", "error", describe_infoblox_failure(result)), failed=True)
+
+
+def _site_attribute_check(ctx: ScriptContext, logged_in: bool) -> _Live:
+    """
+    Is ``[site] ea_name`` defined on the grid, and for networks? An unset name is "off", not a failure.
+
+    The site search filters ``network`` by the attribute, which the grid rejects when the attribute is
+    restricted to other object types (``allowed_object_types``; empty means every type): a wrong
+    setting. Without ``IPv6Network`` only the IPv6 half of the search is skipped: a warning.
+    """
+    from utils.api import describe_infoblox_failure, request_result, site_ea_name
+
+    name = site_ea_name(ctx)
+    if not name:
+        return _Live(HealthCheck("Site attribute", "off", _SITE_ATTRIBUTE_OFF))
+    if not logged_in:
+        return _Live(HealthCheck("Site attribute", "skipped", "needs a working WAPI connection"))
+    uri = f"extensibleattributedef?name={quote(name, safe='')}&_return_fields=name,type,allowed_object_types"
+    result = request_result(ctx, uri, ensure_auth=False)
+    if not result.ok:
+        return _Live(HealthCheck("Site attribute", "error", describe_infoblox_failure(result)), failed=True)
+    if not result.items:
+        return _Live(HealthCheck("Site attribute", "error", f"'{name}' is not defined on the grid ([site] ea_name)"), invalid=True)
+    definition = result.items[0]
+    attribute_type = str(definition.get("type") or "")
+    allowed = definition.get("allowed_object_types")
+    object_types = [str(kind) for kind in allowed] if isinstance(allowed, list) else []  # [] is every type
+    lowered = {kind.lower() for kind in object_types}
+    if object_types and "network" not in lowered:
+        message = f"'{name}' is not allowed on Network objects (allowed: {', '.join(object_types)})"
+        return _Live(HealthCheck("Site attribute", "error", message), invalid=True)
+    if object_types and "ipv6network" not in lowered:
+        skipped = "not allowed on IPv6Network: IPv6 subnets are not searched"
+        return _Live(HealthCheck("Site attribute", "warning", name, ", ".join(filter(None, (attribute_type, skipped)))))
+    return _Live(HealthCheck("Site attribute", "ok", name, attribute_type))
+
+
+def _live_checks(ctx: ScriptContext) -> Tuple[List[HealthCheck], bool, bool]:
+    """Credentials, WAPI version and site attribute, in that order; then "a setting is wrong" and "a check failed"."""
+    credentials = _credentials_check(ctx)
+    if credentials.row.status == "ok":
+        wapi = _wapi_check(ctx)
+    else:
+        wapi = _Live(HealthCheck("Infoblox WAPI", "skipped", "needs credentials"))
+    site = _site_attribute_check(ctx, logged_in=wapi.row.status == "ok")
+    checks = (credentials, wapi, site)
+    return [check.row for check in checks], any(check.invalid for check in checks), any(check.failed for check in checks)
+
+
 class SetupModule(BaseModule):
     """Interactive configuration for plugins with user-facing settings."""
+    cli_name = "doctor"
 
     @property
     def menu_key(self) -> str:
@@ -53,46 +227,29 @@ class SetupModule(BaseModule):
             selected_plugin = configurable_plugins[choice_idx - 1]
             self._configure_plugin(ctx, selected_plugin, user_config_path)
 
+    def run_cli(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
+        """
+        ``cn doctor``: the rows of the menu's status block and, when Infoblox is configured, three
+        live checks (credentials, WAPI version, site attribute). Nothing is changed.
+
+        One section, ``checks`` (``check``, ``status``, ``detail``). Never prompts without a
+        terminal. Exit status: 0 when no check failed (warnings, "off" and skipped rows are fine),
+        2 when a setting is wrong, 3 when the credentials or Infoblox failed; never 1.
+        """
+        ctx.logger.info("Request Type - Application Setup (doctor, command line)")
+        live, invalid, failed = _live_checks(ctx) if ctx.cfg.get("infoblox_enabled") else ([], False, False)
+        checks = health_checks(ctx, live)
+        invalid = invalid or any(row.check == "Config Repo" and row.status == "error" for row in checks)
+        rows = [{"check": row.check, "status": row.status, "detail": row.text} for row in checks]
+        return CliResult(cli_exit_code(found=True, invalid=invalid, failed=failed), {"checks": rows})
+
     def _show_health_summary(self, ctx: ScriptContext) -> None:
         """Display a compact infrastructure health summary above the plugin list."""
-        cfg = ctx.cfg
-        lines: list[str] = []
-
-        # Infoblox API
-        endpoint = cfg.get("api_endpoint", "")
-        if cfg.get("infoblox_enabled"):
-            lines.append(f"  Infoblox API:  [green]Configured[/green] ({endpoint})")
-        else:
-            lines.append("  Infoblox API:  [red]Not configured[/red]")
-
-        # Config Repo
-        if cfg.get("config_repo_enabled"):
-            repo_dir = cfg.get("config_repo_directory", "")
-            lines.append(f"  Config Repo:   [green]Enabled[/green] ({repo_dir})")
-        else:
-            lines.append("  Config Repo:   [dim]Disabled[/dim]")
-
-        # Active Directory
-        if cfg.get("ad_enabled"):
-            ad_uri = cfg.get("ad_uri", "")
-            lines.append(f"  Active Dir:    [green]Enabled[/green] ({ad_uri})" if ad_uri else "  Active Dir:    [yellow]Enabled[/yellow] (no URI)")
-        else:
-            lines.append("  Active Dir:    [dim]Disabled[/dim]")
-
-        # Cache
-        if cfg.get("cache_enabled"):
-            cache_dir = cfg.get("cache_directory", "")
-            lines.append(f"  Cache:         [green]Enabled[/green] ({cache_dir})")
-        else:
-            lines.append("  Cache:         [dim]Disabled[/dim]")
-
-        # Theme
-        theme = cfg.get("theme_name", "default")
-        lines.append(f"  Theme:         [cyan]{theme}[/cyan]")
-
         ctx.console.print("[bold cyan]--- System Status ---[/bold cyan]")
-        for line in lines:
-            ctx.console.print(line)
+        for row in health_checks(ctx):
+            style = _STATUS_STYLES[row.status]
+            detail = f" ({escape(row.detail)})" if row.detail else ""
+            ctx.console.print(f"  {row.check + ':':<15}[{style}]{escape(row.label)}[/{style}]{detail}")
         ctx.console.print()
 
     def _configure_plugin(self, ctx: ScriptContext, plugin, user_config_path: Path) -> None:

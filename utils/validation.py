@@ -1,5 +1,5 @@
 import re
-from typing import Optional
+from typing import Optional, Tuple
 
 
 # Precise match to IP, however search takes over 60 seconds
@@ -22,8 +22,19 @@ PRECISE_IP_REGEXP = re.compile(r"((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.){3}(25[0-5]|
 # Company-specific regex for extracting a site code from a device hostname.
 # This should be customized to your environment's naming convention.
 # Example: Extracts 'SFO-R01' from 'cr01.sfo-r01.us.example.com'
-# The (?P<sitecode>...) part creates a named capture group for easy access.
-HOSTNAME_SITE_CODE_REGEX = re.compile(r'(?i)(?P<sitecode>\b(?:[A-Z0-9]{7}|[A-Z]{3}(?:-[A-Z0-9]{1,4})?|[A-Z]{3})\b)')
+# Site-code conventions differ between organisations, so none is hard-coded here. The
+# defaults below are permissive; `.cn` can tighten them via the ``[site]`` section:
+#   code_pattern     - regex the whole site code must match (case-insensitive)
+#   comment_pattern  - regex template matched against Infoblox network comments; ``{site}``
+#                      is replaced by the escaped site code. Used for the WAPI ``comment:~=``
+#                      query and for the local filter, so keep it to syntax both accept
+#                      (anchors, groups, bracket classes; avoid look-arounds).
+#   hostname_pattern - regex template used to find a site's devices in config files;
+#                      placeholders ``{site}``, ``{site_compact}`` (hyphens removed) and
+#                      ``{country}`` (first two letters of the first subnet comment).
+DEFAULT_SITE_CODE_PATTERN = r"^[A-Za-z0-9][\w.-]{1,63}$"
+DEFAULT_SITE_COMMENT_PATTERN = r"(^|[^A-Za-z0-9_-]){site}($|[^A-Za-z0-9_-])"
+DEFAULT_SITE_HOSTNAME_PATTERN = r"\b{site_compact}[-_\w]*\b|\b{site}[-_\w]*\b"
 
 
 def validate_and_normalize_mac_address(mac: str) -> Optional[str]:
@@ -69,22 +80,64 @@ def validate_ip(ip: str) -> bool:
     return False
 
 
-def is_valid_site(sitecode: str) -> bool:
+def _compile_or_default(pattern: Optional[str], default: str) -> "re.Pattern[str]":
+    """Compile a configured regex, falling back to ``default`` when it is empty or invalid."""
+    candidate = (pattern or "").strip() or default
+    try:
+        return re.compile(candidate, re.IGNORECASE)
+    except re.error:
+        return re.compile(default, re.IGNORECASE)
+
+
+def is_valid_site(sitecode: str, pattern: Optional[str] = None) -> bool:
     """
-    Validates a site code using a regular expression.
+    Validates a site code against ``pattern`` (the ``[site] code_pattern`` setting) or, when
+    no pattern is configured, against the permissive default: 2-64 characters made of
+    letters, digits, ``.``, ``_`` and ``-``.
 
     @param sitecode: Site code to validate.
+    @param pattern: Optional regex the whole code must match (case-insensitive).
     @return: True if the site code is valid, False otherwise.
     """
+    if not sitecode:
+        return False
+    return _compile_or_default(pattern, DEFAULT_SITE_CODE_PATTERN).fullmatch(sitecode) is not None
 
-    # This regex allows for either three alphanumeric characters followed by a hyphen and another one to four alphanumeric characters,
-    # or simply three alphanumeric characters without the hyphen.
-    valid_site_regex = "^[a-z0-9]{7}$|^[a-z0-9]{3}$|^[a-z0-9]{3}(?:-[a-z0-9]{1,4})?$"
 
-    if re.search(valid_site_regex, sitecode, re.IGNORECASE):
-        return True
+def site_code_format_hint(pattern: Optional[str] = None) -> str:
+    """Human-readable description of the accepted site code format, for prompts."""
+    configured = (pattern or "").strip()
+    if configured:
+        return f"must match {configured}"
+    return "2-64 letters, digits, '.', '_' or '-'"
 
-    return False
+
+def _render_site_template(template: Optional[str], default: str, **fields: str) -> str:
+    """Fill a ``{placeholder}`` template with regex-escaped values; fall back to ``default``."""
+    candidate = (template or "").strip() or default
+    escaped = {key: re.escape(value) for key, value in fields.items()}
+    try:
+        rendered = candidate.format(**escaped)
+        re.compile(rendered, re.IGNORECASE)
+        return rendered
+    except (KeyError, IndexError, ValueError, re.error):
+        return default.format(**escaped)
+
+
+def site_comment_regex(sitecode: str, template: Optional[str] = None) -> str:
+    """Regex that an Infoblox network comment must match to belong to ``sitecode``."""
+    return _render_site_template(template, DEFAULT_SITE_COMMENT_PATTERN, site=sitecode)
+
+
+def site_hostname_regex(sitecode: str, template: Optional[str] = None, country: Optional[str] = None) -> str:
+    """Regex that finds ``sitecode``'s devices in configuration files."""
+    return _render_site_template(
+        template,
+        DEFAULT_SITE_HOSTNAME_PATTERN,
+        site=sitecode,
+        site_compact=sitecode.replace("-", ""),
+        country=country or "",
+    )
 
 
 def is_fqdn(hostname: str) -> bool:
@@ -112,3 +165,32 @@ def is_fqdn(hostname: str) -> bool:
 
     # Check that all labels match that pattern.
     return all(fqdn_re.match(label) for label in labels)
+
+
+# The one wording for a bad ``--tcp`` list, shared by the CLI (argparse) and the menu prompt.
+MAX_TCP_PORTS = 5
+PORT_LIST_MESSAGE = "'{text}' is not a port list: use up to 5 ports from 1 to 65535, separated by commas"
+
+
+def parse_tcp_ports(text: str) -> Tuple[int, ...]:
+    """
+    Parse a comma-separated TCP port list such as ``"22, 443,22"``.
+
+    Spaces around each port are stripped and duplicates are dropped, keeping the first
+    occurrence's order. At most ``MAX_TCP_PORTS`` distinct ports, each 1-65535.
+
+    @param text: The list as typed.
+    @return: The ports, in order, without duplicates.
+    @raise ValueError: ``PORT_LIST_MESSAGE`` for an empty, malformed or oversized list.
+    """
+    ports = []
+    for part in text.split(","):
+        part = part.strip()
+        # ASCII digits only: int() would also take "+22", "٢٢" and "2_2", and a long run of digits.
+        if not re.fullmatch(r"[0-9]{1,5}", part) or not 1 <= int(part) <= 65535:
+            raise ValueError(PORT_LIST_MESSAGE.format(text=text))
+        ports.append(int(part))
+    unique = tuple(dict.fromkeys(ports))
+    if len(unique) > MAX_TCP_PORTS:
+        raise ValueError(PORT_LIST_MESSAGE.format(text=text))
+    return unique
