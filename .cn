@@ -4,6 +4,10 @@ verify_ssl = true
 timeout = 10
 # Infoblox network view the lookups search (empty: every view; cn --view / --all-views override it)
 #network_view = default
+# Infoblox's own account (optional). The user name only: the password comes from INFOBLOX_PW,
+# [gpg] infoblox_credentials or a prompt, never from this file. INFOBLOX_USER overrides it.
+# It applies to every cn run of this user, cron jobs included.
+# user = svc-ipam
 
 [logging]
 logfile = ~/cn.log
@@ -25,6 +29,16 @@ history_dir = history
 
 [gpg]
 # credentials = ~/cn-tool.gpg
+# GPG file with the Infoblox account (User = / Password = lines; no age limit)
+# infoblox_credentials = ~/infoblox.gpg
+
+[auth]
+# Names of the environment variables that hold the credentials: names only, never passwords.
+# Blank means the default shown; edit here and restart cn.
+# device_user_var = USER
+# device_password_var = TACACS_PW
+# infoblox_user_var = INFOBLOX_USER
+# infoblox_password_var = INFOBLOX_PW
 
 [cache]
 enabled = true

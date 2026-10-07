@@ -264,7 +264,7 @@ class IPRequestModule(BaseModule):
             ip_addresses, processed_data_by_ip, failed_ips, scope.scoped(NO_RECORD), scope.scoped(NO_RECORD_V6)
         )
         for ip, reason in misses.items():
-            console.print(f"[{colors['success']} {colors['bold']}]{ip}[/] - [{colors['error']}]{reason}[/]")
+            console.print(f"[{colors['success']} {colors['bold']}]{ip}[/] - [{colors['error']}]{escape(reason)}[/]")
 
         save_rows, print_data_all = self._rows_for(ctx, scope, ip_addresses, processed_data_by_ip, ptr_names)
 

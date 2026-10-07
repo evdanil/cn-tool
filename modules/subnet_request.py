@@ -1226,7 +1226,7 @@ class SubnetRequestModule(BaseModule):
             issues = format_partial_results_message(f'{len(warnings)} lookup issue(s) for {network}{in_view}.')
             console.print(f"[{colors['warning']}]{escape(issues)}[/]")
             for warning in warnings:
-                console.print(f"[{colors['warning']}]Warning:[/] [{colors['error']}]{warning}[/]")
+                console.print(f"[{colors['warning']}]Warning:[/] [{colors['error']}]{escape(warning)}[/]")  # may name the account
 
         if data:
             print_table_data(

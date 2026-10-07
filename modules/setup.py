@@ -7,8 +7,14 @@ from rich.markup import escape
 
 from core.base import BaseModule, CliResult, ScriptContext, cli_exit_code
 from modules.config_analyzer_module import resolve_repo_roots
-from utils.auth import credential_source, credentials_hint, ensure_infoblox_auth
-from utils.config import BASE_CONFIG_SCHEMA, coerce_bool, coerce_config_value, write_config_value
+from utils.auth import (
+    InfobloxSource, credential_source, credentials_hint, ensure_infoblox_auth, infoblox_credentials_hint,
+    infoblox_credentials_known, infoblox_source,
+)
+from utils.config import (
+    BASE_CONFIG_SCHEMA, coerce_bool, coerce_config_value, env_name, env_name_problem, unset_env_note,
+    write_config_value,
+)
 from utils.file_io import check_dir_accessibility
 from utils.network_views import ViewScope, configured_view, scope_network, view_scope
 from utils.user_input import press_any_key, read_user_input
@@ -110,16 +116,61 @@ class _Live(NamedTuple):
     failed: bool = False
 
 
-_CREDENTIAL_ROWS = {"TACACS_PW": ("TACACS_PW is set", ""), "prompt": ("will be asked for", "terminal")}
 _SITE_ATTRIBUTE_OFF = "not set: site codes are matched in subnet comments"
 
 
+def _infoblox_account_row(source: InfobloxSource) -> Tuple[str, str]:
+    """
+    The ``Credentials`` row of Infoblox's own account: its label, and where each half comes from (the detail).
+
+    A half that a person would be asked for says so; ``source.note`` (a GPG file that could not be used, a
+    custom variable that is not set) follows, and makes the row a warning.
+    """
+    if not source.username:  # the user name would be asked for
+        if source.password_from == "prompt":
+            return "Infoblox user and password will be asked for", source.note
+        password = f"password from {source.password_from}"
+        return "Infoblox user will be asked for", "; ".join(filter(None, (password, source.note)))
+    label = f"Infoblox account {source.username}"
+    if source.user_from == source.password_from:  # both lines of one GPG file
+        return label, f"user and password from {source.user_from}"
+    if source.password_from == "prompt":
+        asked = f"password will be asked for: {source.note}" if source.note else "password will be asked for"
+        return label, f"user from {source.user_from}, {asked}"
+    return label, f"user from {source.user_from}, password from {source.password_from}"
+
+
 def _credentials_check(ctx: ScriptContext) -> _Live:
+    """
+    The ``Credentials`` row: the login Infoblox would use, found without prompting.
+
+    A wrong ``[auth]`` setting is a wrong setting (``invalid``), named by its key, never by its value. With
+    an Infoblox setting present the row describes Infoblox's own account (``infoblox_source``): ``error``
+    when a login would stop (a half is missing and nobody can be asked, or the GPG file is for another user),
+    ``warning`` when a half will be asked for although a GPG file or a custom variable was meant to give it,
+    else ``ok``. Otherwise it is the TACACS login Infoblox shares, as it always was; a custom variable that
+    is not set makes the "will be asked for" row a warning too.
+    """
+    problem = env_name_problem(ctx.cfg)
+    if problem:
+        return _Live(HealthCheck("Credentials", "error", problem), invalid=True)
+    own = infoblox_source(ctx)
+    if own is not None:
+        if not own.complete:
+            return _Live(HealthCheck("Credentials", "error", infoblox_credentials_hint(ctx, own)), failed=True)
+        label, detail = _infoblox_account_row(own)
+        return _Live(HealthCheck("Credentials", "warning" if own.note else "ok", label, detail))
     source = credential_source(ctx)
     if source is None:
         return _Live(HealthCheck("Credentials", "error", f"none: {credentials_hint(ctx)}"), failed=True)
-    label, detail = _CREDENTIAL_ROWS.get(source, (source, ""))  # a GPG file is named by its path
-    return _Live(HealthCheck("Credentials", "ok", label, detail))
+    if source == env_name(ctx.cfg, "auth_device_password_var"):  # it exists (it gave the password), so its name is safe
+        return _Live(HealthCheck("Credentials", "ok", f"{source} is set"))
+    if source == "prompt":
+        note = unset_env_note(ctx.cfg, "auth_device_password_var")
+        if note:
+            return _Live(HealthCheck("Credentials", "warning", "will be asked for", f"terminal; {note}"))
+        return _Live(HealthCheck("Credentials", "ok", "will be asked for", "terminal"))
+    return _Live(HealthCheck("Credentials", "ok", source))  # a GPG file is named by its path
 
 
 def _newest_version(versions: Any) -> str:
@@ -148,7 +199,10 @@ def _wapi_check(ctx: ScriptContext) -> _Live:
     if result.ok or result.status in ("invalid_query", "not_found"):  # an endpoint that is no WAPI: a wrong setting
         no_schema = f"no WAPI schema at {ctx.cfg.get('api_endpoint')}: check [api] endpoint, e.g. https://gm.example.com/wapi/v2.12/"
         return _Live(HealthCheck("Infoblox WAPI", "error", no_schema), invalid=True)
-    return _Live(HealthCheck("Infoblox WAPI", "error", describe_infoblox_failure(result)), failed=True)
+    message = describe_infoblox_failure(result)
+    if result.status == "auth_error" and result.account:  # Infoblox's own account: say what to check
+        message = f"{message.removesuffix('.')}: check that password, and that the account may use the API"
+    return _Live(HealthCheck("Infoblox WAPI", "error", message), failed=True)
 
 
 def _site_attribute_check(ctx: ScriptContext, logged_in: bool) -> _Live:
@@ -250,9 +304,12 @@ def _live_checks(
     """
     The four live checks (credentials, WAPI version, site attribute, network view), in that order; then
     "a setting is wrong" and "a check failed". ``args`` carry ``--view`` / ``--all-views`` for the last one.
+
+    The WAPI check logs in unless the credentials check failed or found a wrong setting: a ``warning`` row
+    (a GPG file or a custom variable that gave nothing, so a prompt answers) still logs in.
     """
     credentials = _credentials_check(ctx)
-    if credentials.row.status == "ok":
+    if not (credentials.failed or credentials.invalid):
         wapi = _wapi_check(ctx)
     else:
         wapi = _Live(HealthCheck("Infoblox WAPI", "skipped", "needs credentials"))
@@ -477,13 +534,18 @@ class SetupModule(BaseModule):
                     self._test_ad_connection(ctx)
 
     def _test_infoblox_connection(self, ctx: ScriptContext) -> None:
-        """Test Infoblox API connectivity using existing infrastructure."""
+        """
+        Test Infoblox API connectivity using existing infrastructure.
+
+        The test waits until an Infoblox login is known (``infoblox_credentials_known``): Infoblox's own
+        account once resolved, else the TACACS login when Infoblox shares it.
+        """
         endpoint = ctx.cfg.get("api_endpoint", "")
         if not endpoint or endpoint == "API_URL":
             ctx.console.print("[yellow]No API endpoint configured. Skipping test.[/yellow]")
             return
 
-        if not getattr(ctx, "password", None):
+        if not infoblox_credentials_known(ctx):
             ctx.console.print("[yellow]Connection test skipped (no credentials available yet).[/yellow]")
             return
 
@@ -497,7 +559,7 @@ class SetupModule(BaseModule):
                 ctx.console.print("[green]Infoblox API is reachable. Server responded successfully.[/green]")
             else:
                 msg = describe_infoblox_failure(result)
-                ctx.console.print(f"[red]Connection test failed:[/red] {msg}")
+                ctx.console.print(f"[red]Connection test failed:[/red] {escape(msg)}")  # may name the account
         except Exception as exc:
             ctx.console.print(f"[red]Connection test error:[/red] {exc}")
 

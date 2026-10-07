@@ -3,20 +3,16 @@
 `cn-tool` is a modular network utility for Infoblox lookups, bulk network
 checks, configuration repository searches, and device inventory collection.
 
-## What's new in 0.5.0
+## What's new in 0.6.0
 
-IPv6 in the Infoblox lookups and the bulk tools. `cn ip`, `cn subnet`, `cn ping`, menu items 1, 2, 6
-and 7 (Bulk DNS Lookup) and bare objects take IPv6 addresses and prefixes: `cn 2001:db8::5` runs
-`ip` and `cn 2001:db8:20::/64` runs `subnet`. A run that looks up an IPv6 object gains a `DUID`
-column. Infoblox keeps no DHCP utilization or failover for IPv6 subnets, so those cells are empty.
-A ping of an IPv6 address from a host with no IPv6 route reads `NO ROUTE`, which is not a failure.
-An IPv4-only run sends the same requests and prints the same output as 0.4.1. Menu item 1 is now
-called "IP Information". The release also starts faster (a run that sends no Infoblox request loads
-`requests` later and saves about 70 ms), drops three unused packages from `requirements.txt`, and
-sets Python 3.10 as the minimum, tested in CI on 3.10, 3.12, 3.13 and 3.14. The details are in the
-release notes of 0.5.0 on the Releases page of this repository. Version 0.4.1 made a command load
-only the libraries it uses, version 0.4.0 added Infoblox network views, and version 0.3.0 the
-command line, `cn diff`, `cn doctor` and Config Analyzer 0.2.0; their notes are on the same page.
+Infoblox can log in with its own account, for example a read-only service account: `INFOBLOX_USER`
+(or `[api] user`) and `INFOBLOX_PW`, or a GPG file in `[gpg] infoblox_credentials`. The variable
+names are configurable in `[auth]`. Nothing changes for an install that sets none of them. The
+details are in the release notes of 0.6.0 on the Releases page of this repository. Version 0.5.0
+added IPv6 to the Infoblox lookups and the bulk tools and a faster start, version 0.4.1 made a
+command load only the libraries it uses, version 0.4.0 added Infoblox network views, and version
+0.3.0 the command line, `cn diff`, `cn doctor` and Config Analyzer 0.2.0; their notes are on the
+same page.
 
 ## Included Features
 
@@ -356,8 +352,8 @@ Setup status block in the menu shows the same rows without the live checks.
 | ------ | ------- | -------- |
 | 0 | at least one object returned data | misses are listed in `not_found` |
 | 1 | no object returned data | an IP outside every managed network |
-| 2 | usage or configuration error | unknown command, no or invalid objects, MAC address, an IPv4-mapped or zoned IPv6 address, Infoblox not configured, a network view that is not on the grid, an empty `--view`, unreadable `--file`, no command and no terminal for the menu |
-| 3 | incomplete or not saved | no credentials without a terminal, authentication failure, timeout or server error, rejected or too-large query, the network views could not be listed while one was selected, report not written |
+| 2 | usage or configuration error | unknown command, no or invalid objects, MAC address, an IPv4-mapped or zoned IPv6 address, Infoblox not configured, a network view that is not on the grid, an empty `--view`, unreadable `--file`, no command and no terminal for the menu, an `[auth]` value that is not a variable name |
+| 3 | incomplete or not saved | no credentials (TACACS, or Infoblox's own account) without a terminal, a GPG file for another user, authentication failure, timeout or server error, rejected or too-large query, the network views could not be listed while one was selected, report not written |
 | 130 | interrupted | Ctrl-C |
 
 Status 1 means "no record", not "the IP is free": an unused IPv4 address returns `UNUSED` with
@@ -370,8 +366,8 @@ With status 3, stdout still holds what was found.
 | ------ | --------- | --------- | ----------- |
 | 0 | a host answered ICMP; with `--tcp`, a port was `open` | at least one row in `changes` | no check failed (`warning`, `off`, `info` and `skipped` are allowed) |
 | 1 | no host answered (`NO ROUTE` is no answer), or no port was open | no change in the window, or no such device or snapshot | never |
-| 2 | no targets, a target that is not an IP address, network or name, an IPv4-mapped IPv6 address, a link-local address without an interface, more than a /16 (IPv6: a /112; 1,024 hosts with `--tcp`), bad `--tcp`, no `ping` command without `--tcp` | no devices, bad `--since` or `--line`, `-r FILE`, `[config_repo]` off | the endpoint serves no WAPI schema, `[site] ea_name` is not defined or not allowed on networks, `[api] network_view` (or `--view`) names no network view on the grid, no configuration repository directory can be read, `-r FILE` |
-| 3 | a probe could not run (`ERROR`, `error`), report not written | a repository directory, history folder or snapshot could not be read | no credentials without a terminal, login rejected, timeout or server error, the network views could not be listed while one is selected |
+| 2 | no targets, a target that is not an IP address, network or name, an IPv4-mapped IPv6 address, a link-local address without an interface, more than a /16 (IPv6: a /112; 1,024 hosts with `--tcp`), bad `--tcp`, no `ping` command without `--tcp` | no devices, bad `--since` or `--line`, `-r FILE`, `[config_repo]` off | the endpoint serves no WAPI schema, `[site] ea_name` is not defined or not allowed on networks, `[api] network_view` (or `--view`) names no network view on the grid, no configuration repository directory can be read, an `[auth]` value that is not a variable name, `-r FILE` |
+| 3 | a probe could not run (`ERROR`, `error`), report not written | a repository directory, history folder or snapshot could not be read | no credentials (TACACS, or Infoblox's own account) without a terminal, a GPG file for another user, login rejected, timeout or server error, the network views could not be listed while one is selected |
 
 `--report` appends the result to the xlsx report (`[report] filename`, or `-r FILE`, which implies
 `--report`); the command line does not save without it. A report that cannot be written makes the
@@ -436,6 +432,68 @@ Use `set -o pipefail` so that a failed `cn` is not hidden by the status of `jq`.
 24 hours is used (see GPG Credentials File below). Without a terminal `cn` never prompts: it exits
 3 at once with a message that names `TACACS_PW` and the GPG file, so cron jobs and
 `ssh host cn …` cannot hang. `cn doctor` shows which source applies and whether the login works.
+
+Infoblox can log in with an account of its own, for example a read-only service account, while
+devices and Active Directory keep the TACACS login. Four settings give it: `INFOBLOX_USER` (the
+user name; it wins over `[api] user`), `INFOBLOX_PW` (the password), `[api] user` in `.cn` (the user
+name only: `.cn` holds no Infoblox password) and `[gpg] infoblox_credentials` (a GPG file, see
+below). The password comes from `INFOBLOX_PW`, else the Infoblox GPG file, else a prompt; the user
+name from `INFOBLOX_USER`, else `[api] user`, else the GPG file's `User =` line. `$USER` is never
+used as the Infoblox user name.
+
+Once any of them is set, Infoblox never uses the TACACS login: a missing half is asked for on a
+terminal, and without one `cn` exits 3 and names it, with the reason when a GPG file could not be
+used (`cn: no Infoblox password for svc-ipam: set INFOBLOX_PW, or [gpg] infoblox_credentials`). A
+GPG file for a different user than `INFOBLOX_USER` or `[api] user` stops the run before anything is
+sent. `[api] user` in `.cn` with `INFOBLOX_PW` exported is the setup to start with:
+
+```ini
+[api]
+user = svc-ipam
+```
+
+```bash
+read -rs -p 'Infoblox password: ' INFOBLOX_PW; echo; export INFOBLOX_PW
+cn ip 10.20.0.5
+```
+
+The `.cn` keys apply to every `cn` run of that user, cron jobs included: once `[api] user` is set,
+a job without `INFOBLOX_PW` or the GPG file exits 3. Give the job one of them, or keep it on the
+TACACS login with `cn -c ~/.cn-tacacs …`, where `~/.cn-tacacs` sets to empty every Infoblox
+setting your `~/.cn` has: `[api]` / `user =`, `[gpg]` / `infoblox_credentials =`, and `[auth]` /
+`infoblox_user_var =` and `infoblox_password_var =` (empty means `INFOBLOX_USER` and `INFOBLOX_PW`,
+which the job does not export). `-c` adds a layer on top of `~/.cn`, so the empty values override
+it, while a file that merely lacks the keys would change nothing.
+
+`cn` does not read `INFOBLOX_USERNAME` or `INFOBLOX_PASSWORD`, the names the Terraform provider and
+the Ansible NIOS modules use, unless `[auth]` names them (below). An automation account exported
+for those tools is never used by accident; `cn doctor` shows which login applies.
+
+When the grid refuses the account's login, `cn` says so with the user and the source of the
+password (`Infoblox refused user 'svc-ipam' (password from INFOBLOX_PW).`), sends an account's
+first request alone and, after a refusal, nothing more as that account for the rest of the run: a
+wrong password costs one refused login per run. A cron job still costs one per run, so act on exit
+3 before the grid's lockout (if enabled) locks the account.
+
+The names of the four variables are configurable in `[auth]`: `device_user_var` (default `USER`),
+`device_password_var` (`TACACS_PW`), `infoblox_user_var` (`INFOBLOX_USER`) and
+`infoblox_password_var` (`INFOBLOX_PW`). The section holds names, never passwords. A blank value
+means the default, and a value that is not a variable name stops the login with exit 2 and the
+key's name. When `cn` says where a value came from, it names the variable (`password from
+INFOBLOX_PASSWORD`). When it asks you to set a variable that is not set, it names the `[auth]` key
+instead (`set the variable named in [auth] infoblox_password_var`): `cn` cannot tell a variable
+name from a password typed there by mistake, so it prints a custom name only once that variable
+exists. To use the account the Terraform provider and the Ansible NIOS modules read, say so in two
+lines:
+
+```ini
+[auth]
+infoblox_user_var = INFOBLOX_USERNAME
+infoblox_password_var = INFOBLOX_PASSWORD
+```
+
+`cn` then logs in with whatever those tools use, write rights included (`cn` itself only reads).
+The names are read when `cn` logs in: edit `.cn` and restart `cn`.
 
 ## Configuration
 
@@ -535,6 +593,26 @@ Notes:
 - `cn-tool` will ignore credential files older than 24 hours.
 - The file must be decryptable by `gpg` in the environment where `cn-tool` runs.
 - If you do not want to use GPG, set `TACACS_PW` or enter the credential interactively.
+
+#### Infoblox account file
+
+Infoblox's own account (see [Credentials](#credentials)) can have a file of its own: point
+`[gpg] infoblox_credentials` at it. It has the same two lines (`User =` and `Password =`) but, unlike
+the file above, no age limit; recreate it when the password changes. One way to create it, without
+writing anything plain to disk:
+
+```bash
+read -rs -p 'Infoblox password: ' pw; echo
+printf 'User = %s\nPassword = %s\n' svc-ipam "$pw" |
+  gpg --yes --encrypt --recipient YOUR_KEY_ID --output ~/infoblox.gpg
+unset pw
+chmod 600 ~/infoblox.gpg
+```
+
+`printf` is a shell builtin, so the password never appears in the process list, and `--yes` lets the
+same command replace the file when the password changes. A cron job decrypts with `gpg --batch`, so
+it needs a key that gpg can use without asking: a passphrase cached in gpg-agent, or a key kept for
+this purpose.
 
 ### Active Directory
 

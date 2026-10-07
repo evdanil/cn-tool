@@ -1,7 +1,7 @@
 # core/base.py
 from abc import ABC, abstractmethod
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import sys
 from time import perf_counter
@@ -16,18 +16,32 @@ if TYPE_CHECKING:
     from utils.stats import StatsManager
 
 
+@dataclass(frozen=True)
+class Credentials:
+    """One account: a user name, its password, and where the password came from (``source``).
+
+    The password is not part of ``repr``, so a log line that formats the object never shows it.
+    """
+    username: str
+    password: str = field(repr=False)
+    source: str = ""  # "INFOBLOX_PW", "GPG file /home/alice/infoblox.gpg" or "prompt"
+
+
 @dataclass
 class ScriptContext:
     """A container for shared objects used throughout the script."""
-    cfg: Dict[str, Any]
+    cfg: Dict[str, Any] = field(repr=False)  # .cn as typed: it can hold an [email] password, or one pasted into [auth]
     logger: logging.Logger
     console: "ThemedConsole"  # Use quotes for forward reference
     cache: Optional["CacheManager"]  # Use quotes for forward reference
     event_bus: EventBus
     username: str
-    password: str
+    password: str = field(repr=False)  # the TACACS password: repr(ctx) never shows it
     plugins: List["BasePlugin"]
     stats: Optional["StatsManager"] = None
+    # Infoblox's own account once resolved; None while unknown, and always None when Infoblox uses the
+    # shared login (username/password above).
+    infoblox_credentials: Optional[Credentials] = None
 
 
 class CliResult(NamedTuple):

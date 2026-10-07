@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
 
-from core.base import ScriptContext
+from core.base import Credentials, ScriptContext
 from utils.display import get_global_color_scheme
 from utils.validation import site_comment_regex
 from utils.infoblox_safety import (
@@ -178,6 +178,10 @@ class InfobloxResult:
     full_url: str = ""
     truncated: bool = False
     next_page_id: Optional[str] = None
+    # Who sent the request, for the text of a refusal: "user 'svc-ipam' (password from INFOBLOX_PW)" when
+    # Infoblox has an account of its own, "" for the shared login, whose text stays "Authentication failed
+    # against Infoblox." (and for every result a caller builds without one).
+    account: str = ""
 
     @property
     def ok(self) -> bool:
@@ -262,7 +266,17 @@ def _classify_http_status(status_code: int, body_text: str) -> str:
 
 
 def describe_infoblox_failure(result: InfobloxResult) -> str:
+    """
+    The sentence that says why ``result`` failed (the same one that ``InfobloxResult.message`` holds).
+
+    A refusal (``auth_error``: the grid answered 401 or 403) names the account when Infoblox has one of its
+    own, ``Infoblox refused user 'svc-ipam' (password from INFOBLOX_PW).``, so the engineer knows which
+    account to check. "Refused", not "rejected the credentials", because a 403 may also mean that the
+    account has no permission. The shared login keeps ``Authentication failed against Infoblox.``
+    """
     if result.status == "auth_error":
+        if result.account:
+            return f"Infoblox refused {result.account}."
         return "Authentication failed against Infoblox."
     if result.status == "timeout":
         return "Infoblox request timed out."
@@ -287,11 +301,48 @@ def describe_infoblox_failure(result: InfobloxResult) -> str:
     return "Infoblox request failed."
 
 
+def _infoblox_account(ctx: ScriptContext) -> Optional[Credentials]:
+    """Infoblox's own account on ``ctx``, or None: a context without one, or a test double, uses the shared login."""
+    account = getattr(ctx, "infoblox_credentials", None)
+    return account if isinstance(account, Credentials) else None
+
+
+def _account_label(account: Optional[Credentials]) -> str:
+    """
+    How a refusal names ``account``: ``user 'svc-ipam' (password from INFOBLOX_PW)``,
+    ``... (password from GPG file <path>)`` or ``... (password typed at the prompt)``; "" for None.
+    The password variable is printed as ``Credentials.source`` stores it (the one that gave the password).
+    """
+    if account is None:
+        return ""
+    label = f"user '{account.username}'"
+    if not account.source:
+        return label
+    if account.source == "prompt":
+        return f"{label} (password typed at the prompt)"
+    return f"{label} (password from {account.source})"
+
+
 class InfobloxClient:
-    """Thin shared client for live Infoblox requests."""
+    """
+    Thin shared client for live Infoblox requests.
+
+    When Infoblox has an account of its own (``ctx.infoblox_credentials``) the client guards it against
+    lock-out, because a refused account may be locked for the whole team by a burst of refused logins.
+    The first request of an account is sent alone: the requests behind it wait for its outcome (the gate).
+    Any outcome but a 401 (an answer, a timeout, a connection failure) opens the gate and the rest run in
+    parallel as usual; a 401 refuses the account, and from then on none of its requests is sent, each one
+    returns the same ``auth_error`` result at once (the breaker). A wrong password therefore costs one
+    refused login per run, whatever the number of objects and workers. A 401 that arrives later in the run
+    trips the breaker too. The state belongs to one ``Credentials`` object, compared by identity, so a new
+    object is tried again. The shared (TACACS) login, and a 403, never reach the gate or the breaker.
+    """
 
     def __init__(self, http_session: requests.Session):
         self._session = http_session
+        self._refused: Optional[Credentials] = None  # the grid answered 401 to this account in this process
+        self._answered: Optional[Credentials] = None  # this account's first request ended in any other way
+        self._first_login = threading.Lock()  # held only around the first request of an account
 
     def request(
         self,
@@ -332,6 +383,7 @@ class InfobloxClient:
         endpoint = str(ctx.cfg.get("api_endpoint") or "").strip()
         debug_payloads = infoblox_debug_payloads_enabled(ctx)
         redacted_uri = redact_infoblox_uri(uri)
+        account: Optional[Credentials] = None  # Infoblox's own account: known once the login below has run
 
         def build_result(
             *,
@@ -356,6 +408,7 @@ class InfobloxClient:
                 uri=uri,
                 full_url=full_url_value,
                 next_page_id=next_page_id,
+                account=_account_label(account),
             )
             if debug_payloads:
                 ctx.logger.debug(
@@ -392,11 +445,13 @@ class InfobloxClient:
 
             ensure_infoblox_auth(ctx)
 
+        account = _infoblox_account(ctx)
         full_url = f"{endpoint}{uri}"
 
         def build_http_failure(error_response: requests.Response, status_code: int) -> InfobloxResult:
             content = error_response.content or b""
             status = _classify_http_status(status_code, content.decode("utf-8", errors="replace"))
+            # The account goes into this result too, so that ``message`` and describe_infoblox_failure(result) agree.
             message = describe_infoblox_failure(
                 InfobloxResult(
                     status=status,
@@ -405,6 +460,7 @@ class InfobloxClient:
                     content=content,
                     uri=uri,
                     full_url=full_url,
+                    account=_account_label(account),
                 )
             )
             return build_result(
@@ -416,6 +472,14 @@ class InfobloxClient:
                 error_kind=status,
                 full_url_value=full_url,
             )
+
+        def not_sent(refused: Credentials) -> InfobloxResult:
+            """The breaker's answer: the grid's 401 to this account, said again without asking it again."""
+            ctx.logger.debug("Infoblox request not sent: the grid refused %s earlier in this run", refused.username)
+            return build_http_failure(_build_response(401, url=full_url), 401)
+
+        if account is not None and account is self._refused:
+            return not_sent(account)
 
         # Resolved before the try block, so that its except clauses always have the classes. Nothing above
         # this line loads requests: a run that stops at the missing credentials never pays for it.
@@ -430,97 +494,117 @@ class InfobloxClient:
 
         verify_ssl = bool(ctx.cfg.get("api_verify_ssl", True))
         timeout = int(ctx.cfg.get("api_timeout", 10))
-        response = _build_response(500, url=full_url)
 
-        try:
-            with warnings.catch_warnings():
-                if not verify_ssl:
-                    warnings.simplefilter("ignore", InsecureRequestWarning)
-                response = self._session.get(full_url, verify=verify_ssl, timeout=timeout)
+        def send() -> InfobloxResult:
+            response = _build_response(500, url=full_url)
 
-            response.raise_for_status()
-        except Timeout:
-            response = _build_response(504, url=full_url)
-            return build_result(
-                status="timeout",
-                status_code=504,
-                response_obj=response,
-                content=response.content,
-                message="Infoblox request timed out.",
-                error_kind="timeout",
-                full_url_value=full_url,
-            )
-        except SSLError:
-            response = _build_response(495, url=full_url)
-            return build_result(
-                status="tls_error",
-                status_code=495,
-                response_obj=response,
-                content=response.content,
-                message="TLS verification failed while contacting Infoblox.",
-                error_kind="tls_error",
-                full_url_value=full_url,
-            )
-        except RequestsConnectionError as exc:
-            exc_lower = str(exc).lower()
-            if any(kw in exc_lower for kw in ("reset", "aborted", "disconnected", "broken pipe", "eof occurred", "timed out")):
-                status = "connection_lost"
-                message = "Infoblox did not respond in time. The request may have been too large or exceeded the server timeout."
-            else:
-                status = "connection_error"
-                message = "Unable to reach the Infoblox API endpoint."
-            response = _build_response(503, url=full_url)
-            return build_result(
-                status=status,
-                status_code=503,
-                response_obj=response,
-                content=response.content,
-                message=message,
-                error_kind=status,
-                full_url_value=full_url,
-            )
-        except HTTPError as exc:
-            # requests.Response.__bool__ is ``.ok``, so every 4xx/5xx response is falsy: test for None
-            error_response = exc.response if exc.response is not None else response
-            return build_http_failure(error_response, error_response.status_code or 500)
-        except RequestException as exc:
-            error_response = getattr(exc, "response", None)
-            if error_response is not None:
-                return build_http_failure(error_response, error_response.status_code or response.status_code or 500)
-            return build_result(
-                status="request_error",
-                status_code=response.status_code or 500,
-                response_obj=response,
-                content=response.content,
-                message="Infoblox request failed.",
-                error_kind="request_error",
-                full_url_value=full_url,
-            )
+            try:
+                with warnings.catch_warnings():
+                    if not verify_ssl:
+                        warnings.simplefilter("ignore", InsecureRequestWarning)
+                    response = self._session.get(full_url, verify=verify_ssl, timeout=timeout)
 
-        try:
-            payload = response.json()
-        except ValueError:
+                response.raise_for_status()
+            except Timeout:
+                response = _build_response(504, url=full_url)
+                return build_result(
+                    status="timeout",
+                    status_code=504,
+                    response_obj=response,
+                    content=response.content,
+                    message="Infoblox request timed out.",
+                    error_kind="timeout",
+                    full_url_value=full_url,
+                )
+            except SSLError:
+                response = _build_response(495, url=full_url)
+                return build_result(
+                    status="tls_error",
+                    status_code=495,
+                    response_obj=response,
+                    content=response.content,
+                    message="TLS verification failed while contacting Infoblox.",
+                    error_kind="tls_error",
+                    full_url_value=full_url,
+                )
+            except RequestsConnectionError as exc:
+                exc_lower = str(exc).lower()
+                if any(kw in exc_lower for kw in ("reset", "aborted", "disconnected", "broken pipe", "eof occurred", "timed out")):
+                    status = "connection_lost"
+                    message = "Infoblox did not respond in time. The request may have been too large or exceeded the server timeout."
+                else:
+                    status = "connection_error"
+                    message = "Unable to reach the Infoblox API endpoint."
+                response = _build_response(503, url=full_url)
+                return build_result(
+                    status=status,
+                    status_code=503,
+                    response_obj=response,
+                    content=response.content,
+                    message=message,
+                    error_kind=status,
+                    full_url_value=full_url,
+                )
+            except HTTPError as exc:
+                # requests.Response.__bool__ is ``.ok``, so every 4xx/5xx response is falsy: test for None
+                error_response = exc.response if exc.response is not None else response
+                return build_http_failure(error_response, error_response.status_code or 500)
+            except RequestException as exc:
+                error_response = getattr(exc, "response", None)
+                if error_response is not None:
+                    return build_http_failure(error_response, error_response.status_code or response.status_code or 500)
+                return build_result(
+                    status="request_error",
+                    status_code=response.status_code or 500,
+                    response_obj=response,
+                    content=response.content,
+                    message="Infoblox request failed.",
+                    error_kind="request_error",
+                    full_url_value=full_url,
+                )
+
+            try:
+                payload = response.json()
+            except ValueError:
+                return build_result(
+                    status="invalid_json",
+                    status_code=response.status_code,
+                    response_obj=response,
+                    content=response.content,
+                    message="Infoblox returned an invalid JSON response.",
+                    error_kind="invalid_json",
+                    full_url_value=full_url,
+                )
+
             return build_result(
-                status="invalid_json",
+                status="ok",
                 status_code=response.status_code,
                 response_obj=response,
                 content=response.content,
-                message="Infoblox returned an invalid JSON response.",
-                error_kind="invalid_json",
+                items=_normalize_items(payload),
+                message="",
+                error_kind="",
                 full_url_value=full_url,
+                next_page_id=(payload.get("next_page_id") or None) if isinstance(payload, dict) else None,
             )
 
-        return build_result(
-            status="ok",
-            status_code=response.status_code,
-            response_obj=response,
-            content=response.content,
-            items=_normalize_items(payload),
-            message="",
-            error_kind="",
-            full_url_value=full_url,
-            next_page_id=(payload.get("next_page_id") or None) if isinstance(payload, dict) else None,
-        )
+        if account is not None and account is not self._answered:
+            # The account's first request goes alone: the others wait for its outcome here (no prompt can be
+            # open meanwhile, the login above has finished). A 401 refuses the account, anything else opens the gate.
+            with self._first_login:
+                if account is self._refused:
+                    return not_sent(account)
+                if account is not self._answered:
+                    result = send()
+                    if result.status_code == 401:
+                        self._refused = account
+                    else:
+                        self._answered = account
+                    return result
+        result = send()
+        if account is not None and result.status_code == 401:
+            self._refused = account  # a 401 later in the run (the account was locked meanwhile) trips the breaker too
+        return result
 
 
 _INFOBLOX_CLIENT = InfobloxClient(session)

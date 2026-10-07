@@ -2,13 +2,24 @@ import configparser
 import argparse
 import logging
 import math
+import os
+import re
 from pathlib import Path
-from typing import Dict, Any, List, NamedTuple, Tuple
+from typing import Dict, Any, List, Mapping, NamedTuple, Tuple
 
 from core.base import ScriptContext
 from utils.file_io import check_dir_accessibility
 
 # --- Configuration Schema ---
+# Names of the environment variables that hold the credentials: the defaults live here and nowhere else.
+# [auth] in .cn renames them; it holds names, never passwords (see env_name and shown_env_name).
+AUTH_ENV_DEFAULTS: Dict[str, str] = {
+    "auth_device_user_var": "USER",
+    "auth_device_password_var": "TACACS_PW",
+    "auth_infoblox_user_var": "INFOBLOX_USER",
+    "auth_infoblox_password_var": "INFOBLOX_PW",
+}
+
 BASE_CONFIG_SCHEMA = {
     "api_endpoint":          {"section": "api", "ini_key": "endpoint", "type": "str", "fallback": "API_URL"},
     "api_verify_ssl":        {"section": "api", "ini_key": "verify_ssl", "type": "bool", "fallback": True},
@@ -16,6 +27,8 @@ BASE_CONFIG_SCHEMA = {
     "api_max_workers":       {"section": "api", "ini_key": "max_workers", "type": "int", "fallback": 8},
     "api_debug_payloads":    {"section": "api", "ini_key": "debug_payloads", "type": "bool", "fallback": False},
     "api_network_view":      {"section": "api", "ini_key": "network_view", "type": "str", "fallback": ""},
+    # Infoblox's own account (optional): the user name only; the password never lives in this file.
+    "api_user":              {"section": "api", "ini_key": "user", "type": "str", "fallback": ""},
     "ssh_config_file":       {"section": "ssh", "ini_key": "config_file", "type": "str", "fallback": "~/.ssh/config"},
     "logging_file":          {"section": "logging", "ini_key": "logfile", "type": "path", "fallback": "~/cn.log"},
     "logging_level":         {"section": "logging", "ini_key": "level", "type": "str", "fallback": "INFO"},
@@ -24,6 +37,12 @@ BASE_CONFIG_SCHEMA = {
     "report_lock_timeout":   {"section": "report", "ini_key": "lock_timeout", "type": "int", "fallback": 120},
     "report_max_config_tab_kb": {"section": "report", "ini_key": "max_config_tab_kb", "type": "int", "fallback": 512},
     "gpg_credentials":       {"section": "gpg", "ini_key": "credentials", "type": "path", "fallback": "~/cn-tool.gpg"},
+    "gpg_infoblox_credentials": {"section": "gpg", "ini_key": "infoblox_credentials", "type": "path", "fallback": ""},
+    # Names of the environment variables that hold the credentials; names only, never values.
+    "auth_device_user_var":       {"section": "auth", "ini_key": "device_user_var", "type": "str", "fallback": AUTH_ENV_DEFAULTS["auth_device_user_var"]},
+    "auth_device_password_var":   {"section": "auth", "ini_key": "device_password_var", "type": "str", "fallback": AUTH_ENV_DEFAULTS["auth_device_password_var"]},
+    "auth_infoblox_user_var":     {"section": "auth", "ini_key": "infoblox_user_var", "type": "str", "fallback": AUTH_ENV_DEFAULTS["auth_infoblox_user_var"]},
+    "auth_infoblox_password_var": {"section": "auth", "ini_key": "infoblox_password_var", "type": "str", "fallback": AUTH_ENV_DEFAULTS["auth_infoblox_password_var"]},
     "config_repo_enabled":   {"section": "config_repo", "ini_key": "enabled", "type": "str", "fallback": ""},
     "config_repo_directory": {"section": "config_repo", "ini_key": "directory", "type": "path", "fallback": ""},
     "config_repo_regions":   {"section": "config_repo", "ini_key": "regions", "type": "list[str]", "fallback": "ap,eu,am"},
@@ -184,6 +203,106 @@ def _apply_types(cfg: Dict[str, Any], schema: Dict[str, Any], logger: logging.Lo
     return typed_cfg
 
 
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_AUTH_USER_KEYS = ("auth_device_user_var", "auth_infoblox_user_var")
+_AUTH_PASSWORD_KEYS = ("auth_device_password_var", "auth_infoblox_password_var")
+
+
+def _auth_ini_key(key: str) -> str:
+    return BASE_CONFIG_SCHEMA[key]["ini_key"]
+
+
+def _configured_env_name(cfg: Mapping[str, Any], key: str) -> str:
+    """What the [auth] key holds, stripped; "" when it is missing, blank or not text (a test double)."""
+    value = cfg.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def env_name(cfg: Mapping[str, Any], key: str) -> str:
+    """The variable name `key` configures: its stripped value, or the default when it is missing or blank.
+
+    Call only after env_name_problem(cfg) is "" (an invalid value is returned as it is).
+    """
+    return _configured_env_name(cfg, key) or AUTH_ENV_DEFAULTS[key]
+
+
+def env_name_problem(cfg: Mapping[str, Any]) -> str:
+    """"" when the four [auth] names are usable; else the message for the first bad key, in table order.
+
+    A key is bad when it is not an environment variable name, or when a user key names a password
+    variable (the password would be used, and printed, as a user name). The text names keys only,
+    never a configured value: a password typed into a *_var key by mistake is never echoed.
+    The message has no "cn: " prefix; a caller that ends the run adds it.
+    """
+    for key, default in AUTH_ENV_DEFAULTS.items():
+        name = env_name(cfg, key)
+        if not _ENV_NAME.fullmatch(name):
+            return (
+                f"[auth] {_auth_ini_key(key)} must name an environment variable "
+                "(ASCII letters, digits and _, not starting with a digit), not hold a password; "
+                f"leave it empty for {default}"
+            )
+        if key in _AUTH_USER_KEYS:
+            for password_key in _AUTH_PASSWORD_KEYS:
+                if name == env_name(cfg, password_key):
+                    return (
+                        f"{_auth_key_label(cfg, key)} names the same variable as {_auth_key_label(cfg, password_key)}; "
+                        "give the user name a variable of its own"
+                    )
+    return ""
+
+
+def _auth_key_label(cfg: Mapping[str, Any], key: str) -> str:
+    """"[auth] <ini_key>", and "(blank: <default>)" after it when the key is blank.
+
+    The user may never have written a blank key, so a text that blames it says which variable it stands for.
+    """
+    blank = f" (blank: {AUTH_ENV_DEFAULTS[key]})" if not _configured_env_name(cfg, key) else ""
+    return f"[auth] {_auth_ini_key(key)}{blank}"
+
+
+def _env_name_is_shown(name: str, key: str) -> bool:
+    """The display rule: a name is printed when it is the default, or is a variable that exists."""
+    return name == AUTH_ENV_DEFAULTS[key] or (bool(_ENV_NAME.fullmatch(name)) and name in os.environ)
+
+
+def shown_env_name(cfg: Mapping[str, Any], key: str) -> str:
+    """How a text names the variable `key` configures.
+
+    The name when it is the default or exists in the environment (exported, even empty); otherwise
+    "the variable named in [auth] <key>". The reason: a password typed into a *_var key can pass
+    the name check ("Winter2026" does), and a hint names the variable exactly when it is missing.
+    A variable that exists is evidently a name.
+    """
+    name = env_name(cfg, key)
+    if _env_name_is_shown(name, key):
+        return name
+    return f"the variable named in [auth] {_auth_ini_key(key)}"
+
+
+def unset_env_note(cfg: Mapping[str, Any], key: str) -> str:
+    """"the variable named in [auth] <key> is not set" when `key` holds a non-default name whose variable is
+    unset or blank; "" otherwise (always "" with the default names, so a default run says nothing new).
+
+    It is how ``cn doctor`` explains the common mistake, a misspelt or unexported custom name, and a password
+    typed into the key, without printing the value.
+    """
+    name = env_name(cfg, key)
+    if name == AUTH_ENV_DEFAULTS[key] or (os.environ.get(name) or "").strip():
+        return ""
+    return f"the variable named in [auth] {_auth_ini_key(key)} is not set"
+
+
+def _loggable_config(cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """The configuration for the DEBUG dump: an [auth] value that shown_env_name would not print is hidden."""
+    masked = dict(cfg)
+    for key in AUTH_ENV_DEFAULTS:
+        raw = _configured_env_name(cfg, key)
+        if raw and not _env_name_is_shown(raw, key):
+            masked[key] = "<not shown>"
+    return masked
+
+
 def new_parser() -> configparser.ConfigParser:
     """The one non-interpolating parser every ini reader uses, so a literal '%' in a value is safe."""
     return configparser.ConfigParser(interpolation=None)
@@ -233,7 +352,7 @@ def read_config(config_files: List[Path], schema: Dict[str, Any], logger: loggin
 
     # Apply final type conversions and sanitization to the entire config dict.
     final_cfg = _apply_types(loaded_cfg, schema, logger)
-    logger.debug(f"CONFIG: Final configuration object after processing: {final_cfg}")
+    logger.debug(f"CONFIG: Final configuration object after processing: {_loggable_config(final_cfg)}")
 
     return final_cfg
 

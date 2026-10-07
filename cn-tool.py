@@ -164,7 +164,7 @@ _GLOBAL_OPTIONS: tuple[dict[str, Any], ...] = (
     {"flags": ("-t", "--theme"), "choices": ["default", "monochrome", "pastel", "dark"], "help": "color theme"},
     {"flags": ("-l", "--log-file"), "help": "specify logfile"},
     {"flags": ("-r", "--report-file"), "help": "report filename (with a command it also turns --report on)"},
-    {"flags": ("-g", "--gpg-file"), "help": "GPG credentials file"},
+    {"flags": ("-g", "--gpg-file"), "help": "GPG credentials file of the TACACS login"},
     {"flags": ("-v", "--version"), "action": "version", "version": f"cn-tool v{VERSION}", "root_only": True},
     {"flags": ("--log-level",), "choices": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], "help": "Set the logging level."},
 )
@@ -388,7 +388,10 @@ Colour is off when stdout is not a terminal or NO_COLOR is set.
 Exit status: 0 found, 1 nothing found, 2 usage error, 3 Infoblox,
 credential, repository or report failure, 130 interrupted.
 Credentials: $USER and $TACACS_PW, or a GPG credentials file (-g FILE or
-[gpg] credentials; ignored when older than 24 h).
+[gpg] credentials; ignored when older than 24 h). Infoblox can use its
+own account: $INFOBLOX_USER (or [api] user) with $INFOBLOX_PW, or a GPG
+file in [gpg] infoblox_credentials. [auth] in .cn renames the variables;
+cn doctor shows which login applies.
 Without a terminal cn never prompts. More: cn <command> --help.
 Global options also work after the command (not -v).
 """

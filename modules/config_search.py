@@ -243,7 +243,7 @@ class ConfigSearchModule(BaseModule):
             return
 
         if lookup_result.status == "partial_error":
-            console.print(f"[{colors['warning']}]{format_partial_results_message(lookup_result.message)}[/]")
+            console.print(f"[{colors['warning']}]{escape(format_partial_results_message(lookup_result.message))}[/]")  # may name the account
 
         for notice in lookup_result.notices:
             console.print(f"[{colors['warning']}]{escape(notice)}[/]")
