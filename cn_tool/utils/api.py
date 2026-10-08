@@ -32,6 +32,20 @@ WAPI_MAX_PAGES = 10
 WAPI_MAX_ROWS = WAPI_PAGE_SIZE * WAPI_MAX_PAGES
 
 _WAPI_TEXT_LIMIT = 120  # characters of a WAPI error text quoted back to the user
+
+# Two WAPI answers say that a network a request refers to does not exist. Both are HTTP 400, and both mean "there
+# is no such object", not "the request is malformed":
+# - ``ipv4address?ip_address=X`` and ``ipv6address?ip_address=X`` are built from the network that holds the address;
+#   when none does the grid answers "A network was not found for this address." (``Client.Ibap.Data``);
+# - a request that filters by ``network=<cidr>`` for a CIDR no network matches (seen on several of the detail lookups
+#   of ``cn subnet`` for a subnet that exists nowhere) answers "<cidr> does not match any network"
+#   (``Client.Ibap.Proto``).
+# The error text is matched in lower case with its white space collapsed, on this core of each sentence only, so that
+# a prefix ("An IPv6 network was ...") or the CIDR in front does not hide it; nothing else is matched.
+_NETWORK_MISSING_TEXTS = ("network was not found", "does not match any network")
+# The reason ``cn ip`` gives for an address in no network (one place: ``describe_infoblox_failure`` and
+# ``modules.ip_request`` both use it).
+NO_NETWORK = "No Infoblox network contains this address"
 _DEFAULT_INFOBLOX_MAX_WORKERS = 8
 _MAX_INFOBLOX_MAX_WORKERS = 32
 # Guards the pool size, the https adapter and the building of the session. Re-entrant: the session proxy
@@ -192,6 +206,15 @@ class InfobloxResult:
         return self.status not in {"ok", "not_found"}
 
     @property
+    def no_network(self) -> bool:
+        """
+        The grid's 400 that says the network a request refers to does not exist (no network holds the
+        address, or none matches the CIDR): ``_classify_http_status`` turns it into ``not_found`` (the only 400
+        it does), so a miss and not a failure. A 404 is not this: it says the lookup found no record.
+        """
+        return self.status == "not_found" and self.status_code == 400
+
+    @property
     def has_items(self) -> bool:
         return bool(self.items)
 
@@ -262,6 +285,8 @@ def _classify_http_status(status_code: int, body_text: str) -> str:
         return "not_found"
     if status_code == 400 and "result set too large" in body_text.lower():
         return "too_many_results"
+    if status_code == 400 and any(text in " ".join(body_text.lower().split()) for text in _NETWORK_MISSING_TEXTS):
+        return "not_found"  # the network does not exist: there is no such object, which is not an error
     return "invalid_query"
 
 
@@ -297,8 +322,21 @@ def describe_infoblox_failure(result: InfobloxResult) -> str:
         detail = _wapi_error_text(result.content)
         return f"{message}: {detail[:_WAPI_TEXT_LIMIT]}" if detail else f"{message}."
     if result.status == "not_found":
-        return "No matching Infoblox records were found."
+        return f"{NO_NETWORK}." if result.no_network else "No matching Infoblox records were found."
     return "Infoblox request failed."
+
+
+def join_wapi_url(endpoint: str, uri: str) -> str:
+    """
+    The URL of a WAPI request: ``endpoint`` and the relative path ``uri``, joined by exactly one ``/``.
+
+    ``[api] endpoint`` is the WAPI base (``https://gm.example.com/wapi/v2.12``), typed with or without its
+    trailing slash, and a request path has no leading one (``network?...``). A path that starts with ``?``
+    (the ``?_schema`` probe) is appended as it is: the grid answers it on either spelling of the endpoint.
+    """
+    if uri.startswith("?"):
+        return f"{endpoint}{uri}"
+    return f"{endpoint.rstrip('/')}/{uri.lstrip('/')}"
 
 
 def _infoblox_account(ctx: ScriptContext) -> Optional[Credentials]:
@@ -446,7 +484,7 @@ class InfobloxClient:
             ensure_infoblox_auth(ctx)
 
         account = _infoblox_account(ctx)
-        full_url = f"{endpoint}{uri}"
+        full_url = join_wapi_url(endpoint, uri)
 
         def build_http_failure(error_response: requests.Response, status_code: int) -> InfobloxResult:
             content = error_response.content or b""

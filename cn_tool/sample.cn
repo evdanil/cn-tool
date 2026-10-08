@@ -1,6 +1,7 @@
 [api]
-# Set this first: the Infoblox grid's URL. Until it is set, Infoblox lookups are off.
-# endpoint = https://infoblox.example.com
+# Set this first: the WAPI base URL of your Infoblox grid, with the WAPI version (the trailing slash is
+# optional). Until it is set, Infoblox lookups are off.
+# endpoint = https://gm.example.com/wapi/v2.12/
 verify_ssl = true
 timeout = 10
 # Infoblox network view the lookups search (empty: every view; cn --view / --all-views override it)

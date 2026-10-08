@@ -274,7 +274,7 @@ ln -s /path/to/main.py ~/bin/cn
 | Command  | Objects | Returns |
 | -------- | ------- | ------- |
 | `subnet` | `10.1.2.0/24`, `10.1.2.0/255.255.255.0`, `2001:db8:20::/64` or an IP address (its subnet); a container prefix expands to its subnets and lists its child containers, not expanded | subnet summary with DHCP utilization %, DHCP ranges, DNS records, fixed addresses, extensible attributes (an IPv6 subnet has no DHCP utilization or failover); a `child containers` table for a container prefix; one summary row and one set of details per network view that holds the subnet |
-| `ip`     | IPv4 and IPv6 addresses | network view (on a grid with several), subnet, DNS name, status, MAC (IPv4), DUID (IPv6) and PTR name, one row per network view that holds the address; an unused IPv4 address is reported as `UNUSED` |
+| `ip`     | IPv4 and IPv6 addresses | network view (on a grid with several), subnet, DNS name, status, MAC (IPv4), DUID (IPv6) and PTR name, one row per network view that holds the address; an unused IPv4 address is reported as `UNUSED`; an address that no Infoblox network contains is in `not_found` as `No Infoblox network contains this address` |
 | `fqdn`   | names or name prefixes (at least three characters) | A, AAAA, host and CNAME records whose name contains the text, with type, DNS view (on a grid with several), zone, TTL and a PTR check |
 | `site`   | site codes; with `-k/--keyword`, keywords | the subnets of each site code, or matching each keyword, with DHCP utilization % and, on a grid with several network views, the network view |
 | `ping`   | IPv4 and IPv6 addresses, host names, `10.1.2.0/24` and `2001:db8::/120` networks | ICMP result per host and, with `--tcp 22,443`, the state of each port |
@@ -453,7 +453,8 @@ An IPv4-only run sends the same requests and prints the same output as 0.4.x.
   returned, not decoded.
 - **Unused addresses and PTR names.** `ip` shows a row for each IPv6 address for which the grid
   returns an object (whatever its status) and a `not_found` line `No matching IPv6 record found`
-  when it returns none. `PTR name` comes from `record:ptr?ipv6addr=`, asked for each IPv6 address
+  when it returns none, or `No Infoblox network contains this address` when no network holds it
+  (the reason an IPv4 address has too). `PTR name` comes from `record:ptr?ipv6addr=`, asked for each IPv6 address
   whose record types include `PTR`. These behaviours follow the WAPI reference and have not been
   compared with a live grid.
 - **Containers.** An input shorter than /126 can be a container; the request counts are IPv4's.
@@ -558,7 +559,10 @@ Setup status block in the menu shows the same rows without the live checks.
 | 130 | interrupted | Ctrl-C |
 
 Status 1 means "no record", not "the IP is free": an unused IPv4 address returns `UNUSED` with
-status 0.
+status 0. An address that no Infoblox network contains is a miss, not a failure: the grid answers
+HTTP 400 ("A network was not found for this address."), which cn lists in `not_found` as `No
+Infoblox network contains this address`. It does not fail the run (status 1 when nothing else was
+found, and no error in the log). Any other 400 is still a rejected query, status 3.
 With status 3, stdout still holds what was found.
 
 `ping`, `diff` and `doctor` use the same statuses with their own meaning of "data":
@@ -717,7 +721,8 @@ Example:
 
 ```ini
 [api]
-endpoint = https://infoblox.example.com
+# the WAPI base URL of your grid, with the WAPI version; the trailing slash is optional
+endpoint = https://gm.example.com/wapi/v2.12/
 verify_ssl = true
 timeout = 10
 # Infoblox network view the lookups search (empty: every view; cn --view / --all-views override it)

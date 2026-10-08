@@ -2,13 +2,13 @@ import argparse
 import ipaddress
 import json
 from time import perf_counter
-from typing import Callable, Dict, Any, List, Optional, Set, Tuple
+from typing import Callable, Collection, Dict, Any, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 from rich.markup import escape
 
 from cn_tool.core.base import BaseModule, CliResult, ScriptContext, cli_exit_code
-from cn_tool.utils.api import bound_infoblox_workers, describe_infoblox_failure, request_result
+from cn_tool.utils.api import NO_NETWORK, bound_infoblox_workers, describe_infoblox_failure, request_result
 from cn_tool.utils.auth import ensure_infoblox_auth
 from cn_tool.utils.cli_input import read_objects
 from cn_tool.utils.display import console, get_global_color_scheme, print_table_data, table_columns
@@ -144,14 +144,17 @@ def _explain_misses(
     failed_ips: Dict[str, str],
     no_record: str = NO_RECORD,
     no_record_v6: str = NO_RECORD_V6,
+    no_network_ips: Collection[str] = frozenset(),
+    no_network: str = NO_NETWORK,
 ) -> Dict[str, str]:
     """
     The reason each address in ``ip_addresses`` (lookup keys) has no row, in input order: the failure of
-    its lookup, else ``no_record`` for an IPv4 address and ``no_record_v6`` for an IPv6 one (both name the
-    requested network view when there is one).
+    its lookup, else ``no_network`` for an address in ``no_network_ips`` (the grid said that no network
+    contains it), else ``no_record`` for an IPv4 address and ``no_record_v6`` for an IPv6 one. The three
+    sentences name the requested network view when there is one.
     """
     return {
-        ip: failed_ips.get(ip, no_record_v6 if _is_ipv6(ip) else no_record)
+        ip: failed_ips.get(ip, no_network if ip in no_network_ips else no_record_v6 if _is_ipv6(ip) else no_record)
         for ip in ip_addresses
         if ip not in processed_data_by_ip
     }
@@ -256,12 +259,13 @@ class IPRequestModule(BaseModule):
         ip_addresses = list(dict.fromkeys(ip_addresses_input))
 
         # --- API Call and Data Processing ---
-        processed_data_by_ip, failed_ips = self._fetch_ips(ctx, ip_addresses, scope.requested)
+        processed_data_by_ip, failed_ips, no_network_ips = self._fetch_ips(ctx, ip_addresses, scope.requested)
         ptr_names, ptr_failures = self._fetch_ptr_names(ctx, _ptr_addresses(ip_addresses, processed_data_by_ip))
 
         # --- Display and Save Results ---
         misses = _explain_misses(
-            ip_addresses, processed_data_by_ip, failed_ips, scope.scoped(NO_RECORD), scope.scoped(NO_RECORD_V6)
+            ip_addresses, processed_data_by_ip, failed_ips, scope.scoped(NO_RECORD), scope.scoped(NO_RECORD_V6),
+            no_network_ips, scope.scoped(NO_NETWORK),
         )
         for ip, reason in misses.items():
             console.print(f"[{colors['success']} {colors['bold']}]{ip}[/] - [{colors['error']}]{escape(reason)}[/]")
@@ -335,13 +339,14 @@ class IPRequestModule(BaseModule):
             if view_problem:  # a view that is not on the grid, or a grid that will not say: nothing is looked up
                 console.print(f"cn ip: {view_problem.message}", markup=False)
                 return CliResult(view_problem.exit_code, {})
-            processed_data_by_ip, failed_ips = self._fetch_ips(ctx, ip_addresses, scope.requested)
+            processed_data_by_ip, failed_ips, no_network_ips = self._fetch_ips(ctx, ip_addresses, scope.requested)
             ptr_names, ptr_failures = self._fetch_ptr_names(ctx, _ptr_addresses(ip_addresses, processed_data_by_ip))
             save_rows, print_data_all = self._rows_for(ctx, scope, ip_addresses, processed_data_by_ip, ptr_names)
             self._save_report(ctx, ip_addresses, processed_data_by_ip, save_rows)
             _publish_stats(ctx, len(keys), ip_addresses, processed_data_by_ip, print_data_all)
             misses = _explain_misses(
-                ip_addresses, processed_data_by_ip, failed_ips, scope.scoped(NO_RECORD), scope.scoped(NO_RECORD_V6)
+                ip_addresses, processed_data_by_ip, failed_ips, scope.scoped(NO_RECORD), scope.scoped(NO_RECORD_V6),
+                no_network_ips, scope.scoped(NO_NETWORK),
             )
             reasons.update({obj: misses[key] for obj, key in keys.items() if key in misses})
 
@@ -355,15 +360,17 @@ class IPRequestModule(BaseModule):
 
     def _fetch_ips(
         self, ctx: ScriptContext, ip_addresses: List[str], network_view: str = ""
-    ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str]]:
+    ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str], Set[str]]:
         """
         Ask Infoblox about each address (``ipv4address`` or ``ipv6address`` by its family; in
         ``network_view`` only, or in every view when it is "") and run the ``process_data`` hook on
         every address-view of every answer, one at a time.
 
         Returns the processed data of the addresses that have a record (one entry per network view
-        that holds the address, in view-name order), and the failure message of each address whose
-        lookup failed (an address with no record is in neither).
+        that holds the address, in view-name order), the failure message of each address whose
+        lookup failed, and the addresses that the grid said no network contains (a miss, not a
+        failure: the grid cannot build an address object without a network). An address with no
+        record is in none of the three.
         """
         logger = ctx.logger
         colors = get_global_color_scheme(ctx.cfg)
@@ -381,6 +388,7 @@ class IPRequestModule(BaseModule):
 
         processed_data_by_ip: Dict[str, List[Dict[str, Any]]] = {}
         failed_ips: Dict[str, str] = {}
+        no_network_ips: Set[str] = set()
         for ip, response in results.items():
             if response.ok:
                 for payload in _item_payloads(response.content):
@@ -393,11 +401,13 @@ class IPRequestModule(BaseModule):
                         processed_data_by_ip.setdefault(ip, []).append(data)
             elif response.failed:
                 failed_ips[ip] = describe_infoblox_failure(response)
+            elif response.no_network:
+                no_network_ips.add(ip)
 
         end = perf_counter()
         logger.info(f"IP Information search took {round(end - start, 3)} seconds!")
         console.print(f"[{colors['description']}]Request Type - IP Information - Search took [{colors['success']}]{round(end-start, 3)}[/] seconds![/]")
-        return processed_data_by_ip, failed_ips
+        return processed_data_by_ip, failed_ips, no_network_ips
 
     def _fetch_ptr_names(
         self, ctx: ScriptContext, ips: List[str]
