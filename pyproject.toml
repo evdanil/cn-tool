@@ -1,0 +1,68 @@
+# What `python -m build` reads to make the wheel and the sdist of cn-tool.
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cn-tool"
+dynamic = ["version"]
+description = "Infoblox lookups and network checks from a menu or the command line"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Evgeny Danilchenko", email = "evgeny@netsectech.com.au" }]
+keywords = ["infoblox", "ipam", "dns", "dhcp", "network", "cli"]
+# 3.11 is not tested (CI runs 3.10, 3.12, 3.13 and 3.14), so it is not claimed.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Networking",
+]
+# The same list as requirements.txt, line for line: that file serves the zip release.
+dependencies = [
+    "rich",
+    "requests >= 2.32.3",
+    "pandas >= 2.2.2, < 4",
+    "openpyxl",
+    "diskcache",
+    "netmiko < 5",
+    "ldap3",
+    "pyyaml",
+    "textual>=8.2,<9",
+    "python-dateutil",
+    "click",
+]
+
+[project.urls]
+Homepage = "https://github.com/evdanil/cn-tool"
+Source = "https://github.com/evdanil/cn-tool"
+Issues = "https://github.com/evdanil/cn-tool/issues"
+Changelog = "https://github.com/evdanil/cn-tool/releases"
+
+[project.scripts]
+cn = "cn_tool.main:main"
+cn-tool = "cn_tool.main:main"
+
+# The version file inside the package is the single source of the version: cn_buildstamp turns its MAJOR, MINOR and
+# BUILD into the wheel's version.
+[tool.hatch.version]
+source = "code"
+path = "cn_tool/cn_buildstamp.py"
+expression = "build_stamp().package_version"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cn_tool", "config_analyzer"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["cn_tool", "config_analyzer", "LICENSE", "README.md", "pyproject.toml"]

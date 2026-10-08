@@ -1,18 +1,26 @@
 # cn-tool
 
 `cn-tool` is a modular network utility for Infoblox lookups, bulk network
-checks, configuration repository searches, and device inventory collection.
+checks, configuration repository searches, and device inventory collection. It runs on Linux, macOS
+and Windows (natively, without WSL) and installs with `pipx install cn-tool`.
 
-## What's new in 0.6.0
+## What's new in 0.7.0
 
-Infoblox can log in with its own account, for example a read-only service account: `INFOBLOX_USER`
-(or `[api] user`) and `INFOBLOX_PW`, or a GPG file in `[gpg] infoblox_credentials`. The variable
-names are configurable in `[auth]`. Nothing changes for an install that sets none of them. The
-details are in the release notes of 0.6.0 on the Releases page of this repository. Version 0.5.0
-added IPv6 to the Infoblox lookups and the bulk tools and a faster start, version 0.4.1 made a
-command load only the libraries it uses, version 0.4.0 added Infoblox network views, and version
-0.3.0 the command line, `cn diff`, `cn doctor` and Config Analyzer 0.2.0; their notes are on the
-same page.
+cn-tool runs natively on Windows 10 and 11 and installs from PyPI: `pipx install cn-tool` puts the
+commands `cn` and `cn-tool` on your PATH (`python -m cn_tool` works too). A new command, `cn init`,
+writes a commented starting configuration to `~/.cn`, and `cn doctor`, the menu and a refused lookup
+point to it while no configuration file exists. On Windows, Bulk PING uses the system's `ping`, the
+device login's user name comes from `USERNAME`, Bulk Network Trace is not available (it needs
+`mtr`), and the command line writes UTF-8. Bulk PING also works on macOS now. `.cn` is read as UTF-8
+(a byte-order mark is fine). Nothing else changes for an install that has a configuration file. The
+details, and what to do when you upgrade a zip or a clone, are in the release notes of 0.7.0 on the
+[Releases page](https://github.com/evdanil/cn-tool/releases). Version 0.6.0 let Infoblox log in
+with its own account, for example a read-only service account (`INFOBLOX_USER` or `[api] user`, and
+`INFOBLOX_PW` or a GPG file in `[gpg] infoblox_credentials`; the variable names are configurable in
+`[auth]`). Version 0.5.0 added IPv6 to the Infoblox lookups and the bulk tools and a faster start,
+version 0.4.1 made a command load only the libraries it uses, version 0.4.0 added Infoblox network
+views, and version 0.3.0 the command line, `cn diff`, `cn doctor` and Config Analyzer 0.2.0; their
+notes are on the same page.
 
 ## Included Features
 
@@ -20,8 +28,9 @@ same page.
   by an Infoblox extensible attribute (`[site] ea_name`) or by subnet comment; an object held in
   several network views is listed once per view, and `--view NAME` limits a lookup to one
 - Command line (`cn subnet|ip|fqdn|site|ping|diff|doctor`) with table, JSON, Markdown and CSV
-  output and exit codes for scripts
-- Bulk ping (IPv4 and IPv6) with an optional TCP port check, resolve, and traceroute operations
+  output and exit codes for scripts, and `cn init` to write a starting configuration
+- Bulk ping (IPv4 and IPv6) with an optional TCP port check, resolve, and (on Linux and macOS)
+  traceroute operations
 - `cn diff`: which snapshot of a device added or removed a configuration line, and who made it
 - `cn doctor`: configuration, credential and Infoblox WAPI checks
 - Configuration repository search with optional SD-WAN YAML enrichment
@@ -33,33 +42,217 @@ same page.
 
 ## Installation
 
-cn-tool needs Python 3.10 or newer.
+cn-tool needs Python 3.10 or newer, on Linux, macOS or Windows 10 and 11 (x64). On Windows, Python
+3.12 to 3.14 is recommended (see [Windows](#windows)). The test suite runs on all three systems
+(macOS once a week). The macOS `ping` and `ping6` were run on a real Apple-silicon Mac runner (macOS
+26); a silent IPv6 host, Intel Macs and older macOS versions have not been run.
 
-1. Clone the repository.
-2. Create and activate a virtual environment.
-3. Install dependencies:
+### From PyPI
+
+[pipx](https://pipx.pypa.io/) gives cn-tool a virtual environment of its own and puts its commands
+on your PATH. On Windows, `py -m pip install --user pipx`, then `py -m pipx ensurepath` and a new
+terminal install pipx itself.
+
+```bash
+pipx install cn-tool
+cn --version
+```
+
+Or install it into a virtual environment you manage:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate      # Windows PowerShell: .venv\Scripts\Activate.ps1
+pip install cn-tool
+```
+
+Either way you get the commands `cn` and `cn-tool` (the same program) and `python -m cn_tool`. If
+another program on your PATH already provides a `cn` (the npm package of that name does), use
+`cn-tool`. Upgrade with `pipx upgrade cn-tool`, or `pip install --upgrade cn-tool`.
+
+### From the zip or a clone
+
+Unpack the zip of a release (or clone the repository), create a virtual environment, and install the
+dependencies:
 
 ```bash
 pip install -r requirements.txt
-```
-
-4. Copy the sample configuration and adjust it for your environment:
-
-```bash
-cp .cn ~/.cn
-```
-
-5. Run the tool:
-
-```bash
 python main.py
 ```
 
+`pip install .` in the same directory gives the same install as from PyPI. When you upgrade a zip,
+unpack it into a new, empty directory: the code lives in a `cn_tool` folder now, and the release
+notes of 0.7.0 say what to move.
+
 On a shared server where users cannot write to the install directory, run
-`python -m compileall -q /path/to/cn-tool` after each install or update, with the Python that runs
+`python -m compileall -q /path/to/cn-tool` after each unpack or update, with the Python that runs
 `cn`. Python cannot cache compiled modules in a read-only directory, so without this step it
 compiles every cn module on every start: about 0.14 s more for a lookup (0.42 s instead of 0.28 s
-on a shared dev host, measured with 0.4.1).
+on a shared dev host, measured with 0.4.1). A pip install compiles its files when it installs.
+
+### First run
+
+```bash
+cn init
+```
+
+writes a commented starting configuration to `~/.cn` (`%USERPROFILE%\.cn` on Windows). It never
+overwrites a file: it exits 2 and changes nothing when `~/.cn` exists. Open the file in a text editor
+(`notepad $HOME\.cn` on Windows), remove the `# ` in front of `endpoint` in `[api]` and set your
+Infoblox grid, and save the file as UTF-8. Then run:
+
+```bash
+cn doctor
+```
+
+It checks the configuration, the credentials and the Infoblox WAPI. While no configuration file
+exists at all, `cn doctor` (a `Config file` row first), the menu's start-up warning and a refused
+command-line lookup tell you to run `cn init`; the `.cn` in the root of a zip or a clone counts as
+a configuration file, so only a pip install sees these hints.
+
+Edit `~/.cn` in a text editor, not through the menu's Application Setup (`s`): Setup rewrites the file
+without its comments. The rest of the configuration is described in [Configuration](#configuration).
+
+## Windows
+
+cn-tool runs natively on Windows 10 and 11 (x64), in Windows PowerShell 5.1 and in PowerShell 7,
+without WSL. The commands on this page are for PowerShell.
+
+### Terminal and Python
+
+- **Terminal.** Windows Terminal is recommended; the older console window works too, though spinner
+  glyphs may show as boxes there. In Warp (warp.dev), typed text at a line prompt such as Bulk Ping's
+  can be drawn over the line above the cursor; plain PowerShell and the ordinary console are not
+  affected, and no cause in `cn` was found (the likely one, a cursor move that Windows' pseudo-console
+  sends after the menu's alternate screen, is inferred, not confirmed in Warp): use Windows Terminal or
+  PowerShell. The menu needs a real console: the terminal of Git Bash is not
+  one, so `cn` alone refuses to open the menu there (`cn: no command given and no terminal for the
+  menu`) and exits 2; run `winpty cn`, or use Windows Terminal. A command such as `cn ip 10.1.2.3`
+  works anywhere.
+- **Python.** Install it from python.org or with the Python install manager; both provide the `py`
+  launcher. The Microsoft Store Python works but has no `py`: write `python -m pip` where this page
+  says `py -m pip`. Python 3.12 to 3.14 is recommended: Python 3.15 was too new for PyYAML's Windows
+  wheel when 0.7.0 was released, so pip would need a compiler there. On Windows on Arm, install the
+  x64 Python; cn runs under emulation.
+- **When `cn.exe` is blocked** by AppLocker or antivirus: `py -m pip install --user cn-tool`, then
+  `py -m cn_tool` with the same commands and options (`py -m cn_tool ip 10.1.2.3`). A pipx install
+  keeps cn-tool in its own environment, so `py -m cn_tool` finds nothing there.
+
+### Passwords in PowerShell
+
+PowerShell's PSReadLine saves your command lines in plain text in
+`%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt`, except lines that
+contain words such as `password` or `secret`. So never type `$env:TACACS_PW = 'secret'`. For one
+terminal, without leaving the password in the history file:
+
+```powershell
+$env:TACACS_PW = Read-Host 'TACACS password' -MaskInput
+```
+
+(PowerShell 7.1 and later), or, in Windows PowerShell 5.1, which has no `-MaskInput`:
+
+```powershell
+$env:TACACS_PW = [Net.NetworkCredential]::new('', (Read-Host 'TACACS password' -AsSecureString)).Password
+```
+
+Or leave it unset: `cn` asks, without echo, when it needs it. `setx TACACS_PW …` is worse:
+- it stores the password in plain text in the registry (`HKCU\Environment`);
+- every program you start later can read it;
+- it roams with a roaming profile;
+- the terminal you typed it in does not see it.
+
+Use `setx` for names only (`setx INFOBLOX_USER svc-ipam`). Remove a stored password with
+`[Environment]::SetEnvironmentVariable('TACACS_PW', $null, 'User')`. The same holds for
+`INFOBLOX_PW`.
+
+The device login's user name is read from `USERNAME` (Windows has no `USER`). If your device login
+is not your Windows user name, put it in a variable of your own (`setx CN_USER alice`, a name is
+not a secret) and name that variable in `.cn`:
+
+```ini
+[auth]
+device_user_var = CN_USER
+```
+
+### Scheduled tasks
+
+A Task Scheduler task sees only the environment that is stored for its account, and it cannot show
+gpg's passphrase window: gpg waits out its 90 second timeout, and a device GPG file older than 24
+hours is ignored. Keep the password with DPAPI, which only your account on that computer can read:
+once, in a normal PowerShell session,
+
+```powershell
+Read-Host 'TACACS password' -AsSecureString | ConvertFrom-SecureString | Set-Content $HOME\.cn-tacacs
+```
+
+and in the task's script, before `cn`:
+
+```powershell
+$env:TACACS_PW = [Net.NetworkCredential]::new('', (Get-Content $HOME\.cn-tacacs | ConvertTo-SecureString)).Password
+```
+
+To save text from a task, redirect through `cmd`: `cmd /c "cn ping 10.1.2.0/24 --format csv > out.csv"`
+(see [Output and encoding](#output-and-encoding)).
+
+### GPG credentials file
+
+Install [Gpg4win](https://www.gpg4win.org/) for `-g` and `[gpg]` files, and open a new terminal so
+that `gpg` is on the PATH; without it `cn` says `gpg is not installed (install Gpg4win, then open a
+new terminal)`. gpg-agent asks for the key's passphrase in Gpg4win's window. Make the credentials
+file in an editor such as Notepad, saved as UTF-8, encrypt it, and delete the plain copy:
+
+```powershell
+notepad $HOME\cn-tool-credentials.txt     # two lines: User = alice and Password = ...
+gpg --encrypt --recipient YOUR_KEY_ID --output $HOME\cn-tool.gpg $HOME\cn-tool-credentials.txt
+Remove-Item $HOME\cn-tool-credentials.txt
+```
+
+One way of writing the file fails in Windows PowerShell 5.1: `>` and a plain `Out-File` write UTF-16,
+and `cn` then says the file `could not be decrypted by gpg --batch`. Notepad, `Set-Content -Encoding
+utf8`, `Out-File -Encoding utf8` and `[IO.File]::WriteAllText($path, $text)` write UTF-8, and so do
+`>`, `Out-File` and `Set-Content` in PowerShell 7. A byte-order mark at the start of the file, which
+Windows PowerShell 5.1 adds to `-Encoding utf8` output, is dropped when `cn` reads the decrypted text.
+
+### Output and encoding
+
+`cn` writes UTF-8 on Windows, also when its output is redirected or piped. PowerShell (5.1 and 7)
+decodes a program's output with the console's code page (`[Console]::OutputEncoding`, the OEM code
+page: 850 or 437, for example), so a name such as `Zürich` comes out garbled in
+`cn … | ConvertFrom-Json` until you run `[Console]::OutputEncoding = [Text.UTF8Encoding]::new()`
+(put it in your `$PROFILE` to keep it). Windows PowerShell 5.1 also writes `>` redirections as
+UTF-16, which other tools may not read: let `cmd` redirect instead (`cmd /c "cn doctor > out.txt"`
+writes UTF-8; PowerShell 7's `>` writes UTF-8 too). Save `.cn` as UTF-8 as well (see
+[Configuration](#configuration)). The tables use box-drawing characters, so whatever reads them
+must read UTF-8.
+
+### Files, reports and certificates
+
+- **Where files go.** `C:\Users\<you>\.cn`, `cn.log`, `report.xlsx` and the `.cn-cache` folder sit in
+  your profile folder, which OneDrive does not sync. The keys move them; on a roaming profile,
+  `[cache] directory = ~/AppData/Local/cn-tool/cache` keeps the cache off the network. `pipx
+  uninstall cn-tool` leaves these files behind.
+- **A report open in Excel.** Excel locks a workbook it has open, so a lookup cannot save to it.
+  `cn` says `Error: Could not write the report: C:\Users\alice\report.xlsx is open in another
+  program (Excel?). This result is not in the report; close the file before the next lookup.` The
+  result is dropped, not retried, and a command-line run exits 3.
+- **Certificates.** `requests` trusts the certificate bundle that ships with it, not the Windows
+  certificate store. Behind a proxy that inspects TLS, point `REQUESTS_CA_BUNDLE` at your
+  organisation's CA bundle (`$env:REQUESTS_CA_BUNDLE = 'C:\certs\corp-ca.pem'`), or turn off
+  `[api] verify_ssl` (which disables the check).
+- **SSH to devices.** A bastion named by `ProxyJump` in `~\.ssh\config` runs Windows' OpenSSH client
+  (`ssh.exe`), which Windows 10 and 11 include as an optional feature.
+
+### What differs from Linux
+
+- Bulk PING runs Windows' own `ping` (see [Bulk ping](#bulk-ping-cn-ping)). An IPv6 target that this
+  computer has no route to reads `NO RESPONSE`, not `NO ROUTE`.
+- Bulk Network Trace (menu item `t`) is not available: it needs `mtr`, which does not exist on
+  Windows. `cn` says `Bulk Network Trace needs mtr, which is not available on Windows.` and returns
+  to the menu.
+- On Python before 3.14, Windows may not interrupt a bulk run that is waiting for its probes (a
+  Python limitation that 3.14 fixes). If Ctrl-C does not stop it, close the window, or use Python
+  3.14.
+- On the command line, give a file of objects with `--file`, not `< file`: PowerShell reserves `<`.
 
 ## Command line
 
@@ -70,8 +263,9 @@ status a script can test. Without a command the menu opens as before.
 cn [global options] <command> [objects…|-] [--file PATH|-] [--format table|json|md|csv] [--report]
 ```
 
-For scripted use, install a symlink instead of calling `python main.py`: a shell alias is not
-expanded in scripts, cron jobs or `ssh host cmd`. Native Windows is not supported.
+For scripted use, call `cn` from the PATH (a pip install puts it there) rather than a shell alias,
+which is not expanded in scripts, cron jobs or `ssh host cmd`. From a zip or a clone, install a
+symlink instead of calling `python main.py` (on Windows, `pip install .` installs the `cn` command):
 
 ```bash
 ln -s /path/to/main.py ~/bin/cn
@@ -86,6 +280,7 @@ ln -s /path/to/main.py ~/bin/cn
 | `ping`   | IPv4 and IPv6 addresses, host names, `10.1.2.0/24` and `2001:db8::/120` networks | ICMP result per host and, with `--tcp 22,443`, the state of each port |
 | `diff`   | device names, as in `<name>.cfg` in the configuration repositories | configuration lines added or removed since the last change or `--since`, with the snapshot, author and time |
 | `doctor` | none | one row per configuration, credential and Infoblox check |
+| `init`   | none | nothing on stdout: it writes a commented starting configuration to `~/.cn` and never overwrites a file (exit 0 written, 2 the file exists, 3 it could not be written) |
 
 `site` results are paged: up to 10,000 subnets per address family (IPv4 and IPv6 networks are
 fetched separately); at the cap a warning says so. `fqdn` pages each record type (A, AAAA, host,
@@ -93,12 +288,13 @@ CNAME) and its PTR search up to 10,000 rows.
 
 `ip`, `subnet`, `fqdn`, `site` and `doctor` add `--view NAME` and `--all-views` (see
 [Network views](#network-views)). `ping` adds `--tcp PORTS`, and `diff` adds `--since WHEN` and
-`--line TEXT`. `doctor` takes neither objects nor `--file`. `diff` and `doctor` write no report:
-they have no `--report`, and `-r FILE` is refused with exit 2. An option name is never abbreviated
-(`--rep` is an error, not `--report`).
+`--line TEXT`. `doctor` and `init` take neither objects nor `--file`. `diff`, `doctor` and `init`
+write no report: they have no `--report`, and `-r FILE` is refused with exit 2. An option name is
+never abbreviated (`--rep` is an error, not `--report`).
 
 Objects are arguments, or one per line from `--file PATH`; a positional `-` or `--file -` reads
-standard input. Blank lines and `#` comments are ignored. Global options (`-c`, `-nc`, `-t`, `-l`,
+standard input (in PowerShell use `--file`: it reserves `<`, so `cn subnet - < scope.txt` is not
+possible there). Blank lines and `#` comments are ignored. Global options (`-c`, `-nc`, `-t`, `-l`,
 `-r`, `-g`, `--log-level`) work before and after the command. `cn <command> --help` shows the
 details of one command.
 
@@ -284,14 +480,19 @@ an IPv4 address or, only when the name has none, to an IPv6 address, and ICMP an
 address; a name that does not resolve is listed in `not_found` as `no such host`. A link-local
 IPv6 address needs its interface (`cn ping fe80::1%eth0`), and an IPv4-mapped one is refused with
 the IPv4 address to use. `--tcp PORTS` also connects to up to 5 TCP ports (1-65535) and allows at
-most 1,024 hosts (a /22, or an IPv6 /118). Every probe gives up after 3 seconds. ICMP runs the same
-`ping -n -w3 -c2` for both families, so `ping` must take IPv6 literals (current iputils does).
+most 1,024 hosts (a /22, or an IPv6 /118). Every probe gives up after 3 seconds. ICMP runs the
+system's `ping`: on Linux `ping -n -w3 -c2` for both families, so `ping` must take IPv6 literals
+(current iputils does); on macOS `ping -n -c 2 -t 3`, and `ping6 -n -c 2` for IPv6 (it has no
+deadline flag, so `cn` stops a ping still running after 7 seconds); on Windows `ping -n 2 -w 1500`. On
+Windows cn counts the reply lines instead of reading Windows' summary, which is in the user's language,
+so the answer is the same in every language.
 
 Columns: `host`, `address`, `result` (`OK`, `OK (1/2 replies)`, `NO RESPONSE`, `NO ROUTE`, `ERROR`,
 or `not run` when ICMP was skipped) and one `tcp_<port>` column per port: `open`, `closed` (refused
 or reset; a firewall that rejects connections looks the same), `timeout`, `unreachable` or
-`error`. `NO ROUTE` is an IPv6 ping from a host that has no route to the address or no IPv6; it is
-the ICMP side of `unreachable`, so a run in which nothing else answered exits 1, not 3. The columns
+`error`. `NO ROUTE` is an IPv6 ping from a Linux or macOS host that has no route to the address or
+no IPv6; it is the ICMP side of `unreachable`, so a run in which nothing else answered exits 1, not
+3. (On Windows the same case reads `NO RESPONSE`: the exit status is 1 either way.) The columns
 follow the arguments: `--tcp 22,443` always gives `tcp_22` and `tcp_443`. Without a `ping` command
 `cn ping` exits 2; with `--tcp` it skips ICMP and the ports decide the status.
 
@@ -428,10 +629,12 @@ Use `set -o pipefail` so that a failed `cn` is not hidden by the status of `jq`.
 
 ### Credentials
 
-`cn` logs in as `$USER` with `$TACACS_PW`; if it is not set, a GPG credentials file younger than
-24 hours is used (see GPG Credentials File below). Without a terminal `cn` never prompts: it exits
-3 at once with a message that names `TACACS_PW` and the GPG file, so cron jobs and
-`ssh host cn …` cannot hang. `cn doctor` shows which source applies and whether the login works.
+`cn` logs in as `$USER` with `$TACACS_PW` (on Windows the user name is `%USERNAME%`, which is the
+default of the `[auth]` setting `device_user_var`); if the password is not set, a GPG credentials
+file younger than 24 hours is used (see GPG Credentials File below). Without a terminal `cn` never
+prompts: it exits 3 at once with a message that names `TACACS_PW` and the GPG file, so cron jobs
+and `ssh host cn …` cannot hang. `cn doctor` shows which source applies and whether the login
+works. On Windows, set the password for one terminal as described under [Windows](#windows).
 
 Infoblox can log in with an account of its own, for example a read-only service account, while
 devices and Active Directory keep the TACACS login. Four settings give it: `INFOBLOX_USER` (the
@@ -475,8 +678,8 @@ first request alone and, after a refusal, nothing more as that account for the r
 wrong password costs one refused login per run. A cron job still costs one per run, so act on exit
 3 before the grid's lockout (if enabled) locks the account.
 
-The names of the four variables are configurable in `[auth]`: `device_user_var` (default `USER`),
-`device_password_var` (`TACACS_PW`), `infoblox_user_var` (`INFOBLOX_USER`) and
+The names of the four variables are configurable in `[auth]`: `device_user_var` (default `USER`, and
+`USERNAME` on Windows), `device_password_var` (`TACACS_PW`), `infoblox_user_var` (`INFOBLOX_USER`) and
 `infoblox_password_var` (`INFOBLOX_PW`). The section holds names, never passwords. A blank value
 means the default, and a value that is not a variable name stops the login with exit 2 and the
 key's name. When `cn` says where a value came from, it names the variable (`password from
@@ -497,11 +700,18 @@ The names are read when `cn` logs in: edit `.cn` and restart `cn`.
 
 ## Configuration
 
-`cn-tool` reads ini-style configuration from:
+`cn-tool` reads ini-style configuration from these files, in this order (a later file overrides an
+earlier one):
 
-1. `.cn` next to the script
-2. `~/.cn`
+1. `.cn` in the root of a zip or a clone, next to `main.py` (a pip install has none)
+2. `~/.cn` (`%USERPROFILE%\.cn` on Windows), the file `cn init` creates
 3. a file passed with `-c`
+
+Save `.cn` as UTF-8; a byte-order mark is fine. A file in another encoding (a Windows ANSI code page
+with an accented letter in it) is not read: `cn` logs the parse error and runs on its defaults.
+Paths may start with `~`, and on Windows may be drive paths such as `D:\configs`. The log, the
+report, the cache and the GPG file default to `~/cn.log`, `~/report.xlsx`, `~/.cn-cache` and
+`~/cn-tool.gpg`, in your home directory on every system; the keys below move them.
 
 Example:
 
@@ -592,6 +802,9 @@ Notes:
 
 - `cn-tool` will ignore credential files older than 24 hours.
 - The file must be decryptable by `gpg` in the environment where `cn-tool` runs.
+- The decrypted text must be UTF-8 (a byte-order mark at the start is dropped). On Windows, `gpg`
+  comes from Gpg4win, and PowerShell 5.1's `>` writes UTF-16, which is not read: see
+  [Windows](#windows).
 - If you do not want to use GPG, set `TACACS_PW` or enter the credential interactively.
 
 #### Infoblox account file
@@ -693,6 +906,7 @@ debug = false
 
 ## Notes
 
-- Reports are written to `report.xlsx` by default.
-- The `Application Setup` menu edits the user-level `~/.cn` file.
+- Reports are written to `report.xlsx` in your home directory by default.
+- The `Application Setup` menu edits the user-level `~/.cn` file and rewrites it without its
+  comments: edit the file in a text editor to keep them.
 - Secrets can be provided interactively or via your own local configuration.

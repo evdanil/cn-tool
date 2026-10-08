@@ -1,9 +1,9 @@
 rich
 requests >= 2.32.3
-pandas >= 2.2.2
+pandas >= 2.2.2, < 4
 openpyxl
 diskcache
-netmiko
+netmiko < 5
 ldap3
 pyyaml
 textual>=8.2,<9

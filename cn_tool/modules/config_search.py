@@ -1,0 +1,559 @@
+import re
+import ipaddress
+from pathlib import Path
+from time import perf_counter
+from typing import List, Dict, Set, Optional, Tuple, Any
+from concurrent.futures import ThreadPoolExecutor
+
+from rich.markup import escape
+
+from cn_tool.core.base import BaseModule, ScriptContext
+from cn_tool.utils.user_input import press_any_key, read_user_input
+from cn_tool.utils.auth import ensure_infoblox_auth
+from cn_tool.utils.display import console, get_global_color_scheme, print_search_config_data, print_table_data
+from cn_tool.utils.file_io import check_dir_accessibility, queue_save
+from cn_tool.utils.infoblox_ux import format_no_match_message, format_partial_results_message
+from cn_tool.utils.network_views import NETWORK_VIEW, present_rows, view_scope
+from cn_tool.utils.validation import is_valid_site, site_hostname_regex
+from cn_tool.utils.config import make_dir_list
+from cn_tool.utils.process_data import remove_duplicate_rows_sorted_by_col
+from cn_tool.utils.api import fetch_network_data
+from cn_tool.utils.cache import CacheManager
+from cn_tool.utils.cache_helpers import build_config_path, parse_repo_metadata
+
+# Assuming search_cache_config is a helper you'll create in a cache_helpers.py or similar
+# For now, this module will handle both live and cached logic paths.
+from cn_tool.utils.cache_helpers import search_cache_config
+from cn_tool.wordlists.keywords import stop_words
+
+# Module-specific regex
+ip_regexp = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
+
+
+class ConfigSearchModule(BaseModule):
+    """
+    Module for searching through device configuration files.
+    Handles both generic keyword/subnet searches and specialized
+    site demobilization checks.
+    """
+    # This flag tells the main loop that this module needs the config repo to function.
+    requires_config_repo = True
+
+    @property
+    def menu_key(self) -> str:
+        return "5"
+
+    @property
+    def menu_title(self) -> str:
+        return "Configuration Lookup (by subnet or keyword)"
+
+    @property
+    def visibility_config_key(self) -> Optional[str]:
+        return "config_repo_enabled"
+
+    def _show_help(self, ctx: ScriptContext):
+        """Private helper to display help if the config repo is missing."""
+        colors = get_global_color_scheme(ctx.cfg)
+        ctx.console.print(
+            "\n"
+            f"[{colors['warning']}]Unable to access configuration repository[/]\n"
+            f"[{colors['description']}]Check the [{colors['header']} {colors['bold']}]{escape('[config_repo]')}[/] section in your configuration file.[/]\n"
+            f"[{colors['description']}]Verify that [{colors['success']} {colors['bold']}]directory[/] is set to the correct path.[/]\n"
+            f"[{colors['description']}]If the path is correct, verify that you have read access to it.[/]\n"
+        )
+
+    def run(self, ctx: ScriptContext) -> None:
+        """
+        Main entry point for the generic configuration search feature.
+        (Original `search_config_request` logic)
+        """
+        logger = ctx.logger
+        colors = get_global_color_scheme(ctx.cfg)
+
+        # --- Pre-flight check ---
+        if not check_dir_accessibility(ctx.logger, ctx.cfg.get("config_repo_directory", '')):
+            self._show_help(ctx)
+            return
+
+        logger.info("Configuration Repository - Search Request")
+
+        console.print(
+            f"\n[{colors['description']}]Enter subnet([{colors['code']}]IP_ADDRESS/[MASK][/]) or keyword(regular expression), one item per line[/]\n"
+            f"[{colors['description']}]Empty input line starts the process[/]\n"
+            "\n"
+            f"[{colors['header']}]Subnet Examples:[/]\n"
+            f"[{colors['success']} {colors['bold']}]10.10.10.0/24[/]\n"
+            f"[{colors['success']} {colors['bold']}]134.143.169.176/29[/]\n"
+            f"[{colors['header']}]Keywords Regex Examples:[/]\n"
+            f"[{colors['success']} {colors['bold']}]router bgp 655\\d+$[/]\n"
+            f"[{colors['success']} {colors['bold']}]neighbor \\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}}\\.\\d{{1,3}} description VOCUS\\s+[/]\n"
+        )
+
+        keyword_regexps: List[str] = []
+        networks: List[ipaddress.IPv4Network] = []
+        validated_search_input: List[str] = []
+        MIN_INPUT_LEN = 5
+
+        while True:
+            search_input = read_user_input(ctx, "").strip()
+            if search_input == "":
+                break
+
+            is_network = False
+            try:
+                if "/" in search_input or re.fullmatch(ip_regexp, search_input):
+                    net = ipaddress.ip_network(search_input, strict=False)
+                    if isinstance(net, ipaddress.IPv4Network):
+                        networks.append(net)
+                        validated_search_input.append(str(net))
+                        is_network = True
+            except (ValueError, TypeError):
+                pass
+
+            if not is_network:
+                # Short inputs are refused as keywords unless the deployment defines a site-code
+                # shape ([site] code_pattern) and the input is a site code by that definition.
+                site_pattern = ctx.cfg.get("site_code_pattern")
+                looks_like_site = bool(site_pattern) and is_valid_site(search_input, site_pattern)
+                if len(search_input) < MIN_INPUT_LEN and not looks_like_site:
+                    console.print(f"[{colors['error']}]Input keyword is too short: {search_input}[/]")
+                    continue
+
+                try:
+                    re.compile(search_input, re.IGNORECASE)
+                    keyword_regexps.append(search_input)
+                    validated_search_input.append(search_input)
+                except re.error as e:
+                    console.print(f"[{colors['error']}]Invalid regular expression: {e}[/]")
+
+        if not networks and not keyword_regexps:
+            return
+
+        logger.info(f"User input - {', '.join(validated_search_input)}")
+        search_input_str = "\n".join(validated_search_input)
+
+        total_start_time = perf_counter()
+
+        # Allow plugins early access to parsed input
+        pre_run_data: Dict[str, Any] = {
+            "networks": networks,
+            "terms": keyword_regexps,
+            "search_input": search_input_str,
+        }
+        pre_run_result: Dict[str, Any] = self.execute_hook("pre_run", ctx, pre_run_data)
+        networks = pre_run_result.get("networks", networks)
+        keyword_regexps = pre_run_result.get("terms", keyword_regexps)
+        search_input_str = pre_run_result.get("search_input", search_input_str)
+
+        data_to_save, matched_nets, core_search_time = self._execute_search(ctx, networks, keyword_regexps, search_input_str)
+        logger.info(f"Core search took {core_search_time} seconds!")
+
+        processed: Dict[str, Any] = self.execute_hook(
+            "process_data",
+            ctx,
+            {
+                "results": data_to_save,
+                "matched_nets": matched_nets,
+                "networks": networks,
+                "search_terms": keyword_regexps,
+                "search_input": search_input_str,
+            },
+        )
+        data_to_save = processed.get("results", data_to_save)
+        matched_nets = processed.get("matched_nets", matched_nets)
+
+        total_end_time = perf_counter()
+        total_duration = round(total_end_time - total_start_time, 3)
+        logger.info(f"Total search (core + plugins) took {total_duration} seconds!")
+        console.print(f"[{get_global_color_scheme(ctx.cfg)['description']}]Search took [{get_global_color_scheme(ctx.cfg)['success']}]{total_duration}[/] seconds![/]")        
+
+        if not data_to_save:
+            logger.info("Configuration Repository - No matches found!")
+            console.print(f"[{colors['error']}]No matches found![/]")
+            press_any_key(ctx)
+            return
+
+        missing_nets = list(set(networks) - set(matched_nets)) if networks else []
+
+        for missed_net in missing_nets:
+            net_str = str(missed_net)
+            if net_str.endswith("/32"):
+                net_str = net_str[:-3]
+            console.print(f"[{colors['description']}]Subnet [{colors['hostname']}]{net_str}[/] - [{colors['error']}]No matches found[/]")
+
+        sorted_data = remove_duplicate_rows_sorted_by_col(data_to_save, 2)
+        print_search_config_data(ctx, sorted_data)
+
+        if ctx.cfg["report_auto_save"]:
+            self._save_found_data(ctx, data_to_save, missing_nets, matched_nets, "Config Check", site_search=False)
+
+        ctx.event_bus.publish(
+            "stats:module_detail",
+            {
+                "unit_count": max(1, len(validated_search_input)),
+                "query_count": len(validated_search_input),
+                "network_count": len(networks),
+                "term_count": len(keyword_regexps),
+                "match_count": len(sorted_data),
+                "matched_subnet_count": len(matched_nets),
+                "miss_count": len(missing_nets),
+                "search_mode": "generic",
+            },
+        )
+
+        press_any_key(ctx)
+
+    def execute_demob_search(self, ctx: ScriptContext, sitecode: str, ensure_auth: bool = True):
+        """
+        Executes the search logic for a given sitecode.
+        This is a public method designed to be called by other modules.
+
+        The subnets come from ``fetch_network_data`` with the configured network view (``[api]
+        network_view``; every view when it is unset), so a subnet that exists in several views is one
+        row per view in the table. Each CIDR is searched in the configurations once.
+
+        Args:
+            ctx: The script context.
+            sitecode: The validated site code to search for.
+        """
+        logger = ctx.logger
+        console = ctx.console
+        colors = get_global_color_scheme(ctx.cfg)
+        normalized_sitecode = str(sitecode or "").strip().upper()
+        if not is_valid_site(normalized_sitecode, ctx.cfg.get("site_code_pattern")):
+            logger.info(f"Executing demobilization search rejected invalid sitecode: {sitecode}")
+            console.print(f"[{colors['error']}]Invalid site code format.[/]")
+            press_any_key(ctx)
+            return
+
+        sitecode = normalized_sitecode
+        logger.info(f"Executing demobilization search for sitecode: {sitecode}")
+
+        if ensure_auth:
+            ensure_infoblox_auth(ctx)
+
+        # Step 1: Fetch network data from Infoblox (the configured network view applies)
+        scope = view_scope(ctx)
+        lookup_result = fetch_network_data(ctx, sitecode, ensure_auth=False)
+        processed_data = lookup_result.data
+
+        if lookup_result.status == "error" and not lookup_result.has_data:
+            console.print(f"[{colors['error']}]{escape(lookup_result.message)}[/]")  # may name "[site]"
+            press_any_key(ctx)
+            return
+
+        if lookup_result.status == "partial_error":
+            console.print(f"[{colors['warning']}]{escape(format_partial_results_message(lookup_result.message))}[/]")  # may name the account
+
+        for notice in lookup_result.notices:
+            console.print(f"[{colors['warning']}]{escape(notice)}[/]")
+
+        if not processed_data.get("location"):
+            console.print(f"[{colors['error']}]{escape(scope.scoped(format_no_match_message('subnet records', sitecode)))}[/]")
+            press_any_key(ctx)
+            return
+
+        view_labels = [row.get(NETWORK_VIEW) for row in processed_data["location"]]
+        shown_rows = present_rows(processed_data["location"], NETWORK_VIEW, scope.column(view_labels), fallback=scope.requested)
+        print_table_data(ctx, {**processed_data, "location": shown_rows})
+        console.print(f'[{colors["description"]}]Received {len(processed_data["location"])} subnet records for [{colors["success"]} {colors["bold"]}]{sitecode}[/]')
+
+        if read_user_input(ctx, f"[{colors['warning']}]Proceed with configuration search for this site code (Y/N)? [/]").lower() != "y":
+            return
+
+        if not check_dir_accessibility(ctx.logger, ctx.cfg.get("config_repo_directory", '')):
+            self._show_help(ctx)
+            press_any_key(ctx)
+            return
+
+        # Step 2: Prepare search terms from the fetched network data
+        locations = processed_data["location"]
+        networks: List[ipaddress.IPv4Network] = []
+        country: Optional[str] = None
+        for location in locations:
+            try:
+                net = ipaddress.ip_network(location["network"])
+                if not isinstance(net, ipaddress.IPv4Network):
+                    continue
+                if country is None:
+                    country = location.get("comment", "XX")[:2].upper()
+                networks.append(net)
+            except ValueError:
+                logger.warning(f"Skipping invalid network from Infoblox: {location.get('network')}")
+        networks = list(dict.fromkeys(networks))  # a CIDR in several network views is searched once
+
+        # Device names are found with [site] hostname_pattern (default: names starting with the
+        # site code); the template may use {site}, {site_compact} and {country}.
+        search_terms: List[str] = [
+            site_hostname_regex(sitecode, ctx.cfg.get("site_hostname_pattern"), country)
+        ]
+
+        # Step 3: Execute the search using the internal helper
+        data_to_save, matched_nets, core_search_time = self._execute_search(
+            ctx, networks, search_terms, sitecode
+        )
+        logger.info(f"Demob core search took {core_search_time} seconds!")
+
+        if not data_to_save:
+            logger.info(f"Configuration Repository - No matches for {sitecode} found!")
+            console.print(f"[{colors['error']}]No matching configuration entries found for site code [{colors['success']} {colors['bold']}]{sitecode}[/].[/]")
+            press_any_key(ctx)
+            return
+
+        # Step 4: Process and display results
+        missing_nets = list(set(networks) - set(matched_nets))
+        if missing_nets:
+            for missed_net in missing_nets:
+                net_str = str(missed_net)
+                if net_str.endswith("/32"):
+                    net_str = net_str[:-3]
+                console.print(f"[{colors['description']}]Subnet [{colors['success']} {colors['bold']}]{net_str}[/] - [{colors['error']}]No configuration matches found[/]")
+
+        sorted_data = remove_duplicate_rows_sorted_by_col(data_to_save, 2)
+        print_search_config_data(ctx, sorted_data)
+
+        if ctx.cfg["report_auto_save"]:
+            self._save_found_data(ctx, data_to_save, missing_nets, matched_nets, "Demob Site Check", site_search=True)
+
+        ctx.event_bus.publish(
+            "stats:module_detail",
+            {
+                "unit_count": 1,
+                "query_count": 1,
+                "network_count": len(networks),
+                "match_count": len(sorted_data),
+                "matched_subnet_count": len(matched_nets),
+                "miss_count": len(missing_nets),
+                "search_mode": "demob",
+            },
+        )
+
+        press_any_key(ctx)
+
+    def _execute_search(self, ctx: ScriptContext, networks: List, search_terms: List, search_input: str) -> Tuple[List, Set, float]:
+        """A centralized method to run the search via cache or live scan."""
+        logger = ctx.logger
+        start = perf_counter()
+        data_to_save: List[List[Any]] = []
+        matched_nets: Set[ipaddress.IPv4Network] = set()
+
+        if not ctx.cache or not isinstance(ctx.cache, CacheManager) or ctx.cache.dc.get("indexing", False):
+            logger.info("Performing live file system search...")
+            for folder in make_dir_list(ctx):
+                lines, nets = self._search_folder_live(ctx, folder, networks, search_terms, search_input)
+                data_to_save.extend(lines)
+                matched_nets.update(nets)
+        else:
+            logger.info("Performing cached search...")
+            with console.status(f"[{get_global_color_scheme(ctx.cfg)['description']}]Searching through configurations...[/]", spinner="dots12"):
+                data_to_save, matched_nets = search_cache_config(ctx, "", networks, search_terms, search_input)
+
+        end = perf_counter()
+        duration = round(end - start, 3)
+
+        return data_to_save, matched_nets, duration
+
+    def _search_folder_live(self, ctx: ScriptContext, folder: Path, nets: List, search_terms: List, search_input: str) -> Tuple[List, Set]:
+        """Private helper containing the logic of the original `search_config` function."""
+        colors = get_global_color_scheme(ctx.cfg)
+        data_to_save: List[Any] = []
+        matched_nets: Set[ipaddress.IPv4Network] = set()
+
+        try:
+            dir_list = list(folder.iterdir())
+        except FileNotFoundError:
+            return data_to_save, matched_nets
+
+        # Derive vendor/type/region by anchoring on the repo base (parts[0..]),
+        # the same way the cache indexer does (parse_repo_metadata). Negative
+        # indexing off the absolute folder path (parts[-4]) depended on
+        # filesystem depth and mis-derived vendor (often the base-dir name),
+        # silently disabling stop-word filtering and diverging from cached
+        # search. This label is for display/fallback; per-file vendor is
+        # resolved authoritatively in _matched_lines via parse_repo_metadata.
+        vendor, device_type = 'vendor', 'type'
+        base_dir = ctx.cfg.get("config_repo_directory")
+        regions = bool(ctx.cfg.get("config_repo_regions", []))
+        try:
+            rel_parts = folder.relative_to(base_dir).parts if base_dir else ()
+        except ValueError:
+            rel_parts = ()
+        if len(rel_parts) >= (3 if regions else 2):
+            vendor = str(rel_parts[0]).lower()
+            device_type = str(rel_parts[1]).upper()
+        else:
+            ctx.logger.warning('Repository has non-expected directory path(missing vendor/type/region)')
+
+        with ThreadPoolExecutor() as executor, console.status(f"[{colors['description']}]Searching through [{colors['type']}]{vendor.upper()}/{device_type}[/] configurations...[/]"):
+            futures = [
+                executor.submit(self._matched_lines, ctx, device, vendor, nets, search_terms, search_input)
+                for device in dir_list if device.is_file()
+            ]
+            for future in futures:
+                lines, subnets = future.result()
+                if lines:
+                    data_to_save.extend(lines)
+                if subnets:
+                    matched_nets.update(subnets)
+
+        return data_to_save, matched_nets
+
+    def _matched_lines(self, ctx: ScriptContext, filename: Path, vendor: str, ip_nets: Optional[List], search_terms: List, search_input: str) -> Tuple[List, Set]:
+        """Private worker method, containing the logic from the original `matched_lines`."""
+        logger = ctx.logger
+        data_to_save: List[List[Any]] = []
+        matched_nets: Set[ipaddress.IPv4Network] = set()
+
+        rows_to_save: Dict[int, str] = {}
+        device = filename.stem.upper()
+
+        # Resolve vendor via the same helper the cache indexer uses so live
+        # and cached searches classify the device identically (parity on
+        # stop-word filtering). Fall back to the caller-supplied vendor for
+        # off-layout files the helper cannot classify.
+        meta = parse_repo_metadata(ctx, filename)
+        resolved_vendor = meta[0] if meta else str(vendor).lower()
+        vendor_stop_list = stop_words.get(resolved_vendor, ("NEVERMATCHED",))
+
+        try:
+            with open(filename, "r", encoding="utf-8", errors='ignore') as f:
+                for index, line in enumerate(f):
+                    line_strip = line.strip()
+
+                    # IP matching runs regardless of stop words: a routable IP
+                    # (e.g. a route-map "set ip next-hop ... 10.1.2.3") is a
+                    # legitimate hit even on a stop-word line. This mirrors the
+                    # cache indexer (utils.cache_helpers.get_device_facts), which
+                    # also extracts IPs before applying the stop-word skip, so
+                    # cached and --no-cache subnet searches stay consistent.
+                    if ip_nets:
+                        found_matches = re.finditer(ip_regexp, line_strip)
+                        for match in found_matches:
+                            try:
+                                found_ip = ipaddress.ip_address(match.group())
+                                if not isinstance(found_ip, ipaddress.IPv4Address):
+                                    continue
+                            except (re.error, ValueError):
+                                continue
+                            else:
+                                for net in ip_nets:
+                                    if found_ip in net:
+                                        matched_nets.add(net)
+                                        rows_to_save[index] = line_strip
+                                        break
+
+                    # Stop-word skip applies to free-text term search only, to
+                    # keep keyword noise down (parity with the keyword index).
+                    if line_strip.startswith(vendor_stop_list):
+                        continue
+
+                    if search_terms:
+                        for search_term in search_terms:
+                            if re.search(search_term, line_strip, re.IGNORECASE):
+                                rows_to_save[index] = line_strip
+                                break
+        except (IOError, OSError) as e:
+            logger.error(f"Error reading file {filename} for device {device}: {e}")
+
+        if rows_to_save:
+            rows = [[search_input, device, index, line, str(filename)] for index, line in sorted(rows_to_save.items())]
+            data_to_save.extend(rows)
+
+        return data_to_save, matched_nets
+
+    def _save_found_data(
+        self,
+        ctx: ScriptContext,
+        data: List,
+        missed_nets: List,
+        matched_nets: Set,
+        sheet: str,
+        *,
+        site_search: bool = False,
+    ) -> None:
+        """Private save method, containing the logic from the original `save_found_data`.
+
+        ``site_search`` names the subnet sheet's first column "Site Code" (demob searches)
+        instead of "Search Terms"; it is decided by the caller, not by the input's shape.
+        """
+        logger = ctx.logger
+        logger.info(f"Configuration Search - Saving results to sheet: {sheet}")
+        if not data:
+            return
+
+        search_input = str(data[0][0])
+        if missed_nets or matched_nets:
+            missed_data = [[search_input, str(net), "No match"] for net in missed_nets if net]
+            matched_data = [[search_input, str(net), "Used"] for net in matched_nets if net]
+            save_nets_data = missed_data + matched_data
+
+            columns = ["Site Code", "Subnet", "Status"] if site_search else ["Search Terms", "Subnet", "Status"]
+            if save_nets_data:
+                queue_save(ctx, columns, save_nets_data, sheet_name=sheet, index=False, force_header=True)
+
+        columns_check = ["Search Terms", "Device", "Line number", "Line"]
+        sorted_data = [[search_input, row[1], f'=HYPERLINK("#\'{row[1]}\'!A{int(row[2]) + 1}", {row[2]})', row[3]] for row in data]
+        queue_save(ctx, columns_check, sorted_data, sheet_name=sheet, index=False, force_header=True)
+
+        # --- Device Config Saving Logic ---
+        device_list: Set[Tuple[str, Optional[str]]] = set()
+        is_cached_run = ctx.cache and isinstance(ctx.cache, CacheManager)
+
+        if is_cached_run:
+            logger.info("Saving device configs using data from cache index...")
+
+            if ctx.cache is None:
+                return
+
+            dev_idx = ctx.cache.dev_idx
+            device_names = {(row[1], row[4])for row in data}
+
+            for device_name, filename in device_names:
+                if filename != '' and Path(filename).exists():
+                    device_list.add((device_name, filename))
+                else:
+                    device_info = dev_idx.get(device_name, {})
+                    fname = build_config_path(ctx, device_name, device_info.get('region', ''), device_info.get('vendor', ''), device_info.get('type', ''))
+                    if fname:
+                        device_list.add((device_name, fname))
+        else:
+            logger.info("Saving device configs using data from direct file scan...")
+            device_list = {(row[1], row[4]) for row in data}
+
+        if len(device_list) > 50:
+            logger.info(f"Too many devices ({len(device_list)}) have matches, skipping full config report update.")
+            return
+
+        max_config_tab_kb = int(ctx.cfg.get("report_max_config_tab_kb", 512) or 512)
+        max_config_tab_bytes = max(1, max_config_tab_kb) * 1024
+
+        logger.info(f"Saving full configs for {len(device_list)} devices.")
+        for device, filename in device_list:
+            if not filename:
+                logger.error(f"{device} is missing full pathname information; unable to save.")
+                continue
+            file_path = Path(filename)
+            try:
+                file_size = file_path.stat().st_size
+                if file_size > max_config_tab_bytes:
+                    message = (
+                        f"Config omitted: size {round(file_size / 1024, 1)} KB exceeds "
+                        f"limit {max_config_tab_kb} KB. Adjust [report] max_config_tab_kb to include."
+                    )
+                    logger.info(f"{device}: {message}")
+                    queue_save(
+                        ctx,
+                        columns=["Notice"],
+                        raw_data=[[message]],
+                        sheet_name=device.upper(),
+                        index=False,
+                        skip_if_exists=True,
+                        force_header=True,
+                    )
+                    continue
+
+                with open(file_path, "r", encoding="utf-8", errors='ignore') as f:
+                    file_content = f.readlines()
+                    queue_save(ctx, columns=None, raw_data=file_content, sheet_name=device.upper(), index=False, skip_if_exists=True)
+            except (IOError, OSError) as e:
+                logger.error(f"Error reading file {filename} for device {device}: {e}")

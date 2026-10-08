@@ -1,0 +1,56 @@
+from typing import Optional
+
+from cn_tool.core.base import BaseModule, ScriptContext
+from cn_tool.utils.email_helper import (
+    interpret_bool,
+    send_configured_report,
+    send_report_email,
+)
+from cn_tool.utils.user_input import press_any_key
+from cn_tool.utils.file_io import wait_for_all_saves, saves_in_progress
+
+
+class EmailReportModule(BaseModule):
+    """Module to manually trigger sending the report file via email."""
+
+    @property
+    def visibility_config_key(self) -> Optional[str]:
+        return "email_enabled"
+
+    @property
+    def menu_key(self) -> str:
+        return "e"
+
+    @property
+    def menu_title(self) -> str:
+        return "Send Report via Email"
+
+    def run(self, ctx: ScriptContext) -> None:
+        if not interpret_bool(ctx.cfg.get("email_enabled")):
+            ctx.console.print("[red]Email feature is disabled in configuration.[/red]")
+            press_any_key(ctx)
+            return
+
+        ctx.logger.info("Request Type - Manual Email Report")
+
+        # If report is still being written, wait for completion to avoid sending partial data
+        if saves_in_progress():
+            with ctx.console.status("[yellow]Report is still being updated. Waiting to finish...[/]", spinner="dots12"):
+                wait_for_all_saves()
+        ctx.console.print("[cyan]Attempting to send the report via email...[/]")
+
+        receiver = ctx.cfg.get("email_to")
+        success = send_configured_report(
+            ctx,
+            report_path=ctx.cfg.get("report_file"),
+            receiver=receiver,
+            prefix="EMAIL (manual)",
+            success_message=f"[green]Report has been sent successfully to {receiver}.[/green]" if receiver else None,
+            failure_message="[red]Failed to send the report. Please check the logs for details.[/red]",
+            send_email_fn=send_report_email,
+        )
+
+        if success is False:
+            ctx.logger.debug("EMAIL (manual): send_configured_report returned False")
+
+        press_any_key(ctx)
