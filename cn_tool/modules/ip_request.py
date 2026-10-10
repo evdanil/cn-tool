@@ -2,7 +2,7 @@ import argparse
 import ipaddress
 import json
 from time import perf_counter
-from typing import Callable, Collection, Dict, Any, List, Optional, Set, Tuple
+from typing import Callable, Collection, Dict, Any, List, Optional, Sequence, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 from rich.markup import escape
@@ -13,7 +13,9 @@ from cn_tool.utils.auth import ensure_infoblox_auth
 from cn_tool.utils.cli_input import read_objects
 from cn_tool.utils.display import console, get_global_color_scheme, print_table_data, table_columns
 from cn_tool.utils.file_io import queue_save
-from cn_tool.utils.network_views import NETWORK_VIEW, NETWORK_VIEW_TITLE, ViewScope, present_rows, scope_network, view_scope
+from cn_tool.utils.network_views import (
+    NETWORK_VIEW, NETWORK_VIEW_TITLE, ViewScope, merge_view_results, present_rows, request_in_views, view_scope,
+)
 from cn_tool.utils.process_data import process_data
 from cn_tool.utils.user_input import press_any_key, read_user_input
 from cn_tool.utils.validation import ipv6_form_problem
@@ -28,7 +30,8 @@ DUID = "DUID"
 # A run that looks up an IPv6 address shows the DUID column (empty for an IPv4 row); an IPv4-only run never does.
 COLUMNS_WITH_DUID = [*COLUMNS[:-1], DUID, COLUMNS[-1]]
 
-# The address lookup answers once per network view that holds the address; the PTR lookup is never scoped,
+# The address lookup answers for one network view: the grid searches only its default view when the request names
+# none, so a lookup of every view sends it once for each view (``_fetch_ips``). The PTR lookup is never scoped,
 # because a PTR record belongs to a DNS view. ``ipv6address`` has no MAC, and asks for the address back (the IPv4
 # object's ``_ref`` carries it).
 ADDRESS_URI = "ipv4address?ip_address={ip}&_return_fields=network,names,status,types,lease_state,mac_address,network_view"
@@ -88,6 +91,7 @@ def _item_payloads(content: bytes) -> List[bytes]:
     The answer of one address split into one JSON payload per network view, in view-name order, so
     each address-view is parsed (and handed to the ``process_data`` hook) on its own.
 
+    The answer is the joined answers of the views (``merge_view_results``), so each view is one payload.
     Items that carry no ``network_view`` label keep only the first one, as the lookup always did.
     An answer that is not a list of items (empty, or not JSON) is returned whole as the only payload.
     """
@@ -259,7 +263,9 @@ class IPRequestModule(BaseModule):
         ip_addresses = list(dict.fromkeys(ip_addresses_input))
 
         # --- API Call and Data Processing ---
-        processed_data_by_ip, failed_ips, no_network_ips = self._fetch_ips(ctx, ip_addresses, scope.requested)
+        processed_data_by_ip, failed_ips, no_network_ips = self._fetch_ips(
+            ctx, ip_addresses, scope.requested, scope.all_views()
+        )
         ptr_names, ptr_failures = self._fetch_ptr_names(ctx, _ptr_addresses(ip_addresses, processed_data_by_ip))
 
         # --- Display and Save Results ---
@@ -339,7 +345,9 @@ class IPRequestModule(BaseModule):
             if view_problem:  # a view that is not on the grid, or a grid that will not say: nothing is looked up
                 console.print(f"cn ip: {view_problem.message}", markup=False)
                 return CliResult(view_problem.exit_code, {})
-            processed_data_by_ip, failed_ips, no_network_ips = self._fetch_ips(ctx, ip_addresses, scope.requested)
+            processed_data_by_ip, failed_ips, no_network_ips = self._fetch_ips(
+                ctx, ip_addresses, scope.requested, scope.all_views()
+            )
             ptr_names, ptr_failures = self._fetch_ptr_names(ctx, _ptr_addresses(ip_addresses, processed_data_by_ip))
             save_rows, print_data_all = self._rows_for(ctx, scope, ip_addresses, processed_data_by_ip, ptr_names)
             self._save_report(ctx, ip_addresses, processed_data_by_ip, save_rows)
@@ -359,12 +367,17 @@ class IPRequestModule(BaseModule):
         return CliResult(cli_exit_code(found=bool(print_data_all), invalid=invalid, failed=failed), data)
 
     def _fetch_ips(
-        self, ctx: ScriptContext, ip_addresses: List[str], network_view: str = ""
+        self, ctx: ScriptContext, ip_addresses: List[str], network_view: str = "", all_views: Sequence[str] = ()
     ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str], Set[str]]:
         """
-        Ask Infoblox about each address (``ipv4address`` or ``ipv6address`` by its family; in
-        ``network_view`` only, or in every view when it is "") and run the ``process_data`` hook on
-        every address-view of every answer, one at a time.
+        Ask Infoblox about each address (``ipv4address`` or ``ipv6address`` by its family) and run the
+        ``process_data`` hook on every address-view of every answer, one at a time.
+
+        The grid answers such a request for one network view only: the default one when it names none.
+        So the request goes to ``network_view`` alone when one is given, else to each of ``all_views``
+        (``ViewScope.all_views``: every view of a grid with several), and without either it is sent as
+        it is, unscoped. The answers of the views are joined (``merge_view_results``): an address is a
+        miss only when every view missed, and a failure in any view is the address's failure.
 
         Returns the processed data of the addresses that have a record (one entry per network view
         that holds the address, in view-name order), the failure message of each address whose
@@ -377,14 +390,12 @@ class IPRequestModule(BaseModule):
         logger.info(f"User input - IPs: {', '.join(ip_addresses)}")
 
         start = perf_counter()
-        req_urls = {
-            ip: scope_network((ADDRESS_URI_V6 if _is_ipv6(ip) else ADDRESS_URI).format(ip=ip), network_view)
-            for ip in ip_addresses
-        }
+        req_urls = {ip: (ADDRESS_URI_V6 if _is_ipv6(ip) else ADDRESS_URI).format(ip=ip) for ip in ip_addresses}
+        views = (network_view,) if network_view else tuple(all_views)
 
-        with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(req_urls))) as executor, console.status(f"[{colors['description']}]Fetching IP information...[/]"):
-            future_to_ip = {executor.submit(request_result, ctx, uri, ensure_auth=False): ip for ip, uri in req_urls.items()}
-            results = {future_to_ip[future]: future.result() for future in future_to_ip}
+        with console.status(f"[{colors['description']}]Fetching IP information...[/]"):
+            answers = request_in_views(ctx, req_urls, views, request_fn=request_result)
+        results = {ip: merge_view_results([result for _, result in answered]) for ip, answered in answers.items()}
 
         processed_data_by_ip: Dict[str, List[Dict[str, Any]]] = {}
         failed_ips: Dict[str, str] = {}

@@ -53,10 +53,15 @@ class ThemedConsole:
         self.theme = Theme(theme_styles)
         # Spinners animate only when both streams are terminals; a pipe or a cron log gets no frames.
         both_are_terminals = _is_tty(sys.stdout) and _is_tty(sys.stderr)
+        # The stream this console writes to decides whether it is a terminal. Rich would also take a set
+        # FORCE_COLOR (or TTY_COMPATIBLE) for one, and then hide the cursor around every spinner and bold the
+        # text, in a file or a pipe too. A terminal is left to Rich (NO_COLOR, TERM=dumb and the like).
+        writes_to_a_terminal = _is_tty(sys.stderr if self._stderr else sys.stdout)
         self.console = Console(
             theme=self.theme,
             emoji=False,
             stderr=self._stderr,
+            force_terminal=None if writes_to_a_terminal else False,
             force_interactive=None if both_are_terminals else False,
         )
 

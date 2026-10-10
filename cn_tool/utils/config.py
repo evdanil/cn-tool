@@ -71,6 +71,8 @@ BASE_CONFIG_SCHEMA = {
     "cache_index_skip_ip_vendors": {"section": "cache", "ini_key": "index_skip_ip_vendors", "type": "list[str]", "fallback": ""},
     "cache_sqlite_cache_size": {"section": "cache", "ini_key": "sqlite_cache_size", "type": "str", "fallback": "16M"},
     "cache_sqlite_mmap_size":  {"section": "cache", "ini_key": "sqlite_mmap_size", "type": "str", "fallback": "32M"},
+    "ping_history_file":     {"section": "ping", "ini_key": "history_file", "type": "path", "fallback": "~/.cn-ping-history.db"},
+    "ping_history_days":     {"section": "ping", "ini_key": "history_days", "type": "int", "fallback": 30},
     "theme_name":            {"section": "theme", "ini_key": "theme", "type": "str", "fallback": "default"},
     # Config Analyzer (external TUI) settings
     "config_repo_history_dir":     {"section": "config_repo", "ini_key": "history_dir", "type": "str", "fallback": "history"},

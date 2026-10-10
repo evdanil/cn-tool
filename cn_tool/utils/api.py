@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 from urllib.parse import quote
 
 from cn_tool.core.base import Credentials, ScriptContext
@@ -55,6 +56,9 @@ _session_pool_size = _DEFAULT_INFOBLOX_MAX_WORKERS
 _inheritance_support_by_endpoint: Dict[str, bool] = {}
 _inheritance_support_lock = threading.Lock()
 _inheritance_support_inflight: Dict[str, threading.Event] = {}
+# ``[api] verify_ssl = false``: the one process-wide warning filter and the one log line, set by the first request.
+_tls_off_lock = threading.Lock()
+_tls_off_noted = False
 
 
 def _sanitize_infoblox_worker_limit(value: Any) -> int:
@@ -80,6 +84,44 @@ def bound_infoblox_workers(ctx_or_cfg: Any, task_count: int) -> int:
     return max(1, min(task_count, get_infoblox_max_workers(ctx_or_cfg)))
 
 
+class _InFlightLimiter:
+    """
+    Holds back the Infoblox requests beyond the ceiling ``[api] max_workers``, whoever sends them.
+
+    A pool sized with ``bound_infoblox_workers`` bounds only its own requests. A lookup nests pools (``cn subnet``
+    runs a pool of CIDRs, and each CIDR a pool of its requests, ``1 + 3k`` of them on a grid of k network views;
+    address resolution runs a pool of addresses with a pool of views inside), so the pools multiply: up to
+    ``max_workers`` x ``max_workers`` requests at once, where the setting promises ``max_workers`` in all. This count
+    is process wide and sits in ``InfobloxClient._request_once``, the one function every request passes through, so
+    the ceiling holds whatever the call sites and their pools do, and no call site has to know about it.
+
+    A slot is held only while one HTTP call runs. Nothing that holds a slot waits for anything else (not for another
+    slot, a pool or a lock), so a request that waits for a slot never waits for one that is held by a waiter: the
+    holders always finish, and nested pools cannot deadlock on it.
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._in_flight = 0
+
+    @contextlib.contextmanager
+    def slot(self, limit: int) -> Iterator[None]:
+        """Wait until fewer than ``limit`` requests are in flight, count this one, and uncount it on exit."""
+        with self._condition:
+            while self._in_flight >= limit:
+                self._condition.wait()
+            self._in_flight += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._in_flight -= 1
+                self._condition.notify_all()
+
+
+_IN_FLIGHT = _InFlightLimiter()
+
+
 def _build_http_adapter(pool_size: int) -> HTTPAdapter:
     """An https adapter with a connection pool of ``pool_size`` that retries idempotent requests on transient errors."""
     from requests.adapters import HTTPAdapter
@@ -92,6 +134,30 @@ def _build_http_adapter(pool_size: int) -> HTTPAdapter:
         backoff_factor=2,
     )
     return HTTPAdapter(max_retries=retries, pool_connections=pool_size, pool_maxsize=pool_size)
+
+
+def _note_tls_verification_off(ctx: ScriptContext) -> None:
+    """
+    ``[api] verify_ssl = false``: ignore urllib3's ``InsecureRequestWarning`` for the rest of the process and say
+    once in the log that the certificate is not checked. Both happen on the first request that runs unverified,
+    under a lock, before it is sent, so a request in a worker thread never meets the warning unfiltered.
+
+    The filter is process wide on purpose: ``warnings.catch_warnings()`` around a request is not thread safe (the
+    request that leaves it first restores the filters the other one saw, and the warning comes back on stderr).
+    Only that one class is ignored. urllib3 loads here, not at start.
+    """
+    global _tls_off_noted
+    with _tls_off_lock:
+        if _tls_off_noted:
+            return
+        from urllib3.exceptions import InsecureRequestWarning
+
+        warnings.simplefilter("ignore", InsecureRequestWarning)
+        _tls_off_noted = True
+    ctx.logger.warning(
+        "TLS certificate verification is off ([api] verify_ssl = false): the Infoblox server is not authenticated; "
+        "urllib3's InsecureRequestWarning is not shown."
+    )
 
 
 def _session_is_built() -> bool:
@@ -528,20 +594,18 @@ class InfobloxClient:
             SSLError,
             Timeout,
         )
-        from urllib3.exceptions import InsecureRequestWarning
 
         verify_ssl = bool(ctx.cfg.get("api_verify_ssl", True))
+        if not verify_ssl:
+            _note_tls_verification_off(ctx)
         timeout = int(ctx.cfg.get("api_timeout", 10))
 
         def send() -> InfobloxResult:
             response = _build_response(500, url=full_url)
 
             try:
-                with warnings.catch_warnings():
-                    if not verify_ssl:
-                        warnings.simplefilter("ignore", InsecureRequestWarning)
+                with _IN_FLIGHT.slot(get_infoblox_max_workers(ctx)):  # [api] max_workers requests at most, in all
                     response = self._session.get(full_url, verify=verify_ssl, timeout=timeout)
-
                 response.raise_for_status()
             except Timeout:
                 response = _build_response(504, url=full_url)

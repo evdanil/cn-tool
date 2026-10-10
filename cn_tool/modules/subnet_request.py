@@ -3,7 +3,8 @@ import ipaddress
 import json
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Executor, ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from time import perf_counter
@@ -17,6 +18,7 @@ from cn_tool.utils.api import (
     WAPI_MAX_ROWS,
     bound_infoblox_workers,
     describe_infoblox_failure,
+    get_infoblox_max_workers,
     request_result,
     request_result_with_inheritance,
 )
@@ -30,8 +32,11 @@ from cn_tool.utils.network_views import (
     NETWORK_VIEW,
     NETWORK_VIEW_TITLE,
     ViewScope,
+    merge_view_results,
     present_rows,
+    request_in_views,
     scope_network,
+    scoped_uris,
     view_scope,
 )
 from cn_tool.utils.process_data import CONTAINER_UTILIZATION_SCALE, process_data, utilization_percent
@@ -44,7 +49,12 @@ NetworkObject = Union[ipaddress.IPv4Network, ipaddress.IPv6Network, ipaddress.IP
 RowDict = Dict[str, Any]
 
 #: Tables of one subnet's details, in the order the menu shows them (the rest follow alphabetically).
-DETAIL_TABLE_ORDER = ("general", "DHCP range", "DHCP options", "DHCP members", "DHCP failover", "DNS records", "fixed addresses")
+DETAIL_TABLE_ORDER = (
+    "general", "DHCP range", "DHCP options", "DHCP members", "DHCP failover", "DNS records", "fixed addresses", "IP addresses",
+)
+#: The menu's title of the ``IP addresses`` table is "IP addresses in use": a suffix, because the section name is also its
+#: JSON key (``ip_addresses``), and the command line titles every section by its name.
+DETAIL_TABLE_SUFFIX = {"general": "Information", "IP addresses": "in use"}
 #: The section (and menu table) listing the containers inside a container prefix; they are listed, never expanded.
 CHILD_CONTAINERS = "child containers"
 #: What ``cn subnet`` always returns besides ``subnets``, the child containers and ``warnings``, so the JSON keys do not depend on the data.
@@ -59,7 +69,18 @@ MALFORMED_MESSAGE = "Not an IP address or network."
 #: and ``{cidr}`` the network as ``str(network)``; every URI then goes through ``scope_network``. The IPv4
 #: entries are the strings the requests were always built from. IPv6 asks only for the fields its objects
 #: have: ``ipv6network`` has no ``dhcp_utilization`` (WAPI answers 400 to it), ``ipv6range`` has no
-#: ``failover_association`` and no utilisation or host counts, and ``ipv6fixedaddress`` has the DUID.
+#: ``failover_association`` and no utilisation or host counts, ``ipv6fixedaddress`` has the DUID and no MAC
+#: (WAPI answers 400 to ``mac_address``, which lost every IPv6 fixed address of a subnet), and ``ipv6address``
+#: has the DUID and no MAC either.
+#: ``IP addresses`` lists every used address with all its record types: ``status=USED`` is searchable and
+#: leaves out the unused addresses (and the network and broadcast address) on the server, which keeps a /16
+#: from being 65,536 rows; ``types`` can only be matched with ``=`` (no ``!``, no ``~``), so the DHCP-range
+#: fillers cannot be excluded there and are dropped when the answer is parsed (they count against the paging
+#: cap of each view). ``status=USED`` leads, so that the URI does not begin like the ``DNS records`` one
+#: (``ipv4address?network=``): whatever tells requests apart by their start, as the test fakes do, keeps the two apart.
+#: The grid answers ``contains``, ``DNS records``, ``range bundle``, ``fixed addresses`` and ``IP addresses`` for
+#: ONE network view (the default one when the request names none), so with no view chosen they are sent once for
+#: each view of the grid (``RESTRICTED_TO_ONE_VIEW``); the other purposes search every view.
 WAPI_URIS: Dict[int, Dict[str, str]] = {
     4: {
         "contains": "network?contains_address={address}",
@@ -73,6 +94,9 @@ WAPI_URIS: Dict[int, Dict[str, str]] = {
             "dhcp_utilization,dhcp_utilization_status,dynamic_hosts,static_hosts,total_hosts,network_view"
         ),
         "fixed addresses": "fixedaddress?network={cidr}&_return_fields=ipv4addr,mac,name,network_view",
+        "IP addresses": (
+            "ipv4address?status=USED&network={cidr}&_return_fields=ip_address,names,types,usage,mac_address,lease_state,network_view"
+        ),
     },
     6: {
         "contains": "ipv6network?contains_address={address}",
@@ -82,9 +106,14 @@ WAPI_URIS: Dict[int, Dict[str, str]] = {
         "network bundle": "ipv6network?network={cidr}&_return_fields=network,comment,extattrs,options,members,network_view",
         "DNS records": "ipv6address?network={cidr}&usage=DNS&_return_fields=ip_address,names,network_view",
         "range bundle": "ipv6range?network={cidr}&_return_fields=network,start_addr,end_addr,member,network_view",
-        "fixed addresses": "ipv6fixedaddress?network={cidr}&_return_fields=ipv6addr,duid,mac_address,name,network_view",
+        "fixed addresses": "ipv6fixedaddress?network={cidr}&_return_fields=ipv6addr,duid,name,network_view",
+        "IP addresses": (
+            "ipv6address?status=USED&network={cidr}&_return_fields=ip_address,names,types,usage,duid,lease_state,network_view"
+        ),
     },
 }
+#: The purposes (keys of ``WAPI_URIS``) whose request the grid answers for one network view only.
+RESTRICTED_TO_ONE_VIEW = frozenset({"contains", "DNS records", "range bundle", "fixed addresses", "IP addresses"})
 #: The sections the range answer feeds, which are also its warning labels; IPv6 has no failover section.
 RANGE_SECTIONS: Dict[int, Tuple[str, ...]] = {4: ("DHCP range", "DHCP failover"), 6: ("DHCP range",)}
 #: The column of a fixed address's DHCPv6 identity (JSON ``duid``), shown whenever the run has an IPv6 object.
@@ -136,6 +165,17 @@ def _wapi_uri(purpose: str, network: Network, network_view: str = "") -> str:
     """The lookup ``purpose`` (a key of ``WAPI_URIS``) for ``network``, in the table of its family, limited to one view."""
     template = WAPI_URIS[network.version][purpose]
     return scope_network(template.format(address=str(network.network_address), cidr=str(network)), network_view)
+
+
+def _views_for(purpose: str, network_view: str, all_views: Sequence[str]) -> Tuple[str, ...]:
+    """
+    The views the lookup ``purpose`` is sent to, one request each; () is the one request that names no view.
+    A requested view takes every lookup. Otherwise only a lookup that the grid answers for one view
+    (``RESTRICTED_TO_ONE_VIEW``) goes to each of ``all_views``: the others search every view in one request.
+    """
+    if network_view:
+        return (network_view,)
+    return tuple(all_views) if purpose in RESTRICTED_TO_ONE_VIEW else ()
 
 
 def _is_truncation(warning: str) -> bool:
@@ -247,7 +287,7 @@ class InputResolutionResult:
 @dataclass(frozen=True)
 class SubnetFetchOutcome:
     """
-    What the four lookups of one CIDR returned. ``data`` is the part of the answers that named no
+    What the lookups of one CIDR returned. ``data`` is the part of the answers that named no
     network view (today's data); ``by_view`` has one entry for each view the answers named. The
     warnings belong to the CIDR, so every view shares them.
     """
@@ -323,7 +363,10 @@ class SubnetRequestModule(BaseModule):
             start = perf_counter()
 
             # --- 2. Resolve all inputs into an ordered list of query targets ---
-            query_targets, resolution_errors, containers = self._resolve_inputs_to_targets(ctx, user_inputs, scope.requested)
+            all_views = scope.all_views()  # the views to ask where the grid answers for one view only
+            query_targets, resolution_errors, containers = self._resolve_inputs_to_targets(
+                ctx, user_inputs, scope.requested, all_views
+            )
             self._print_resolution_errors(ctx, resolution_errors)
             if not query_targets:
                 if containers:  # only child containers: they are the answer, there is no subnet to look up
@@ -340,7 +383,9 @@ class SubnetRequestModule(BaseModule):
             logger.info(f"Resolved to {len(unique_networks)} unique subnets for data fetching.")
             console.print(f"[{colors['description']}]Found [{colors['success']}]{len(unique_networks)}[/] unique subnets to query.[/]")
 
-            subnet_data_cache, subnet_warning_cache, views_by_network = self._fetch_subnets(ctx, unique_networks, scope.requested)
+            subnet_data_cache, subnet_warning_cache, views_by_network = self._fetch_subnets(
+                ctx, unique_networks, scope.requested, all_views
+            )
 
             # --- 4. Prepare data for display and saving ---
             query_targets, subnet_data_cache, subnet_warning_cache, containers, save_view = self._settle_views(
@@ -405,13 +450,17 @@ class SubnetRequestModule(BaseModule):
             duid = self._has_ipv6_object(candidates)
             scope = view_scope(ctx, args, request_result)
             query_targets, resolution_errors, containers = [], {}, []
+            all_views: Tuple[str, ...] = ()
             if candidates:
                 ensure_infoblox_auth(ctx)
                 view_problem = scope.problem()
                 if view_problem:  # a view that is not on the grid, or a grid that cannot say: nothing is looked up
                     ctx.console.print(f"cn subnet: {view_problem.message}", markup=False)
                     return CliResult(view_problem.exit_code, {})
-                query_targets, resolution_errors, containers = self._resolve_inputs_to_targets(ctx, candidates, scope.requested)
+                all_views = scope.all_views()  # the views to ask where the grid answers for one view only
+                query_targets, resolution_errors, containers = self._resolve_inputs_to_targets(
+                    ctx, candidates, scope.requested, all_views
+                )
             # An input that is only a container prefix, with child containers and no subnets, is answered too.
             resolved_inputs = {target.original_input for target in query_targets} | {row["container"] for row in containers}
             misses = [
@@ -433,7 +482,9 @@ class SubnetRequestModule(BaseModule):
 
             unique_networks = self._unique_networks(query_targets)
             ctx.logger.info(f"Resolved to {len(unique_networks)} unique subnets for data fetching.")
-            subnet_data_cache, subnet_warning_cache, views_by_network = self._fetch_subnets(ctx, unique_networks, scope.requested)
+            subnet_data_cache, subnet_warning_cache, views_by_network = self._fetch_subnets(
+                ctx, unique_networks, scope.requested, all_views
+            )
 
             query_targets, subnet_data_cache, subnet_warning_cache, containers, save_view = self._settle_views(
                 ctx, scope, query_targets, subnet_data_cache, subnet_warning_cache, views_by_network, containers,
@@ -573,11 +624,12 @@ class SubnetRequestModule(BaseModule):
             ctx.console.print(f"[{colors['description']}]{prefix}: {note}[/]")
 
     def _fetch_subnets(
-        self, ctx: ScriptContext, networks: List[Network], network_view: str = ""
+        self, ctx: ScriptContext, networks: List[Network], network_view: str = "", all_views: Sequence[str] = ()
     ) -> tuple[Dict[str, Dict], Dict[str, List[str]], Dict[str, Tuple[str, ...]]]:
         """
         Fetch every CIDR in parallel (``network_view`` limits the lookups to one view, "" searches every
-        view): (data, warnings, views). Data and warnings are keyed by the CIDR's text, only when
+        view, asking each of ``all_views`` where the grid answers for one view only; see
+        ``_fetch_all_data_for_subnet``): (data, warnings, views). Data and warnings are keyed by the CIDR's text, only when
         non-empty. The part of a CIDR's answers that names no view is its data under the plain CIDR;
         the part of each view it names is under ``_cache_key(_make_network(cidr, view))``. ``views`` lists,
         for each CIDR whose answers named any, those views (sorted).
@@ -586,10 +638,18 @@ class SubnetRequestModule(BaseModule):
         subnet_data_cache: Dict[str, Dict] = {}
         subnet_warning_cache: Dict[str, List[str]] = {}
         views_by_network: Dict[str, Tuple[str, ...]] = {}
+        # Two pools, not a pool in every CIDR's worker: the CIDR workers (at most W) only wait, and the requests of
+        # all the CIDRs share one pool of W threads, so a run holds at most 2W worker threads however many CIDRs and
+        # views it has. The request pool is opened first so that it is closed last, after the CIDR workers are done.
         with ctx.console.status(f"[{colors['description']}]Fetching subnets information...[/]"):
-            with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(networks))) as executor:
+            with (
+                ThreadPoolExecutor(max_workers=get_infoblox_max_workers(ctx)) as requests_pool,
+                ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(networks))) as executor,
+            ):
                 future_to_net = {
-                    executor.submit(self._fetch_and_process_subnet_data, ctx, network, network_view): network
+                    executor.submit(
+                        self._fetch_and_process_subnet_data, ctx, network, network_view, all_views, requests_pool
+                    ): network
                     for network in networks
                 }
 
@@ -687,22 +747,28 @@ class SubnetRequestModule(BaseModule):
         return list(dict.fromkeys(inputs))
 
     def _resolve_inputs_to_targets(
-        self, ctx: ScriptContext, inputs: List[str], network_view: str = ""
+        self, ctx: ScriptContext, inputs: List[str], network_view: str = "", all_views: Sequence[str] = ()
     ) -> tuple[List[QueryTarget], Dict[str, str], List[Dict[str, Any]]]:
         """
         Takes raw user input strings and resolves them into an ordered list of QueryTarget objects.
         This preserves the original input and its order. Also returns the errors by input and the
         child containers of every container prefix, which are listed but never expanded.
-        ``network_view`` limits every lookup to that view; "" searches every view.
+        ``network_view`` limits every lookup to that view; "" searches every view, asking each of
+        ``all_views`` where the grid answers for one view only (an address).
         """
         all_targets: List[QueryTarget] = []
         errors: Dict[str, str] = {}
         containers: List[Dict[str, Any]] = []
         with ctx.console.status(f"[{get_global_color_scheme(ctx.cfg)['description']}]Resolving inputs and finding subnets...[/]"):
-            # Using executor.map preserves the order of the inputs
-            with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(inputs))) as executor:
+            # The input workers only wait; the address lookups of all of them share one request pool (see _fetch_subnets).
+            with (
+                ThreadPoolExecutor(max_workers=get_infoblox_max_workers(ctx)) as requests_pool,
+                ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(inputs))) as executor,
+            ):
+                # Using executor.map preserves the order of the inputs
                 results_generator = executor.map(
-                    lambda item: self._resolve_single_input_detailed(ctx, item, network_view), inputs
+                    lambda item: self._resolve_single_input_detailed(ctx, item, network_view, all_views, requests_pool),
+                    inputs,
                 )
                 for original_input, resolution in zip(inputs, results_generator):
                     if resolution.failure_message:
@@ -763,12 +829,21 @@ class SubnetRequestModule(BaseModule):
         return False
 
     def _resolve_single_input_detailed(
-        self, ctx: ScriptContext, an_input: str, network_view: str = ""
+        self,
+        ctx: ScriptContext,
+        an_input: str,
+        network_view: str = "",
+        all_views: Sequence[str] = (),
+        executor: Optional[Executor] = None,
     ) -> InputResolutionResult:
         """
         Worker function to resolve a single input string into one or more network objects.
 
-        Every lookup is limited to ``network_view`` when one is given. An answer item that names its
+        Every lookup is limited to ``network_view`` when one is given. The address lookup
+        (``network?contains_address=``) is answered for one view only, the default one when the request
+        names none, so without a ``network_view`` it is sent to each of ``all_views`` and the answers are
+        joined (``merge_view_results``): a view that does not hold the address adds nothing, and a failure
+        in any view is the input's failure. An answer item that names its
         view gives a ``ViewNetwork`` (``ViewNetwork6`` for IPv6): an address found in two views resolves
         to a target for each, and a container's children are targets per (network, view). An item without
         a view gives a plain network, as it always did (an address: the first item). A network without a
@@ -785,7 +860,11 @@ class SubnetRequestModule(BaseModule):
         try:
             net = self._parse_network(an_input)
             if net.prefixlen == net.max_prefixlen:
-                result = request_result(ctx, _wapi_uri("contains", net, network_view), ensure_auth=False)
+                answers = request_in_views(
+                    ctx, {"contains": _wapi_uri("contains", net)}, _views_for("contains", network_view, all_views),
+                    request_fn=request_result, executor=executor,
+                )
+                result = merge_view_results([answer for _, answer in answers["contains"]])
                 if result.ok and result.has_items:
                     labelled = {
                         _make_network(item["network"], item["network_view"])
@@ -864,16 +943,22 @@ class SubnetRequestModule(BaseModule):
         return rows
 
     def _fetch_and_process_subnet_data(
-        self, ctx: ScriptContext, network: Network, network_view: str = ""
+        self,
+        ctx: ScriptContext,
+        network: Network,
+        network_view: str = "",
+        all_views: Sequence[str] = (),
+        executor: Optional[Executor] = None,
     ) -> SubnetFetchOutcome:
         """
         Fetches all data for a single subnet, processes it, and prepares it for display.
-        This function is designed to be run in a thread pool for a *unique* network.
+        This function is designed to be run in a thread pool for a *unique* network; ``executor`` is the request
+        pool that all those workers share (see ``_fetch_all_data_for_subnet``).
 
         The ``process_data`` hook runs once on the data that named no view (always, when no view was
         named at all: that is today's single call) and once on the data of each view the answers named.
         """
-        outcome = self._fetch_all_data_for_subnet(ctx, network, network_view)
+        outcome = self._fetch_all_data_for_subnet(ctx, network, network_view, all_views, executor)
         processed_data = outcome.data
         if outcome.data or not outcome.by_view:
             processed_data = self.execute_hook('process_data', ctx, outcome.data)
@@ -881,14 +966,34 @@ class SubnetRequestModule(BaseModule):
         return SubnetFetchOutcome(data=processed_data, warnings=outcome.warnings, by_view=by_view)
 
     def _fetch_all_data_for_subnet(
-        self, ctx: ScriptContext, network: Network, network_view: str = ""
+        self,
+        ctx: ScriptContext,
+        network: Network,
+        network_view: str = "",
+        all_views: Sequence[str] = (),
+        executor: Optional[Executor] = None,
     ) -> SubnetFetchOutcome:
         """
-        Fetches all related data points for a single subnet in parallel: four requests, each one asking
+        Fetches all related data points for a single subnet in parallel: five lookups, each one asking
         for the ``network_view`` field (``network_view`` limits them to that view; "" searches every view).
         The URIs come from ``WAPI_URIS`` by the subnet's family: an IPv6 subnet asks the IPv6 objects only
         for the fields they have, and its range answer feeds the ``DHCP range`` section alone (Infoblox
-        holds no failover association for it), so IPv6 has no utilisation figures and no failover.
+        holds no failover association for it), so IPv6 has no utilisation figures and no failover. The
+        fifth lookup lists every used address of the subnet by type (the ``IP addresses`` section).
+
+        The network bundle spans the views, but the grid answers the DNS records, the ranges, the fixed
+        addresses and the used addresses (``RESTRICTED_TO_ONE_VIEW``) for one view: the default one when the
+        request names none. So with no ``network_view`` and several ``all_views`` (``ViewScope.all_views``)
+        each of those four is sent once for each view, and the bundle once: ``1 + 4k`` requests. A view
+        without the network answers the 400 "does not match any network", a miss that adds nothing; a failure
+        in a view is a warning for the CIDR, and the other views keep their rows. The used addresses of a view
+        are parsed from that view's own answer (its items name it), so the rows of two views of one CIDR stay
+        two groups, and a DHCP range's fillers count against the 10,000-row cap of each view.
+
+        The requests run on ``executor`` when the caller gives one: ``_fetch_subnets`` passes the one request
+        pool that the workers of all its CIDRs share, so the pools do not multiply (a pool in every CIDR's worker
+        would hold W x W threads). Without one the requests get a pool of their own, bounded by ``[api]
+        max_workers``. The calling thread must not be a thread of ``executor``: it waits on the futures.
 
         Every answer is split by the view its items name. The part that names none is ``data``; each
         view gets its own entry in ``by_view`` and is parsed on its own, so one view's description or
@@ -897,38 +1002,48 @@ class SubnetRequestModule(BaseModule):
         net_str = str(network)
         paged_request = partial(request_result, paged=True)  # these lists can outgrow one WAPI page
         range_sections = RANGE_SECTIONS[network.version]
-        request_specs = {
+        request_specs = {  # the key is the purpose of the lookup (a key of WAPI_URIS)
             "network bundle": {
-                "uri": _wapi_uri("network bundle", network, network_view),
                 "parser_types": ("general", "network options"),
                 "warning_labels": ("general", "network options"),
                 "request_fn": request_result_with_inheritance,
             },
             "DNS records": {
-                "uri": _wapi_uri("DNS records", network, network_view),
                 "parser_types": ("DNS records",),
                 "warning_labels": ("DNS records",),
                 "request_fn": paged_request,
             },
             "range bundle": {
-                "uri": _wapi_uri("range bundle", network, network_view),
                 "parser_types": range_sections,
                 "warning_labels": range_sections,
                 "request_fn": paged_request,
             },
             "fixed addresses": {
-                "uri": _wapi_uri("fixed addresses", network, network_view),
                 "parser_types": ("fixed addresses",),
                 "warning_labels": ("fixed addresses",),
                 "request_fn": paged_request,
             },
+            "IP addresses": {
+                "parser_types": ("IP addresses",),
+                "warning_labels": ("IP addresses",),
+                "request_fn": paged_request,
+            },
         }
+        planned = [  # (lookup, uri): one for the bundle, one for each view for the three the grid answers per view
+            (label, uri)
+            for label in request_specs
+            for _, uri in scoped_uris(_wapi_uri(label, network), _views_for(label, network_view, all_views))
+        ]
         partitions: Dict[str, Dict[str, Any]] = {}  # network view -> its parsed sections; "" = no view named
         warnings: List[str] = []
-        with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(request_specs))) as executor:
+        pool = (
+            nullcontext(executor) if executor is not None
+            else ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(planned)))
+        )
+        with pool as running:
             future_to_label = {
-                executor.submit(spec["request_fn"], ctx, spec["uri"], ensure_auth=False): label
-                for label, spec in request_specs.items()
+                running.submit(request_specs[label]["request_fn"], ctx, uri, ensure_auth=False): label
+                for label, uri in planned
             }
             for future in as_completed(future_to_label):
                 label = future_to_label[future]
@@ -974,7 +1089,7 @@ class SubnetRequestModule(BaseModule):
         unlabelled = partitions.pop("", defaultdict(list))
         return SubnetFetchOutcome(
             data=unlabelled,
-            warnings=warnings,
+            warnings=list(dict.fromkeys(warnings)),  # the same line from the requests of two views is said once
             by_view={view: partitions[view] for view in sorted(partitions)},
         )
 
@@ -1095,8 +1210,8 @@ class SubnetRequestModule(BaseModule):
         the column, even when no network is left to carry it (every input missed), and it is the view a
         miss row names; without one a miss row's view is blank.
 
-        ``duid`` (the run has an IPv6 object) gives every ``fixed addresses`` row a ``DUID`` column, empty for
-        an IPv4 address; without it an IPv4 run has no such column.
+        ``duid`` (the run has an IPv6 object) gives every ``fixed addresses`` and ``IP addresses`` row a ``DUID``
+        column, empty for an IPv4 address; without it an IPv4 run has no such column.
         """
         show_view = bool(fallback_view) or any(_view_of(network) for network in networks)
         details: Dict[str, List[Dict[str, Any]]] = {name: [] for name in CLI_DETAIL_SECTIONS}
@@ -1110,6 +1225,7 @@ class SubnetRequestModule(BaseModule):
 
         no_data = self._build_summary_state({}, [])
         details["fixed addresses"] = _with_duid(details["fixed addresses"], duid)
+        details["IP addresses"] = _with_duid(details["IP addresses"], duid)
 
         miss_rows = [
             {
@@ -1232,7 +1348,7 @@ class SubnetRequestModule(BaseModule):
             print_table_data(
                 ctx,
                 data,
-                suffix={"general": "Information"},
+                suffix=DETAIL_TABLE_SUFFIX,
                 table_order=list(DETAIL_TABLE_ORDER),
             )
             return
@@ -1272,7 +1388,9 @@ class SubnetRequestModule(BaseModule):
         every row of the subnet (before ``IP``, so right after ``Original Input``), which keeps a filter
         on that column from splitting a subnet. A DNS-record or fixed-address row has the mask of its
         address (``/32``, or ``/128`` for an IPv6 address), and an IPv6 fixed address row also carries
-        its ``DUID`` (the sheet puts that column after ``MAC``).
+        its ``DUID`` (the sheet puts that column after ``MAC``). Each used address of the "IP addresses"
+        section is one more row, shaped like those, with its record types, usage and lease state in
+        ``Notes`` (``IP address: HOST; usage DNS,DHCP``): no new column, so the sheet's header is unchanged.
         """
         data_rows: List[RowDict] = []
         general_info = processed_data.get("general", [{}])[0]
@@ -1284,6 +1402,7 @@ class SubnetRequestModule(BaseModule):
         dhcp_failover = processed_data.get("DHCP failover", [])
         dns_records = processed_data.get("DNS records", [])
         fixed_addrs = processed_data.get("fixed addresses", [])
+        used_addrs = processed_data.get("IP addresses", [])
         ext_attrs = processed_data.get("Extensible Attributes", [])
         ad_info = processed_data.get("Active Directory", [{}])[0]
         inherited_fields = self._collect_save_inherited_fields(processed_data)
@@ -1327,6 +1446,18 @@ class SubnetRequestModule(BaseModule):
                 "Name": fa.get("name"), "MAC": fa.get("MAC"),
                 **({DUID: fa[DUID]} if DUID in fa else {}),  # an IPv6 fixed address; an IPv4 row has no key
                 "Notes": "Fixed IP"
+            })
+        for used in used_addrs:
+            what = "; ".join(part for part in (
+                used.get("types", ""),
+                f"usage {used['usage']}" if used.get("usage") else "",
+                f"lease {used['lease state']}" if used.get("lease state") else "",
+            ) if part)
+            data_rows.append({
+                "IP": used.get("IP address"), "Mask": _host_mask(used.get("IP address")),
+                "Name": used.get("names", ""), "MAC": used.get("MAC", ""),
+                **({DUID: used[DUID]} if DUID in used else {}),
+                "Notes": f"IP address: {what}" if what else "IP address",
             })
         if network_view:
             data_rows = present_rows(data_rows, NETWORK_VIEW_TITLE, True, fallback=network_view, before="IP")

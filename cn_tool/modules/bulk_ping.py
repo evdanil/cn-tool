@@ -56,8 +56,9 @@ _PING_RECEIVED_RE = re.compile(r"(\d+)\s+packets transmitted,\s*(\d+)\s+(?:packe
 # unreachable, "TTL expired" and "General failure" lines have neither sign. A rule that wants a letter before the sign
 # misses a Russian IPv6 reply decoded to U+FFFD and the space Japanese Windows puts before it.
 _WINDOWS_REPLY = re.compile(r"[=<]\d")
-# What iputils prints, with no counts, when an IPv6 ping cannot leave the host: no IPv6 route, or no IPv6 at all.
-_NO_ROUTE_TEXTS = ("Network is unreachable", "Address family not supported")
+# What ping prints, with no counts, when an IPv6 ping cannot leave the host: no IPv6 route, or no IPv6 at all
+# (iputils), or no route to the address (macOS ping6: "ping6: UDP connect: No route to host").
+_NO_ROUTE_TEXTS = ("Network is unreachable", "Address family not supported", "No route to host")
 _DIGITS_AND_DOTS = re.compile(r"[0-9.]+")  # never a host name, even when it is not an IPv4 address
 
 # (host as typed, address to ping and connect to): a name is resolved once, an address is its own.
@@ -507,7 +508,7 @@ class BulkPingModule(BaseModule):
 
     def _resolve(self, names: List[str]) -> Tuple[Dict[str, str], List[str]]:
         """
-        Resolve host names to addresses, each name once, in a pool of at most a batch of workers.
+        Resolve host names to addresses, each name once (``_look_up``).
         A name gets its IPv4 address; only a name with none gets its IPv6 address (``_lookup_address``).
 
         Returns:
@@ -515,10 +516,14 @@ class BulkPingModule(BaseModule):
         """
         if not names:
             return {}, []
-        with ThreadPoolExecutor(max_workers=min(BATCH_SIZE, len(names))) as pool:
-            answers = list(pool.map(_lookup_address, names))
+        answers = self._look_up(names)
         addresses = {name: address for name, address in zip(names, answers) if address}
         return addresses, [name for name, address in zip(names, answers) if not address]
+
+    def _look_up(self, names: List[str]) -> List[Optional[str]]:
+        """``_lookup_address`` for each name, in input order, in a pool of at most a batch of workers."""
+        with ThreadPoolExecutor(max_workers=min(BATCH_SIZE, len(names))) as pool:
+            return list(pool.map(_lookup_address, names))
 
     def _address_targets(self, hosts: List[str]) -> Tuple[List[Target], List[str]]:
         """Pair every host with the address to test: its own, or the one its name resolves to."""
@@ -538,17 +543,33 @@ class BulkPingModule(BaseModule):
         colors = get_global_color_scheme(ctx.cfg)
         results: List[Row] = []
         total_batches = -(-len(targets) // BATCH_SIZE)
-        for number, start in enumerate(range(0, len(targets), BATCH_SIZE), 1):
-            batch = targets[start:start + BATCH_SIZE]
+        sweep = self._sweep(targets, ctx.logger, tcp_ports, icmp)
+        for number in range(1, total_batches + 1):
             ending = f" batch {number} out of {total_batches}" if total_batches > 1 else "..."
 
             with console.status(f"[{colors['description']}]Pinging hosts{ending}[/]", spinner="dots12"):
-                batch_rows = {row["Host"]: row for row in self._ping_batch(batch, ctx.logger, tcp_ports, icmp)}
-            # Ensure the results are added in the same order as the batch was given.
-            for host, address in batch:
-                results.append(batch_rows[host] if host in batch_rows else _row(host, address, "ERROR (No Result)", tcp_ports))
+                _, rows = next(sweep)
+            results.extend(rows)
 
         return self.execute_hook('process_data', ctx, results)
+
+    def _sweep(
+        self, targets: List[Target], logger: Logger, tcp_ports: Sequence[int], icmp: bool = True
+    ) -> Iterator[Tuple[List[Target], List[Row]]]:
+        """
+        Test the targets a batch of ``BATCH_SIZE`` at a time, yielding each batch with its rows in the order given; a
+        target the batch did not report on is an ``ERROR (No Result)`` row.
+
+        No spinner and no hook: ``_ping_all`` adds both, and the Ping Monitor drives the batches under its own live view.
+        """
+        for start in range(0, len(targets), BATCH_SIZE):
+            batch = targets[start:start + BATCH_SIZE]
+            batch_rows = {row["Host"]: row for row in self._ping_batch(batch, logger, tcp_ports, icmp)}
+            # Ensure the results are added in the same order as the batch was given.
+            yield batch, [
+                batch_rows[host] if host in batch_rows else _row(host, address, "ERROR (No Result)", tcp_ports)
+                for host, address in batch
+            ]
 
     def _ping_batch(
         self, batch: List[Target], logger: Logger, tcp_ports: Sequence[int] = (), icmp: bool = True
@@ -654,8 +675,9 @@ class BulkPingModule(BaseModule):
         """
         Classify ping results, keeping any reply as success while reporting probe loss.
 
-        An IPv6 ping that printed no counts but says ``Network is unreachable`` or ``Address family
-        not supported`` never left this host: it is ``NO ROUTE``, neither an answer nor a failure.
+        An IPv6 ping that printed no counts but says ``Network is unreachable``, ``Address family
+        not supported`` or ``No route to host`` never left this host: it is ``NO ROUTE``, neither an
+        answer nor a failure.
         An IPv4 ping with the same output stays ``ERROR``.
 
         On Windows the answer is the number of reply lines (``_windows_reply_count``): its summary is in the

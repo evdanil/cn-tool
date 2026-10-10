@@ -251,7 +251,10 @@ def _probe_every_view(ctx: ScriptContext, scope: ViewScope) -> str:
     """
     The first network view a search without a view did not reach, or "" (nothing was missed, or the probe
     could not tell). Two requests: one network of the first non-default view, then the same CIDR asked for
-    in no view. A search that spans every view must return the copy in the first view too.
+    in no view. A search that spans every view must return the copy in the first view too. It checks the
+    searches by network that a lookup sends once (a subnet by its CIDR, the site search); the requests about
+    an address, which the grid answers for the default view only, are sent once for each view (see
+    ``ViewScope.all_views``) and need no probe.
     """
     from cn_tool.utils.api import request_result
 

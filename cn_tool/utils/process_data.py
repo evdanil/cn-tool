@@ -342,18 +342,57 @@ def _parse_dhcp_failover_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[
 
 
 def _parse_fixed_addresses_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """Parses data for the 'fixed addresses' type."""
+    """
+    Parses data for the 'fixed addresses' type. An IPv4 fixed address has a ``mac``; an IPv6 one has a DUID and
+    no MAC (``ipv6fixedaddress`` has no such field), so its ``MAC`` cell stays empty, there for the one shape of a mixed run.
+    """
     processed_data = defaultdict(list)
     processed_data["fixed addresses"] = [
         {
             "IP address": addr["ipv4addr"] if "ipv4addr" in addr else addr.get("ipv6addr", ""),
             "name": addr.get("name", ""),
-            "MAC": addr["mac"] if "mac" in addr else addr.get("mac_address", ""),
+            "MAC": addr.get("mac", ""),
             # An IPv6 fixed address always has the key, also when it matches by MAC and has no DUID.
             **({"DUID": addr.get("duid") or ""} if "ipv6addr" in addr else {}),
         }
         for addr in raw_data
     ]
+    return processed_data
+
+
+#: The types of an address that is only part of the subnet's structure, not of anything anyone put there: the
+#: network and broadcast addresses, and the filler addresses of a DHCP range (the "DHCP range" section describes it).
+STRUCTURAL_ADDRESS_TYPES = frozenset({"NETWORK", "BROADCAST", "DHCP_RANGE"})
+
+
+def _parse_ip_addresses_data(raw_data: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Parses the 'IP addresses' type: the used addresses of a subnet (``ipv4address`` / ``ipv6address``
+    objects), one row each with all of its record types, whatever they are.
+
+    An address whose types are all structural (``STRUCTURAL_ADDRESS_TYPES``) has no row; one that is
+    structure and something else (a lease inside a range) keeps all of its types. An unknown type is
+    printed as returned, and an address with no type at all keeps a row with an empty ``types``. An IPv4
+    item gets ``MAC``, an IPv6 item (it has the ``duid`` field) gets ``DUID`` instead. With nothing left
+    there is no section: an empty one would make a subnet that has no other data read as partial.
+    """
+    rows: List[Dict[str, Any]] = []
+    for item in raw_data:
+        types = list(item.get("types") or [])
+        if types and all(kind in STRUCTURAL_ADDRESS_TYPES for kind in types):
+            continue
+        rows.append({
+            "IP address": item.get("ip_address", ""),
+            "types": ",".join(types),
+            "usage": ",".join(item.get("usage") or []),
+            "names": ", ".join(item.get("names") or []),
+            "lease state": item.get("lease_state") or "",
+            **({"MAC": item["mac_address"] or ""} if "mac_address" in item else {}),
+            **({"DUID": item["duid"] or ""} if "duid" in item else {}),
+        })
+    processed_data = defaultdict(list)
+    if rows:
+        processed_data["IP addresses"] = rows
     return processed_data
 
 
@@ -444,4 +483,5 @@ DATA_PARSERS = {
     "DHCP range": _parse_dhcp_range_data,
     "DHCP failover": _parse_dhcp_failover_data,
     "fixed addresses": _parse_fixed_addresses_data,
+    "IP addresses": _parse_ip_addresses_data,
 }

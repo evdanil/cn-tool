@@ -27,7 +27,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 import warnings
-from typing import Any, Callable, Dict, NoReturn, Optional, TypeVar
+from typing import Any, Callable, Dict, List, NoReturn, Optional, TypeVar
 
 # This suppresses the specific CryptographyDeprecationWarning from paramiko
 # which can be noisy on some systems.
@@ -67,6 +67,7 @@ from cn_tool.utils.cache_status import build_cache_status_line
 from cn_tool.utils.cli_input import read_objects
 from cn_tool.utils.render import FORMATS, emit
 from cn_tool.utils.config_history import parse_since
+from cn_tool.utils.ping_history import parse_duration, parse_window
 from cn_tool.utils.network_views import parse_view_name
 from cn_tool.utils.validation import ipv6_form_problem, is_fqdn, parse_tcp_ports, validate_and_normalize_mac_address
 from cn_tool.core.background import start_background_tasks
@@ -232,6 +233,7 @@ CLI_COMMANDS: tuple[tuple[str, str], ...] = (
     ("fqdn", "DNS records containing TEXT, 3+ chars (menu 3)"),
     ("site", "subnets of a site code, or a keyword with -k (menu 4)"),
     ("ping", "ICMP/TCP reachability of hosts and subnets (menu 6)"),
+    ("monitor", "ping over a period, with history (menu m)"),
     ("diff", "config changes of devices since a time (menu c)"),
     ("doctor", "configuration, credential and Infoblox checks (menu s)"),
     ("init", "write a starting configuration to ~/.cn"),
@@ -272,7 +274,8 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "Subnet details from Infoblox: general data and extensible attributes, DHCP ranges with "
             "utilisation, options, members and failover, DNS records and fixed addresses. Lists are paged up "
             "to 10,000 rows per subnet. For IPv6 subnets Infoblox reports no DHCP utilisation and no failover, "
-            "so those cells are empty."
+            "so those cells are empty. Every used address is also listed with all its record types (HOST, A, "
+            "PTR, FA, RESERVATION, LEASE, ...)."
         ),
         "objects": (
             "10.1.2.0/24, 10.1.2.0/255.255.255.0, 2001:db8:20::/64, or an address (its subnet); a container "
@@ -414,6 +417,61 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
         "examples": ("cn init",),
         "exit": "exit: 0 written, 2 the file exists (nothing changed), 3 it could not be written.",
     },
+    # Last on purpose: _OPTION_OWNERS keeps the first command that declares a flag, so --tcp stays
+    # ping's and --since diff's in the hint for a bare object.
+    "monitor": {
+        "menu": ("m", "Ping Monitor"),
+        "about": (
+            "Pings the targets round after round and records every round in the ping history ([ping] "
+            "history_file, default ~/.cn-ping-history.db): which hosts were seen, when first and last, and "
+            "when they stayed online. Targets, --tcp and the limits are cn ping's. Without --every and --for "
+            "it records one round and adds the earlier rounds of the same targets to the summary. --list, "
+            "--show and --follow read the history and ping nothing."
+        ),
+        "menu_line": 'Same as menu item m, "Ping Monitor".',
+        "objects": "10.1.2.3, 2001:db8::5, a host name, or 10.1.2.0/24; '-' reads objects from stdin",
+        "objects_optional_with": ("list", "show", "follow"),
+        "options": (
+            {
+                "flags": ("--tcp",), "metavar": "PORTS", "type": _arg_type(parse_tcp_ports), "default": None,
+                "help": "also connect to these TCP ports, e.g. 22,443 (up to 5), as cn ping does",
+            },
+            {
+                "flags": ("--every",), "metavar": "INTERVAL", "type": _arg_type(parse_duration), "default": None,
+                "help": "start a round every INTERVAL (30s, 5m, 1h; at least 10s); without --for, until q or Ctrl+C",
+            },
+            {
+                "flags": ("--for",), "dest": "run_for", "metavar": "DURATION", "type": _arg_type(parse_duration),
+                "default": None,
+                "help": "stop starting rounds after DURATION (30m, 2h, 1d; at least 10s); without --every, one round"
+                        " a minute",
+            },
+            {
+                "flags": ("--since",), "metavar": "WHEN", "type": _arg_type(parse_window), "default": None,
+                "help": "earlier rounds to include: 24h, 7d, 2026-10-01 (UTC); default all kept, 0m this run only",
+            },
+            {"flags": ("--list",), "action": "store_true", "help": "list the recorded requests, running ones included; no targets"},
+            {
+                "flags": ("--show",), "metavar": "ID", "default": None,
+                "help": "the summary of a recorded request (an ID or a prefix from --list); no targets",
+            },
+            {
+                "flags": ("--follow",), "metavar": "ID", "default": None,
+                "help": "the live view of a request another process is recording, then its summary; needs a terminal",
+            },
+        ),
+        "examples": (
+            "cn monitor 10.1.2.0/24 --for 2h --every 1m",
+            "cn monitor --file sites.txt --tcp 22",
+            "cn monitor --list",
+            "cn monitor --show a3f9 --since 24h --format md",
+        ),
+        "exit": (
+            "exit: 0 a host was seen in the window (with --tcp: a port was open), 1 none was, 2 invalid input or "
+            "options, no such ID, or --follow without a terminal, 3 a probe could not run, the history could not "
+            "be read or written (the summary is still printed) or the report failed, 130 a second Ctrl+C."
+        ),
+    },
 }
 
 _USAGE = (
@@ -477,10 +535,14 @@ _VALUE_FLAGS = {
     if spec.get("action") not in _NO_VALUE_ACTIONS
     for flag in spec["flags"]
 }
-# flag -> the command that takes it, for the options that belong to one command (``cn 10.1.2.3 --tcp 443``)
-_OPTION_OWNERS = {
-    flag: name for name, detail in _COMMAND_DETAILS.items() for spec in detail.get("options", ()) for flag in spec["flags"]
-}
+# flag -> the command that takes it, for the options that belong to one command (``cn 10.1.2.3 --tcp 443``). The
+# first command that declares a flag keeps it: monitor repeats --tcp and --since, which stay ping's and diff's.
+_OPTION_OWNERS: dict[str, str] = {}
+for _name, _detail in _COMMAND_DETAILS.items():
+    for _spec in _detail.get("options", ()):
+        for _flag in _spec["flags"]:
+            _OPTION_OWNERS.setdefault(_flag, _name)
+del _name, _detail, _spec, _flag
 
 
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
@@ -662,6 +724,22 @@ def _infer_command(argv: list[str]) -> list[str]:
     return [*argv[:start], command, *argv[start:]]
 
 
+def _takes_no_objects(args: argparse.Namespace) -> bool:
+    """A mode of the command that reads no objects (``cn monitor --list``): its spec's ``objects_optional_with``."""
+    # Given as an option, even empty (``--show ''``): its value is checked later, never read as no option at all.
+    names = _COMMAND_DETAILS[args.command].get("objects_optional_with", ())
+    return any(getattr(args, name, None) not in (None, False) for name in names)
+
+
+def _check_monitor_modes(args: argparse.Namespace) -> None:
+    """``cn monitor``'s mode conflicts are usage errors, found before anything is read or started."""
+    from cn_tool.modules.ping_monitor import usage_problem  # only cn monitor needs the module this early
+
+    problem = usage_problem(args)
+    if problem:
+        _usage_error(problem)
+
+
 def _writes_report(command: Optional[str]) -> bool:
     """The menu and most commands write a report; ``diff`` and ``doctor`` do not."""
     return command is None or _COMMAND_DETAILS[command].get("report", True)
@@ -838,7 +916,9 @@ def _read_cli_objects(args: argparse.Namespace) -> None:
         hint = f"did you mean 'cn {args.command} -'?" if piped else f"see cn {args.command} --help"
         _input_error(f"cn: no objects given; {hint}")
     # The module reads the objects again (it is testable on its own); handing it the resolved
-    # list makes that a pass-through that never touches stdin.
+    # list makes that a pass-through that never touches stdin. The file's name stays known: cn monitor
+    # names a recorded request by it.
+    args.source_file = None if args.file in (None, "-") else args.file
     args.objects, args.file = objects, None
 
 
@@ -961,7 +1041,9 @@ def main() -> None:
         console.set_stderr(True)  # from here on stdout carries results only
         if args.command == "init":
             sys.exit(_init_config())  # before objects and start-up: no configuration, no module, no log
-        if _COMMAND_DETAILS[args.command]["objects"] is not None:
+        if args.command == "monitor":
+            _check_monitor_modes(args)  # before stdin is read: a mode that takes no objects never consumes it
+        if _COMMAND_DETAILS[args.command]["objects"] is not None and not _takes_no_objects(args):
             _read_cli_objects(args)  # before any plugin connects: '-' is consumed, bad input never logs in
 
     ctx, modules = _startup(args)
@@ -972,6 +1054,16 @@ def main() -> None:
 
 
 # --- Interactive menu -----------------------------------------------------------------------------
+# The structure and order of the menu: a section header, then its keys.
+_MENU_LAYOUT: Dict[str, List[str]] = {
+    "--- Tasks ---": ['1', '2', '3', '4', '5', '6', 'm', '7', '8', '9', 'b', 'o', 't'],
+    # Keep 'a' for your existing module and add 'c' for Config Analyzer
+    "--- Info ---": ['a', 'c'],
+    "--- Reporting ---": ['e', 'd', 'u'],
+    "--- Application ---": ['s', '0']
+}
+
+
 def _run_menu(ctx: ScriptContext, loaded_modules: Dict[str, BaseModule]) -> None:
     """The interactive menu: start the cache and the writer, then loop until the user exits."""
     cfg = ctx.cfg
@@ -983,18 +1075,9 @@ def _run_menu(ctx: ScriptContext, loaded_modules: Dict[str, BaseModule]) -> None
 
     colors = get_global_color_scheme(cfg)
     menu_header = """  """
-    # Define the structure and order of your menu
-    menu_layout = {
-        "--- Tasks ---": ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'b', 'o', 't'],
-        # Keep 'a' for your existing module and add 'c' for Config Analyzer
-        "--- Info ---": ['a', 'c'],
-        "--- Reporting ---": ['e', 'd', 'u'],
-        "--- Application ---": ['s', '0']
-    }
-
     menu_lines = [menu_header, f"    [{colors['error']} {colors['title']}]MENU[/][{colors['code']}]"]
 
-    for header, keys in menu_layout.items():
+    for header, keys in _MENU_LAYOUT.items():
         # A flag to track if we should print the header for this section
         header_printed = False
         section_lines = []

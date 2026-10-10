@@ -1,25 +1,40 @@
 """
 Infoblox network views: which view a lookup searches, how to scope a request to it and when to show it.
 
-Every Infoblox lookup asks the same three questions, and this module answers all of them so the
+Every Infoblox lookup asks the same four questions, and this module answers all of them so the
 lookup modules only call it:
 
 * which network view to search (``--view``, ``--all-views`` or ``[api] network_view``);
 * how to scope a request URI to that view (``scope_network`` and ``scope_dns``);
-* whether the view column shows in the result (``ViewScope.column`` and ``ViewScope.result_column``).
+* whether the view column shows in the result (``ViewScope.column`` and ``ViewScope.result_column``);
+* which views to ask when none is chosen (``ViewScope.all_views``, ``request_in_views`` and
+  ``merge_view_results``).
+
+The last one exists because the WAPI does not search every view when a request names none. The
+searches by network (``network?network=``, ``network_container=``, an extensible attribute or a
+comment) and by record name span the views, but a request about an address, or about the objects of
+one network (``ipv4address?ip_address=``, ``network?contains_address=``, ``ipv4address?network=``,
+``range?network=``, ``fixedaddress?network=`` and the IPv6 twins) is answered for the default view only.
+So a lookup that wants every view sends such a request once for each view and joins the answers.
 
 ``utils.api`` imports this module, so this module imports ``utils.api`` only inside functions.
 """
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+import contextlib
+import json
+from dataclasses import dataclass, field, replace
+from typing import (
+    TYPE_CHECKING, Any, Callable, Dict, Hashable, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, TypeVar,
+)
 from urllib.parse import quote
 
 from cn_tool.core.base import ScriptContext
 
 if TYPE_CHECKING:
+    from concurrent.futures import Executor
+
     from cn_tool.utils.api import InfobloxResult
 
 # Row keys of the view column. The JSON name of the first two is ``network_view``, of DNS_VIEW ``dns_view``.
@@ -55,6 +70,110 @@ def scope_network(uri: str, network_view: str) -> str:
 def scope_dns(uri: str, dns_view: str) -> str:
     """``uri`` limited to one DNS view (``&view=``), for the DNS record searches; unchanged for ""."""
     return f"{uri}&view={quote(dns_view, safe='')}" if dns_view else uri
+
+
+Key = TypeVar("Key", bound=Hashable)
+
+
+def scoped_uris(uri: str, views: Sequence[str]) -> List[Tuple[str, str]]:
+    """
+    ``(view, uri)`` for each of ``views``: ``uri`` limited to that view, in the order given. Without
+    views it is ``[("", uri)]``, the request unchanged (the byte-identical single request of a grid
+    with one view, or of a grid whose views could not be listed).
+    """
+    if not views:
+        return [("", uri)]
+    return [(view, scope_network(uri, view)) for view in views]
+
+
+def request_in_views(
+    ctx: ScriptContext,
+    uris: Mapping[Key, str],
+    views: Sequence[str],
+    *,
+    request_fn: Optional[RequestFn] = None,
+    paged: bool = False,
+    executor: Optional[Executor] = None,
+) -> Dict[Key, List[Tuple[str, InfobloxResult]]]:
+    """
+    Send every request of ``uris`` (a key for each WAPI path) once for each view of ``views``, and return
+    the answers by key: ``[(view, result)]`` in the order of ``views``. Without views each request is sent
+    once, as it is, and its view is "".
+
+    The requests run on ``executor`` when the caller gives one, else on a pool of their own bounded by
+    ``[api] max_workers``. A caller that already runs in a pool of its own (``cn subnet`` resolving many
+    addresses) passes one request pool that all its workers share, so the pools do not multiply into
+    W x W threads; a worker that waits on this call must not itself be a thread of ``executor``. The
+    ceiling on requests in flight is held by the client (``api._InFlightLimiter``), not by the pools.
+
+    This is the one place that asks the views one by one, for the requests the WAPI answers for the default
+    view when they name none (see the module text). ``request_fn`` is the module's own name for
+    ``request_result`` (None: ``utils.api.request_result``); a request is sent with ``ensure_auth=False``,
+    because a lookup has logged in already, and with ``paged=True`` only when ``paged`` is set.
+    """
+    if not uris:
+        return {}
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    from cn_tool.utils import api  # here, not at the top: utils.api imports this module
+
+    send = api.request_result if request_fn is None else request_fn
+    options: Dict[str, Any] = {"paged": True} if paged else {}
+    jobs = [(key, view, uri) for key, base in uris.items() for view, uri in scoped_uris(base, views)]
+    if len(jobs) == 1:  # one request needs no pool: the calling thread sends it, as it always did
+        results = [send(ctx, jobs[0][2], ensure_auth=False, **options)]
+    else:
+        pool = (
+            contextlib.nullcontext(executor) if executor is not None
+            else ThreadPoolExecutor(max_workers=api.bound_infoblox_workers(ctx, len(jobs)))
+        )
+        with pool as running:
+            futures = [running.submit(send, ctx, uri, ensure_auth=False, **options) for _, _, uri in jobs]
+            results = [future.result() for future in futures]
+    answers: Dict[Key, List[Tuple[str, InfobloxResult]]] = {key: [] for key in uris}
+    for (key, view, _), result in zip(jobs, results):
+        answers[key].append((view, result))
+    return answers
+
+
+def _items_of(result: InfobloxResult) -> List[Dict[str, Any]]:
+    """The items of an answer: ``items``, else the list its ``content`` holds (a fake carries only the bytes)."""
+    if result.items:
+        return list(result.items)
+    try:
+        payload = json.loads(result.content)
+    except (TypeError, ValueError):
+        return []
+    return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+
+def merge_view_results(results: Sequence[InfobloxResult]) -> InfobloxResult:
+    """
+    The answers of one request asked in several views, as the one answer a single unscoped request would
+    have given if the grid searched every view. ``results`` is not empty, in view order.
+
+    - Any failure (anything but a hit or a miss) is the merge's failure: the first one, in view order.
+    - Otherwise the items of every answered view are joined, in view order, with the content to match; a
+      view that missed (the grid's 400 "no network holds the address", or a 404) contributes nothing, and
+      the merge is truncated when any view was.
+    - It is a miss only when every view missed. It then is a record miss (not "no network holds the
+      address") as soon as one view said so, because a network holds the address somewhere.
+
+    A single result is returned as it is, so a grid with one view sees the very result of its request.
+    """
+    if len(results) == 1:
+        return results[0]
+    failure = next((result for result in results if result.failed), None)
+    if failure is not None:
+        return failure
+    answered = [result for result in results if result.ok]
+    if not answered:
+        return next((result for result in results if not result.no_network), results[0])
+    items = [item for result in answered for item in _items_of(result)]
+    return replace(
+        answered[0], items=items, content=json.dumps(items).encode(), truncated=any(r.truncated for r in answered)
+    )
 
 
 def present_rows(
@@ -147,8 +266,10 @@ class ViewScope:
     a lookup was scoped. ``json`` tells that the run renders JSON.
 
     The grid's views are read lazily, at most once per run, and only when the answer matters: a
-    requested view must exist, or the rows carry views and the number of views decides whether the
-    view column shows. Unlabelled answers without a requested view never trigger the request.
+    requested view must exist, a lookup with no requested view that must ask each view (``all_views``)
+    needs the list, or the rows carry views and the number of views decides whether the view column
+    shows. For a lookup that asks each view only for the column (``site``, ``fqdn``), unlabelled answers
+    without a requested view never trigger the request.
     """
 
     def __init__(
@@ -166,6 +287,7 @@ class ViewScope:
         self.json = json
         self._request_fn = request_fn  # None: utils.api.request_result, looked up when it is called
         self._grid: Optional[GridViews] = None
+        self._fallback_logged = False  # all_views() said once that it fell back to the default view
 
     # -- the grid ------------------------------------------------------------------------------------
 
@@ -248,6 +370,28 @@ class ViewScope:
             return ()
         return tuple(self.grid().dns.get(self.requested, ()))
 
+    def all_views(self) -> Tuple[str, ...]:
+        """
+        The network views to ask, one request each, for the requests the WAPI answers for the default view
+        when they name none (``request_in_views``): every view of the grid in name order when none is
+        requested and the grid has more than one. () otherwise, and then a lookup sends its request as it
+        always did: a requested view is applied by the caller (one scoped request), a grid with one view
+        needs no argument, and a grid whose views cannot be listed is searched in its default view only
+        (logged once), which is what such a lookup did before.
+
+        The first call may read the grid's views (one request, kept for the run), so call it from the main
+        thread, after the login.
+        """
+        if self.requested:
+            return ()
+        grid = self.grid()
+        if grid.error:
+            if not self._fallback_logged:
+                self._fallback_logged = True
+                self._ctx.logger.warning("Without the list of network views a lookup searches the default network view only.")
+            return ()
+        return tuple(sorted(grid.names)) if len(grid.names) > 1 else ()
+
     # -- the view column -----------------------------------------------------------------------------
 
     def column(self, labels: Iterable[Any], *, dns: bool = False) -> bool:
@@ -270,9 +414,13 @@ class ViewScope:
         return (grid.dns_view_count if dns else len(grid.names)) > 1
 
     def result_column(self, labels: Iterable[Any], *, dns: bool = False) -> bool:
-        """Whether the rows handed back to the renderer carry the view: JSON always does when a row has a label."""
+        """
+        Whether the rows handed back to the renderer carry the view: JSON always does when a row has a label,
+        and for ``dns`` (``fqdn``) without one too, because an IPAM-only host record has no DNS view and its
+        row says so with an empty ``dns_view``, like the rows of the other records.
+        """
         named = _named(labels)
-        if self.json and named:
+        if self.json and (named or dns):
             return True
         return self.column(named, dns=dns)
 

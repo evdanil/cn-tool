@@ -55,6 +55,13 @@ version = 6
 # index_batch_size = 256
 # index_skip_keyword_vendors = paloalto
 
+[ping]
+# The Ping Monitor's history (menu m, cn monitor): one SQLite file per machine. A file on a network
+# file system (NFS, SMB) works for one machine at a time.
+# history_file = ~/.cn-ping-history.db
+# Days a recorded round is kept; a run removes the older rounds when it starts.
+# history_days = 30
+
 [theme]
 # theme = default
 

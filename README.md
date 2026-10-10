@@ -4,6 +4,20 @@
 checks, configuration repository searches, and device inventory collection. It runs on Linux, macOS
 and Windows (natively, without WSL) and installs with `pipx install cn-tool`.
 
+## What's new in 0.8.0
+
+The Ping Monitor, menu item `m` and the command `cn monitor`, pings a set of targets round after
+round for as long as you choose and records every round in a history file
+(`~/.cn-ping-history.db`; SQLite from Python's standard library, so no new dependency). Its summary
+says which hosts were seen, when first and last, and when they stayed online; running the same
+targets again adds the earlier rounds. While a run goes on, a small network is drawn as a live grid,
+one character per address. The recorded requests, running ones included, can be listed, shown and
+followed from another terminal without pinging (`cn monitor --list`, `--show ID`, `--follow ID`).
+Two configuration keys are new, `[ping] history_file` and `[ping] history_days`. `cn ping` and Bulk
+PING (item 6) are unchanged, except that on macOS an IPv6 ping to an address without a route now
+reads `NO ROUTE`, as on Linux. See [Ping monitor](#ping-monitor-cn-monitor) and the release notes
+of 0.8.0 on the [Releases page](https://github.com/evdanil/cn-tool/releases).
+
 ## What's new in 0.7.0
 
 cn-tool runs natively on Windows 10 and 11 and installs from PyPI: `pipx install cn-tool` puts the
@@ -27,10 +41,12 @@ notes are on the same page.
 - IPv4 and IPv6 address, subnet, FQDN, and location lookups using the Infoblox API; a site is found
   by an Infoblox extensible attribute (`[site] ea_name`) or by subnet comment; an object held in
   several network views is listed once per view, and `--view NAME` limits a lookup to one
-- Command line (`cn subnet|ip|fqdn|site|ping|diff|doctor`) with table, JSON, Markdown and CSV
-  output and exit codes for scripts, and `cn init` to write a starting configuration
+- Command line (`cn subnet|ip|fqdn|site|ping|monitor|diff|doctor`) with table, JSON, Markdown and
+  CSV output and exit codes for scripts, and `cn init` to write a starting configuration
 - Bulk ping (IPv4 and IPv6) with an optional TCP port check, resolve, and (on Linux and macOS)
   traceroute operations
+- Ping Monitor (menu `m`, `cn monitor`): bulk ping over a period, a history between runs, a live
+  grid of a small network, and the recorded requests listed, shown and followed without pinging
 - `cn diff`: which snapshot of a device added or removed a configuration line, and who made it
 - `cn doctor`: configuration, credential and Infoblox WAPI checks
 - Configuration repository search with optional SD-WAN YAML enrichment
@@ -227,10 +243,10 @@ must read UTF-8.
 
 ### Files, reports and certificates
 
-- **Where files go.** `C:\Users\<you>\.cn`, `cn.log`, `report.xlsx` and the `.cn-cache` folder sit in
-  your profile folder, which OneDrive does not sync. The keys move them; on a roaming profile,
-  `[cache] directory = ~/AppData/Local/cn-tool/cache` keeps the cache off the network. `pipx
-  uninstall cn-tool` leaves these files behind.
+- **Where files go.** `C:\Users\<you>\.cn`, `cn.log`, `report.xlsx`, `.cn-ping-history.db` and the
+  `.cn-cache` folder sit in your profile folder, which OneDrive does not sync. The keys move them;
+  on a roaming profile, `[cache] directory = ~/AppData/Local/cn-tool/cache` keeps the cache off the
+  network. `pipx uninstall cn-tool` leaves these files behind.
 - **A report open in Excel.** Excel locks a workbook it has open, so a lookup cannot save to it.
   `cn` says `Error: Could not write the report: C:\Users\alice\report.xlsx is open in another
   program (Excel?). This result is not in the report; close the file before the next lookup.` The
@@ -246,6 +262,10 @@ must read UTF-8.
 
 - Bulk PING runs Windows' own `ping` (see [Bulk ping](#bulk-ping-cn-ping)). An IPv6 target that this
   computer has no route to reads `NO RESPONSE`, not `NO ROUTE`.
+- The Ping Monitor (see [Ping monitor](#ping-monitor-cn-monitor)): closing the window leaves the
+  run `lost`, not `stopped`, because Windows sends no SIGTERM or SIGHUP to end it cleanly; its
+  finished rounds are kept. Windows prints an IPv6 ICMP error without its sender, so an IPv6 target
+  is only ever `!` or `.` there.
 - Bulk Network Trace (menu item `t`) is not available: it needs `mtr`, which does not exist on
   Windows. `cn` says `Bulk Network Trace needs mtr, which is not available on Windows.` and returns
   to the menu.
@@ -273,11 +293,12 @@ ln -s /path/to/main.py ~/bin/cn
 
 | Command  | Objects | Returns |
 | -------- | ------- | ------- |
-| `subnet` | `10.1.2.0/24`, `10.1.2.0/255.255.255.0`, `2001:db8:20::/64` or an IP address (its subnet); a container prefix expands to its subnets and lists its child containers, not expanded | subnet summary with DHCP utilization %, DHCP ranges, DNS records, fixed addresses, extensible attributes (an IPv6 subnet has no DHCP utilization or failover); a `child containers` table for a container prefix; one summary row and one set of details per network view that holds the subnet |
+| `subnet` | `10.1.2.0/24`, `10.1.2.0/255.255.255.0`, `2001:db8:20::/64` or an IP address (its subnet); a container prefix expands to its subnets and lists its child containers, not expanded | subnet summary with DHCP utilization %, DHCP ranges, DNS records, fixed addresses, every used IP address with its record types (`HOST`, `A`, `PTR`, `FA`, `RESERVATION`, `LEASE`, ...), extensible attributes (an IPv6 subnet has no DHCP utilization or failover); a `child containers` table for a container prefix; one summary row and one set of details per network view that holds the subnet |
 | `ip`     | IPv4 and IPv6 addresses | network view (on a grid with several), subnet, DNS name, status, MAC (IPv4), DUID (IPv6) and PTR name, one row per network view that holds the address; an unused IPv4 address is reported as `UNUSED`; an address that no Infoblox network contains is in `not_found` as `No Infoblox network contains this address` |
 | `fqdn`   | names or name prefixes (at least three characters) | A, AAAA, host and CNAME records whose name contains the text, with type, DNS view (on a grid with several), zone, TTL and a PTR check |
 | `site`   | site codes; with `-k/--keyword`, keywords | the subnets of each site code, or matching each keyword, with DHCP utilization % and, on a grid with several network views, the network view |
 | `ping`   | IPv4 and IPv6 addresses, host names, `10.1.2.0/24` and `2001:db8::/120` networks | ICMP result per host and, with `--tcp 22,443`, the state of each port |
+| `monitor` | as `ping`; none with `--list`, `--show ID` or `--follow ID` | pings round after round (`--every`, `--for`) and records each round in the ping history; then the hosts seen in the window (first and last seen, rounds seen, online periods), every host's result in the last round and a summary. `--list`: the recorded requests; `--show`, `--follow`: a recorded request's summary, from the history |
 | `diff`   | device names, as in `<name>.cfg` in the configuration repositories | configuration lines added or removed since the last change or `--since`, with the snapshot, author and time |
 | `doctor` | none | one row per configuration, credential and Infoblox check |
 | `init`   | none | nothing on stdout: it writes a commented starting configuration to `~/.cn` and never overwrites a file (exit 0 written, 2 the file exists, 3 it could not be written) |
@@ -287,8 +308,10 @@ fetched separately); at the cap a warning says so. `fqdn` pages each record type
 CNAME) and its PTR search up to 10,000 rows.
 
 `ip`, `subnet`, `fqdn`, `site` and `doctor` add `--view NAME` and `--all-views` (see
-[Network views](#network-views)). `ping` adds `--tcp PORTS`, and `diff` adds `--since WHEN` and
-`--line TEXT`. `doctor` and `init` take neither objects nor `--file`. `diff`, `doctor` and `init`
+[Network views](#network-views)). `ping` adds `--tcp PORTS`; `monitor` adds `--tcp PORTS`,
+`--every INTERVAL`, `--for DURATION`, `--since WHEN`, `--list`, `--show ID` and `--follow ID`; and
+`diff` adds `--since WHEN` and `--line TEXT`. `doctor` and `init` take neither objects nor `--file`,
+and `monitor` takes no objects with `--list`, `--show` or `--follow`. `diff`, `doctor` and `init`
 write no report: they have no `--report`, and `-r FILE` is refused with exit 2. An option name is
 never abbreviated (`--rep` is an error, not `--report`).
 
@@ -308,8 +331,8 @@ A bare object is routed by its shape: `cn 10.1.2.3` or `cn 2001:db8::5` runs `ip
 or `cn 2001:db8:20::/64` runs `subnet`, `cn host.example.com` runs `fqdn`. Only an IPv4 or IPv6
 address, a network of either family or an FQDN is recognised, and the two families mix inside one
 kind (`cn 10.1.2.3 2001:db8::5` is `ip`). A MAC address, a partial address such as `10.1.2`, a
-bracketed address (`[2001:db8::1]`) and a mix of kinds exit 2. `ping`, `diff` and `doctor` are
-never inferred: use `cn ping 10.1.2.3 --tcp 443`.
+bracketed address (`[2001:db8::1]`) and a mix of kinds exit 2. `ping`, `monitor`, `diff` and
+`doctor` are never inferred: use `cn ping 10.1.2.3 --tcp 443`.
 
 ### PTR, DHCP utilization and child containers
 
@@ -387,10 +410,11 @@ cn ip 10.20.0.5 --format json | jq -r '.ip_information[] | "\(.network_view) \(.
   record goes to the row of the network view that holds its DNS view; one whose DNS view is not
   listed goes to every row. A PTR record in a DNS view of a network view where the address has no
   row is not shown.
-- **`subnet`**: four requests per network, however many views hold it. The answers are split by
-  view into one summary row and one set of details per view. The 10,000-row cap of a list is shared
-  by the views, and the warning names them (`shared by network views default, lab`). The menu
-  names the view (`Details [2/2] for: 10.20.0.0/24 in network view lab`), and the "Subnet Data
+- **`subnet`**: five requests per network on a grid with one view, and `1 + 4k` on a grid with k
+  views (the network lookup once, the DNS records, ranges, fixed addresses and used IP addresses
+  once for each view). The answers are split by view into one summary row and one set of details per
+  view. The 10,000-row cap of a list is per view and per list, and the warning says which list was
+  cut. The menu names the view (`Details [2/2] for: 10.20.0.0/24 in network view lab`), and the "Subnet Data
   Detail" sheet gets `Network view` on every row.
 - **`site`**: one row per network and view, in the grid's order.
 - **`fqdn`**: rows are sorted by name, type, address and DNS view, and a record in two DNS views is
@@ -433,7 +457,8 @@ cn ping 2001:db8:20::5 web06.example.net --tcp 443
 cn ping fe80::1%eth0
 ```
 
-An IPv4-only run sends the same requests and prints the same output as 0.4.x.
+An IPv4-only run sends the same requests and prints the same output as 0.4.x, except that `subnet`
+also lists every used address in its `IP addresses` section (one more request for each network).
 
 - **Forms.** Any spelling Python's `ipaddress` accepts works, and cn sends the compressed
   lower-case form, so two spellings of one address are one lookup and one row. Rows show the
@@ -447,8 +472,8 @@ An IPv4-only run sends the same requests and prints the same output as 0.4.x.
 - **Columns.** There is no family column; the address says which family a row is. IPv6 rows share
   each section and sheet with the IPv4 rows, and a field IPv6 lacks is an empty cell: `MAC`,
   `DHCP utilization %`, the range counts and `DHCP failover`. `DUID` (JSON `duid`) is the DHCPv6
-  identity. It appears in `ip` and in the `fixed addresses` of `subnet` whenever the run looks up
-  an IPv6 object, empty for an IPv4 row, and an IPv4-only run has none. Like `tcp_<port>`, it
+  identity. It appears in `ip` and in the `fixed addresses` and `IP addresses` of `subnet` whenever
+  the run looks up an IPv6 object, empty for an IPv4 row, and an IPv4-only run has none. Like `tcp_<port>`, it
   follows the input, not the data: read it with `.duid // ""`. DHCPv6 options are shown as
   returned, not decoded.
 - **Unused addresses and PTR names.** `ip` shows a row for each IPv6 address for which the grid
@@ -492,10 +517,95 @@ Columns: `host`, `address`, `result` (`OK`, `OK (1/2 replies)`, `NO RESPONSE`, `
 or `not run` when ICMP was skipped) and one `tcp_<port>` column per port: `open`, `closed` (refused
 or reset; a firewall that rejects connections looks the same), `timeout`, `unreachable` or
 `error`. `NO ROUTE` is an IPv6 ping from a Linux or macOS host that has no route to the address or
-no IPv6; it is the ICMP side of `unreachable`, so a run in which nothing else answered exits 1, not
-3. (On Windows the same case reads `NO RESPONSE`: the exit status is 1 either way.) The columns
-follow the arguments: `--tcp 22,443` always gives `tcp_22` and `tcp_443`. Without a `ping` command
-`cn ping` exits 2; with `--tcp` it skips ICMP and the ports decide the status.
+no IPv6 (`ping` printed no counts and says `Network is unreachable`, `Address family not supported`
+or, from macOS `ping6`, `No route to host`); it is the ICMP side of `unreachable`, so a run in which
+nothing else answered exits 1, not 3. (On Windows the same case reads `NO RESPONSE`: the exit status
+is 1 either way.) The columns follow the arguments: `--tcp 22,443` always gives `tcp_22` and
+`tcp_443`. Without a `ping` command `cn ping` exits 2; with `--tcp` it skips ICMP and the ports
+decide the status.
+
+### Ping monitor (`cn monitor`)
+
+```bash
+cn monitor 10.1.2.0/24 --for 2h --every 1m        # watch for 2 hours, then print the summary
+cn monitor 10.1.2.0/28 --every 30s                # until q or Ctrl+C
+cn monitor --file sites.txt --tcp 22              # one round, recorded, with the earlier rounds
+cn monitor --list                                 # the recorded requests, running ones included
+cn monitor --show a3f9 --since 24h --format md    # a summary from the history; nothing is pinged
+cn monitor --follow a3f9                          # the live view of a run another process records
+```
+
+`cn monitor` (menu item `m`, "Ping Monitor") pings `cn ping`'s targets, with the same limits and
+`--tcp`, round after round, and records every round in the ping history. Its summary says which
+hosts were seen, when first and last, in how many rounds, and when they stayed online
+(`09:00–09:41, 09:55–now`, UTC). A crontab line that records one round every 5 minutes:
+
+```
+*/5 * * * * cn monitor --file sites.txt --since 0m --format json >/dev/null
+```
+
+- **How long.** Without `--every` and `--for` a run is one round. `--every INTERVAL` (`30s`, `5m`,
+  `1h`; at least `10s`) starts a round every INTERVAL, until `q` or Ctrl+C unless `--for DURATION`
+  (`30m`, `2h`, `1d`) ends it; `--for` alone pings every minute. Rounds start on a grid of slots
+  (the start plus a whole number of intervals): a round that overruns skips the slots it covered,
+  and the next round starts at the next slot, never right after the late one. Names are resolved
+  again in every round.
+- **Earlier rounds.** The summary adds the rounds of the same request that the history already
+  holds, so a second run continues the record. `--since WHEN` (`24h`, `7d`, `2026-10-01`, UTC)
+  keeps the earlier rounds from WHEN on; `--since 0m` takes this run's rounds only. The same request
+  means the same targets, normalised and sorted (`10.1.2.5/24` is `10.1.2.0/24`, a name is lower
+  case, order and duplicates do not matter), the same TCP ports and the same expanded host list. An
+  edited `--file` is a new request, and so are the same targets with other ports.
+- **The live view.** While a run goes on, and stderr is a terminal, every address of a small
+  network is one character, one block per subnet and a `Hosts` block for single addresses and
+  names; when they do not fit the terminal, one counter line per target replaces them. A host that
+  comes or goes prints a change line above the view.
+
+  | Character | Meaning |
+  | --------- | ------- |
+  | `!` | replied (in the warning colour when only some echo requests did) |
+  | `R` | rejected: the host itself sent an ICMP error, so it is up, behind its own firewall |
+  | `T` | silent to ping, but a TCP port answered (only with `--tcp`) |
+  | `x` | gone: not seen now, but seen earlier in the window |
+  | `U` | unreachable: never seen, and an ICMP error came from another address (a router, a firewall, this host), or IPv6 `NO ROUTE`; it stays until the host is seen |
+  | `E`, `?` | the probe failed; the name did not resolve |
+  | `.` | silent: no answer (a firewall that drops looks the same) |
+
+- **Keys**, read only when stdin is a terminal: `q` or the first Ctrl+C ends the run, drops the
+  round in flight and prints the summary of the finished rounds; a second Ctrl+C stops at once
+  (exit 130 on the command line); `v` switches between the grid and a table. On Linux and macOS,
+  SIGTERM and SIGHUP end a run as `q` does. Without a terminal (cron), or in the background
+  (`cn monitor ... &`, or Ctrl+Z and `bg`), nothing is drawn and no key is read, and stdout gets
+  only the result.
+- **`REJECTED` and `UNREACHABLE`**, read by the monitor only: when `cn ping` reads `NO RESPONSE`,
+  the monitor looks for an ICMP error in the ping's output, and its sender decides: the pinged
+  address is `REJECTED`, any other address (or, on macOS, a local send error) `UNREACHABLE`. A
+  reply always wins, and a line that cannot be placed stays `NO RESPONSE`. Windows prints an IPv6
+  ICMP error without its sender, so an IPv6 target there is only ever `!` or `.`. `cn ping` is
+  unchanged.
+- **`--list`** lists the recorded requests, newest first: `ID` (8 hex digits, the same in every
+  run), `Targets` (the newest run's `--file` name, then the targets), `TCP`, `Runs`, `Rounds`,
+  `Last round` and `State`: `running: round 14 of up to 120, next at 09:15:00`, `finished`,
+  `stopped early`, `failed`, or `lost at 09:14:00` (the process ended without saying so: killed, a
+  reboot, a closed console on Windows; a run is lost when it has given no sign of life for 2.5
+  intervals or 60 seconds, whichever is longer, or its process on this machine is gone).
+  **`--show ID`** prints a recorded request's summary from the history; `ID` may be a prefix of at
+  least 4 hex digits that only one request starts with. **`--follow ID`** draws the live view of a
+  run that another process records, until it ends or `q`, then prints the summary (at once, with a
+  note on stderr, when nothing records the request); it needs a terminal on stderr.
+- **The menu.** Item `m` opens at the list of recorded requests (at the target prompt when nothing
+  is recorded). A number shows that request's summary, where a window (`24h`, `2026-10-08`) narrows
+  it, `g` draws the grid of the last round, `f` follows the run going on, and `n` starts a new run
+  of the same targets. A new run asks item 6's questions, whether to include the earlier rounds,
+  then `Run for how long` (Enter: one round) and `Ping every` (Enter: 1m). With `[report]
+  auto_save` the "Ping Monitor" sheet gets every host seen, with every online period.
+- **The history** is an SQLite file, `[ping] history_file` (default `~/.cn-ping-history.db`), kept
+  for `[ping] history_days` (default 30) days. It is one file per machine: SQLite's WAL journal does
+  not work over a network file system, so a home directory on NFS or SMB works for one machine at a
+  time. `--list`, `--show`, `--follow` and the menu's list never create or change it. A killed run
+  keeps every round it finished and shows as `lost`. A history that cannot be written is reported
+  once (`cn: monitor: history: ...`) and the run goes on without it, with exit status 3; so does a
+  Python built without `sqlite3`.
 
 ### Configuration changes (`cn diff`)
 
@@ -574,9 +684,21 @@ With status 3, stdout still holds what was found.
 | 2 | no targets, a target that is not an IP address, network or name, an IPv4-mapped IPv6 address, a link-local address without an interface, more than a /16 (IPv6: a /112; 1,024 hosts with `--tcp`), bad `--tcp`, no `ping` command without `--tcp` | no devices, bad `--since` or `--line`, `-r FILE`, `[config_repo]` off | the endpoint serves no WAPI schema, `[site] ea_name` is not defined or not allowed on networks, `[api] network_view` (or `--view`) names no network view on the grid, no configuration repository directory can be read, an `[auth]` value that is not a variable name, `-r FILE` |
 | 3 | a probe could not run (`ERROR`, `error`), report not written | a repository directory, history folder or snapshot could not be read | no credentials (TACACS, or Infoblox's own account) without a terminal, a GPG file for another user, login rejected, timeout or server error, the network views could not be listed while one is selected |
 
+`cn monitor` decides by mode ("the window" is this run's rounds and the earlier ones `--since`
+keeps):
+
+| Status | A run (targets) | `--list` | `--show`, `--follow` |
+| ------ | --------------- | -------- | -------------------- |
+| 0 | a host was seen in the window; with `--tcp`, a port was `open` in some round | a request is recorded | a host was seen in the window; with TCP ports, a port was `open` |
+| 1 | no host was seen, or no round finished | nothing is recorded | no host was seen in the window |
+| 2 | as `cn ping`, and `--every` under `10s`, `--for` shorter than `--every`, a bad interval, or two modes together | `--since`, targets or another mode given | no request has that ID, or the prefix starts several; `--follow` without a terminal on stderr |
+| 3 | a probe could not run in a round of this run; the history could not be read or written (the summary is still printed); report not written | the history cannot be read | the history cannot be read; report not written |
+| 130 | a second Ctrl+C (the first ends the run with its summary) | Ctrl-C | Ctrl-C; with `--follow`, a second Ctrl+C |
+
 `--report` appends the result to the xlsx report (`[report] filename`, or `-r FILE`, which implies
 `--report`); the command line does not save without it. A report that cannot be written makes the
-status 3.
+status 3. `cn ping` writes the "Bulk PING" sheet, and `cn monitor` (a run, `--show` or `--follow`)
+the "Ping Monitor" sheet: every host seen in the window, with every online period.
 
 pandas and openpyxl load at the first save, not at start-up. If they cannot be loaded, the save
 fails with a message that names the library and the `pip install -r requirements.txt` command for
@@ -605,13 +727,26 @@ be read.
 | `fqdn`   | `fqdn`, `not_found`, `warnings` |
 | `site`   | `location`, `not_found`, `warnings` |
 | `ping`   | `ping` (`host`, `address`, `result`, `tcp_<port>`...), `not_found` |
+| `monitor` | a run: `seen`, `latest`, `summary`, `not_found`; `--list`: `requests`; `--show` and `--follow`: `seen`, `latest`, `summary` |
 | `diff`   | `compared`, `changes`, `not_found`, `warnings` |
 | `doctor` | `checks` |
 
+`cn monitor`'s columns:
+
+| Section | Columns |
+| ------- | ------- |
+| `seen` | one row per host seen in the window: `host`, `address`, `latest` (the result in the last finished round, `cn ping`'s values plus `REJECTED` and `UNREACHABLE`), `tcp_<port>` (ports in ascending order), `first_seen`, `last_seen`, `seen_rounds`, `rounds` (integers), `online` (a list of `{"from", "to"}` times, `to` `null` while a period is open in a running request) |
+| `latest` | every host of the last finished round: `host`, `address`, `result`, `tcp_<port>`; read from the history, a host that was not seen has an empty `address` |
+| `summary` | `id`, `started`, `ended`, `rounds`, `earlier_rounds`, `interval` (seconds, `null` for one round), `hosts`, `seen`, `answering` |
+| `requests` | `id`, `targets`, `tcp` (`-` for none), `runs`, `rounds`, `last_round`, `state` (`running`, `finished`, `stopped`, `failed` or `lost`), `detail` (the rest of the state, e.g. `round 14 of up to 120, next at 09:15:00`) |
+
+Times are UTC, to the second (`2026-10-09T09:14:00+00:00`).
+
 New columns: `fqdn` has `type`, `canonical`, `dns_view`, `zone`, `ttl` and `ptr`; `ip_information`
 has `network_view`, `ptr_name` and, in runs that look up an IPv6 object, `duid`; the
-`fixed_addresses` of `subnet` have `duid` in the same runs; `subnets`, `general` and `location`
-have `dhcp_utilization`;
+`fixed_addresses` and `ip_addresses` of `subnet` have `duid` in the same runs; `ip_addresses`
+(every used address of the subnet) has `ip_address`, `types`, `usage`, `names`, `lease_state` and
+`mac` (IPv4 rows); `subnets`, `general` and `location` have `dhcp_utilization`;
 `dhcp_range` has `utilization`, `utilization_status`, `leases`, `static` and `total`;
 `child_containers` has `container`, `child_container`, `comment` and `utilization`. Utilization
 values are numbers when known and `""` when not. `network_view` is in every row of
@@ -627,6 +762,7 @@ cn ip --file ips.txt --format json | jq -r '.not_found[].object'
 cn ip 10.20.0.5 --format json | jq -r '.ip_information[] | "\(.network_view) \(.subnet)"'
 cn ip 10.20.0.5 2001:db8:20::5 --format json | jq -r '.ip_information[] | "\(.ip) \(.duid // "")"'
 cn ping web01 --tcp 443 --format json | jq -r '.ping[] | select(.tcp_443 == "open") | .host'
+cn monitor --show a3f9 --since 24h --format json | jq -r '.seen[] | "\(.host) \(.seen_rounds)/\(.rounds) \(.last_seen)"'
 ```
 
 Use `set -o pipefail` so that a failed `cn` is not hidden by the status of `jq`.
@@ -714,8 +850,9 @@ earlier one):
 Save `.cn` as UTF-8; a byte-order mark is fine. A file in another encoding (a Windows ANSI code page
 with an accented letter in it) is not read: `cn` logs the parse error and runs on its defaults.
 Paths may start with `~`, and on Windows may be drive paths such as `D:\configs`. The log, the
-report, the cache and the GPG file default to `~/cn.log`, `~/report.xlsx`, `~/.cn-cache` and
-`~/cn-tool.gpg`, in your home directory on every system; the keys below move them.
+report, the cache, the GPG file and the Ping Monitor's history default to `~/cn.log`,
+`~/report.xlsx`, `~/.cn-cache`, `~/cn-tool.gpg` and `~/.cn-ping-history.db`, in your home directory
+on every system; the keys below move them.
 
 Example:
 
@@ -761,6 +898,12 @@ config_file = ~/.ssh/config
 # ea_name = Site                                          ; Infoblox extensible attribute that holds the site code (default: none)
 # comment_pattern = ^[^;]+;\s*{site}\s*(;|$)              ; where the site appears in Infoblox subnet comments
 # hostname_pattern = \b{country}{site_compact}[-_\w]*\b    ; how a site's device names look in configs
+
+[ping]
+# The Ping Monitor's history (cn monitor, menu m): one SQLite file per machine
+# history_file = ~/.cn-ping-history.db
+# Days a recorded round is kept; a run removes older rounds when it starts
+# history_days = 30
 ```
 
 Site codes and device naming differ between organisations, so by default cn-tool accepts
