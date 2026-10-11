@@ -1,6 +1,6 @@
 """Collect the objects a command-line run works on: arguments, a ``--file`` and/or stdin."""
 import sys
-from typing import Iterable, List, Optional, Sequence, TextIO
+from typing import Callable, Iterable, List, Optional, Sequence, TextIO
 
 STDIN_MARKER = "-"
 
@@ -13,7 +13,13 @@ def _tokens(lines: Iterable[str]) -> List[str]:
     return tokens
 
 
-def read_objects(objects: Sequence[str], file: Optional[str], *, stdin: Optional[TextIO] = None) -> List[str]:
+def read_objects(
+    objects: Sequence[str],
+    file: Optional[str],
+    *,
+    stdin: Optional[TextIO] = None,
+    on_terminal: Optional[Callable[[], None]] = None,
+) -> List[str]:
     """
     Objects named on the command line, then those in ``file``; the first occurrence of each wins.
 
@@ -22,12 +28,17 @@ def read_objects(objects: Sequence[str], file: Optional[str], *, stdin: Optional
     where it stands; ``--file -`` puts them after the arguments. File and stdin text is split
     into whitespace-separated tokens after dropping ``# comments`` and blank lines.
 
+    ``on_terminal`` is called once, just before stdin is read, when stdin is a terminal: a person
+    typing the objects gets no other sign that cn is waiting (a pipe or a file never calls it).
+
     Raises:
         OSError: ``file`` cannot be read, or is not UTF-8 text.
     """
     stdin_objects: List[str] = []
     if STDIN_MARKER in objects or file == STDIN_MARKER:
         stream = sys.stdin if stdin is None else stdin
+        if on_terminal is not None and stream.isatty():
+            on_terminal()
         # A piped file may carry a UTF-8 BOM; files opened here use utf-8-sig, stdin cannot.
         stdin_objects = _tokens(stream.read().removeprefix("﻿").splitlines())
 

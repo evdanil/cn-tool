@@ -426,11 +426,12 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "history_file, default ~/.cn-ping-history.db): which hosts were seen, when first and last, and "
             "when they stayed online. Targets, --tcp and the limits are cn ping's. Without --every and --for "
             "it records one round and adds the earlier rounds of the same targets to the summary. --list, "
-            "--show and --follow read the history and ping nothing."
+            "--show and --follow read the history and ping nothing. --delete and --clear remove recorded "
+            "requests from it, after asking. --rerun ID runs a recorded request again."
         ),
         "menu_line": 'Same as menu item m, "Ping Monitor".',
         "objects": "10.1.2.3, 2001:db8::5, a host name, or 10.1.2.0/24; '-' reads objects from stdin",
-        "objects_optional_with": ("list", "show", "follow"),
+        "objects_optional_with": ("list", "show", "follow", "delete", "clear", "rerun"),
         "options": (
             {
                 "flags": ("--tcp",), "metavar": "PORTS", "type": _arg_type(parse_tcp_ports), "default": None,
@@ -459,17 +460,40 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
                 "flags": ("--follow",), "metavar": "ID", "default": None,
                 "help": "the live view of a request another process is recording, then its summary; needs a terminal",
             },
+            {
+                "flags": ("--rerun",), "metavar": "ID", "default": None,
+                "help": "a new run of a recorded request (an ID or a prefix from --list) with its targets, TCP ports, "
+                        "interval and length; --every and --for change them",
+            },
+            {
+                "flags": ("--delete",), "metavar": "ID", "default": None,
+                "help": "delete a recorded request with all its runs and rounds (an ID or a prefix from --list); "
+                        "asks first",
+            },
+            {
+                "flags": ("--clear",), "action": "store_true",
+                "help": "delete every recorded request, emptying the ping history; asks first",
+            },
+            {
+                "flags": ("-y", "--yes"), "action": "store_true",
+                "help": "with --delete or --clear: do not ask (needed without a terminal)",
+            },
         ),
         "examples": (
             "cn monitor 10.1.2.0/24 --for 2h --every 1m",
             "cn monitor --file sites.txt --tcp 22",
             "cn monitor --list",
             "cn monitor --show a3f9 --since 24h --format md",
+            "cn monitor --delete a3f9",
+            "cn monitor --rerun a3f9 --for 8h",
         ),
         "exit": (
             "exit: 0 a host was seen in the window (with --tcp: a port was open), 1 none was, 2 invalid input or "
             "options, no such ID, or --follow without a terminal, 3 a probe could not run, the history could not "
-            "be read or written (the summary is still printed) or the report failed, 130 a second Ctrl+C."
+            "be read or written (the summary is still printed) or the report failed, 130 a second Ctrl+C. "
+            "--delete and --clear: 0 deleted, 1 nothing deleted (not confirmed, or nothing recorded), 2 a run of it "
+            "is going on, or no terminal to ask on and no --yes. --rerun exits as a run, and 2 while a run of the "
+            "request is going on."
         ),
     },
 }
@@ -899,6 +923,13 @@ def _stop(ctx: ScriptContext, code: int, message: str) -> NoReturn:
     raise AssertionError("exit_now returned")  # pragma: no cover
 
 
+def _say_stdin_is_read() -> None:
+    """Objects typed on a terminal: one line on stderr says that cn waits, and how the input ends."""
+    ending = "Ctrl-Z, then Enter," if oscompat.is_windows() else "Ctrl-D"  # the Windows console echoes Ctrl-D as ^D
+    message = f"cn: reading objects from standard input; end with {ending} on a line of its own."
+    console.print(message, markup=False, soft_wrap=True)
+
+
 def _read_cli_objects(args: argparse.Namespace) -> None:
     """
     Resolve the objects named on the command line (positionals, ``--file``, ``-``) into
@@ -906,7 +937,10 @@ def _read_cli_objects(args: argparse.Namespace) -> None:
     module can prompt, and a bad file or an empty list must fail before cn logs in anywhere.
     """
     try:
-        objects = read_objects(args.objects, args.file)
+        objects = read_objects(args.objects, args.file, on_terminal=_say_stdin_is_read)
+    except KeyboardInterrupt:  # typing the objects: no start-up has run yet, so there is nothing to wind down
+        console.print("\ncn: interrupted", markup=False, soft_wrap=True)
+        sys.exit(EXIT_INTERRUPTED)
     except (OSError, UnicodeDecodeError) as exc:
         source = args.file if args.file and args.file != "-" else "stdin"
         reason = getattr(exc, "strerror", None) or exc

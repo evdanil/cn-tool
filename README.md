@@ -12,7 +12,9 @@ round for as long as you choose and records every round in a history file
 says which hosts were seen, when first and last, and when they stayed online; running the same
 targets again adds the earlier rounds. While a run goes on, a small network is drawn as a live grid,
 one character per address. The recorded requests, running ones included, can be listed, shown and
-followed from another terminal without pinging (`cn monitor --list`, `--show ID`, `--follow ID`).
+followed from another terminal without pinging (`cn monitor --list`, `--show ID`, `--follow ID`), and a
+recorded request can be run again with its targets, ports, interval and length (`--rerun ID`). One request,
+or all of them, can be deleted from the history (`--delete ID`, `--clear`; both ask first).
 Two configuration keys are new, `[ping] history_file` and `[ping] history_days`. `cn ping` and Bulk
 PING (item 6) are unchanged, except that on macOS an IPv6 ping to an address without a route now
 reads `NO ROUTE`, as on Linux. See [Ping monitor](#ping-monitor-cn-monitor) and the release notes
@@ -298,7 +300,7 @@ ln -s /path/to/main.py ~/bin/cn
 | `fqdn`   | names or name prefixes (at least three characters) | A, AAAA, host and CNAME records whose name contains the text, with type, DNS view (on a grid with several), zone, TTL and a PTR check |
 | `site`   | site codes; with `-k/--keyword`, keywords | the subnets of each site code, or matching each keyword, with DHCP utilization % and, on a grid with several network views, the network view |
 | `ping`   | IPv4 and IPv6 addresses, host names, `10.1.2.0/24` and `2001:db8::/120` networks | ICMP result per host and, with `--tcp 22,443`, the state of each port |
-| `monitor` | as `ping`; none with `--list`, `--show ID` or `--follow ID` | pings round after round (`--every`, `--for`) and records each round in the ping history; then the hosts seen in the window (first and last seen, rounds seen, online periods), every host's result in the last round and a summary. `--list`: the recorded requests; `--show`, `--follow`: a recorded request's summary, from the history |
+| `monitor` | as `ping`; none with `--list`, `--show ID`, `--follow ID`, `--rerun ID`, `--delete ID` or `--clear` | pings round after round (`--every`, `--for`) and records each round in the ping history; then the hosts seen in the window (first and last seen, rounds seen, online periods), every host's result in the last round and a summary. `--list`: the recorded requests; `--show`, `--follow`: a recorded request's summary, from the history; `--rerun`: a new run of a recorded request, output as a run; `--delete`, `--clear`: one row per request deleted from the history, after asking |
 | `diff`   | device names, as in `<name>.cfg` in the configuration repositories | configuration lines added or removed since the last change or `--since`, with the snapshot, author and time |
 | `doctor` | none | one row per configuration, credential and Infoblox check |
 | `init`   | none | nothing on stdout: it writes a commented starting configuration to `~/.cn` and never overwrites a file (exit 0 written, 2 the file exists, 3 it could not be written) |
@@ -309,9 +311,10 @@ CNAME) and its PTR search up to 10,000 rows.
 
 `ip`, `subnet`, `fqdn`, `site` and `doctor` add `--view NAME` and `--all-views` (see
 [Network views](#network-views)). `ping` adds `--tcp PORTS`; `monitor` adds `--tcp PORTS`,
-`--every INTERVAL`, `--for DURATION`, `--since WHEN`, `--list`, `--show ID` and `--follow ID`; and
-`diff` adds `--since WHEN` and `--line TEXT`. `doctor` and `init` take neither objects nor `--file`,
-and `monitor` takes no objects with `--list`, `--show` or `--follow`. `diff`, `doctor` and `init`
+`--every INTERVAL`, `--for DURATION`, `--since WHEN`, `--list`, `--show ID`, `--follow ID`,
+`--rerun ID`, `--delete ID`, `--clear` and `-y/--yes`; and `diff` adds `--since WHEN` and
+`--line TEXT`. `doctor` and `init` take neither objects nor `--file`, and `monitor` takes no objects
+with `--list`, `--show`, `--follow`, `--rerun`, `--delete` or `--clear`. `diff`, `doctor` and `init`
 write no report: they have no `--report`, and `-r FILE` is refused with exit 2. An option name is
 never abbreviated (`--rep` is an error, not `--report`).
 
@@ -513,7 +516,8 @@ deadline flag, so `cn` stops a ping still running after 7 seconds); on Windows `
 Windows cn counts the reply lines instead of reading Windows' summary, which is in the user's language,
 so the answer is the same in every language.
 
-Columns: `host`, `address`, `result` (`OK`, `OK (1/2 replies)`, `NO RESPONSE`, `NO ROUTE`, `ERROR`,
+Columns: `host`, `address`, `result` (the ICMP result alone, whatever the ports did: `OK`,
+`OK (1/2 replies)`, `NO RESPONSE`, `NO ROUTE`, `ERROR`,
 or `not run` when ICMP was skipped) and one `tcp_<port>` column per port: `open`, `closed` (refused
 or reset; a firewall that rejects connections looks the same), `timeout`, `unreachable` or
 `error`. `NO ROUTE` is an IPv6 ping from a Linux or macOS host that has no route to the address or
@@ -533,6 +537,9 @@ cn monitor --file sites.txt --tcp 22              # one round, recorded, with th
 cn monitor --list                                 # the recorded requests, running ones included
 cn monitor --show a3f9 --since 24h --format md    # a summary from the history; nothing is pinged
 cn monitor --follow a3f9                          # the live view of a run another process records
+cn monitor --rerun a3f9 --for 8h                  # a3f9's targets and ports again, its interval, 8 hours
+cn monitor --delete a3f9                          # delete a recorded request (asks first)
+cn monitor --clear --yes                          # empty the history, without asking
 ```
 
 `cn monitor` (menu item `m`, "Ping Monitor") pings `cn ping`'s targets, with the same limits and
@@ -571,9 +578,17 @@ hosts were seen, when first and last, in how many rounds, and when they stayed o
   | `E`, `?` | the probe failed; the name did not resolve |
   | `.` | silent: no answer (a firewall that drops looks the same) |
 
+- **The table** (`v`) has a row for each host seen so far: `Host`, `Flag` (its character in the
+  grid, in the grid's colour; the legend under the table lists the flags that its rows show),
+  `Latest ping`, one `TCP <port>` column for each `--tcp` port (the port's state in the latest
+  round: `open`, `closed`, `timeout`, `unreachable` or `error`; empty for a host that was not seen
+  in it), `Last seen` and `Seen`. `Latest ping` is the ICMP result alone: `OK` means the echo
+  requests were answered, whatever the ports did, so a host can be `OK` and have a `closed` port,
+  and a `T` host reads `NO RESPONSE` with its open port beside it. A narrow terminal drops the
+  columns `Last seen`, `Seen` and the ports (the last first), in that order.
 - **Keys**, read only when stdin is a terminal: `q` or the first Ctrl+C ends the run, drops the
   round in flight and prints the summary of the finished rounds; a second Ctrl+C stops at once
-  (exit 130 on the command line); `v` switches between the grid and a table. On Linux and macOS,
+  (exit 130 on the command line); `v` switches between the grid and the table. On Linux and macOS,
   SIGTERM and SIGHUP end a run as `q` does. Without a terminal (cron), or in the background
   (`cn monitor ... &`, or Ctrl+Z and `bg`), nothing is drawn and no key is read, and stdout gets
   only the result.
@@ -592,20 +607,39 @@ hosts were seen, when first and last, in how many rounds, and when they stayed o
   **`--show ID`** prints a recorded request's summary from the history; `ID` may be a prefix of at
   least 4 hex digits that only one request starts with. **`--follow ID`** draws the live view of a
   run that another process records, until it ends or `q`, then prints the summary (at once, with a
-  note on stderr, when nothing records the request); it needs a terminal on stderr.
+  note on stderr, when nothing records the request); it needs a terminal on stderr. **`--rerun ID`**
+  runs a recorded request again: its stored targets and TCP ports (a `--file` is not read again),
+  with the interval and length of its newest run that pinged round after round (one round if none
+  did); `--every` and `--for` change them, each alone. On a terminal one line says what is reused. A
+  request with a run going on is refused (exit 2), so a crontab line such as `0 8 * * 1-5 cn monitor
+  --rerun a3f9 --for 8h --format json > /var/tmp/a3f9.json` never starts a second run. An override
+  sticks: the run a rerun starts is the newest run that pinged round after round, so it is the next
+  template, and `--rerun ID --for 8h` makes a later plain `--rerun ID` run for 8 hours too (the
+  one-round runs that cron feeds never replace it). **`--delete ID`** deletes one recorded request, a
+  row of `--list`, with every run, round and result of it, and **`--clear`** deletes every request.
+  Both ask first (`... Delete it from <file>? This cannot be undone. [y/N]`): only `y` or `yes`
+  deletes, anything else leaves the history alone (exit 1). Without a terminal they exit 2 and say so;
+  `--yes` (`-y`) deletes without asking, and goes with `--delete` or `--clear` only. A request with a
+  run going on is refused (`--clear`: any run), exit 2; a run that is only `lost` does not block.
+  Neither creates the history file, and `--clear` gives the space back but keeps the file (`--list`
+  then exits 1).
 - **The menu.** Item `m` opens at the list of recorded requests (at the target prompt when nothing
   is recorded). A number shows that request's summary, where a window (`24h`, `2026-10-08`) narrows
-  it, `g` draws the grid of the last round, `f` follows the run going on, and `n` starts a new run
-  of the same targets. A new run asks item 6's questions, whether to include the earlier rounds,
-  then `Run for how long` (Enter: one round) and `Ping every` (Enter: 1m). With `[report]
-  auto_save` the "Ping Monitor" sheet gets every host seen, with every online period.
+  it, `g` draws the grid of the last round, `f` follows the run going on, `n` starts a new run of the
+  same targets, `r` runs the request again with the plan its keys line names, asking nothing, and `d`
+  deletes the request after the `--delete` question (`r` and `d` are offered while no run of it goes
+  on). At the list, `c` clears the history after the `--clear` question. A new run asks item 6's
+  questions, whether to include the earlier rounds, then `Run for how long` (Enter: one round) and
+  `Ping every` (Enter: 1m). With `[report] auto_save` the "Ping Monitor" sheet gets every host seen,
+  with every online period.
 - **The history** is an SQLite file, `[ping] history_file` (default `~/.cn-ping-history.db`), kept
   for `[ping] history_days` (default 30) days. It is one file per machine: SQLite's WAL journal does
   not work over a network file system, so a home directory on NFS or SMB works for one machine at a
-  time. `--list`, `--show`, `--follow` and the menu's list never create or change it. A killed run
-  keeps every round it finished and shows as `lost`. A history that cannot be written is reported
-  once (`cn: monitor: history: ...`) and the run goes on without it, with exit status 3; so does a
-  Python built without `sqlite3`.
+  time. `--list`, `--show`, `--follow`, `--rerun` (before its run) and the menu's list never create or
+  change it. Only a run (and its prune), `--delete`, `--clear` and the menu's `d` and `c` write, and
+  the last four never create the file. A killed run keeps every round it finished and shows as
+  `lost`. A history that cannot be written is reported once (`cn: monitor: history: ...`) and the run
+  goes on without it, with exit status 3; so does a Python built without `sqlite3`.
 
 ### Configuration changes (`cn diff`)
 
@@ -687,17 +721,17 @@ With status 3, stdout still holds what was found.
 `cn monitor` decides by mode ("the window" is this run's rounds and the earlier ones `--since`
 keeps):
 
-| Status | A run (targets) | `--list` | `--show`, `--follow` |
-| ------ | --------------- | -------- | -------------------- |
-| 0 | a host was seen in the window; with `--tcp`, a port was `open` in some round | a request is recorded | a host was seen in the window; with TCP ports, a port was `open` |
-| 1 | no host was seen, or no round finished | nothing is recorded | no host was seen in the window |
-| 2 | as `cn ping`, and `--every` under `10s`, `--for` shorter than `--every`, a bad interval, or two modes together | `--since`, targets or another mode given | no request has that ID, or the prefix starts several; `--follow` without a terminal on stderr |
-| 3 | a probe could not run in a round of this run; the history could not be read or written (the summary is still printed); report not written | the history cannot be read | the history cannot be read; report not written |
-| 130 | a second Ctrl+C (the first ends the run with its summary) | Ctrl-C | Ctrl-C; with `--follow`, a second Ctrl+C |
+| Status | A run (targets, `--rerun`) | `--list` | `--show`, `--follow` | `--delete ID`, `--clear` |
+| ------ | -------------------------- | -------- | -------------------- | ------------------------ |
+| 0 | a host was seen in the window; with `--tcp`, a port was `open` in some round | a request is recorded | a host was seen in the window; with TCP ports, a port was `open` | the request (`--clear`: every request) was deleted; or (`--clear`) the leftovers of an interrupted delete were freed |
+| 1 | no host was seen, or no round finished | nothing is recorded | no host was seen in the window | nothing was deleted: the answer was not `y`, or (`--clear`) nothing is recorded, leftover rounds included |
+| 2 | as `cn ping`, and `--every` under `10s`, `--for` shorter than `--every`, a bad interval, or two modes together; with `--rerun`: no request has that ID, a run of it is going on, targets or `--tcp` given, a `--for` shorter than the interval it keeps or an `--every` longer than the length it keeps | `--since`, targets or another mode given | no request has that ID, or the prefix starts several; `--follow` without a terminal on stderr | no request has that ID (nothing recorded included), the prefix starts several IDs or has fewer than 4 hex digits; a run of the request (`--clear`: any run) is going on; no terminal to ask on and no `--yes`; targets, `--tcp`, `--every`, `--for`, `--since` or another mode given; `--yes` without `--delete` or `--clear` |
+| 3 | a probe could not run in a round of this run; the history could not be read or written (the summary is still printed); report not written; with `--rerun`: the history cannot be read (nothing started) | the history cannot be read | the history cannot be read; report not written | the history cannot be opened, read or written; nothing was deleted |
+| 130 | a second Ctrl+C (the first ends the run with its summary) | Ctrl-C | Ctrl-C; with `--follow`, a second Ctrl+C | Ctrl-C (at the question: nothing was deleted) |
 
 `--report` appends the result to the xlsx report (`[report] filename`, or `-r FILE`, which implies
 `--report`); the command line does not save without it. A report that cannot be written makes the
-status 3. `cn ping` writes the "Bulk PING" sheet, and `cn monitor` (a run, `--show` or `--follow`)
+status 3. `cn ping` writes the "Bulk PING" sheet, and `cn monitor` (a run, `--rerun`, `--show` or `--follow`)
 the "Ping Monitor" sheet: every host seen in the window, with every online period.
 
 pandas and openpyxl load at the first save, not at start-up. If they cannot be loaded, the save
@@ -727,7 +761,7 @@ be read.
 | `fqdn`   | `fqdn`, `not_found`, `warnings` |
 | `site`   | `location`, `not_found`, `warnings` |
 | `ping`   | `ping` (`host`, `address`, `result`, `tcp_<port>`...), `not_found` |
-| `monitor` | a run: `seen`, `latest`, `summary`, `not_found`; `--list`: `requests`; `--show` and `--follow`: `seen`, `latest`, `summary` |
+| `monitor` | a run or `--rerun`: `seen`, `latest`, `summary`, `not_found`; `--list`: `requests`; `--show` and `--follow`: `seen`, `latest`, `summary`; `--delete` and `--clear`: `deleted` (one row per request deleted) |
 | `diff`   | `compared`, `changes`, `not_found`, `warnings` |
 | `doctor` | `checks` |
 
@@ -735,7 +769,7 @@ be read.
 
 | Section | Columns |
 | ------- | ------- |
-| `seen` | one row per host seen in the window: `host`, `address`, `latest` (the result in the last finished round, `cn ping`'s values plus `REJECTED` and `UNREACHABLE`), `tcp_<port>` (ports in ascending order), `first_seen`, `last_seen`, `seen_rounds`, `rounds` (integers), `online` (a list of `{"from", "to"}` times, `to` `null` while a period is open in a running request) |
+| `seen` | one row per host seen in the window: `host`, `address`, `latest` (the ping result in the last finished round, never a port's answer: `cn ping`'s values plus `REJECTED` and `UNREACHABLE`), `tcp_<port>` (ports in ascending order), `first_seen`, `last_seen`, `seen_rounds`, `rounds` (integers), `online` (a list of `{"from", "to"}` times, `to` `null` while a period is open in a running request) |
 | `latest` | every host of the last finished round: `host`, `address`, `result`, `tcp_<port>`; read from the history, a host that was not seen has an empty `address` |
 | `summary` | `id`, `started`, `ended`, `rounds`, `earlier_rounds`, `interval` (seconds, `null` for one round), `hosts`, `seen`, `answering` |
 | `requests` | `id`, `targets`, `tcp` (`-` for none), `runs`, `rounds`, `last_round`, `state` (`running`, `finished`, `stopped`, `failed` or `lost`), `detail` (the rest of the state, e.g. `round 14 of up to 120, next at 09:15:00`) |

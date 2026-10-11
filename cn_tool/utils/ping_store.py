@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import json
 import re
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from cn_tool.utils.ping_history import GAP_FACTOR
 
@@ -31,6 +32,12 @@ RUN_STATUSES = ("running", "finished", "stopped", "failed")
 _FINAL_STATUSES = RUN_STATUSES[1:]
 _BUSY_TIMEOUT = 10  # seconds a connection waits for another one's write lock
 _DAY = 86400
+# sweep(): at most this many result rows in a batch, so that no write lock is held for long (22 batches, the longest
+# 0.44 s, for 30 days of the README's /24: 43,200 rounds, 4.3 million result rows); the pause between two batches is
+# over SQLite's longest busy-retry step (100 ms), so that a run waiting for the lock gets it.
+_SWEEP_RESULTS = 200_000
+_SWEEP_BATCH = 5000  # rounds looked at in one read
+_SWEEP_PAUSE = 0.15  # seconds
 _PREFIX = re.compile(r"[0-9a-fA-F]{4,}")
 Cursor = Tuple[float, int]  # (started, id) of a round: where the next page of rounds starts
 ID_MESSAGE = "'{prefix}' is not a request ID: give 4 or more hex digits"
@@ -63,6 +70,7 @@ _RUN_COLUMNS = (
     " (SELECT COUNT(*) FROM round WHERE round.run_id = run.id)"
 )
 _ROUNDS = "FROM round JOIN run ON run.id = round.run_id"
+_UNOWNED = "NOT EXISTS (SELECT 1 FROM run WHERE run.id = round.run_id)"  # a round that delete() left without its run
 
 
 class StoreError(Exception):
@@ -104,6 +112,15 @@ class RequestInfo:
     last_round: Optional[float]
     newest_run: Optional[RunInfo]
     running: Tuple[RunInfo, ...] = ()
+
+
+@dataclass(frozen=True)
+class Deletion:
+    """What ``PingStore.delete`` did: the requests it deleted, with their counts as read in its transaction; when a run
+    of them was going on (``going_on``), nothing was deleted and ``requests`` are those it would have deleted."""
+
+    requests: Tuple[RequestInfo, ...]
+    going_on: Tuple[RunInfo, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -182,15 +199,21 @@ def _exists(path: Path) -> bool:
         raise StoreError(f"cannot read {path}: {error.strerror or error}") from error
 
 
-def _reader_uri(path: Path) -> str:
-    """The read-only ``file:`` URI of ``path``. A Windows UNC path (``\\\\server\\share\\...``) turns into a URI
-    with a host, which SQLite refuses: its name goes after ``file:`` as it is, escaped, which SQLite reads as a path."""
+def _uri(path: Path, mode: str) -> str:
+    """The ``file:`` URI of ``path`` that opens the file as it is and never creates it: ``mode`` is ``ro`` or ``rw``. A
+    Windows UNC path (``\\\\server\\share\\...``) turns into a URI with a host, which SQLite refuses: its name goes
+    after ``file:`` as it is, escaped, which SQLite reads as a path."""
     uri = path.absolute().as_uri()
     if not uri.startswith("file:///"):
         from urllib.parse import quote
 
         uri = "file:" + quote(str(path.absolute()), safe="\\/:")
-    return f"{uri}?mode=ro"
+    return f"{uri}?mode={mode}"
+
+
+def _reader_uri(path: Path) -> str:
+    """The read-only ``file:`` URI of ``path``."""
+    return _uri(path, "ro")
 
 
 def _dump(value: Any) -> str:
@@ -223,41 +246,45 @@ class PingStore:
     # --- opening and closing -----------------------------------------------------------------
 
     @classmethod
-    def open(cls, path: Path, *, write: bool) -> Optional["PingStore"]:
+    def open(cls, path: Path, *, write: bool, create: bool = True) -> Optional["PingStore"]:
         """
         Open the history at ``path``, as a writer or a reader.
 
-        A reader of a missing file gets ``None`` ("nothing recorded"): ``connect()`` would create it.
-        A writer creates missing parent directories, and the schema in an empty database.
+        A reader of a missing file gets ``None`` ("nothing recorded"): ``connect()`` would create it. So does a
+        writer that passed ``create=False`` (``--delete``, ``--clear``: they never make a history), which opens the
+        file read-write by a ``mode=rw`` URI, so one removed after the check is not created again, and which
+        refuses an empty database instead of writing a schema into it. Otherwise a writer creates missing
+        parent directories, and the schema in an empty database.
 
         @raise StoreError: the file cannot be opened, is not a cn ping history (a text file, another
             program's database), or was written by a newer cn; or this Python has no ``sqlite3``.
         """
         path = Path(path)
-        if not write and not _exists(path):
+        existing_only = not write or not create
+        if existing_only and not _exists(path):
             return None
         sqlite3 = _sqlite3()
         verb = "write" if write else "read"
-        if write:
+        if write and create:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
             except OSError as error:
                 raise StoreError(f"cannot write {path}: {error.strerror or error}") from error
-        # A reader opens read-only, so a history removed since the check above is never created again.
-        uri = None if write else _reader_uri(path)
+        # Opened as it is, so a history removed since the check above is never created again.
+        uri = None if write and create else _uri(path, "rw") if write else _reader_uri(path)
         try:
             with _reported(verb, path):
                 connection = sqlite3.connect(uri or str(path), timeout=_BUSY_TIMEOUT, isolation_level=None,
                                              uri=uri is not None)
         except StoreError:
-            if not write and not _exists(path):
+            if existing_only and not _exists(path):
                 return None
             raise
         store = cls(path, connection, write=write)
         try:
             with _reported(verb, path):
                 connection.execute("PRAGMA foreign_keys = ON")  # off by default: the cascades need it
-            store._check_schema()
+            store._check_schema(create=create)
             if write:  # only once the file is known to be ours: the journal mode is stored in the file
                 with _reported(verb, path):
                     connection.execute("PRAGMA journal_mode = WAL").fetchone()
@@ -313,11 +340,12 @@ class PingStore:
                 connection.rollback()  # a no-op when SQLite has already rolled back
                 raise
 
-    def _check_schema(self) -> None:
-        """A writer creates the schema in an empty database; anything but a cn store of this version is refused."""
+    def _check_schema(self, *, create: bool = True) -> None:
+        """A writer creates the schema in an empty database (unless it must not create anything); anything but a cn
+        store of this version is refused."""
         with self._transaction(write=self._write) as connection:
             tables = {name for (name,) in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-            if not tables and self._write:
+            if not tables and self._write and create:
                 for statement in _SCHEMA:
                     connection.execute(statement)
                 connection.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
@@ -439,6 +467,102 @@ class PingStore:
                 "DELETE FROM request WHERE NOT EXISTS (SELECT 1 FROM run WHERE run.request_id = request.id)"
             )
         return int(deleted)
+
+    def delete(self, keys: Optional[Sequence[str]], *, going_on: Callable[[RunInfo], bool]) -> Deletion:
+        """
+        Delete the requests whose keys are ``keys`` (``None``: every one) with their runs, in one short transaction.
+
+        Only the ``run`` and ``request`` rows go: the rounds and their results stay, owned by no run, and every read
+        reaches a round through its run, so the request is gone, whole, at the commit, for every reader (cn 0.8.0's
+        too). ``sweep`` frees the rounds after. Deleting them here, under one lock, took 9 to 16 s for 4.3 million result
+        rows, and another run waits 10 s for the lock at most. The cascades would delete them, so foreign keys are off
+        for this transaction (SQLite ignores the pragma inside one), and on again after, whatever happens.
+
+        ``going_on`` is asked about every row of the requests that says ``running``, inside the lock: when it accepts
+        one, nothing is deleted and ``Deletion.going_on`` has those runs.
+        """
+        if not self._write:
+            raise StoreError(f"cannot write {self.path}: opened read-only")
+        sqlite3 = _sqlite3()
+        connection = self._connection
+        where, params = ("", ()) if keys is None else (f"WHERE key IN ({', '.join('?' * len(keys))})", tuple(keys))
+        with _reported("write", self.path):
+            connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with self._transaction(write=True):
+                infos = _request_infos(connection, where, params)
+                running = tuple(run for info in infos for run in info.running if going_on(run))
+                if running:
+                    return Deletion(tuple(infos), going_on=running)  # nothing was written: the commit is a no-op
+                if keys is None:
+                    connection.execute("DELETE FROM run")
+                    connection.execute("DELETE FROM request")
+                elif infos:
+                    marks = ", ".join("?" * len(infos))
+                    ids = [info.id for info in infos]
+                    connection.execute(f"DELETE FROM run WHERE request_id IN ({marks})", ids)
+                    connection.execute(f"DELETE FROM request WHERE id IN ({marks})", ids)
+                return Deletion(tuple(infos))
+        finally:
+            with suppress(sqlite3.Error):  # a closed connection has nothing to restore
+                connection.execute("PRAGMA foreign_keys = ON")
+
+    def sweep(self, *, vacuum: bool = False) -> int:
+        """
+        Free the rounds no run owns (what ``delete`` leaves), with their results, in batches of at most
+        ``_SWEEP_RESULTS`` result rows: each batch is one short transaction, and the sweep waits ``_SWEEP_PAUSE``
+        between two of them, with nothing held, so a run that records meanwhile gets the lock. Returns the number of
+        rounds freed.
+
+        Ownership is read again under each batch's lock. Only ``delete`` makes such rounds, so a sweep that ends early
+        (Ctrl+C, a crash) leaves rounds nobody sees, and the next one frees them. ``vacuum`` (after ``--clear``, which
+        leaves the file empty) also rewrites the file, under the write lock: it never follows a ``--delete``, whose
+        freed pages the next rounds reuse. The counters (``sqlite_sequence``) are kept, so a round id is never given
+        twice.
+        """
+        if not self._write:
+            raise StoreError(f"cannot write {self.path}: opened read-only")
+        freed, last = 0, 0
+        cut = self._orphans(last)
+        while cut is not None:
+            freed += self._free(last, cut)
+            last, cut = cut, self._orphans(cut)
+            if cut is not None:
+                time.sleep(_SWEEP_PAUSE)
+        if vacuum:
+            with _reported("write", self.path):
+                self._connection.execute("VACUUM")
+        return freed
+
+    def has_leftovers(self) -> bool:
+        """Whether rounds no run owns are left: what a delete whose sweep was interrupted (Ctrl+C, a crash) leaves,
+        which no reader sees. A read, for any connection."""
+        return self._orphans(0) is not None
+
+    def _orphans(self, last: int) -> Optional[int]:
+        """The id that ends the next batch of rounds no run owns after ``last``, where their result rows reach
+        ``_SWEEP_RESULTS`` (or the last one found), None when there are none. A read: it never blocks a WAL writer."""
+        with self._transaction(write=False) as connection:
+            found = connection.execute(
+                f"SELECT id, answered FROM round WHERE id > ? AND {_UNOWNED} ORDER BY id LIMIT ?", (last, _SWEEP_BATCH)
+            ).fetchall()
+        cut, results = None, 0
+        for round_id, answered in found:
+            cut, results = round_id, results + answered
+            if results >= _SWEEP_RESULTS:
+                break
+        return cut
+
+    def _free(self, last: int, cut: int) -> int:
+        """Delete the unowned rounds with an id in (``last``, ``cut``], their results first, in one transaction."""
+        with self._transaction(write=True) as connection:
+            connection.execute(
+                f"DELETE FROM result WHERE round_id IN (SELECT id FROM round WHERE id > ? AND id <= ? AND {_UNOWNED})",
+                (last, cut),
+            )
+            return int(connection.execute(
+                f"DELETE FROM round WHERE id > ? AND id <= ? AND {_UNOWNED}", (last, cut)
+            ).rowcount)
 
     def _require_run(self, cursor: "sqlite3.Cursor", run_id: str) -> None:
         if cursor.rowcount == 0:

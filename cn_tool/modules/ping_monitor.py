@@ -1,7 +1,9 @@
 # modules/ping_monitor.py
 """
 Menu item m and ``cn monitor``: ping a request round after round, record every round in the ping history, and
-summarise what was seen; list, show and follow what was recorded (docs/plans/2026-10-ping-monitor-plan.md).
+summarise what was seen; list, show and follow what was recorded (docs/plans/2026-10-ping-monitor-plan.md), delete a
+recorded request or all of them (docs/plans/2026-10-ping-history-management-plan.md), and run a recorded request again
+(docs/plans/2026-10-ping-monitor-rerun-plan.md).
 
 ``PingMonitorModule`` is ``BulkPingModule`` with its own menu item and command: target parsing, name resolution and
 the ping and TCP probes are inherited, and ``_sweep`` gives a round batch by batch. The model is
@@ -29,13 +31,15 @@ from rich.markup import escape
 
 from cn_tool.core.base import CliResult, ScriptContext, cli_exit_code
 from cn_tool.modules import bulk_ping
-from cn_tool.utils import oscompat, ping_grid, ping_live
+from cn_tool.utils import auth, oscompat, ping_grid, ping_live
 from cn_tool.utils import ping_history as ph
 from cn_tool.utils.cli_input import read_objects
 from cn_tool.utils.config_history import format_time, since_time
 from cn_tool.utils.display import console, get_global_color_scheme, print_table_data, table_columns
 from cn_tool.utils.file_io import queue_save
-from cn_tool.utils.ping_store import PingStore, RequestInfo, ResultRow, RunInfo, StoreError, StoredRound, id_problem
+from cn_tool.utils.ping_store import (
+    Deletion, PingStore, RequestInfo, ResultRow, RunInfo, StoreError, StoredRound, id_problem,
+)
 from cn_tool.utils.user_input import press_any_key, read_user_input
 
 Row = Dict[str, Any]
@@ -58,30 +62,44 @@ RUNS_SHOWN = 5  # runs a summary's header names one by one; one-round runs are c
 DISPLAY_THRESHOLD = 32  # item 6's: a subnet with more hosts shows the seen ones and one line for the rest
 _HISTORY = "cn: monitor: history: {}"
 _NO_ROUND = "No round finished."
+_MODES = ("list", "show", "follow", "rerun", "delete", "clear")
+_NOTHING_DELETED = "cn: monitor: nothing was deleted"
+_NOTHING_RECORDED = "cn: monitor: nothing is recorded; nothing was deleted"
+_KEEPS_SPACE = "the deleted rounds keep their space until the next --delete or --clear"
+_NO_USABLE_TARGET = "no usable target; see cn monitor --help"
+_CLEAR_QUESTION = "Delete all of it? This cannot be undone. [y/N] "
 
 
 def usage_problem(args: argparse.Namespace) -> Optional[str]:
     """
     What is wrong with a ``cn monitor`` command line, or None: the modes (targets, ``--list``, ``--show``,
-    ``--follow``) exclude each other, ``--every``/``--for``/``--tcp`` go with targets only, ``--since`` not with
-    ``--list``, an ID has 4 or more hex digits, and the interval and the duration are at least ``MIN_INTERVAL``.
-    ``main`` refuses with it before anything starts.
+    ``--follow``, ``--rerun``, ``--delete``, ``--clear``) exclude each other, ``--every``/``--for``/``--tcp`` go with
+    targets only (``--rerun`` takes ``--every`` and ``--for`` too: they change the plan it reuses), ``--since`` not
+    with ``--list``, ``--delete`` or ``--clear``, ``--yes`` goes with ``--delete`` or ``--clear``, an ID has 4 or more
+    hex digits, and the interval and the duration are at least ``MIN_INTERVAL``. ``main`` refuses with it before
+    anything starts (and before stdin is read).
     """
-    modes = [name for name in ("list", "show", "follow") if getattr(args, name, None) not in (None, False)]  # even ''"
+    modes = [name for name in _MODES if getattr(args, name, None) not in (None, False)]  # even ''
     since = getattr(args, "since", None)
     if len(modes) > 1:
         return " and ".join(f"--{mode}" for mode in modes) + " cannot be combined"
+    if getattr(args, "yes", False) and not {"delete", "clear"} & set(modes):
+        return "--yes goes with --delete or --clear"
     if modes:
         mode = modes[0]
         if getattr(args, "objects", None) or getattr(args, "file", None) is not None:
             return f"--{mode} takes no targets"
         for name, flag in (("tcp", "--tcp"), ("every", "--every"), ("run_for", "--for")):
+            if mode == "rerun" and name != "tcp":
+                continue  # a rerun's --every and --for override the plan it reuses
             if getattr(args, name, None) is not None:
                 return f"{flag} goes with targets, not with --{mode}"
-        if mode == "list" and since is not None:
-            return "--since does not go with --list"
-        if mode != "list":
-            return id_problem(getattr(args, mode))
+        if mode in ("list", "delete", "clear") and since is not None:
+            return f"--since does not go with --{mode}"
+        if mode in ("show", "follow", "rerun", "delete"):
+            problem = id_problem(getattr(args, mode))
+            if problem:
+                return problem
     every, run_for = getattr(args, "every", None), getattr(args, "run_for", None)
     if every is not None and every.total_seconds() < MIN_INTERVAL:
         return f"--every must be at least {int(MIN_INTERVAL)}s"
@@ -276,6 +294,141 @@ def state_text(state: str, detail: str) -> str:
     return f"{state} {detail}".strip()
 
 
+def _title(info: RequestInfo) -> str:
+    """``a3f9c2e1 · sites.txt: 10.1.2.0/24, web01.example.net +10 · TCP 22,443``: a request's line over its summary and
+    over the question that deletes it."""
+    title = f"{ph.short_id(info.key)} · {_targets_label(info)}"
+    if info.tcp_ports:
+        title += f" · TCP {','.join(str(port) for port in info.tcp_ports)}"
+    return title
+
+
+def _holds(runs: int, rounds: int, first: Optional[float], last: Optional[float]) -> str:
+    """``3 runs, 412 rounds from 2026-10-08T22:00:00+00:00 to 2026-10-09T09:14:00+00:00``; no span without a round."""
+    text = f"{_count(runs, 'run')}, {_rounds(rounds)}"
+    return f"{text} from {_when(first)} to {_when(last)}" if rounds else text
+
+
+def _clearing(path: Path, infos: Sequence[RequestInfo]) -> str:
+    """The line before the question of ``--clear`` and of the menu's ``c``: what the history holds."""
+    firsts = [info.first_round for info in infos if info.first_round is not None]
+    lasts = [info.last_round for info in infos if info.last_round is not None]
+    holds = _holds(sum(info.runs for info in infos), sum(info.rounds for info in infos),
+                   min(firsts, default=None), max(lasts, default=None))
+    return f"The ping history {path} holds {_count(len(infos), 'request')}: {holds}."
+
+
+def _asking(path: Path, infos: Sequence[RequestInfo], *, whole: bool) -> Tuple[List[str], str]:
+    """What a delete shows before it asks: the lines that say what is about to go, and the question (``--delete`` takes
+    one request, ``--clear`` and the menu's ``c`` all of them)."""
+    if whole:
+        return [_clearing(path, infos)], _CLEAR_QUESTION
+    [info] = infos
+    lines = [_title(info), _holds(info.runs, info.rounds, info.first_round, info.last_round)]
+    return lines, f"Delete it from {path}? This cannot be undone. [y/N] "
+
+
+def _tcp_column(info: RequestInfo) -> str:
+    """The ``TCP`` column of a request: its ports, or ``-``."""
+    return ",".join(str(port) for port in info.tcp_ports) or "-"
+
+
+def _confirmed(ctx: ScriptContext, question: str) -> bool:
+    """Ask ``question`` (it ends in ``[y/N]``): ``y`` or ``yes``, in any case, is a yes. Anything else is a no: Enter,
+    another answer, and the end of input (Ctrl+D; Ctrl+Z Enter on Windows). It never asks again."""
+    # read_user_input reads with markup: unescaped, Rich would take "[y/N]" (and a "[" in a path) for a tag.
+    return read_user_input(ctx, escape(question)).strip().lower() in ("y", "yes")
+
+
+def _capital(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
+def _started_on(run: RunInfo, now: float) -> str:
+    """``since 09:00:00 on host01, pid 4242``: where a run that is going on started."""
+    return f"since {_clock(run.started, now)} on {run.host}, pid {run.pid}"
+
+
+def _going_as_text(info: RequestInfo, request: Request, run: RunInfo, now: float) -> str:
+    """Why a rerun of ``info`` is refused when this cn expands its targets to another host list: the run would record
+    under ``request``, which has ``run`` going on (the command line and the menu add their own ending)."""
+    return (f"this cn expands {ph.short_id(info.key)}'s targets to another host list, recorded as {request.short_id}; "
+            f"a run of {request.short_id} is going on ({_started_on(run, now)})")
+
+
+def _no_run() -> Dict[str, List[Row]]:
+    """The sections of a run that started nothing: what a refusal prints."""
+    return {"seen": [], "latest": [], "summary": [], "not_found": []}
+
+
+# --- running a recorded request again -------------------------------------------------------------------------
+
+def _plan_text(every: Optional[float], length: Optional[float]) -> str:
+    """``every 1m for 2h``, ``every 30s until stopped`` or ``one round``."""
+    if every is None:
+        return "one round"
+    return f"every {_span(every)} " + ("until stopped" if length is None else f"for {_span(length)}")
+
+
+def _planned_length(run: RunInfo) -> Optional[float]:
+    """The length a run was planned for: ``until`` less ``started`` in whole seconds (``until`` is ``time() + --for``
+    taken a few ms before ``started``, and a typed length is whole seconds), None for a run until stopped or one round.
+    Not the time the run lasted: one stopped by ``q`` after ten minutes still reruns for its two hours."""
+    return None if run.until is None else float(round(run.until - run.started))
+
+
+@dataclass(frozen=True)
+class Rerun:
+    """What ``--rerun`` and the menu's ``r`` start: ``template``, the run whose plan is reused (None: the request has
+    no run), and the plan, a round every ``every`` seconds (None: one round) for ``length`` seconds (None: until
+    stopped). ``changed``: ``--every`` or ``--for`` made it another plan than the template's."""
+
+    template: Optional[RunInfo]
+    every: Optional[float]
+    length: Optional[float]
+    changed: bool = False
+
+    def text(self) -> str:
+        """The plan as it is run, ``every 1m for 2h``."""
+        return _plan_text(self.every, self.length)
+
+    def template_text(self) -> str:
+        """The plan of the template run, as it was recorded."""
+        if self.template is None:
+            return _plan_text(None, None)
+        return _plan_text(self.template.interval, _planned_length(self.template))
+
+
+def _rerun(short_id: str, runs: Sequence[RunInfo], *, every: Optional[float] = None, run_for: Optional[float] = None,
+           now: Optional[float] = None) -> Tuple[Rerun, Optional[str]]:
+    """
+    The plan of a request's rerun from its ``runs`` (newest first, ``PingStore.runs``), and the problem with it, if any.
+    The template is the newest run that pinged round after round, else the newest run (a request that cron feeds one
+    round at a time reruns the two-hour watch someone made, not one round). ``every`` and ``run_for`` (seconds) change
+    its interval or its length, each alone (plan section 3): a template of one round (or none) takes ``run_for`` alone
+    as a run does, every minute, and ``every`` alone until stopped. Pure, but for ``now`` (the clock the template's
+    start is shown against, default ``time.time()``): the command line and the menu share it.
+    """
+    template = next((run for run in runs if run.interval is not None), runs[0] if runs else None)
+    base_every = template.interval if template is not None else None
+    base_length = _planned_length(template) if template is not None else None
+    plan_every = base_every if every is None else every
+    plan_length = base_length if run_for is None else run_for
+    if base_every is None and every is None and run_for is not None:
+        plan_every = DEFAULT_INTERVAL  # as a run: --for alone is a round every minute
+    rerun = Rerun(template, plan_every, plan_length, (plan_every, plan_length) != (base_every, base_length))
+    problem = None
+    if template is not None and base_every is not None and (every is None) != (run_for is None):
+        started = f"{_clock(template.started, time.time() if now is None else now)} UTC"
+        if run_for is not None and run_for < base_every:
+            problem = (f"--for {_span(run_for)} is shorter than the {_span(base_every)} interval of {short_id}'s run "
+                       f"started {started}; add --every")
+        elif every is not None and base_length is not None and every > base_length:
+            problem = (f"--every {_span(every)} is longer than the {_span(base_length)} length of {short_id}'s run "
+                       f"started {started}; add --for")
+    return rerun, problem
+
+
 class PingMonitorModule(bulk_ping.BulkPingModule):
     """
     Menu item m and ``cn monitor``: a bulk ping over a period, recorded round by round, with a live grid, and the
@@ -350,13 +503,18 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         return Request(list(tokens), ordered, expanded, inputs, ph.request_key(tokens, ordered, expanded))
 
     # --- the store -----------------------------------------------------------------------------------
-    def _open_store(self, ctx: ScriptContext, *, write: bool) -> Tuple[Optional[PingStore], Optional[str]]:
-        """The store, or None with the reason. A reader of a missing file gets (None, None): nothing recorded."""
+    def _history_path(self, ctx: ScriptContext) -> Path:
         configured = ctx.cfg.get("ping_history_file")
         # "history_file =" left empty is the default: the path type reads an empty value as "." (the working directory).
-        path = Path(configured if configured and str(configured) != "." else "~/.cn-ping-history.db").expanduser()
+        return Path(configured if configured and str(configured) != "." else "~/.cn-ping-history.db").expanduser()
+
+    def _open_store(
+        self, ctx: ScriptContext, *, write: bool, create: bool = True
+    ) -> Tuple[Optional[PingStore], Optional[str]]:
+        """The store, or None with the reason. A reader of a missing file gets (None, None): nothing recorded; so does a
+        writer that passed ``create=False`` (the delete paths never make a history)."""
         try:
-            return PingStore.open(path, write=write), None
+            return PingStore.open(self._history_path(ctx), write=write, create=create), None
         except StoreError as error:
             return None, str(error)
 
@@ -389,21 +547,54 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         """The ids of the request's runs that are going on (``RunOutcome.live_runs``)."""
         return frozenset(run.id for run in (info.running if info else ()) if self._state(run)[0] == "running")
 
+    def _going_on(self, run: RunInfo) -> bool:
+        """Whether a run whose row says ``running`` is going on: live, not lost (``PingStore.delete`` asks this)."""
+        return self._state(run)[0] == "running"
+
+    def _going(self, infos: Sequence[RequestInfo]) -> List[RunInfo]:
+        """The runs of these requests that are going on, each request's newest first."""
+        return [run for info in infos for run in info.running if self._going_on(run)]
+
+    def _going_text(self, infos: Sequence[RequestInfo], runs: Sequence[RunInfo]) -> str:
+        """Why nothing is deleted: ``a run of a3f9c2e1 is going on (since 09:00:00 on host01, pid 4242); stop it or let
+        it end first; nothing was deleted``. Several runs are counted, and named with their requests when the requests
+        differ."""
+        now = time.time()
+        ids = {info.id: ph.short_id(info.key) for info in infos}
+        requests = list(dict.fromkeys(ids[run.request_id] for run in runs))
+
+        def where(run: RunInfo) -> str:
+            return _started_on(run, now)
+
+        if len(runs) == 1:
+            subject, verb, ending, detail = f"a run of {requests[0]}", "is", "stop it or let it end first", where(runs[0])
+        else:
+            subject = f"{len(runs)} runs of {requests[0]}" if len(requests) == 1 else f"{len(runs)} runs"
+            verb, ending = "are", "stop them or let them end first"
+            detail = "; ".join(where(run) if len(requests) == 1 else f"{ids[run.request_id]} {where(run)}" for run in runs)
+        return f"{subject} {verb} going on ({detail}); {ending}; nothing was deleted"
+
     # --- the command line ----------------------------------------------------------------------------
     def run_cli(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
         """
-        ``cn monitor``: a run (targets), ``--list``, ``--show ID`` or ``--follow ID``; the sections and exit status
-        of each are in plan section 2.2. ``main`` has refused every mix of modes before (``usage_problem``).
+        ``cn monitor``: a run (targets), ``--list``, ``--show ID``, ``--follow ID``, ``--delete ID``, ``--clear`` or
+        ``--rerun ID``; the sections and exit status of each are in plan section 2.2 (``--delete`` and ``--clear``:
+        the history-management plan, section 5; ``--rerun``: a run's, the rerun plan, section 4). ``main`` has
+        refused every mix of modes before (``usage_problem``).
         """
         ctx.logger.info("Request Type - Ping Monitor (command line)")
         if args.list:
             return self._cli_list(ctx, args.format)
+        if args.delete or args.clear:
+            return self._cli_delete(ctx, args)
+        if args.rerun:
+            return self._cli_rerun(ctx, args)
         if args.show or args.follow:
             return self._cli_show(ctx, args)
         return self._cli_run(ctx, args)
 
     def _cli_run(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
-        empty: Dict[str, List[Row]] = {"seen": [], "latest": [], "summary": [], "not_found": []}
+        empty = _no_run()
         try:
             objects = read_objects(args.objects, args.file)
         except (OSError, UnicodeDecodeError) as exc:  # a file that is missing, a directory or not UTF-8
@@ -413,8 +604,26 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         if not objects:
             _say("cn: monitor: no targets given; see cn monitor --help")
             return CliResult(2, empty)
+        source_file = getattr(args, "source_file", None)
+        return self._cli_track(
+            ctx, args, objects, tuple(args.tcp or ()),
+            every=args.every.total_seconds() if args.every else (DEFAULT_INTERVAL if args.run_for else None),
+            length=args.run_for.total_seconds() if args.run_for else None,
+            source=Path(source_file).name if source_file else None,
+        )
 
-        ports = tuple(args.tcp or ())
+    def _cli_track(
+        self, ctx: ScriptContext, args: argparse.Namespace, lines: Iterable[str], ports: Tuple[int, ...], *,
+        every: Optional[float], length: Optional[float], source: Optional[str],
+        before: Optional[Callable[[Request], Optional[Tuple[int, str]]]] = None,
+    ) -> CliResult:
+        """
+        What a run does with the targets it has, typed (``_cli_run``) or recorded (``_cli_rerun``): the ICMP check, the
+        request, the plan (a round every ``every`` seconds, none after ``length`` seconds from now), the run, its
+        sections, the report and the exit status. ``before`` is told the request just before the run starts and may
+        refuse it: an exit status and the line to say (nothing is started, the refused targets stay in ``not_found``).
+        """
+        empty = _no_run()
         icmp = shutil.which("ping") is not None
         missing = bulk_ping._PING_MISSING.replace("cn: ping:", "cn: monitor:")
         if not icmp:
@@ -424,19 +633,21 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
             _say(f"{missing}; ICMP skipped")
 
         not_found: List[Dict[str, str]] = []
-        request = self._request(objects, ports, lambda target, reason: not_found.append({"object": target, "reason": reason}))
+        request = self._request(lines, ports, lambda target, reason: not_found.append({"object": target, "reason": reason}))
         if request is None:
-            _say("cn: monitor: no usable target; see cn monitor --help")
+            _say(f"cn: monitor: {_NO_USABLE_TARGET}")
             return CliResult(2, {**empty, "not_found": not_found})
         invalid = bool(not_found)
 
-        every = args.every.total_seconds() if args.every else (DEFAULT_INTERVAL if args.run_for else None)
-        source = getattr(args, "source_file", None)
+        refusal = before(request) if before is not None else None
+        if refusal is not None:
+            _say(refusal[1])
+            return CliResult(refusal[0], {**empty, "not_found": not_found})
         plan = RunPlan(
             every=every,
-            until=time.time() + args.run_for.total_seconds() if args.run_for else None,
+            until=time.time() + length if length is not None else None,
             since=_since(args.since),
-            source=Path(source).name if source else None,
+            source=source,
             icmp=icmp,
         )
         outcome = self._track(ctx, request, plan)
@@ -452,6 +663,120 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         found = bool(outcome.rounds) and (outcome.tcp_open if request.ports else bool(data["seen"]))
         failed = outcome.probe_failed or outcome.store_error is not None
         return CliResult(cli_exit_code(found, invalid, failed), data)
+
+    def _cli_rerun(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
+        """
+        ``--rerun ID`` (rerun plan, section 4): a new run of a recorded request with its stored targets and ports and
+        the plan of its template run (``_rerun``), ``--every`` and ``--for`` changing it. In order: read the history (a
+        reader: it creates nothing); the request and its runs in one snapshot; a run of it going on; the plan against
+        the template; then a run's own tail (``_cli_track``). Every refusal is one stderr line, a run's empty sections
+        on stdout, and nothing started.
+        """
+        empty = _no_run()
+        store, error = self._open_store(ctx, write=False)
+        if error:
+            _say(_HISTORY.format(error))
+            return CliResult(3, empty)
+        if store is None:
+            _say(f"cn: monitor: no recorded request has the ID '{args.rerun}': nothing is recorded yet")
+            return CliResult(2, empty)
+        with store:
+            try:
+                info, problem, runs = self._request_and_runs(store, args.rerun)
+            except StoreError as exc:
+                _say(_HISTORY.format(exc))
+                return CliResult(3, empty)
+        if info is None:
+            _say(f"cn: monitor: {problem}")
+            return CliResult(2, empty)
+        short = ph.short_id(info.key)
+        now = time.time()
+        going = self._live(info, now)
+        if going is not None:
+            _say(f"cn: monitor: a run of {short} is going on ({_started_on(going, now)}); --follow {short} shows it; "
+                 "nothing was started")
+            return CliResult(2, empty)
+        rerun, problem = _rerun(
+            short, runs, every=args.every.total_seconds() if args.every else None,
+            run_for=args.run_for.total_seconds() if args.run_for else None, now=now,
+        )
+        if problem:
+            _say(f"cn: monitor: {problem}")
+            return CliResult(2, empty)
+        # Without a terminal the line is not printed: cron mails any stderr, and the README promises warnings and errors.
+        on_terminal = ping_live.LiveScreen(get_global_color_scheme(ctx.cfg)).enabled
+
+        def announce(request: Request) -> Optional[Tuple[int, str]]:
+            other, reason = self._going_as(ctx, info, request)
+            if reason is not None:
+                return 3, _HISTORY.format(reason)
+            if other is not None:
+                return 2, (f"cn: monitor: {_going_as_text(info, request, other, time.time())}; "
+                           f"--follow {request.short_id} shows it; nothing was started")
+            line, warning = self._rerun_notice(ctx, info, rerun, request, line=on_terminal)
+            if line:
+                _say(line)
+            if warning:
+                _say(f"cn: monitor: {warning}")
+            return None
+
+        return self._cli_track(
+            ctx, args, info.targets, info.tcp_ports, every=rerun.every, length=rerun.length,
+            source=info.newest_run.source if info.newest_run is not None else None, before=announce,
+        )
+
+    def _rerun_notice(
+        self, ctx: ScriptContext, info: RequestInfo, rerun: Rerun, request: Request, *, line: bool
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        What a rerun says before it starts (rerun plan, section 5), for the command line and the menu: the log line
+        (always), the line that names what is reused (``line``: only where it is wanted, else None) and the warning
+        that this cn expands the stored targets to another host list, so that the run records a new request (None when
+        it is the same one).
+        """
+        short, template = ph.short_id(info.key), rerun.template
+        if template is None:
+            ctx.logger.info("Ping Monitor - rerun of %s: %s", short, rerun.text())
+        else:
+            ctx.logger.info("Ping Monitor - rerun of %s as run %s started %s: %s", short, template.id,
+                            _when(template.started), rerun.text())
+        warning = None
+        if request.key != info.key:
+            warning = (f"this cn expands {short}'s targets to another host list ({_count(len(request.hosts), 'host')}, "
+                       f"recorded {len(info.hosts):,}); the run records a new request, {request.short_id}, without "
+                       f"{short}'s rounds")
+        if not line:
+            return None, warning
+        text = f"Re-running {_title(info)} · {rerun.text()}"
+        if template is not None:
+            started = f"{_clock(template.started, time.time())} UTC"
+            text += (f"; its run started {started}: {rerun.template_text()}" if rerun.changed
+                     else f", as its run started {started}")
+        return text, warning
+
+    def _going_as(
+        self, ctx: ScriptContext, info: RequestInfo, request: Request
+    ) -> Tuple[Optional[RunInfo], Optional[str]]:
+        """
+        The run going on of the request that a rerun of ``info`` records under, when that is not ``info`` itself: this
+        cn expands the stored targets to another host list, hence another key, and that request (a first rerun made it)
+        may have a run going on that the check of ``info``'s own runs cannot see. The request is looked up now, just
+        before the run starts, by its key. Returns (run, None) when there is one, (None, reason) when the history
+        cannot be read, else (None, None). Shared by ``--rerun`` and the menu's ``r``.
+        """
+        if request.key == info.key:
+            return None, None  # the same request: the check of its own runs was made
+        store, error = self._open_store(ctx, write=False)
+        if error:
+            return None, error
+        if store is None:
+            return None, None
+        with store:
+            try:
+                other = store.request(request.key)
+            except StoreError as exc:
+                return None, str(exc)
+        return (self._live(other) if other is not None else None), None
 
     def _cli_list(self, ctx: ScriptContext, fmt: str) -> CliResult:
         store, error = self._open_store(ctx, write=False)
@@ -479,7 +804,7 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         row.update({
             "ID": ph.short_id(info.key),
             "Targets": _targets_label(info),
-            "TCP": ",".join(str(port) for port in info.tcp_ports) or "-",
+            "TCP": _tcp_column(info),
             "Runs": info.runs,
             "Rounds": info.rounds,
             "Last round": _when(info.last_round),
@@ -502,6 +827,18 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
             candidates = ", ".join(ph.short_id(info.key) for info in matches)
             return None, f"'{prefix}' is the start of {len(matches)} IDs ({candidates}); give more digits"
         return matches[0], None
+
+    def _request_and_runs(
+        self, store: PingStore, prefix: str
+    ) -> Tuple[Optional[RequestInfo], Optional[str], List[RunInfo]]:
+        """The request that ``prefix`` names (``_find``: its reason when none) and its runs, newest first, read in one
+        snapshot, so the runs going on and the template of a rerun are of one moment. ``--rerun`` and the menu's ``r``
+        both read the history this way when they start.
+
+        @raise StoreError: the history cannot be read."""
+        with store.snapshot():
+            info, problem = self._find(store, prefix)
+            return info, problem, store.runs(info.id) if info is not None else []
 
     def _cli_show(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
         empty: Dict[str, List[Row]] = {"seen": [], "latest": [], "summary": []}
@@ -535,6 +872,119 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         self._save_report_rows(ctx, self._seen_rows(outcome, "report"))
         found = outcome.tcp_open if outcome.request.ports else bool(data["seen"])
         return CliResult(0 if found else 1, data)
+
+    # --- deleting from the history -------------------------------------------------------------------
+    def _delete(
+        self, store: PingStore, keys: Optional[Sequence[str]], *, whole: bool
+    ) -> Tuple[Deletion, Optional[str]]:
+        """
+        Delete the requests ``keys`` (None: every one) and, unless a run of them is going on or there was nothing to
+        delete, free their rounds (``whole``: and give the file's pages back). The command line and the menu share it.
+        Returns the deletion and, when the sweep failed, its reason: the records are gone by then, so that is a warning.
+
+        @raise StoreError: the delete failed, nothing was deleted.
+        """
+        deletion = store.delete(keys, going_on=self._going_on)
+        if not deletion.requests or deletion.going_on:
+            return deletion, None
+        try:
+            store.sweep(vacuum=whole)
+        except StoreError as error:
+            return deletion, str(error)
+        return deletion, None
+
+    def _deleted_row(self, info: RequestInfo) -> Row:
+        """One row of the ``deleted`` section: a request as ``--list`` shows it, with its first round too."""
+        return {
+            "ID": ph.short_id(info.key),
+            "Targets": _targets_label(info),
+            "TCP": _tcp_column(info),
+            "Runs": info.runs,
+            "Rounds": info.rounds,
+            "First round": _when(info.first_round),
+            "Last round": _when(info.last_round),
+        }
+
+    def _cli_delete(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
+        """
+        ``--delete ID`` and ``--clear`` (history-management plan, section 3). In order: no terminal to ask on and no
+        ``--yes`` (before the history is opened); open it without creating it; the request; a run going on; the
+        question; the delete. Every refusal is one stderr line and an empty ``deleted`` section.
+        """
+        whole = bool(args.clear)
+        refused: Dict[str, List[Row]] = {"deleted": []}
+        if not args.yes and not auth._can_prompt():
+            _say(f"cn: monitor: {'--clear' if whole else '--delete'} asks before deleting and there is no terminal to "
+                 "ask on; add --yes to delete without asking")
+            return CliResult(2, refused)
+        store, error = self._open_store(ctx, write=True, create=False)
+        if error:
+            _say(_HISTORY.format(error))
+            return CliResult(3, refused)
+        if store is None:
+            if whole:
+                _say(_NOTHING_RECORDED)
+                return CliResult(1, refused)
+            _say(f"cn: monitor: no recorded request has the ID '{args.delete}': nothing is recorded yet")
+            return CliResult(2, refused)
+        with store:
+            try:
+                return self._cli_delete_from(ctx, store, args)
+            except StoreError as exc:
+                _say(_HISTORY.format(exc))
+                return CliResult(3, refused)
+
+    def _cli_clear_leftovers(self, store: PingStore) -> CliResult:
+        """``--clear`` of a history with no request: exit 1, nothing recorded, unless an interrupted delete left rounds that
+        no run owns (and no reader sees). Those are freed, and the file gives its space back, as ``--clear`` does: exit
+        0, the cleanup being what was asked for. Nothing anyone can see is deleted, so nothing is asked. A run that
+        starts meanwhile is safe: its rounds have a run row, and a round without one is never anyone's."""
+        refused: Dict[str, List[Row]] = {"deleted": []}
+        freed = store.sweep(vacuum=True) if store.has_leftovers() else 0
+        if not freed:  # none there, or another cn freed them first
+            _say(_NOTHING_RECORDED)
+            return CliResult(1, refused)
+        _say(f"cn: monitor: freed {_count(freed, 'leftover round')} of an interrupted delete; the ping history is empty")
+        return CliResult(0, refused)
+
+    def _cli_delete_from(self, ctx: ScriptContext, store: PingStore, args: argparse.Namespace) -> CliResult:
+        whole = bool(args.clear)
+        refused: Dict[str, List[Row]] = {"deleted": []}
+        if whole:
+            infos = store.requests()
+            if not infos:
+                return self._cli_clear_leftovers(store)
+        else:
+            info, problem = self._find(store, args.delete)
+            if info is None:
+                _say(f"cn: monitor: {problem}")
+                return CliResult(2, refused)
+            infos = [info]
+        going = self._going(infos)
+        if going:
+            _say(f"cn: monitor: {self._going_text(infos, going)}")
+            return CliResult(2, refused)
+        if not args.yes:
+            lines, question = _asking(store.path, infos, whole=whole)
+            for line in lines:
+                _say(line)
+            if not _confirmed(ctx, question):
+                _say(_NOTHING_DELETED)
+                return CliResult(1, refused)
+        deletion, warning = self._delete(store, None if whole else [infos[0].key], whole=whole)
+        if deletion.going_on:  # a run started while the question waited
+            _say(f"cn: monitor: {self._going_text(deletion.requests, deletion.going_on)}")
+            return CliResult(2, refused)
+        if not deletion.requests:  # another cn deleted it meanwhile
+            _say(_NOTHING_RECORDED if whole
+                 else f"cn: monitor: {ph.short_id(infos[0].key)} is no longer in the ping history; nothing was deleted")
+            return CliResult(1, refused)
+        if warning:
+            _say(_HISTORY.format(f"{warning}; {_KEEPS_SPACE}"))
+        for gone in deletion.requests:
+            ctx.logger.info("Ping Monitor - deleted %s from the ping history: %s, %s", ph.short_id(gone.key),
+                            _count(gone.runs, "run"), _rounds(gone.rounds))
+        return CliResult(0, {"deleted": [self._deleted_row(gone) for gone in deletion.requests]})
 
     # --- reading the store ---------------------------------------------------------------------------
     def _read(self, store: PingStore, info: RequestInfo, *, since: Optional[float],
@@ -1090,8 +1540,13 @@ def _period(start: float, end: float) -> str:
     return first.strftime("%Y-%m-%d %H:%M") + "–" + last.strftime("%H:%M" if _day(start) == _day(end) else "%Y-%m-%d %H:%M")
 
 
+def _count(count: int, word: str) -> str:
+    """``1 run``, ``3 runs``, ``1,204 rounds``."""
+    return f"{count:,} {word}{'' if count == 1 else 's'}"
+
+
 def _rounds(count: int) -> str:
-    return f"{count:,} round{'' if count == 1 else 's'}"
+    return _count(count, "round")
 
 
 def _ports_text(ports: Sequence[int]) -> str:
@@ -1188,14 +1643,18 @@ class _Follow:
 
 # --- the menu ----------------------------------------------------------------------------------------------
 
+_CLEARED: Any = object()  # what the list's pick returns once ``c`` has emptied the history
+
+
 class _Menu:
     """Menu item m (plan sections 2.1 and 2.3): the list of recorded requests, the summary of one picked from it
-    (a window, ``g``, ``f``, ``n``), and a new run with its questions and its summary."""
+    (a window, ``g``, ``f``, ``n``, ``r``, ``d``), ``c`` at the list, and a new run with its questions and its summary."""
 
     def __init__(self, module: PingMonitorModule, ctx: ScriptContext) -> None:
         self.module = module
         self.ctx = ctx
         self.colors = get_global_color_scheme(ctx.cfg)
+        self.deleted = False  # something was deleted: an empty history then ends the item instead of asking for targets
 
     # -- printing and asking ---------------------------------------------------------------------------
     def _say(self, text: str, color: str = "description") -> None:
@@ -1231,7 +1690,12 @@ class _Menu:
                         infos = store.requests()
                     except StoreError as error:
                         self._say(f"Ping history: {error}", "error")
+            if self.deleted and not infos:
+                self._say("The ping history is empty.")
+                return
             picked = self._pick(infos) if infos else None
+            if picked is _CLEARED:
+                continue  # read again: nothing is left (or a run that started since is listed)
             if picked is None:
                 self.new_run(None)
                 return
@@ -1239,15 +1703,20 @@ class _Menu:
                 return
 
     def _pick(self, infos: List[RequestInfo]) -> Optional[RequestInfo]:
-        """The list, newest first, and the request whose number is typed; None for Enter (a new run)."""
+        """The list, newest first, and the request whose number is typed; None for Enter (a new run), ``_CLEARED`` once
+        ``c`` has deleted everything."""
         rows = [self.module._request_row(info, "table", number) for number, info in enumerate(infos[:LIST_SHOWN], 1)]
         print_table_data(self.ctx, {"Recorded pings, newest first": rows})
         if len(infos) > LIST_SHOWN:
             self._say(f"(+{len(infos) - LIST_SHOWN} older; cn monitor --list shows all)")
         while True:
-            answer = self._ask("Number to see its summary, or Enter for a new run: ")
+            answer = self._ask("Number to see its summary, c to clear the history, or Enter for a new run: ")
             if not answer:
                 return None
+            if answer.lower() == "c":
+                if self._clear(infos):
+                    return _CLEARED
+                continue
             if answer.isdecimal() and 1 <= int(answer) <= len(rows):  # isdigit() takes "²", which int() refuses
                 return infos[int(answer) - 1]
             self._say("Invalid choice", "error")
@@ -1274,12 +1743,24 @@ class _Menu:
                     return True
             self._show(info, runs, outcome)
             while True:
-                answer = self._ask("Window, g, f, n or Enter: " if outcome.running else "Window, g, n or Enter: ")
+                answer = self._ask(
+                    "Window, g, f, n or Enter: " if outcome.running else "Window, g, n, r, d or Enter: ")
                 if not answer:
                     return True
                 if answer.lower() == "n":
                     self.new_run(info)
                     return False
+                if answer.lower() == "r":
+                    started = self._again(info)
+                    if started is None:  # the request is gone or the history unreadable (said): back to the list
+                        return True
+                    if started:
+                        return False
+                    continue
+                if answer.lower() == "d":
+                    if self._delete(info):
+                        return True
+                    continue
                 if answer.lower() == "g":
                     self._grid(outcome)
                     break
@@ -1298,11 +1779,8 @@ class _Menu:
 
     def _show(self, info: RequestInfo, runs: List[RunInfo], outcome: RunOutcome) -> None:
         tracker = outcome.tracker
-        title = f"{ph.short_id(info.key)} · {_targets_label(info)}"
-        if info.tcp_ports:
-            title += f" · TCP {','.join(str(port) for port in info.tcp_ports)}"
         console.print()
-        self._say(title, "header")
+        self._say(_title(info), "header")
         self._say(self._runs_line(runs))
         if tracker.rounds:
             print_table_data(self.ctx, {SHEET: self.module._display_rows(outcome)})
@@ -1317,6 +1795,9 @@ class _Menu:
         keys = ["Enter: back", "24h or 2026-10-08: narrow it", "g: grid"]
         keys += ["f: follow live"] if outcome.running else []
         keys += ["n: a new run of these targets"]
+        if not outcome.running:  # f follows a run; r and d need none going on
+            keys += [f"r: run it again ({_rerun(ph.short_id(info.key), runs)[0].text()})",
+                     "d: delete it from the history"]
         self._say(" · ".join(keys))
 
     def _runs_line(self, runs: List[RunInfo]) -> str:
@@ -1369,15 +1850,109 @@ class _Menu:
             except StoreError as error:
                 self._say(f"Ping history: {error}", "error")
 
+    # -- deleting from the history ---------------------------------------------------------------------
+    def _delete(self, info: RequestInfo) -> bool:
+        """``d``: the request deleted from the history after a question. True when it is gone (back to the list), False
+        when it stays (the summary asks again)."""
+        going = self.module._going([info])
+        if going:
+            run = going[0]
+            self._say(f"A run of these targets is going on ({_started_on(run, time.time())}): stop it or let it end, "
+                      "then delete it.", "error")
+            return False
+        deletion = self._remove([info], whole=False)
+        if deletion is None:
+            return False
+        if not deletion.requests:  # another cn deleted it meanwhile
+            self._say("This request is no longer in the ping history.", "error")
+            return True
+        gone = deletion.requests[0]
+        self._say(f"Deleted {ph.short_id(gone.key)} from the ping history: {_count(gone.runs, 'run')}, "
+                  f"{_rounds(gone.rounds)}.")
+        return True
+
+    def _clear(self, infos: List[RequestInfo]) -> bool:
+        """``c``: the whole history deleted after a question. True when it is (the list is read again), False when it
+        stays (the list asks again)."""
+        going = self.module._going(infos)
+        if going:
+            self._say(_capital(self.module._going_text(infos, going)), "error")
+            return False
+        return self._remove(infos, whole=True) is not None
+
+    def _remove(self, infos: List[RequestInfo], *, whole: bool) -> Optional[Deletion]:
+        """The question for ``infos`` (one request, or the whole history), then the delete. None when nothing was deleted
+        and the request stays (declined, refused, failed: each said); else the deletion, which may hold no request
+        when another cn was first. The error colour marks what went wrong, never a "no"."""
+        lines, question = _asking(self.module._history_path(self.ctx), infos, whole=whole)
+        for line in lines:
+            self._say(line)
+        if not _confirmed(self.ctx, question):
+            self._say("Nothing was deleted.")
+            return None
+        store, error = self.module._open_store(self.ctx, write=True, create=False)
+        if error:
+            self._say(f"Ping history: {error}", "error")
+            return None
+        if store is None:  # the file is gone
+            self.deleted = True
+            return Deletion(())
+        with store:
+            try:
+                deletion, warning = self.module._delete(store, None if whole else [infos[0].key], whole=whole)
+            except StoreError as exc:
+                self._say(f"Ping history: {exc}", "error")
+                return None
+        if deletion.going_on:  # a run started while the question waited
+            self._say(_capital(self.module._going_text(deletion.requests, deletion.going_on)), "error")
+            return None
+        self.deleted = True
+        if warning:
+            self._say(f"Ping history: {warning}; {_KEEPS_SPACE}", "error")
+        return deletion
+
     # -- a new run -------------------------------------------------------------------------------------
-    def new_run(self, stored: Optional[RequestInfo]) -> None:
+    def _again(self, info: RequestInfo) -> Optional[bool]:
+        """``r``: the request run again, with the plan of its template run (``_rerun``) and no question. The history is
+        read again now, as ``--rerun`` reads it (``_request_and_runs``): the summary may be minutes old, and a run that
+        started since must refuse the rerun, one that ended since may be the template. True when the run was started
+        (the item ends with its summary, as after ``n``); False when a run of the request is going on or none of its
+        stored targets is one this cn accepts (said: the summary asks again); None when the request is gone or the
+        history cannot be read (said: back to the list)."""
+        store, error = self.module._open_store(self.ctx, write=False)
+        if error:
+            self._say(f"Ping history: {error}", "error")
+            return None
+        if store is None:  # the file is gone
+            self._say("This request is no longer in the ping history.", "error")
+            return None
+        with store:
+            try:
+                current, _, runs = self.module._request_and_runs(store, info.key)
+            except StoreError as exc:
+                self._say(f"Ping history: {exc}", "error")
+                return None
+        if current is None:
+            self._say("This request is no longer in the ping history.", "error")
+            return None
+        going = self.module._going([current])
+        if going:
+            self._say(f"A run of these targets is going on ({_started_on(going[0], time.time())}): f follows it, "
+                      "n starts another beside it.", "error")
+            return False
+        return self.new_run(current, _rerun(ph.short_id(current.key), runs)[0])
+
+    def new_run(self, stored: Optional[RequestInfo], rerun: Optional[Rerun] = None) -> bool:
         """Item 6's target prompt and TCP question (or a recorded request's targets and ports), the earlier rounds,
-        the period and the interval; then the run, its summary and "Press any key" (plan section 2.1)."""
+        the period and the interval; then the run, its summary and "Press any key" (plan section 2.1). A ``rerun`` of
+        the ``stored`` request takes its plan from it instead: every earlier round, no question (rerun plan, section 6),
+        and its stored targets go through the validation of the command line (``_request``), not ``n``'s. True when
+        the item is over; False when a rerun found no target this cn accepts (said, nothing started)."""
         logger = self.ctx.logger
         if shutil.which("ping") is None:
             logger.error("'ping' command not found. Aborting.")
             press_any_key(self.ctx)
-            return
+            return True
         if stored is None:
             colors = self.colors
             console.print(
@@ -1394,22 +1969,45 @@ class _Menu:
             if not tokens:
                 logger.info("Ping Monitor - No valid hosts to watch.")
                 press_any_key(self.ctx)
-                return
+                return True
             ports = self.module._ask_tcp_ports(self.ctx, hosts)
             request = self.module._request_of(tokens, ports)
             source = None
         else:
             # Today's request of the stored targets: the same key while their expansion is the same; when it changed,
             # a new request, and the stored one is never written to (plan section 3.2).
-            request = self.module._request_of(stored.targets, stored.tcp_ports)
+            if rerun is None:
+                request = self.module._request_of(stored.targets, stored.tcp_ports)
+            else:  # as _cli_track: a token this cn refuses is named and left out, none usable is no run
+                found = self.module._request(
+                    stored.targets, stored.tcp_ports, lambda target, reason: bulk_ping._print_rejected(self.ctx, target, reason))
+                if found is None:
+                    self._say(_capital(_NO_USABLE_TARGET), "error")
+                    return False
+                other, reason = self.module._going_as(self.ctx, stored, found)  # as _cli_rerun: B's runs, not A's
+                if reason is not None:
+                    self._say(f"Ping history: {reason}", "error")
+                    return False
+                if other is not None:
+                    self._say(_capital(_going_as_text(stored, found, other, time.time())) + "; nothing was started", "error")
+                    return False
+                request = found
             source = stored.newest_run.source if stored.newest_run is not None else None
-        include = self._earlier(request)
-        run_for, every = self._period()
+        if stored is not None and rerun is not None:
+            line, warning = self.module._rerun_notice(self.ctx, stored, rerun, request, line=True)
+            self._say(str(line))
+            if warning:
+                self._say(warning, "warning")
+            include, run_for, every = True, rerun.length, rerun.every
+        else:
+            include = self._earlier(request)
+            run_for, every = self._period()
         now = time.time()
         plan = RunPlan(every=every, until=now + run_for if run_for else None, since=None if include else now,
                        source=source)
         outcome = self.module._track(self.ctx, request, plan)
         self._report(outcome)
+        return True
 
     def _earlier(self, request: Request) -> bool:
         """Whether to add the request's earlier rounds; asked only when the history holds some."""
@@ -1499,7 +2097,8 @@ def frame(request: Request, blocks: Sequence[ping_grid.Block], tracker: ph.Track
           times: Optional[Mapping[str, float]] = None) -> List[ping_grid.Line]:
     """The live frame (plan section 2.4): the header, the counters, the grid (the compact view when it does not
     fit, the table after ``v``), the legend and the footer. ``rows`` and ``times``: the round in flight's rows and
-    batch times so far, by host, laid over the last finished round as ``pending`` is."""
+    batch times so far, by host, laid over the last finished round as ``pending`` is. The legend explains the
+    characters of the grid, or, under the table, the flags of its rows."""
     rows, times = rows or {}, times or {}
     answered_partly = {index for index, host in enumerate(request.hosts) if host in rows and ph.partial_reply(rows[host])}
     cells = tracker.cells(pending)
@@ -1509,10 +2108,15 @@ def frame(request: Request, blocks: Sequence[ping_grid.Block], tracker: ph.Track
     seen = len(ever) + sum(1 for index, char in pending.items() if char in ph.SEEN and index not in ever)
     numbers = [f"{counts[char]:,} {word}" for char, word in _COUNT_WORDS if counts.get(char)]
     numbers.append(f"{seen:,} seen of {len(request.hosts):,}")
-    legend = _legend_lines(ping_grid.legend(set(cells) - {ph.UNPROBED}), width)
-    room = max(height - _FRAME_LINES - len(legend) - CHANGE_LINES, 1)
-    if view == "table":
-        body = _table_lines(_table_rows(request, tracker, summaries, cells, pending, rows, times), room, width)
+    table = _table_rows(request, tracker, summaries, cells, pending, rows, times) if view == "table" else None
+    spare = height - _FRAME_LINES - CHANGE_LINES  # the lines left for the body and the legend
+    if table is None:
+        legend = _legend_lines(ping_grid.legend(set(cells) - {ph.UNPROBED}), width)
+    else:
+        legend = _table_legend(table, bool(request.ports), width, spare)
+    room = max(spare - len(legend), 1)
+    if table is not None:
+        body = _table_lines(table, room, width, request.ports)
     else:
         body = ping_grid.grid_lines(
             blocks, cells, width=width, height=room, changed=tracker.changed(pending),
@@ -1527,6 +2131,24 @@ def frame(request: Request, blocks: Sequence[ping_grid.Block], tracker: ph.Track
         *legend,
         [(_fit(footer, width), "dim")],
     ]
+
+
+_TABLE_NOTE = "Latest ping is ICMP alone: a host can be OK with a closed TCP port."
+
+
+def _table_legend(table: Sequence[_TableRow], ports: bool, width: int, spare: int) -> List[ping_grid.Line]:
+    """The legend under ``v``'s table: the flags that its rows show, those of the hosts folded into ``(+N more)``
+    too (the legend's height is known before the table takes the rest of the screen), and, when the request has TCP
+    ports, a note on what the ping result is. ``spare`` is the screen's lines for the table and the legend together:
+    the note, the least important line, goes first when the table would keep less than its header and one more line
+    (``frame`` gives the body one line at least, so a note that crowds it out would push the footer off the screen),
+    and with one line only the table shows no columns for it to explain."""
+    lines = _legend_lines(ping_grid.legend({row.cell for row in table}), width)
+    if table and ports:
+        note = _legend_lines([(_TABLE_NOTE, "dim")], width)
+        if spare - len(lines) - len(note) >= 2:
+            lines += note
+    return lines
 
 
 def _legend_lines(legend: ping_grid.Line, width: int) -> List[ping_grid.Line]:
@@ -1577,54 +2199,113 @@ def _fit(text: str, width: int) -> str:
 
 class _TableRow(NamedTuple):
     host: str
-    latest: str
-    cell: str
+    latest: str  # the ping (ICMP) result; a port's answer is in ``tcp``, never here
+    cell: str  # the grid's character for the host: the flag column
     last_seen: Optional[float]
     seen: int
     rounds: int
+    tcp: Optional[Mapping[int, str]] = None  # each requested port's state in the round the row shows; absent: unknown
 
 
 def _table_rows(request: Request, tracker: ph.Tracker, summaries: Sequence[ph.HostSummary], cells: Sequence[str],
                 pending: Mapping[int, str], rows: Mapping[str, Row], times: Mapping[str, float]) -> List[_TableRow]:
     """``v``'s rows: the hosts seen so far, with the round in flight laid over the last finished round for the hosts
-    it has reached, as the grid does (a host's seen rounds then count of the rounds that reached it)."""
+    it has reached, as the grid does (a host's seen rounds then count of the rounds that reached it). A host's TCP
+    states are those of the round the row shows, when the host was seen in it: the history keeps the ports of a seen
+    host only, so a host that went silent has none."""
     finished = {summary.index: summary for summary in summaries}
     table: List[_TableRow] = []
     for index in sorted(set(finished) | {index for index, char in pending.items() if char in ph.SEEN}):
         host, summary, char = request.hosts[index], finished.get(index), pending.get(index)
         if char is None:
             table.append(_TableRow(host, summary.latest, cells[index], summary.last_seen, summary.seen_rounds,
-                                   summary.rounds))
+                                   summary.rounds, summary.tcp))
         elif char in ph.SEEN:
+            row = rows.get(host, {})
             when = times[host] if summary is None else max(times[host], summary.last_seen)  # as the tracker holds it
-            table.append(_TableRow(host, str(rows.get(host, {}).get("Result", "")), cells[index], when,
-                                   (summary.seen_rounds if summary else 0) + 1, tracker.rounds + 1))
+            table.append(_TableRow(host, str(row.get("Result", "")), cells[index], when,
+                                   (summary.seen_rounds if summary else 0) + 1, tracker.rounds + 1,
+                                   {port: str(row.get(f"TCP {port}", "")) for port in request.ports}))
         else:
             table.append(_TableRow(host, ph.result_text(char), cells[index], summary.last_seen, summary.seen_rounds,
                                    tracker.rounds + 1))
     return table
 
 
-_TABLE_TAIL = 2 + 16 + 2 + 25 + 2 + 11  # Latest, Last seen and Seen ("12345 of 12345") after the host
+_GAP = "  "
+_FLAG_WIDTH = len("Flag")
+_LATEST_WIDTH = len("OK (1/2 replies)")  # the longest ping result
+_HOST_LEAST = 16  # cells: a host name is cut to this before a column is dropped (an IPv4 address is never cut)
+_HOST_FLOOR = 8  # ... and to this when even the flag and the ping result leave no more
+_FIXED = len(_GAP) + _FLAG_WIDTH + len(_GAP) + _LATEST_WIDTH  # what the host, the flag and the result need besides the host
 
 
-def _table_lines(table: Sequence[_TableRow], room: int, width: int) -> List[ping_grid.Line]:
-    """``v``: the hosts seen so far, one line each, as many as fit, then ``(+N more)``; a long name is cut so that no
-    line is wider than the screen (a wrapped line would push the footer off it)."""
+class _Column(NamedTuple):
+    header: str
+    width: int  # cells, as wide as the header and every row's text
+    text: Callable[[_TableRow], str]
+
+
+def _table_columns(table: Sequence[_TableRow], ports: Sequence[int]) -> Tuple[List[_Column], List[_Column]]:
+    """The columns after the ping result, in the order shown, and the same columns in the order a screen too narrow
+    for them drops them: the time of the last sighting first (the widest, and the change lines already tell when a
+    host went), then how often the host was seen, then the ports from the last. The host, its flag and its ping
+    result are never dropped."""
+
+    def column(header: str, text: Callable[[_TableRow], str]) -> _Column:
+        return _Column(header, max([len(header), *(len(text(row)) for row in table)]), text)
+
+    tcp = [column(f"TCP {port}", lambda row, port=port: (row.tcp or {}).get(port, "")) for port in ports]
+    last_seen = column("Last seen", lambda row: _when(row.last_seen))
+    seen = column("Seen", lambda row: f"{row.seen} of {row.rounds}")
+    return [*tcp, last_seen, seen], [last_seen, seen, *reversed(tcp)]
+
+
+def _flag_style(row: _TableRow) -> str:
+    """The style of a row's flag and ping result: the grid's for its character, and the warning colour for a partial
+    reply, as in the grid."""
+    if row.cell == "!" and ph.partial_reply({"Result": row.latest}):
+        return "warning"
+    return ping_grid.STYLES.get(row.cell, "text")
+
+
+def _cells_line(cells: Sequence[Tuple[str, int, str]]) -> ping_grid.Line:
+    """``cells`` (text, width in cells, style) side by side: each but the last cut or padded to its width, with a
+    gap after it."""
+    last = len(cells) - 1
+    return [(text if number == last else set_cell_size(text, width) + _GAP, style)
+            for number, (text, width, style) in enumerate(cells)]
+
+
+def _table_lines(table: Sequence[_TableRow], room: int, width: int, ports: Sequence[int] = ()) -> List[ping_grid.Line]:
+    """``v``: the hosts seen so far, one line each, as many as fit, then ``(+N more)``: the host, its flag (the
+    grid's character, which the legend explains), the ping result, a column for each of ``ports``, the time of the
+    last sighting and how often the host was seen. A screen too narrow for all of them loses columns in the order of
+    ``_table_columns``, and then a long name its tail; no line is wider than the screen (a wrapped line would push
+    the footer off it)."""
     if not table:
         return [_clip([("No host seen yet.", "dim")], width)]
     if room < 2:  # no room for the header and a row
-        return _crop([[(row.host, "label")] for row in table], room, width)
-    host_width = min(max(cell_len(row.host) for row in table), max(width - _TABLE_TAIL, 8))  # in cells, as shown
-    lines: List[ping_grid.Line] = [[(f"{'Host':<{host_width}}  {'Latest':<16}  {'Last seen':<25}  Seen", "header")]]
+        return _crop([[(f"{row.cell} ", _flag_style(row)), (row.host, "label")] for row in table], room, width)
+    columns, droppable = _table_columns(table, ports)
+    host_cells = max(cell_len(row.host) for row in table)
+    for dropped in droppable:
+        if min(host_cells, _HOST_LEAST) + _FIXED + sum(len(_GAP) + column.width for column in columns) <= width:
+            break
+        columns.remove(dropped)
+    host_width = min(host_cells, max(width - _FIXED - sum(len(_GAP) + column.width for column in columns), _HOST_FLOOR))
+    lines: List[ping_grid.Line] = [_cells_line([
+        ("Host", host_width, "header"), ("Flag", _FLAG_WIDTH, "header"), ("Latest ping", _LATEST_WIDTH, "header"),
+        *((column.header, column.width, "header") for column in columns),
+    ])]
     room = max(room - 1, 1)
     shown = table if len(table) <= room else table[:room - 1]
     for row in shown:
-        lines.append([
-            (set_cell_size(_fit(row.host, host_width), host_width) + "  ", "label"),
-            (f"{row.latest:<16}", ping_grid.STYLES.get(row.cell, "text")),
-            (f"  {_when(row.last_seen):<25}  {row.seen} of {row.rounds}", "text"),
-        ])
+        style = _flag_style(row)
+        lines.append(_cells_line([
+            (_fit(row.host, host_width), host_width, "label"), (row.cell, _FLAG_WIDTH, style),
+            (row.latest, _LATEST_WIDTH, style), *((column.text(row), column.width, "text") for column in columns),
+        ]))
     if len(shown) < len(table):
         lines.append([(f"(+{len(table) - len(shown)} more)", "dim")])
     return [_clip(line, width) for line in lines]
