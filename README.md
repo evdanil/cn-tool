@@ -4,6 +4,24 @@
 checks, configuration repository searches, and device inventory collection. It runs on Linux, macOS
 and Windows (natively, without WSL) and installs with `pipx install cn-tool`.
 
+## What's new in 0.8.1
+
+The Ping Monitor can now delete from its history and run a recorded request again. `cn monitor
+--delete ID` removes one recorded request with its runs and rounds, and `cn monitor --clear` removes
+every one; both ask first (`[y/N]`; without a terminal they need `-y/--yes`), refuse while a run of
+the request goes on, and `--clear` gives the space back to the file system. `cn monitor --rerun ID`
+starts a new run of a recorded request with its stored targets and TCP ports and the interval and
+length of its newest run that had an interval; `--every` and `--for` change them, and a request with
+a run going on is refused. In the menu (`m`), a request's summary has `r` (run it again) and `d`
+(delete it), and the list has `c` (clear the history). The live table that `v` shows now has a `Flag`
+column, one `TCP <port>` column for each `--tcp` port, and `Latest ping` in place of `Latest`: `OK` is
+the ICMP result alone, whatever the ports did. Typing objects at a terminal (`cn ip -`) now says on
+stderr how to end the input (Ctrl-Z, then Enter, on Windows), and Ctrl-C there prints `cn:
+interrupted` and exits 130 instead of a Python traceback. No command, configuration key or
+dependency is added, and the history's format is unchanged. See
+[Ping monitor](#ping-monitor-cn-monitor), [Command line](#command-line) and the release notes
+of 0.8.1 on the [Releases page](https://github.com/evdanil/cn-tool/releases).
+
 ## What's new in 0.8.0
 
 The Ping Monitor, menu item `m` and the command `cn monitor`, pings a set of targets round after
@@ -12,9 +30,7 @@ round for as long as you choose and records every round in a history file
 says which hosts were seen, when first and last, and when they stayed online; running the same
 targets again adds the earlier rounds. While a run goes on, a small network is drawn as a live grid,
 one character per address. The recorded requests, running ones included, can be listed, shown and
-followed from another terminal without pinging (`cn monitor --list`, `--show ID`, `--follow ID`), and a
-recorded request can be run again with its targets, ports, interval and length (`--rerun ID`). One request,
-or all of them, can be deleted from the history (`--delete ID`, `--clear`; both ask first).
+followed from another terminal without pinging (`cn monitor --list`, `--show ID`, `--follow ID`).
 Two configuration keys are new, `[ping] history_file` and `[ping] history_days`. `cn ping` and Bulk
 PING (item 6) are unchanged, except that on macOS an IPv6 ping to an address without a route now
 reads `NO ROUTE`, as on Linux. See [Ping monitor](#ping-monitor-cn-monitor) and the release notes
@@ -48,7 +64,8 @@ notes are on the same page.
 - Bulk ping (IPv4 and IPv6) with an optional TCP port check, resolve, and (on Linux and macOS)
   traceroute operations
 - Ping Monitor (menu `m`, `cn monitor`): bulk ping over a period, a history between runs, a live
-  grid of a small network, and the recorded requests listed, shown and followed without pinging
+  grid of a small network, and the recorded requests listed, shown, followed, run again and deleted
+  from the history
 - `cn diff`: which snapshot of a device added or removed a configuration line, and who made it
 - `cn doctor`: configuration, credential and Infoblox WAPI checks
 - Configuration repository search with optional SD-WAN YAML enrichment
@@ -323,6 +340,11 @@ standard input (in PowerShell use `--file`: it reserves `<`, so `cn subnet - < s
 possible there). Blank lines and `#` comments are ignored. Global options (`-c`, `-nc`, `-t`, `-l`,
 `-r`, `-g`, `--log-level`) work before and after the command. `cn <command> --help` shows the
 details of one command.
+
+When stdin is a terminal, `cn ip -` waits for you to type the objects, and says so first on stderr:
+`cn: reading objects from standard input; end with Ctrl-D on a line of its own.` On Windows the line
+names `Ctrl-Z, then Enter` instead. A pipe or a redirected file gets no such line. Ctrl-C while you
+type ends the run with `cn: interrupted` and exit status 130, without a traceback.
 
 A command loads only the libraries it uses: pandas and openpyxl when it saves a report, netmiko
 (with paramiko) when it queries a device over SSH, ldap3 when Active Directory connects, yaml for
