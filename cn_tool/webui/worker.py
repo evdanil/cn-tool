@@ -1,7 +1,9 @@
 """Persistent cn runtime; its sole reader stays responsive during blocking work."""
 from dataclasses import asdict
 from pathlib import Path
+import multiprocessing
 from queue import Queue
+import signal
 from threading import Condition, Event, Lock, Thread
 from uuid import uuid4
 
@@ -9,6 +11,19 @@ from cn_tool.core.interaction import AuthenticationRequired, CredentialReply
 from cn_tool.core.operation import OperationControl
 from cn_tool.core.runtime import RuntimeSession, SetupRequired, abort_initialization
 from .protocol import COMMANDS, decode, encode, envelope
+
+
+def _ignore_parent_interrupts():
+    """Let the launcher coordinate child shutdown after a console Ctrl+C."""
+    if multiprocessing.current_process().name == 'MainProcess':
+        return
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (AttributeError, ValueError):
+        pass
+
+
+_ignore_parent_interrupts()
 
 
 def finish_lookup_report(ctx, module, lookup):
@@ -309,7 +324,7 @@ def run_lookup(runtime, module, scope, inputs, control):
                         outcome=outcome)
 
 
-def worker_main(connection, stop, *, store_factory=None):
+def worker_main(connection, stop, interrupt=None, *, store_factory=None):
     """Importable Windows-spawn target. Only this thread reads from the pipe."""
     from cn_tool.modules.subnet_request import request_result
     from cn_tool.utils.auth import ensure_infoblox_auth, infoblox_account_configured
@@ -321,7 +336,8 @@ def worker_main(connection, stop, *, store_factory=None):
     operation_lock = Lock()
     operation_stop = Event()
     state = {'session': None, 'job': None, 'runtime': None, 'scope': None,
-             'closing': False, 'initializing': False, 'initialization_failed': False, 'orphaned': False, 'thread': None, 'ready': False, 'saving': False}
+             'closing': False, 'initializing': False, 'initialization_failed': False, 'interrupted': False,
+             'orphaned': False, 'thread': None, 'ready': False, 'saving': False}
     def emit(kind, payload, job_id=None):
         try:
             with write_lock:
@@ -330,6 +346,14 @@ def worker_main(connection, stop, *, store_factory=None):
             state['orphaned'] = True
             operation_stop.set()
     interaction = WorkerInteraction(lambda kind, payload: emit(kind, payload, state['job']), operation_stop)
+    if interrupt is not None:
+        def watch_for_interrupt():
+            interrupt.wait()
+            state['interrupted'] = True
+            state['orphaned'] = True
+            operation_stop.set()
+            interaction.close()
+        Thread(target=watch_for_interrupt, daemon=True).start()
 
     def initialize(payload):
         try:
@@ -427,8 +451,9 @@ def worker_main(connection, stop, *, store_factory=None):
             busy = state['thread'] is not None and state['thread'].is_alive()
             if kind == 'shutdown':
                 state['closing'] = True
+                state['interrupted'] = state['interrupted'] or bool(payload.get('interrupted'))
                 # Quit finishes an existing lookup, but releases blocked credentials.
-                if not state['ready']:
+                if state['interrupted'] or not state['ready']:
                     operation_stop.set()
                 interaction.close()
             elif kind == 'cancel' and job == state['job']:
@@ -457,9 +482,15 @@ def worker_main(connection, stop, *, store_factory=None):
                 operation_stop.clear()
                 state['thread'] = Thread(target=lookup, args=(payload, job))
                 state['thread'].start()
+    except KeyboardInterrupt:
+        state['interrupted'] = True
+        state['orphaned'] = True
     except (EOFError, OSError):
         state['orphaned'] = True
     finally:
+        if state['interrupted'] or (interrupt is not None and interrupt.is_set()):
+            state['interrupted'] = True
+            state['orphaned'] = True
         if state['orphaned']:
             operation_stop.set()
         interaction.close()
@@ -468,7 +499,9 @@ def worker_main(connection, stop, *, store_factory=None):
         interaction.close_store()
         runtime = state['runtime']
         if runtime is not None:
-            if state['orphaned'] or state['initialization_failed']:
+            if state['interrupted'] or (interrupt is not None and interrupt.is_set()):
+                abort_initialization(runtime.ctx, exit_code=130)
+            elif state['orphaned'] or state['initialization_failed']:
                 abort_initialization(runtime.ctx)
             else:
                 runtime.close()

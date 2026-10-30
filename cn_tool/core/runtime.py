@@ -17,14 +17,14 @@ class SetupRequired(Exception):
         super().__init__(message)
 
 
-def abort_initialization(ctx: ScriptContext) -> None:
+def abort_initialization(ctx: ScriptContext, *, exit_code: int = 3) -> None:
     """Release opened resources without sending/deleting an existing report."""
     from cn_tool.utils.app_lifecycle import shutdown_resources
 
     send_on_exit = ctx.cfg.get("email_send_on_exit")
     ctx.cfg["email_send_on_exit"] = False
     try:
-        shutdown_resources(ctx, 3, quiet=True)
+        shutdown_resources(ctx, exit_code, quiet=True)
     finally:
         if send_on_exit is None:
             ctx.cfg.pop("email_send_on_exit", None)

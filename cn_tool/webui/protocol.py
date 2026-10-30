@@ -3,7 +3,7 @@ import json
 
 FIELDS = {
     'initialize': {'config_file'}, 'credentials_reply': {'request_id', 'reply', 'remember'}, 'forget_credentials': set(),
-    'lookup': {'inputs'}, 'cancel': set(), 'snapshot_report': {'request_id'}, 'shutdown': set(),
+    'lookup': {'inputs'}, 'cancel': set(), 'snapshot_report': {'request_id'}, 'shutdown': {'interrupted'},
     'ready': {'scope', 'username', 'report_warning', 'report_location'}, 'setup_required': {'message', 'code'},
     'credentials_required': {'request_id', 'account', 'username', 'need_username', 'need_password', 'message', 'store_supported'},
     'credential_store_state': {'account', 'username', 'status', 'message', 'pending'},
@@ -33,6 +33,8 @@ def validate(message):
     required = FIELDS[kind] - ({'path', 'error', 'filename'} if kind == 'report_snapshot' else set())
     if kind == 'credentials_reply':
         required -= {'remember'}
+    if kind == 'shutdown':
+        required -= {'interrupted'}
     if kind == 'credentials_required':
         required -= {'store_supported'}
     if kind == 'ready':
@@ -45,7 +47,7 @@ def validate(message):
         if key == 'inputs':
             if not isinstance(value, list) or not all(isinstance(i, str) for i in value):
                 raise ValueError('Invalid inputs')
-        elif key.startswith('need_') or key in {'remember', 'pending', 'store_supported'}:
+        elif key.startswith('need_') or key in {'interrupted', 'remember', 'pending', 'store_supported'}:
             if type(value) is not bool:
                 raise ValueError('Invalid credential flag')
         elif key == 'code':

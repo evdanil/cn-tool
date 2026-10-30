@@ -37,31 +37,51 @@ async def serve(controller, *, config_file=None, no_browser=False, port=0):
         create_app(controller, access), access_log=False, log_level='warning',
         timeout_graceful_shutdown=_GRACEFUL_SHUTDOWN_TIMEOUT,
     ))
-    controller.start(config_file)
-    async def supervise():
-        while not server.started and not server.should_exit:
-            await asyncio.sleep(.02)
-        if server.started:
-            url = access.origin + '/bootstrap#' + access.bootstrap_token
-            if no_browser:
-                if sys.stdout is not None and sys.stdout.isatty():
-                    print(url, flush=True)
-            else:
-                webbrowser.open(url)
-        while not server.should_exit:
-            if controller.snapshot().phase == 'closed':
-                server.should_exit = True
-            await asyncio.sleep(.1)
-    watcher = asyncio.create_task(supervise())
+    watcher = None
+    startup_attempted = False
+    interrupted = False
     try:
+        startup_attempted = True
+        controller.start(config_file)
+
+        async def supervise():
+            while not server.started and not server.should_exit:
+                await asyncio.sleep(.02)
+            if server.started:
+                url = access.origin + '/bootstrap#' + access.bootstrap_token
+                if no_browser:
+                    if sys.stdout is not None and sys.stdout.isatty():
+                        print(url, flush=True)
+                else:
+                    webbrowser.open(url)
+            while not server.should_exit:
+                if controller.snapshot().phase == 'closed':
+                    server.should_exit = True
+                await asyncio.sleep(.1)
+
+        watcher = asyncio.create_task(supervise())
         await server.serve(sockets=[listener])
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        interrupted = True
+        raise
     finally:
-        controller.quit()
-        while controller.snapshot().phase not in {'closed', 'failed'}:
-            await asyncio.sleep(.05)
-        watcher.cancel()
-        await asyncio.gather(watcher, return_exceptions=True)
-        listener.close()
+        try:
+            if startup_attempted:
+                try:
+                    if interrupted:
+                        controller.quit(interrupted=True)
+                    else:
+                        controller.quit()
+                except (EOFError, OSError, RuntimeError):
+                    pass
+                else:
+                    while controller.snapshot().phase not in {'closed', 'failed'}:
+                        await asyncio.sleep(.05)
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+            listener.close()
 
 
 def main(argv=None):
@@ -71,13 +91,15 @@ def main(argv=None):
     parser.add_argument('--port', type=int, default=0, metavar='PORT', help='listen on a specific local port')
     args = parser.parse_args(argv)
     try:
-        import nicegui  # noqa: F401 -- optional dependency check only
-    except ImportError:
-        _show_error('Install the graphical interface: pip install "cn-tool[webui]"')
-        raise SystemExit(2)
-    from .controller import SessionController
-    try:
+        try:
+            import nicegui  # noqa: F401 -- optional dependency check only
+        except ImportError:
+            _show_error('Install the graphical interface: pip install "cn-tool[webui]"')
+            raise SystemExit(2)
+        from .controller import SessionController
         asyncio.run(serve(SessionController(), config_file=args.config_file, no_browser=args.no_browser, port=args.port))
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
     except Exception:
         _show_error('Subnets could not start. Check the installation and local network configuration.')
         raise SystemExit(3)

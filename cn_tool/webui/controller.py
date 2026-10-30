@@ -35,7 +35,8 @@ class SessionController:
         self.session_id = uuid4().hex
         self._state = SessionSnapshot(self.session_id)
         self._lock = RLock()
-        self._connection = self._process = self._stop = None
+        self._connection = self._process = self._stop = self._interrupt = None
+        self._reader = None
         self._started_at = None
         self._config_file = None
         self._disconnected = False
@@ -45,7 +46,7 @@ class SessionController:
         self._report_completions = {}
 
     def start(self, config_file=None):
-        from .worker import worker_main
+        from .worker_entry import worker_main
         with self._lock:
             if self._process is not None:
                 raise RuntimeError('Session already started')
@@ -53,12 +54,39 @@ class SessionController:
             context = multiprocessing.get_context('spawn')
             parent, child = context.Pipe()
             self._stop = context.Event()
+            self._interrupt = context.Event()
             self._connection = parent
-            self._process = context.Process(target=worker_main, args=(child, self._stop))
-            self._process.start()
-            child.close()
-            Thread(target=self._receive, daemon=True).start()
-            self._send('initialize', None, {'config_file': str(config_file) if config_file else None})
+            self._process = context.Process(target=worker_main, args=(child, self._stop, self._interrupt))
+            try:
+                self._process.start()
+                child.close()
+                self._reader = Thread(target=self._receive, daemon=True)
+                self._reader.start()
+                self._send('initialize', None, {'config_file': str(config_file) if config_file else None})
+            except BaseException:
+                # A Ctrl+C can interrupt any spawn boundary. Stop and join the child here because
+                # its command loop cannot process a graceful shutdown before initialization.
+                self._state.phase = 'closing'
+                self._stop.set()
+                try:
+                    child.close()
+                except OSError:
+                    pass
+                try:
+                    self._connection.close()
+                except OSError:
+                    pass
+                process = self._process
+                if getattr(process, 'pid', None) is not None:
+                    process.join(timeout=1)
+                    if process.is_alive():
+                        process.terminate()
+                        process.join()
+                if self._reader is None or not self._reader.is_alive():
+                    self._reader_finished = True
+                    self._disconnected = True
+                    self._state.phase = 'closed'
+                raise
 
     def retry_initialize(self):
         """Explicit retry after canceled credentials; retain this runtime and account."""
@@ -158,9 +186,13 @@ class SessionController:
             self._report_completions.pop(request_id, None)
             return True
 
-    def quit(self):
+    def quit(self, *, interrupted=False):
         with self._lock:
-            if self._state.phase in {'closed', 'closing'}:
+            if self._state.phase == 'closed':
+                return
+            if interrupted and self._interrupt is not None:
+                self._interrupt.set()
+            if self._state.phase == 'closing':
                 return
             self._state.phase = 'closing'
             self._state.credential_request = None
@@ -170,7 +202,7 @@ class SessionController:
                 if self._reader_finished or self._process is None:
                     self._state.phase = 'closed'
                 return
-            self._send('shutdown', None, {})
+            self._send('shutdown', None, {'interrupted': interrupted})
 
     def _accept(self, event):
         with self._lock:
