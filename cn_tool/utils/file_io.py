@@ -729,3 +729,26 @@ def write_excel_sheets(
                 )
     finally:
         _release_report_lock(lock_fd, lock_fp)
+
+
+def snapshot_report(ctx: ScriptContext, destination: Path) -> None:
+    """Wait for this writer, then copy under the workbook's cross-process lock."""
+    import shutil
+
+    wait_for_all_saves()
+    source = Path(ctx.cfg['report_file']).expanduser()
+    destination = Path(destination)
+    if source.resolve() == destination.resolve():
+        raise ValueError('Snapshot must be separate from the configured report')
+    timeout = max(5.0, min(600.0, float(ctx.cfg.get('report_lock_timeout', 120) or 120)))
+    fd, lock_path = _acquire_report_lock(source, timeout=timeout, logger=ctx.logger)
+    if fd is None or lock_path is None:
+        raise TimeoutError('Report is busy')
+    try:
+        with save_lock:
+            shutil.copyfile(source, destination)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        _release_report_lock(fd, lock_path)

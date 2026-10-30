@@ -1,5 +1,26 @@
 # cn-tool
 
+## Local Subnets interface
+
+Install the optional interface with `python -m pip install "cn-tool[webui]"` (or `pipx install "cn-tool[webui]"`; use `pipx upgrade "cn-tool[webui]"` for an existing pipx install). Launch `cn-web`, optionally `cn-web -c FILE`.
+
+Keep your existing `.cn`: run `cn init` first if needed, then configure `[api] endpoint` and existing credential sources. The UI does not edit configuration. Normal checkout, home and optional `-c FILE` precedence applies. Missing configuration shows setup guidance. Missing credentials open a masked dialog; Cancel returns to setup, and Retry setup tries again. Environment and GPG sources retain precedence.
+
+The password dialog offers **Remember credentials on this computer**, unchecked by default when native storage is available. After startup succeeds, the manually entered password is saved in the current OS user's secure store for this server and account; it is never saved in the browser. Windows Credential Manager, macOS Keychain, and Linux Secret Service are supported in a local desktop session. Headless Linux or a locked or unavailable store falls back to manual entry; a store operation times out after 15 seconds. Environment and GPG values still take precedence. **Forget saved credentials** removes the current saved login but leaves this session signed in. To use a different login after a saved login fails, select Forget, then Quit and relaunch. A timed-out or canceled save or delete may already have reached the OS store, so its outcome is unknown.
+
+An administrator can create a desktop shortcut targeting the installed `cn-web` executable: on Windows, typically `<venv>\\Scripts\\cn-web.exe`; with pipx, locate its executable directory using `pipx environment`. Quote paths containing spaces and optionally append `-c "C:\\path\\chosen.cn"`. Opening that shortcut starts the application and browser without typing a command. Shortcut creation is manual.
+
+The app binds only to `127.0.0.1` on an available port and serves assets locally. A one-use launch link attaches your browser. Keep the launcher running. Tabs share one runtime, account and active lookup; closing or refreshing a tab keeps the application running. Refresh restores completed results but clears an unsent Targets draft. Account or configuration changes require Quit and relaunch.
+
+Subnets uses the configured network view, or all views when none is selected. Paste IP addresses or subnets, one per line, and select **Look up**. Duplicate inputs and networks are fetched once per applicable view. Multiple networks open a summary: **View details**, **Back to summary**, and **Show all details** reuse fetched results. One network opens details directly. IPv4/IPv6 rules, child containers, original inputs, warnings, enrichment and plugin columns follow the existing workflow. **New lookup** keeps targets ready to edit.
+
+Automatic reporting follows `[report] auto_save`. Completed reportable lookups save once to the configured accumulating workbook; navigation never saves again. Stopped or unreportable lookups add no report. Save failures leave results available. **Download report** waits for pending writes and downloads a consistent copy of the existing workbook. It neither enables reporting nor saves the selected view; after a failed or disabled save, it may contain only earlier results.
+
+**Stop** cooperatively stops new work after in-flight requests finish within configured timeouts; it is disabled while saving. **Quit application** finishes work and writes, runs configured exit actions once (including email and delete-after-send when enabled), then closes the worker and local server. Closing a tab does not run exit actions. Unexpected worker failure is shown without rerunning work or replaying email.
+
+Only Subnets is available initially. Other menu workflows, automatic shortcut creation, and a graphical configuration editor remain deferred.
+
+
 `cn-tool` is a modular network utility for Infoblox lookups, bulk network
 checks, configuration repository searches, and device inventory collection. It runs on Linux, macOS
 and Windows (natively, without WSL) and installs with `pipx install cn-tool`.

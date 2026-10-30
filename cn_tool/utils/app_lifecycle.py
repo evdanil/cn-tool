@@ -22,9 +22,9 @@ def _final_status(exit_code: int, message: str) -> str:
     return "failed"
 
 
-def exit_now(ctx: ScriptContext, exit_code: int = 0, message: str = '', *, quiet: bool = False) -> None:
+def shutdown_resources(ctx: ScriptContext, exit_code: int = 0, message: str = '', *, quiet: bool = False) -> None:
     """
-    Gracefully exits from application, closing resources and logging the exit reason.
+    Close application resources and log the exit reason without exiting the process.
 
     ``quiet`` drops only the farewell line; a message, if given, is always printed.
     """
@@ -91,4 +91,9 @@ def exit_now(ctx: ScriptContext, exit_code: int = 0, message: str = '', *, quiet
         stats.finalize_session(final_status)
         stats.close()
 
+
+
+def exit_now(ctx: ScriptContext, exit_code: int = 0, message: str = '', *, quiet: bool = False) -> None:
+    """Clean up application resources, then exit the terminal application."""
+    shutdown_resources(ctx, exit_code, message, quiet=quiet)
     sys.exit(exit_code)

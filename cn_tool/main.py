@@ -775,7 +775,9 @@ def _has_terminal() -> bool:
 
 
 # --- Start-up shared by the menu and the command line ---------------------------------------------
-def _startup(args: argparse.Namespace) -> tuple[ScriptContext, Dict[str, BaseModule]]:
+def _startup(
+    args: argparse.Namespace, *, interaction=None, enabled_commands=None, presentation: bool = True,
+) -> tuple[ScriptContext, Dict[str, BaseModule]]:
     """
     Logging, modules, plugins, configuration and the context: everything the menu and the command
     line have in common. The menu adds the cache, the writer thread, its status line and signals.
@@ -832,8 +834,10 @@ def _startup(args: argparse.Namespace) -> tuple[ScriptContext, Dict[str, BaseMod
         logger.warning(log_msg)
         final_message += log_msg + '\n'
         cfg["report_file"] = Path(cfg["report_file"].name)
+        if enabled_commands is not None:
+            cfg["report_directory_warning"] = log_msg
 
-    if final_message:
+    if final_message and presentation:
         console.print(f"[bold]{final_message}[/]")
         if not cli_mode:
             time.sleep(5)
@@ -847,9 +851,10 @@ def _startup(args: argparse.Namespace) -> tuple[ScriptContext, Dict[str, BaseMod
         username='',
         password='',
         plugins=all_plugins,
+        interaction=interaction,
     )
 
-    if cli_mode:
+    if cli_mode or enabled_commands is not None:
         # The menu connects AD early to hide latency; a one-shot command connects on first use (the
         # plugin's hook), so malformed input never asks for credentials or opens LDAP.
         ctx.cfg["ad_connect_on_startup"] = False
@@ -858,13 +863,39 @@ def _startup(args: argparse.Namespace) -> tuple[ScriptContext, Dict[str, BaseMod
     # SD-WAN YAML loader targets config_search and reads a whole repository on connect); plugins
     # without a target (statistics, email) and the command's own plugin connect as in the menu.
     wanted = _cli_module_name(loaded_modules, args.command) if cli_mode else None
-    for plugin in ctx.plugins:
-        if not plugin.manages_global_connection:
-            continue
-        target = getattr(plugin, "target_module_name", "")
-        if cli_mode and target and target != wanted:
-            continue
-        plugin.connect(ctx)
+    if enabled_commands is not None:
+        from cn_tool.core.runtime import SetupRequired
+        setup_path = (Path(args.config).expanduser() if args.config
+                      else next(reversed(cfg.get('config_files', [])), user_config_path()))
+        if no_config_file_found(cfg):
+            raise SetupRequired(f"No configuration file found: run cn init to create {user_config_path()}, then configure [api] endpoint in {setup_path}.")
+        if not cfg["infoblox_enabled"]:
+            raise SetupRequired(f"Infoblox API URL is not set: configure [api] endpoint in {setup_path}.")
+        loaded_modules = {
+            key: module for key, module in loaded_modules.items()
+            if getattr(module, "cli_name", None) in enabled_commands
+        }
+        targets = {_cli_module_name(loaded_modules, command) for command in enabled_commands}
+        ctx.plugins = [
+            plugin for plugin in all_plugins
+            if not getattr(plugin, "target_module_name", "") or plugin.target_module_name in targets
+        ]
+    connected = []
+    try:
+        for plugin in ctx.plugins:
+            if not plugin.manages_global_connection:
+                continue
+            target = getattr(plugin, "target_module_name", "")
+            if cli_mode and target and target != wanted:
+                continue
+            connected.append(plugin)
+            plugin.connect(ctx)
+    except BaseException:
+        if enabled_commands is not None:
+            from cn_tool.core.runtime import abort_initialization
+            ctx.plugins = connected
+            abort_initialization(ctx)
+        raise
 
     set_global_color_scheme(ctx)
     return ctx, loaded_modules

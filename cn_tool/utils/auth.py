@@ -45,12 +45,43 @@ def _problem(ctx: ScriptContext) -> str:
     return env_name_problem(_cfg(ctx))
 
 
+def _interaction(ctx: ScriptContext):
+    return getattr(ctx, "interaction", None)
+
+
+def _fail(ctx: ScriptContext, code: int, message: str, *, invalid: bool = False) -> None:
+    interaction = _interaction(ctx)
+    if interaction is not None:
+        if invalid:
+            from cn_tool.core.interaction import AuthenticationFailed
+            raise AuthenticationFailed(code, message)
+        interaction.fail(code, message)
+        raise AssertionError("CredentialInteraction.fail returned")
+    from cn_tool.utils.app_lifecycle import exit_now
+    exit_now(ctx, code, message)
+
+
+def _request_credentials(
+    ctx: ScriptContext, account: str, username: Optional[str], password: Optional[str], message: str,
+) -> Tuple[str, str]:
+    from cn_tool.core.interaction import CredentialRequest
+    reply = _interaction(ctx).prompt(CredentialRequest(
+        account, username or "", not bool(username), not bool(password), message,
+    ))
+    if reply is None:
+        _fail(ctx, 3, "Credential entry canceled.")
+    username = username or reply.username.strip()
+    password = password or reply.password
+    if not username or not password:
+        _fail(ctx, 3, "Authentication error - verify credentials.")
+    return username, password
+
+
 def _end_run_for_bad_names(ctx: ScriptContext, problem: str) -> None:
     """A wrong [auth] setting ends the login with exit status 2: the fix is an edit of .cn."""
-    from cn_tool.utils.app_lifecycle import exit_now
 
     ctx.logger.error("Auth - %s", problem)
-    exit_now(ctx, 2, f"cn: {escape(problem)}")
+    _fail(ctx, 2, f"cn: {escape(problem)}", invalid=True)
 
 
 def _is_name(ctx: ScriptContext, key: str, shown: str) -> bool:
@@ -105,10 +136,10 @@ def credential_source(ctx: ScriptContext) -> Optional[str]:
     password_var = _name(ctx, "auth_device_password_var")
     if os.getenv(password_var):
         # the user name comes from the user variable, or from a prompt
-        return password_var if os.getenv(_name(ctx, "auth_device_user_var")) or _can_prompt() else None
+        return password_var if os.getenv(_name(ctx, "auth_device_user_var")) or _interaction(ctx) is not None or _can_prompt() else None
     if get_gpg_credentials(ctx):
         return f"GPG file {ctx.cfg.get('gpg_credentials')}"
-    return "prompt" if _can_prompt() else None
+    return "prompt" if _interaction(ctx) is not None or _can_prompt() else None
 
 
 def get_auth_creds(ctx: ScriptContext) -> Tuple[Optional[str], Optional[str]]:
@@ -120,7 +151,6 @@ def get_auth_creds(ctx: ScriptContext) -> Tuple[Optional[str], Optional[str]]:
     ``USER``, or ``USERNAME`` on Windows, and ``TACACS_PW``). Without a terminal (cron, ``ssh host cn ...``) nothing is ever prompted:
     missing credentials end the run with exit status 3, and a wrong [auth] setting with exit status 2.
     """
-    from cn_tool.utils.app_lifecycle import exit_now
     from cn_tool.utils.display import console, get_global_color_scheme
     from cn_tool.utils.gpg import get_gpg_credentials
     from cn_tool.utils.user_input import read_user_input
@@ -143,9 +173,13 @@ def get_auth_creds(ctx: ScriptContext) -> Tuple[Optional[str], Optional[str]]:
         if creds:
             username, password = creds
             logger.info("Auth - GPG credentials obtained")
+        elif _interaction(ctx) is not None:
+            username, password = _request_credentials(
+                ctx, "device", username, password, credentials_hint(ctx),
+            )
         elif not interactive:
             logger.error("Auth - no credentials available and no terminal to ask on")
-            exit_now(ctx, 3, no_credentials_message(ctx))
+            _fail(ctx, 3, no_credentials_message(ctx))
             return (None, None)
         else:
             logger.info("Auth - GPG credentials not available, requesting credential from user")
@@ -155,10 +189,15 @@ def get_auth_creds(ctx: ScriptContext) -> Tuple[Optional[str], Optional[str]]:
 
     if not username:
         logger.info("Auth - %s not set, requesting username", _shown(ctx, "auth_device_user_var"))
-        username = read_user_input(ctx, f"[{colors['header']} {colors['bold']}]Provide username:[/]") if interactive else ""
+        if _interaction(ctx) is not None:
+            username, password = _request_credentials(
+                ctx, "device", username, password, credentials_hint(ctx),
+            )
+        else:
+            username = read_user_input(ctx, f"[{colors['header']} {colors['bold']}]Provide username:[/]") if interactive else ""
         if not username:
             logger.error("Auth - username is required but not provided")
-            exit_now(ctx, 3, "Username is required for authentication.")
+            _fail(ctx, 3, "Username is required for authentication.")
             return (None, None)
 
     if username:
@@ -199,7 +238,6 @@ def ensure_device_auth(ctx: ScriptContext) -> Tuple[str, str]:
     Serialised via a module-level lock so concurrent workers never race into
     duplicate interactive prompts.
     """
-    from cn_tool.utils.app_lifecycle import exit_now
 
     if ctx.username and ctx.password:
         return (ctx.username, ctx.password)
@@ -211,7 +249,7 @@ def ensure_device_auth(ctx: ScriptContext) -> Tuple[str, str]:
         username, password = get_auth_creds(ctx)
         if not username or not password:
             ctx.logger.error("Auth - credentials are required but incomplete")
-            exit_now(ctx, 3, "Authentication error - verify credentials.")
+            _fail(ctx, 3, "Authentication error - verify credentials.")
 
         install_context_credentials(ctx, str(username), str(password))
         return (ctx.username, ctx.password)
@@ -353,7 +391,7 @@ def _source_of(ctx: ScriptContext, found: _Found) -> InfobloxSource:
 
     if found.conflict:
         return InfobloxSource(found.username, found.user_from, "", conflict=found.conflict)
-    ask = "prompt" if _can_prompt() else ""
+    ask = "prompt" if _interaction(ctx) is not None or _can_prompt() else ""
     halves = (("auth_infoblox_user_var", found.user_from), ("auth_infoblox_password_var", found.password_from))
     notes = []
     for key, given in halves:
@@ -438,7 +476,6 @@ def get_infoblox_creds(ctx: ScriptContext) -> Optional[Credentials]:
     a terminal it ends the run. Returns None only when the exit hook returns (tests). The log names the
     user and where each half came from, never the password.
     """
-    from cn_tool.utils.app_lifecycle import exit_now
     from cn_tool.utils.display import console, get_global_color_scheme
     from cn_tool.utils.user_input import read_user_input
 
@@ -451,21 +488,29 @@ def get_infoblox_creds(ctx: ScriptContext) -> Optional[Credentials]:
         logger.error(
             "Auth - the Infoblox GPG file is for %s, not %s (%s)", found.conflict, found.username, found.user_from
         )
-        exit_now(ctx, 3, no_infoblox_credentials_message(ctx, source))
+        _fail(ctx, 3, no_infoblox_credentials_message(ctx, source), invalid=True)
         return None
     if found.gpg_problem:
         logger.warning("Auth - %s", _gpg_note(ctx, found))
     if not source.complete:
         logger.error("Auth - Infoblox credentials incomplete and no terminal to ask on")
-        exit_now(ctx, 3, no_infoblox_credentials_message(ctx, source))
+        _fail(ctx, 3, no_infoblox_credentials_message(ctx, source))
         return None
+
+    if _interaction(ctx) is not None:
+        username, password = found.username, found.password
+        if not username or not password:
+            username, password = _request_credentials(
+                ctx, "infoblox", username, password, infoblox_credentials_hint(ctx, source),
+            )
+        return Credentials(username, password, found.password_from or "prompt")
 
     username, user_from = found.username, source.user_from
     if not username:
         username = read_user_input(ctx, f"[{colors['header']} {colors['bold']}]Infoblox user:[/]").strip()
         if not username:
             logger.error("Auth - the Infoblox user is required but not provided")
-            exit_now(ctx, 3, no_infoblox_credentials_message(ctx, InfobloxSource("", "", source.password_from)))
+            _fail(ctx, 3, no_infoblox_credentials_message(ctx, InfobloxSource("", "", source.password_from)))
             return None
 
     password, password_from = found.password, source.password_from

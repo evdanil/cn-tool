@@ -11,6 +11,7 @@ from .event_bus import EventBus
 
 
 if TYPE_CHECKING:
+    from cn_tool.core.interaction import CredentialInteraction
     from cn_tool.utils.display import ThemedConsole
     from cn_tool.utils.cache import CacheManager
     from cn_tool.utils.stats import StatsManager
@@ -42,6 +43,7 @@ class ScriptContext:
     # Infoblox's own account once resolved; None while unknown, and always None when Infoblox uses the
     # shared login (username/password above).
     infoblox_credentials: Optional[Credentials] = None
+    interaction: Optional["CredentialInteraction"] = field(default=None, repr=False)
 
 
 class CliResult(NamedTuple):

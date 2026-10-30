@@ -44,6 +44,9 @@ dependencies = [
     "click",
 ]
 
+[project.optional-dependencies]
+webui = ["nicegui>=3.18,<3.19", "keyring>=25.7,<26"]
+
 [project.urls]
 Homepage = "https://github.com/evdanil/cn-tool"
 Source = "https://github.com/evdanil/cn-tool"
@@ -53,6 +56,7 @@ Changelog = "https://github.com/evdanil/cn-tool/releases"
 [project.scripts]
 cn = "cn_tool.main:main"
 cn-tool = "cn_tool.main:main"
+cn-web = "cn_tool.webui.launcher:main"
 
 # The version file inside the package is the single source of the version: cn_buildstamp turns its MAJOR, MINOR and
 # BUILD into the wheel's version.

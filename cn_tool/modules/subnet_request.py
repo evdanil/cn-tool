@@ -8,11 +8,12 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from time import perf_counter
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from rich.markup import escape
 
 # Assuming these are your project's utility modules
+from cn_tool.core.operation import ControlledExecutor, OperationCancelled, OperationControl, controlled_map
 from cn_tool.core.base import BaseModule, CliResult, ScriptContext, cli_exit_code
 from cn_tool.utils.api import (
     WAPI_MAX_ROWS,
@@ -302,6 +303,20 @@ class SubnetSummaryState:
     description: str
 
 
+@dataclass
+class SubnetLookup:
+    inputs: List[str]
+    query_targets: List[QueryTarget]
+    resolution_errors: Dict[str, str]
+    containers: List[Dict[str, Any]]
+    subnet_data: Dict[str, Dict[str, Any]]
+    warnings: Dict[str, List[str]]
+    grouped: Dict[Network, List[str]]
+    save_view: bool
+    duid: bool
+    stopped: bool
+
+
 class SubnetRequestModule(BaseModule):
     """
     Module to fetch detailed information for one or more subnets from an API.
@@ -323,6 +338,61 @@ class SubnetRequestModule(BaseModule):
     @property
     def visibility_config_key(self) -> Optional[str]:
         return "infoblox_enabled"
+
+    def collect_lookup(self, ctx: ScriptContext, inputs: List[str], scope: ViewScope, *,
+                       control: Optional[OperationControl] = None,
+                       _on_resolved: Optional[Callable[[List[QueryTarget], Dict[str, str], List[Dict[str, Any]]], None]] = None) -> SubnetLookup:
+        """Collect data; the terminal observer preserves messages at resolution."""
+        targets, errors, containers = [], {}, []
+        data, warnings, views = {}, {}, {}
+        stopped = False
+        try:
+            if control:
+                control.stage("resolving inputs")
+            all_views = scope.all_views() if inputs else ()
+            if control is None:
+                targets, errors, containers = self._resolve_inputs_to_targets(ctx, inputs, scope.requested, all_views)
+            else:
+                with ControlledExecutor(control, get_infoblox_max_workers(ctx)) as executor:
+                    resolve = lambda item: self._resolve_single_input_detailed(ctx, item, scope.requested, all_views, executor)
+                    for item, resolution in controlled_map(resolve, inputs, control, get_infoblox_max_workers(ctx)):
+                        if resolution.failure_message:
+                            errors[item] = resolution.failure_message
+                        containers.extend(resolution.containers)
+                        targets.extend(QueryTarget(item, net) for net in sorted(resolution.networks, key=_network_order))
+            if _on_resolved:
+                _on_resolved(targets, errors, containers)
+            networks = self._unique_networks(targets)
+            if networks:
+                if control is None:
+                    data, warnings, views = self._fetch_subnets(ctx, networks, scope.requested, all_views)
+                else:
+                    control.stage("fetching subnet information")
+                    with ControlledExecutor(control, get_infoblox_max_workers(ctx)) as executor:
+                        fetch = lambda network: self._fetch_and_process_subnet_data(ctx, network, scope.requested, all_views, executor)
+                        for network, outcome in controlled_map(fetch, networks, control, get_infoblox_max_workers(ctx)):
+                            if outcome.data:
+                                data[str(network)] = outcome.data
+                            for view, rows in outcome.by_view.items():
+                                if rows:
+                                    data[_cache_key(_make_network(network, view))] = rows
+                            if outcome.by_view:
+                                views[str(network)] = tuple(sorted(outcome.by_view))
+                            if outcome.warnings:
+                                warnings[str(network)] = outcome.warnings
+            if control:
+                control.stage("preparing results")
+        except OperationCancelled:
+            stopped = True
+        targets, data, warnings, containers, save_view = self._settle_views(ctx, scope, targets, data, warnings, views, containers)
+        return SubnetLookup(list(inputs), targets, errors, containers, data, warnings,
+                            self._group_by_network(targets), save_view, self._has_ipv6_object(inputs), stopped)
+
+    def lookup_sections(self, ctx: ScriptContext, lookup: SubnetLookup, *, misses: Sequence[str] = (),
+                        fallback_view: str = "") -> Dict[str, List[Dict[str, Any]]]:
+        return self._build_cli_sections(ctx, list(lookup.grouped), lookup.grouped, lookup.subnet_data,
+                                        lookup.warnings, misses, lookup.containers,
+                                        fallback_view=fallback_view, duid=lookup.duid)
 
     def run(self, ctx: ScriptContext) -> None:
         """
@@ -362,36 +432,24 @@ class SubnetRequestModule(BaseModule):
             duid = self._has_ipv6_object(user_inputs)  # the report's DUID column follows the input, never the answers
             start = perf_counter()
 
-            # --- 2. Resolve all inputs into an ordered list of query targets ---
-            all_views = scope.all_views()  # the views to ask where the grid answers for one view only
-            query_targets, resolution_errors, containers = self._resolve_inputs_to_targets(
-                ctx, user_inputs, scope.requested, all_views
-            )
-            self._print_resolution_errors(ctx, resolution_errors)
+            def on_resolved(targets, errors, child_containers):
+                self._print_resolution_errors(ctx, errors)
+                if targets:
+                    count = len(self._unique_networks(targets))
+                    logger.info(f"Resolved to {count} unique subnets for data fetching.")
+                    console.print(f"[{colors['description']}]Found [{colors['success']}]{count}[/] unique subnets to query.[/]")
+
+            lookup = self.collect_lookup(ctx, user_inputs, scope, _on_resolved=on_resolved)
+            query_targets, containers = lookup.query_targets, lookup.containers
             if not query_targets:
-                if containers:  # only child containers: they are the answer, there is no subnet to look up
-                    *_, containers, _ = self._settle_views(ctx, scope, [], {}, {}, {}, containers)
+                if containers:
                     self._print_child_containers(ctx, containers)
                 else:
                     console.print(f"[{colors['error']}]Could not resolve any of the provided inputs to a valid subnet.[{colors['error']}]")
                 press_any_key(ctx)
                 return
-
-            # --- 3. Main Data Fetching and Processing ---
-            # Fetch data for unique subnets only to avoid redundant API calls
-            unique_networks = self._unique_networks(query_targets)
-            logger.info(f"Resolved to {len(unique_networks)} unique subnets for data fetching.")
-            console.print(f"[{colors['description']}]Found [{colors['success']}]{len(unique_networks)}[/] unique subnets to query.[/]")
-
-            subnet_data_cache, subnet_warning_cache, views_by_network = self._fetch_subnets(
-                ctx, unique_networks, scope.requested, all_views
-            )
-
-            # --- 4. Prepare data for display and saving ---
-            query_targets, subnet_data_cache, subnet_warning_cache, containers, save_view = self._settle_views(
-                ctx, scope, query_targets, subnet_data_cache, subnet_warning_cache, views_by_network, containers,
-            )
-            grouped_by_network = self._group_by_network(query_targets)
+            subnet_data_cache, subnet_warning_cache = lookup.subnet_data, lookup.warnings
+            grouped_by_network, save_view = lookup.grouped, lookup.save_view
             all_data_to_save = self._collect_save_data(ctx, grouped_by_network, subnet_data_cache, save_view=save_view)
 
             end = perf_counter()
@@ -449,52 +507,34 @@ class SubnetRequestModule(BaseModule):
             # a column rule taken from the input, never from which rows came back (the rule ``cn ip`` follows too).
             duid = self._has_ipv6_object(candidates)
             scope = view_scope(ctx, args, request_result)
-            query_targets, resolution_errors, containers = [], {}, []
-            all_views: Tuple[str, ...] = ()
             if candidates:
                 ensure_infoblox_auth(ctx)
                 view_problem = scope.problem()
-                if view_problem:  # a view that is not on the grid, or a grid that cannot say: nothing is looked up
+                if view_problem:
                     ctx.console.print(f"cn subnet: {view_problem.message}", markup=False)
                     return CliResult(view_problem.exit_code, {})
-                all_views = scope.all_views()  # the views to ask where the grid answers for one view only
-                query_targets, resolution_errors, containers = self._resolve_inputs_to_targets(
-                    ctx, candidates, scope.requested, all_views
-                )
-            # An input that is only a container prefix, with child containers and no subnets, is answered too.
-            resolved_inputs = {target.original_input for target in query_targets} | {row["container"] for row in containers}
-            misses = [
-                item for item in inputs
-                if item not in resolved_inputs and item not in resolution_errors and item not in malformed
-            ]
-            self._print_resolution_errors(
-                ctx,
-                {item: resolution_errors.get(item) or problems[item] for item in inputs if item in resolution_errors or item in malformed},
-            )
-            invalid = bool(malformed)
-            failed = bool(resolution_errors)
+
+            misses = []
+            def on_resolved(targets, errors, child_containers):
+                resolved = {target.original_input for target in targets} | {row["container"] for row in child_containers}
+                misses.extend(item for item in inputs if item not in resolved and item not in errors and item not in malformed)
+                self._print_resolution_errors(ctx, {
+                    item: errors.get(item) or problems[item]
+                    for item in inputs if item in errors or item in malformed})
+                if targets:
+                    ctx.logger.info(f"Resolved to {len(self._unique_networks(targets))} unique subnets for data fetching.")
+
+            lookup = self.collect_lookup(ctx, candidates, scope, _on_resolved=on_resolved)
+            query_targets, containers = lookup.query_targets, lookup.containers
+            resolution_errors = lookup.resolution_errors
+            invalid, failed = bool(malformed), bool(resolution_errors)
             if not query_targets:
-                *_, containers, _ = self._settle_views(ctx, scope, [], {}, {}, {}, containers)
-                no_sections = self._build_cli_sections(
-                    ctx, [], {}, {}, {}, misses, containers, fallback_view=scope.requested, duid=duid,
-                )
-                return CliResult(cli_exit_code(found=bool(containers), invalid=invalid, failed=failed), no_sections)
-
-            unique_networks = self._unique_networks(query_targets)
-            ctx.logger.info(f"Resolved to {len(unique_networks)} unique subnets for data fetching.")
-            subnet_data_cache, subnet_warning_cache, views_by_network = self._fetch_subnets(
-                ctx, unique_networks, scope.requested, all_views
-            )
-
-            query_targets, subnet_data_cache, subnet_warning_cache, containers, save_view = self._settle_views(
-                ctx, scope, query_targets, subnet_data_cache, subnet_warning_cache, views_by_network, containers,
-            )
-            grouped_by_network = self._group_by_network(query_targets)
+                sections = self.lookup_sections(ctx, lookup, misses=misses, fallback_view=scope.requested)
+                return CliResult(cli_exit_code(found=bool(containers), invalid=invalid, failed=failed), sections)
+            subnet_data_cache, subnet_warning_cache = lookup.subnet_data, lookup.warnings
+            grouped_by_network, save_view = lookup.grouped, lookup.save_view
             all_data_to_save = self._collect_save_data(ctx, grouped_by_network, subnet_data_cache, save_view=save_view)
-            sections = self._build_cli_sections(
-                ctx, list(grouped_by_network), grouped_by_network, subnet_data_cache, subnet_warning_cache, misses, containers,
-                fallback_view=scope.requested, duid=duid,
-            )
+            sections = self.lookup_sections(ctx, lookup, misses=misses, fallback_view=scope.requested)
             if ctx.cfg["report_auto_save"] and all_data_to_save:
                 self._save_subnet_data(ctx, query_targets, all_data_to_save, duid=duid)
             self._publish_stats(ctx, len(inputs), query_targets, list(grouped_by_network), subnet_data_cache)
@@ -857,6 +897,11 @@ class SubnetRequestModule(BaseModule):
         family. An IPv6 spelling Infoblox cannot store (IPv4-mapped, zone ID) comes back as the failure
         message, with the form to type instead; any other malformed text resolves to nothing, silently.
         """
+        def resolve_request(*args, **kwargs):
+            if isinstance(executor, ControlledExecutor):
+                executor.control.checkpoint()
+            return request_result(*args, **kwargs)
+
         try:
             net = self._parse_network(an_input)
             if net.prefixlen == net.max_prefixlen:
@@ -880,7 +925,7 @@ class SubnetRequestModule(BaseModule):
                 return InputResolutionResult(networks=set())
             own_network = _make_network(net, network_view)
             if net.prefixlen < net.max_prefixlen - 2:
-                result = request_result(ctx, _wapi_uri("children", net, network_view), ensure_auth=False)
+                result = resolve_request(ctx, _wapi_uri("children", net, network_view), ensure_auth=False)
                 found_subnets: Set[Network] = set()
                 if result.ok:
                     supernet_data = process_data(ctx, type='supernet', content=result.content)
@@ -891,7 +936,7 @@ class SubnetRequestModule(BaseModule):
                     return InputResolutionResult(networks=set(), failure_message=describe_infoblox_failure(result))
                 # The child containers are listed, not expanded. A failed lookup is reported next to what
                 # the first one found, so a grid that refuses it still answers for a plain /24.
-                container_result = request_result(
+                container_result = resolve_request(
                     ctx, _wapi_uri("child containers", net, network_view), ensure_auth=False
                 )
                 containers = self._child_container_rows(an_input, container_result.items) if container_result.ok else []
@@ -903,7 +948,7 @@ class SubnetRequestModule(BaseModule):
                 if not network_view and (
                     any(_view_of(child) for child in found_subnets) or any(row.get(NETWORK_VIEW) for row in containers)
                 ):
-                    exact_result = request_result(ctx, _wapi_uri("exact", net), ensure_auth=False)
+                    exact_result = resolve_request(ctx, _wapi_uri("exact", net), ensure_auth=False)
                     networks = networks | {
                         _make_network(net, item["network_view"]) for item in exact_result.items if item.get("network_view")
                     }
@@ -913,6 +958,8 @@ class SubnetRequestModule(BaseModule):
         except ValueError:
             ctx.logger.warning(f"Invalid IP/Subnet format for input: '{an_input}'")
             return InputResolutionResult(networks=set(), failure_message=ipv6_form_problem(an_input))
+        except OperationCancelled:
+            raise
         except Exception as e:
             ctx.logger.error(f"Error resolving input '{an_input}': {e}")
             return InputResolutionResult(networks=set(), failure_message="Subnet resolution failed.")
@@ -1077,6 +1124,8 @@ class SubnetRequestModule(BaseModule):
                     if notice:
                         for warning_label in spec["warning_labels"]:
                             warnings.append(f"{warning_label}: {notice}")
+                except OperationCancelled:
+                    continue
                 except Exception as e:
                     ctx.logger.error(f"Failed to fetch data for '{label}' in {net_str}: {e}")
                     for warning_label in spec["warning_labels"]:
