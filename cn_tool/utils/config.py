@@ -4,6 +4,8 @@ import logging
 import math
 import os
 import re
+import stat
+from contextlib import closing, nullcontext
 from pathlib import Path
 from typing import Dict, Any, List, Mapping, NamedTuple, Tuple
 
@@ -455,6 +457,33 @@ def make_dir_list(ctx: ScriptContext) -> List[Path]:
     Reads the config from the context and generates a list of device configuration 
     directories to scan. This is a shared utility used by both caching and live search.
     """
+    return list(iter_config_dirs(ctx))
+
+
+def _strict_config_directory(path: Path, *, optional: bool = False, require_read: bool = True) -> bool:
+    """Classify a configured directory without suppressing access failures."""
+    try:
+        info = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        if optional:
+            return False
+        raise
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    if require_read and not os.access(path, os.R_OK):
+        raise PermissionError("Configuration directory is unreadable")
+    return True
+
+
+def _scandir_paths(path: Path):
+    """Yield one path at a time and close the directory even on early failure."""
+    with os.scandir(path) as entries:
+        for entry in entries:
+            yield Path(entry.path)
+
+
+def iter_config_dirs(ctx: ScriptContext, *, on_entry=None, strict=False, strict_scan=None):
+    """Yield the menu's configured directories without materializing them."""
     logger = ctx.logger
     cfg = ctx.cfg
     config_repo = cfg.get("config_repo_directory")
@@ -469,36 +498,57 @@ def make_dir_list(ctx: ScriptContext) -> List[Path]:
         # History trees should not be indexed as live configs by default.
         excluded_dirs.add(history_dir)
 
-    dir_list: List[Path] = []
-
-    if not config_repo or not check_dir_accessibility(logger, config_repo):
+    root_accessible = bool(config_repo) and (
+        _strict_config_directory(config_repo) if strict else check_dir_accessibility(logger, config_repo)
+    )
+    if not root_accessible:
         logger.warning("Configuration repository storage directory is not accessible.")
-        return dir_list
+        if strict:
+            raise OSError("Configuration repository is unavailable")
+        return
 
     for vendor in cfg.get("config_repo_vendors", []):
         vendor_path = config_repo / vendor.strip()
-        if not check_dir_accessibility(logger, vendor_path):
+        if on_entry:
+            on_entry(vendor_path)
+        vendor_accessible = (_strict_config_directory(vendor_path, optional=True) if strict
+                             else check_dir_accessibility(logger, vendor_path))
+        if not vendor_accessible:
             continue
 
-        for device_type_path in vendor_path.iterdir():
-            if not device_type_path.is_dir():
-                continue
-            if device_type_path.name.lower() in excluded_dirs:
-                logger.debug(f"Skipping excluded config directory: {device_type_path}")
-                continue
+        paths = closing((strict_scan or _scandir_paths)(vendor_path)) if strict else nullcontext(vendor_path.iterdir())
+        with paths as directory_paths:
+            for device_type_path in directory_paths:
+                if on_entry:
+                    on_entry(device_type_path)
+                if strict and device_type_path.name.lower() in excluded_dirs:
+                    logger.debug(f"Skipping excluded config directory: {device_type_path}")
+                    continue
+                is_directory = (_strict_config_directory(device_type_path, require_read=False)
+                                if strict else device_type_path.is_dir())
+                if not is_directory:
+                    continue
+                if device_type_path.name.lower() in excluded_dirs:
+                    logger.debug(f"Skipping excluded config directory: {device_type_path}")
+                    continue
 
-            if regions:
-                for region in regions:
-                    region_path = device_type_path / region.strip()
-                    if region_path.name.lower() in excluded_dirs:
-                        logger.debug(f"Skipping excluded config directory: {region_path}")
-                        continue
-                    if check_dir_accessibility(logger, region_path):
-                        dir_list.append(region_path)
-            else:
-                if check_dir_accessibility(logger, device_type_path):
-                    dir_list.append(device_type_path)
-    return dir_list
+                if regions:
+                    for region in regions:
+                        region_path = device_type_path / region.strip()
+                        if on_entry:
+                            on_entry(region_path)
+                        if region_path.name.lower() in excluded_dirs:
+                            logger.debug(f"Skipping excluded config directory: {region_path}")
+                            continue
+                        region_accessible = (_strict_config_directory(region_path, optional=True) if strict
+                                             else check_dir_accessibility(logger, region_path))
+                        if region_accessible:
+                            yield region_path
+                else:
+                    type_accessible = (_strict_config_directory(device_type_path) if strict
+                                       else check_dir_accessibility(logger, device_type_path))
+                    if type_accessible:
+                        yield device_type_path
 
 
 def _coerce_repo_inputs(value: Any) -> List[Path]:

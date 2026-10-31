@@ -180,7 +180,7 @@ def _try_break_stale_report_lock(lock_path: Path, *, stale_after: float, logger:
         return False
 
 
-def _acquire_report_lock(report_path: Path, *, timeout: float = 15.0, poll: float = 0.1, stale_after: float = 600.0, logger: Optional[logging.Logger] = None) -> tuple[Optional[int], Optional[Path]]:
+def _acquire_report_lock(report_path: Path, *, timeout: float = 15.0, poll: float = 0.1, stale_after: float = 600.0, logger: Optional[logging.Logger] = None, cancel: Optional[threading.Event] = None) -> tuple[Optional[int], Optional[Path]]:
     """Attempt to acquire a cross-process lock for the report file.
 
     Uses atomic lock-file creation. Returns (fd, lock_path) on success, (None, None) on timeout.
@@ -189,6 +189,8 @@ def _acquire_report_lock(report_path: Path, *, timeout: float = 15.0, poll: floa
     lock_path = _lock_path_for(report_path)
     start = time.monotonic()
     while True:
+        if cancel is not None and cancel.is_set():
+            return None, None
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
             # Optionally write PID for debug/ops visibility
@@ -205,7 +207,10 @@ def _acquire_report_lock(report_path: Path, *, timeout: float = 15.0, poll: floa
                 if logger:
                     logger.warning(f"Report lock timeout: unable to acquire lock {lock_path}")
                 return None, None
-            time.sleep(poll)
+            if cancel is None:
+                time.sleep(poll)
+            else:
+                cancel.wait(poll)
         except Exception:
             # On unexpected errors, do not spin forever
             return None, None
@@ -731,22 +736,41 @@ def write_excel_sheets(
         _release_report_lock(lock_fd, lock_fp)
 
 
-def snapshot_report(ctx: ScriptContext, destination: Path) -> None:
+def snapshot_report(ctx: ScriptContext, destination: Path, cancel: Optional[threading.Event] = None) -> None:
     """Wait for this writer, then copy under the workbook's cross-process lock."""
     import shutil
 
-    wait_for_all_saves()
+    if cancel is None:
+        wait_for_all_saves()
+    else:
+        with save_queue.all_tasks_done:
+            while save_queue.unfinished_tasks and not cancel.is_set():
+                save_queue.all_tasks_done.wait(.1)
+        if cancel.is_set():
+            raise InterruptedError('Snapshot cancelled')
     source = Path(ctx.cfg['report_file']).expanduser()
     destination = Path(destination)
     if source.resolve() == destination.resolve():
         raise ValueError('Snapshot must be separate from the configured report')
     timeout = max(5.0, min(600.0, float(ctx.cfg.get('report_lock_timeout', 120) or 120)))
-    fd, lock_path = _acquire_report_lock(source, timeout=timeout, logger=ctx.logger)
+    lock_kwargs = dict(timeout=timeout, logger=ctx.logger)
+    if cancel is not None:
+        lock_kwargs['cancel'] = cancel
+    fd, lock_path = _acquire_report_lock(source, **lock_kwargs)
     if fd is None or lock_path is None:
+        if cancel is not None and cancel.is_set():
+            raise InterruptedError('Snapshot cancelled')
         raise TimeoutError('Report is busy')
     try:
-        with save_lock:
+        while not save_lock.acquire(timeout=.1):
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError('Snapshot cancelled')
+        try:
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError('Snapshot cancelled')
             shutil.copyfile(source, destination)
+        finally:
+            save_lock.release()
     except Exception:
         destination.unlink(missing_ok=True)
         raise

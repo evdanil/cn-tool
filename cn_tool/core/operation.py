@@ -2,7 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
 from threading import Event, BoundedSemaphore
-from typing import Callable
+from typing import Callable, Optional
 
 
 class OperationCancelled(Exception):
@@ -13,6 +13,7 @@ class OperationCancelled(Exception):
 class OperationControl:
     stop: Event
     progress: Callable[[str], None]
+    counted_progress: Optional[Callable[[str, int, int], None]] = None
 
     def checkpoint(self) -> None:
         if self.stop.is_set():
@@ -21,6 +22,13 @@ class OperationControl:
     def stage(self, name: str) -> None:
         self.checkpoint()
         self.progress(name)
+
+    def counted_stage(self, stage: str, completed: int, total: int) -> None:
+        self.checkpoint()
+        if self.counted_progress is None:
+            self.progress(stage)
+        else:
+            self.counted_progress(stage, completed, total)
 
 
 class ControlledExecutor(ThreadPoolExecutor):

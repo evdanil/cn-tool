@@ -69,4 +69,9 @@ expression = "build_stamp().package_version"
 packages = ["cn_tool", "config_analyzer"]
 
 [tool.hatch.build.targets.sdist]
-only-include = ["cn_tool", "config_analyzer", "LICENSE", "README.md", "pyproject.toml"]
+only-include = [
+    "cn_tool", "config_analyzer", "LICENSE", "README.md", "pyproject.toml",
+    "docs/README.md", "docs/installation.md", "docs/windows.md", "docs/cli.md",
+    "docs/infoblox.md", "docs/ping-monitor.md", "docs/configuration.md", "docs/credentials.md",
+    "docs/integrations.md", "docs/config-analyzer.md", "docs/webui.md", "docs/release-notes.md",
+]

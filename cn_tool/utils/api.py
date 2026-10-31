@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
+import math
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -311,6 +313,75 @@ class NetworkSearchResult:
         return [text for text in (self.skipped, self.note) if text]
 
 
+class NetworkFetchBudget:
+    """Shared limits for the two families of a web preview lookup."""
+
+    def __init__(self, *, max_rows: int, max_bytes: int, control: Any = None):
+        if max_rows < 1 or max_bytes < 1:
+            raise ValueError("Network fetch limits must be positive")
+        self.max_rows, self.max_bytes, self.control = max_rows, max_bytes, control
+        self._rows = self._bytes = 0
+        self._encoded_bytes = 2
+        self._lock = threading.Lock()
+
+    def checkpoint(self) -> None:
+        if self.control is not None:
+            self.control.checkpoint()
+
+    def take_bytes(self, count: int) -> bool:
+        with self._lock:
+            if self._bytes + count > self.max_bytes:
+                return False
+            self._bytes += count
+            return True
+
+    def take_page(self, rows: int, encoded_bytes: int) -> bool:
+        with self._lock:
+            if self._rows + rows > self.max_rows or self._encoded_bytes + encoded_bytes > self.max_bytes:
+                return False
+            self._rows += rows
+            self._encoded_bytes += encoded_bytes
+            return True
+
+
+def _valid_preview_rows(payload: Any, *, network_views: bool = False) -> bool:
+    """Reject malformed WAPI envelopes and fields before location processing."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("result"), list):
+        return False
+    page_id = payload.get("next_page_id")
+    if page_id is not None and not isinstance(page_id, str):
+        return False
+    for row in payload["result"]:
+        if network_views:
+            if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"]:
+                return False
+            dns_views = row.get("associated_dns_views")
+            if dns_views is not None and (not isinstance(dns_views, list) or
+                                          any(not isinstance(view, str) for view in dns_views)):
+                return False
+            if row.get("is_default") is not None and type(row["is_default"]) is not bool:
+                return False
+            continue
+        if not isinstance(row, dict) or not isinstance(row.get("network"), str):
+            return False
+        for key in ("network", "comment", "network_view"):
+            value = row.get(key)
+            if value is not None and not isinstance(value, str):
+                return False
+        value = row.get("dhcp_utilization")
+        if value is not None:
+            if type(value) not in (str, int, float):
+                return False
+            try:
+                if not math.isfinite(float(value)):
+                    return False
+            except ValueError:
+                pass  # Unreadable utilization is displayed as blank by the existing parser.
+            except OverflowError:
+                return False
+    return True
+
+
 def _build_response(status_code: int, content: bytes = b"", url: str = "") -> requests.Response:
     import requests
 
@@ -381,6 +452,8 @@ def describe_infoblox_failure(result: InfobloxResult) -> str:
         return f"Infoblox server error ({result.status_code})."
     if result.status == "invalid_json":
         return "Infoblox returned an invalid JSON response."
+    if result.status == "redirect_error":
+        return "Infoblox redirected the preview request; check the configured API endpoint."
     if result.status == "too_many_results":
         return "Infoblox: more than 1,000 records match. Narrow the search (longer prefix or smaller subnet)."
     if result.status == "invalid_query":
@@ -408,6 +481,8 @@ def join_wapi_url(endpoint: str, uri: str) -> str:
 def _infoblox_account(ctx: ScriptContext) -> Optional[Credentials]:
     """Infoblox's own account on ``ctx``, or None: a context without one, or a test double, uses the shared login."""
     account = getattr(ctx, "infoblox_credentials", None)
+    if account is None:
+        account = getattr(ctx, "_webui_infoblox_account", None)
     return account if isinstance(account, Credentials) else None
 
 
@@ -456,6 +531,7 @@ class InfobloxClient:
         ensure_auth: bool = True,
         paged: bool = False,
         max_pages: int = WAPI_MAX_PAGES,
+        budget: Optional[NetworkFetchBudget] = None,
     ) -> InfobloxResult:
         """
         Run one WAPI GET. With ``paged=True`` the pages are followed (WAPI_PAGE_SIZE rows each,
@@ -472,17 +548,35 @@ class InfobloxClient:
         items: List[Dict[str, Any]] = []
         next_page_id: Optional[str] = None
         for _ in range(max(1, max_pages)):
+            if budget is not None:
+                budget.checkpoint()
             page_uri = first_page_uri if next_page_id is None else f"{first_page_uri}&_page_id={quote(next_page_id, safe='')}"
-            page = self._request_once(ctx, page_uri, ensure_auth=ensure_auth)
-            if not page.ok:
+            if budget is None:
+                page = self._request_once(ctx, page_uri, ensure_auth=ensure_auth)
+            else:
+                page = self._request_once(ctx, page_uri, ensure_auth=ensure_auth, budget=budget)
+            if not page.ok or page.truncated:
                 return page
+            if budget is not None:
+                try:
+                    encoded = json.dumps(page.items, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
+                except (ValueError, UnicodeEncodeError, RecursionError):
+                    return replace(page, items=[], content=b'[]', truncated=True)
+                # Each page's brackets conservatively cover the commas between pages.
+                if not budget.take_page(len(page.items), len(encoded)):
+                    return replace(page, items=[], content=b'[]', truncated=True)
             items.extend(page.items)
             next_page_id = page.next_page_id
             if next_page_id is None:
                 break
-        return replace(page, items=items, content=json.dumps(items).encode(), truncated=next_page_id is not None)
+        if budget is None:
+            content = json.dumps(items).encode()
+        else:
+            content = json.dumps(items, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
+        return replace(page, items=items, content=content, truncated=next_page_id is not None)
 
-    def _request_once(self, ctx: ScriptContext, uri: str, *, ensure_auth: bool = True) -> InfobloxResult:
+    def _request_once(self, ctx: ScriptContext, uri: str, *, ensure_auth: bool = True,
+                      budget: Optional[NetworkFetchBudget] = None) -> InfobloxResult:
         configure_infoblox_session(ctx)
         endpoint = str(ctx.cfg.get("api_endpoint") or "").strip()
         debug_payloads = infoblox_debug_payloads_enabled(ctx)
@@ -500,6 +594,7 @@ class InfobloxClient:
             error_kind: str = "",
             full_url_value: str = "",
             next_page_id: Optional[str] = None,
+            truncated: bool = False,
         ) -> InfobloxResult:
             result = InfobloxResult(
                 status=status,
@@ -512,9 +607,10 @@ class InfobloxClient:
                 uri=uri,
                 full_url=full_url_value,
                 next_page_id=next_page_id,
+                truncated=truncated,
                 account=_account_label(account),
             )
-            if debug_payloads:
+            if debug_payloads and budget is None:
                 ctx.logger.debug(
                     "Infoblox API request debug - uri=%s full_url=%s status=%s code=%s content=%r",
                     uri,
@@ -600,11 +696,84 @@ class InfobloxClient:
             _note_tls_verification_off(ctx)
         timeout = int(ctx.cfg.get("api_timeout", 10))
 
+        class PreviewRedirect(Exception):
+            def __init__(self, status_code: int):
+                self.status_code = status_code
+
+        def reject_redirect(response: requests.Response, **kwargs: Any) -> requests.Response:
+            # Session.send resolves Response.next even with allow_redirects=False, which reads the body.
+            if 300 <= response.status_code < 400:
+                response.close()
+                raise PreviewRedirect(response.status_code)
+            return response
+
+        def redirect_result(status_code: int) -> InfobloxResult:
+            return build_result(status="redirect_error", status_code=status_code,
+                                response_obj=_build_response(status_code, url=full_url), content=b"[]",
+                                message="Infoblox redirected the preview request; check the configured API endpoint.",
+                                error_kind="redirect_error", full_url_value=full_url, truncated=True)
+
         def send() -> InfobloxResult:
             response = _build_response(500, url=full_url)
 
             try:
                 with _IN_FLIGHT.slot(get_infoblox_max_workers(ctx)):  # [api] max_workers requests at most, in all
+                    if budget is not None:
+                        budget.checkpoint()
+                        try:
+                            response = self._session.get(full_url, verify=verify_ssl, timeout=timeout, stream=True,
+                                                         allow_redirects=False, hooks={"response": reject_redirect},
+                                                         headers={"Accept-Encoding": "identity"})
+                        except PreviewRedirect as exc:
+                            return redirect_result(exc.status_code)
+                        if account is not None and response.status_code == 401:
+                            self._refused = account
+                        try:
+                            # The hook handles real Requests; check again for injected HTTP clients.
+                            if 300 <= response.status_code < 400:
+                                return redirect_result(response.status_code)
+                            # requests transparently decompresses streams, potentially before our byte check.
+                            encoding = response.headers.get("Content-Encoding", "").strip().lower()
+                            if encoding not in ("", "identity"):
+                                status = _classify_http_status(response.status_code, "") if response.status_code >= 400 else "ok"
+                                return build_result(status=status, status_code=response.status_code,
+                                                    response_obj=_build_response(response.status_code, url=full_url),
+                                                    content=b"[]", error_kind=status if status != "ok" else "",
+                                                    full_url_value=full_url, truncated=True)
+                            chunks = []
+                            for chunk in response.iter_content(chunk_size=min(65536, budget.max_bytes + 1)):
+                                budget.checkpoint()
+                                if not budget.take_bytes(len(chunk)):
+                                    # Keep the real status, especially 401 for the credential breaker.
+                                    status = _classify_http_status(response.status_code, '') if response.status_code >= 400 else 'ok'
+                                    return build_result(status=status, status_code=response.status_code,
+                                                        response_obj=_build_response(response.status_code, url=full_url),
+                                                        content=b'[]', error_kind=status if status != 'ok' else '',
+                                                        full_url_value=full_url, truncated=True)
+                                chunks.append(chunk)
+                            content = b''.join(chunks)
+                            if response.status_code >= 400:
+                                return build_http_failure(_build_response(response.status_code, content, full_url), response.status_code)
+                            try:
+                                payload = json.loads(content)
+                                valid = _valid_preview_rows(payload, network_views=uri.partition("?")[0] == "networkview")
+                            except (ValueError, RecursionError, OverflowError):
+                                valid = False
+                            if not valid:
+                                return build_result(status='invalid_json', status_code=response.status_code,
+                                                    response_obj=_build_response(response.status_code, url=full_url),
+                                                    content=b'[]', error_kind='invalid_json', full_url_value=full_url,
+                                                    truncated=True)
+                            return build_result(status='ok', status_code=response.status_code,
+                                                response_obj=_build_response(response.status_code, url=full_url),
+                                                content=content, items=payload['result'], full_url_value=full_url,
+                                                next_page_id=payload.get('next_page_id') or None)
+                        except RequestException:
+                            if response.status_code == 401:
+                                return build_http_failure(_build_response(401, url=full_url), 401)
+                            raise
+                        finally:
+                            response.close()
                     response = self._session.get(full_url, verify=verify_ssl, timeout=timeout)
                 response.raise_for_status()
             except Timeout:
@@ -648,10 +817,21 @@ class InfobloxClient:
                     full_url_value=full_url,
                 )
             except HTTPError as exc:
+                if budget is not None:
+                    code = getattr(getattr(exc, "response", None), "status_code", None) or response.status_code or 500
+                    return build_http_failure(_build_response(code, url=full_url), code)
                 # requests.Response.__bool__ is ``.ok``, so every 4xx/5xx response is falsy: test for None
                 error_response = exc.response if exc.response is not None else response
                 return build_http_failure(error_response, error_response.status_code or 500)
             except RequestException as exc:
+                if budget is not None:
+                    code = getattr(getattr(exc, "response", None), "status_code", None) or response.status_code or 500
+                    if code >= 400:
+                        return build_http_failure(_build_response(code, url=full_url), code)
+                    return build_result(status="request_error", status_code=503,
+                                        response_obj=_build_response(503, url=full_url), content=b"",
+                                        message="Infoblox request failed.", error_kind="request_error",
+                                        full_url_value=full_url)
                 error_response = getattr(exc, "response", None)
                 if error_response is not None:
                     return build_http_failure(error_response, error_response.status_code or response.status_code or 500)
@@ -723,8 +903,16 @@ def request_result(
     ensure_auth: bool = True,
     paged: bool = False,
     max_pages: int = WAPI_MAX_PAGES,
+    budget: Optional[NetworkFetchBudget] = None,
 ) -> InfobloxResult:
-    return get_infoblox_client().request(ctx, uri, ensure_auth=ensure_auth, paged=paged, max_pages=max_pages)
+    kwargs = {"ensure_auth": ensure_auth, "paged": paged, "max_pages": max_pages}
+    if budget is not None:
+        kwargs["budget"] = budget
+    result = get_infoblox_client().request(ctx, uri, **kwargs)
+    observer = getattr(ctx, '_webui_request_observer', None)
+    if observer is not None:
+        observer(result)
+    return result
 
 
 def _append_query_arg(uri: str, key: str, value: str) -> str:
@@ -857,13 +1045,16 @@ _NETWORK_FIELDS_IPV6 = "_return_fields=network,comment,network_view"
 
 
 def _query_families(
-    ctx: ScriptContext, uri_ipv4: str, uri_ipv6: str, ensure_auth: bool
+    ctx: ScriptContext, uri_ipv4: str, uri_ipv6: str, ensure_auth: bool, budget: Optional[NetworkFetchBudget] = None
 ) -> Tuple[InfobloxResult, InfobloxResult]:
     """Run the paged IPv4 and IPv6 network queries in parallel; returns (IPv4 result, IPv6 result)."""
+    kwargs = {"ensure_auth": ensure_auth, "paged": True}
+    if budget is not None:
+        kwargs["budget"] = budget
     with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, 2)) as executor:
         future_to_family = {
-            executor.submit(request_result, ctx, uri_ipv4, ensure_auth=ensure_auth, paged=True): "ipv4",
-            executor.submit(request_result, ctx, uri_ipv6, ensure_auth=ensure_auth, paged=True): "ipv6",
+            executor.submit(request_result, ctx, uri_ipv4, **kwargs): "ipv4",
+            executor.submit(request_result, ctx, uri_ipv6, **kwargs): "ipv6",
         }
         family_results = {future_to_family[future]: future.result() for future in future_to_family}
     return family_results["ipv4"], family_results["ipv6"]
@@ -874,6 +1065,7 @@ def _network_result(
     search_type: str,
     result_ipv4: InfobloxResult,
     result_ipv6: InfobloxResult,
+    budget: Optional[NetworkFetchBudget] = None,
 ) -> NetworkSearchResult:
     """
     Parse both families' answers as ``search_type``, merge them and judge the outcome.
@@ -881,8 +1073,14 @@ def _network_result(
     The merge drops (network, network view) duplicates and keeps the first row of each, in the
     order the grid returned them (IPv4, then IPv6): one CIDR in two network views stays two rows.
     """
-    processed_data_ipv4: Dict[str, Any] = process_data(ctx, type=search_type, content=result_ipv4.content) if result_ipv4.ok else {}
-    processed_data_ipv6: Dict[str, Any] = process_data(ctx, type=search_type, content=result_ipv6.content) if result_ipv6.ok else {}
+    # The preview must not emit WAPI payloads even when CLI troubleshooting logs are enabled.
+    process_ctx = ctx
+    if budget is not None:
+        process_ctx = copy.copy(ctx)
+        process_ctx.cfg = {**ctx.cfg, "api_debug_payloads": False}
+    log_kwargs = {"log_label": "location"} if budget is not None else {}
+    processed_data_ipv4: Dict[str, Any] = process_data(process_ctx, type=search_type, content=result_ipv4.content, **log_kwargs) if result_ipv4.ok else {}
+    processed_data_ipv6: Dict[str, Any] = process_data(process_ctx, type=search_type, content=result_ipv6.content, **log_kwargs) if result_ipv6.ok else {}
 
     # Merge and deduplicate
     united_locations = processed_data_ipv4.get('location', []) + processed_data_ipv6.get('location', [])
@@ -924,7 +1122,8 @@ def _network_result(
 
 
 def _search_comments(
-    ctx: ScriptContext, search_term: str, keyword: bool, ensure_auth: bool, network_view: str = ""
+    ctx: ScriptContext, search_term: str, keyword: bool, ensure_auth: bool, network_view: str = "",
+    budget: Optional[NetworkFetchBudget] = None
 ) -> NetworkSearchResult:
     """
     Subnets whose comment names the site code (``[site] comment_pattern``) or, for a keyword, contains it.
@@ -945,12 +1144,13 @@ def _search_comments(
     uri_ipv6 = scope_network(
         f"ipv6network?comment:~={encoded_pattern}&_max_results=1000&{_NETWORK_FIELDS_IPV6}", network_view
     )
-    result_ipv4, result_ipv6 = _query_families(ctx, uri_ipv4, uri_ipv6, ensure_auth)
-    return _network_result(ctx, search_type, result_ipv4, result_ipv6)
+    result_ipv4, result_ipv6 = _query_families(ctx, uri_ipv4, uri_ipv6, ensure_auth, budget)
+    return _network_result(ctx, search_type, result_ipv4, result_ipv6, budget)
 
 
 def _search_attribute_then_comments(
-    ctx: ScriptContext, ea_name: str, code: str, ensure_auth: bool, network_view: str = ""
+    ctx: ScriptContext, ea_name: str, code: str, ensure_auth: bool, network_view: str = "",
+    budget: Optional[NetworkFetchBudget] = None
 ) -> NetworkSearchResult:
     """
     Subnets that carry the site code in the extensible attribute ``ea_name``; when none does, the
@@ -964,6 +1164,7 @@ def _search_attribute_then_comments(
         scope_network(f"network?{attribute_filter}&{_NETWORK_FIELDS_IPV4}", network_view),
         scope_network(f"ipv6network?{attribute_filter}&{_NETWORK_FIELDS_IPV6}", network_view),
         ensure_auth,
+        budget,
     )
 
     skipped = ""
@@ -973,7 +1174,7 @@ def _search_attribute_then_comments(
         result_ipv6 = replace(result_ipv6, status="ok", items=[], content=b"[]")
 
     # The grid matched the attribute, and the comment need not name the site: no local comment filter.
-    found = _network_result(ctx, "location_keyword", result_ipv4, result_ipv6)
+    found = _network_result(ctx, "location_keyword", result_ipv4, result_ipv6, budget)
 
     if found.status == "error":
         reason = found.message.rstrip(".")
@@ -982,9 +1183,9 @@ def _search_attribute_then_comments(
             message=f"Site search by extensible attribute '{ea_name}' ([site] ea_name) failed: {reason}; check with: cn doctor",
         )
 
-    if found.status == "ok" and not found.has_data:
+    if found.status == "ok" and not found.has_data and not found.truncated:
         # Both answers came back empty. The comment search covers IPv6 as well, so nothing stays "skipped".
-        by_comment = _search_comments(ctx, code, keyword=False, ensure_auth=ensure_auth, network_view=network_view)
+        by_comment = _search_comments(ctx, code, keyword=False, ensure_auth=ensure_auth, network_view=network_view, budget=budget)
         if by_comment.has_data:
             note = (
                 f"No subnet has the extensible attribute {ea_name} = {code.upper()}; "
@@ -1003,6 +1204,7 @@ def fetch_network_data(
     ensure_auth: bool = True,
     *,
     network_view: Optional[str] = None,
+    budget: Optional[NetworkFetchBudget] = None,
 ) -> NetworkSearchResult:
     """
     Fetches and processes IPv4 and IPv6 network data based on a search term.
@@ -1026,5 +1228,5 @@ def fetch_network_data(
         spinner="dots12",
     ):
         if ea_name:
-            return _search_attribute_then_comments(ctx, ea_name, search_term, ensure_auth, view)
-        return _search_comments(ctx, search_term, keyword, ensure_auth, view)
+            return _search_attribute_then_comments(ctx, ea_name, search_term, ensure_auth, view, budget)
+        return _search_comments(ctx, search_term, keyword, ensure_auth, view, budget)

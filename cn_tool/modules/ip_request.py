@@ -1,6 +1,7 @@
 import argparse
 import ipaddress
 import json
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Callable, Collection, Dict, Any, List, Optional, Sequence, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from rich.markup import escape
 
 from cn_tool.core.base import BaseModule, CliResult, ScriptContext, cli_exit_code
+from cn_tool.core.operation import ControlledExecutor, OperationCancelled, OperationControl, controlled_map
 from cn_tool.utils.api import NO_NETWORK, bound_infoblox_workers, describe_infoblox_failure, request_result
 from cn_tool.utils.auth import ensure_infoblox_auth
 from cn_tool.utils.cli_input import read_objects
@@ -80,6 +82,45 @@ def _validate_ip(ctx: ScriptContext, text: str) -> Optional[str]:
         return RESERVED_ADDRESS
     return ipv6_form_problem(text) or None
 
+
+
+@dataclass
+class IPInputs:
+    originals: List[str]
+    keys: Dict[str, str]
+    invalid: Dict[str, str]
+    ip_addresses: List[str]
+
+
+def prepare_ip_inputs(ctx: ScriptContext, inputs: List[str]) -> IPInputs:
+    originals = [item.strip() for item in inputs if item.strip()]
+    keys: Dict[str, str] = {}
+    invalid: Dict[str, str] = {}
+    for item in originals:
+        problem = _validate_ip(ctx, item)
+        if problem:
+            invalid[item] = problem
+        else:
+            keys[item] = _lookup_key(item)
+    return IPInputs(originals, keys, invalid, list(dict.fromkeys(keys.values())))
+
+
+@dataclass
+class IPLookup:
+    prepared: IPInputs
+    completed_ips: List[str]
+    cancelled_ips: List[str]
+    unattempted_ips: List[str]
+    ptr_not_checked: List[str]
+    processed_data_by_ip: Dict[str, List[Dict[str, Any]]]
+    failed_ips: Dict[str, str]
+    no_network_ips: Set[str]
+    ptr_pairs: Dict[str, List[Tuple[str, str]]]
+    ptr_failures: Dict[str, str]
+    save_rows: List[Dict[str, Any]]
+    rows: List[Dict[str, Any]]
+    misses: Dict[str, str]
+    stopped: bool
 
 def _publishes_ptr(data: Dict[str, Any]) -> bool:
     """True when the record types of a processed address (``extra``/``record type``) include PTR."""
@@ -259,24 +300,18 @@ class IPRequestModule(BaseModule):
         if not ip_addresses_input:
             return
 
-        # Remove duplicates while preserving order (the keys: two spellings of one IPv6 address are one)
-        ip_addresses = list(dict.fromkeys(ip_addresses_input))
-
-        # --- API Call and Data Processing ---
-        processed_data_by_ip, failed_ips, no_network_ips = self._fetch_ips(
-            ctx, ip_addresses, scope.requested, scope.all_views()
-        )
-        ptr_names, ptr_failures = self._fetch_ptr_names(ctx, _ptr_addresses(ip_addresses, processed_data_by_ip))
-
-        # --- Display and Save Results ---
-        misses = _explain_misses(
-            ip_addresses, processed_data_by_ip, failed_ips, scope.scoped(NO_RECORD), scope.scoped(NO_RECORD_V6),
-            no_network_ips, scope.scoped(NO_NETWORK),
-        )
-        for ip, reason in misses.items():
-            console.print(f"[{colors['success']} {colors['bold']}]{ip}[/] - [{colors['error']}]{escape(reason)}[/]")
-
-        save_rows, print_data_all = self._rows_for(ctx, scope, ip_addresses, processed_data_by_ip, ptr_names)
+        prepared = prepare_ip_inputs(ctx, ip_addresses_input)
+        ip_addresses = prepared.ip_addresses
+        lookup = self.collect_lookup(ctx, prepared, scope)
+        processed_data_by_ip = lookup.processed_data_by_ip
+        ptr_failures = lookup.ptr_failures
+        save_rows, print_data_all = lookup.save_rows, lookup.rows
+        misses = dict(lookup.misses)
+        misses.update(lookup.failed_ips)
+        for ip in ip_addresses:
+            if ip in misses:
+                reason = misses[ip]
+                console.print(f"[{colors['success']} {colors['bold']}]{ip}[/] - [{colors['error']}]{escape(reason)}[/]")
 
         if print_data_all:
             # The print_table_data utility is designed to handle a list of dictionaries.
@@ -319,22 +354,15 @@ class IPRequestModule(BaseModule):
             reason = getattr(exc, "strerror", None) or exc
             console.print(f"[{colors['error']}]cn ip: cannot read {escape(str(source))}: {escape(str(reason))}[/]")
             return CliResult(2, {})
-        if not objects:
+        prepared = prepare_ip_inputs(ctx, objects)
+        if not prepared.originals:
             console.print(f"[{colors['error']}]cn ip: no addresses given; see cn ip --help[/]")
             return CliResult(2, {})
 
-        reasons: Dict[str, str] = {}
-        keys: Dict[str, str] = {}  # each usable object -> its lookup key
-        for obj in objects:
-            problem = _validate_ip(ctx, obj)
-            if problem:
-                reasons[obj] = problem
-            else:
-                keys[obj] = _lookup_key(obj)
+        reasons = dict(prepared.invalid)
+        keys = prepared.keys
         invalid = bool(reasons)
-        ip_addresses = list(dict.fromkeys(keys.values()))
-
-        processed_data_by_ip: Dict[str, List[Dict[str, Any]]] = {}
+        ip_addresses = prepared.ip_addresses
         failed_ips: Dict[str, str] = {}
         ptr_failures: Dict[str, str] = {}
         print_data_all: List[Dict[str, Any]] = []
@@ -342,32 +370,77 @@ class IPRequestModule(BaseModule):
             ensure_infoblox_auth(ctx)
             scope = view_scope(ctx, args, request_result)
             view_problem = scope.problem()
-            if view_problem:  # a view that is not on the grid, or a grid that will not say: nothing is looked up
+            if view_problem:
                 console.print(f"cn ip: {view_problem.message}", markup=False)
                 return CliResult(view_problem.exit_code, {})
-            processed_data_by_ip, failed_ips, no_network_ips = self._fetch_ips(
-                ctx, ip_addresses, scope.requested, scope.all_views()
-            )
-            ptr_names, ptr_failures = self._fetch_ptr_names(ctx, _ptr_addresses(ip_addresses, processed_data_by_ip))
-            save_rows, print_data_all = self._rows_for(ctx, scope, ip_addresses, processed_data_by_ip, ptr_names)
-            self._save_report(ctx, ip_addresses, processed_data_by_ip, save_rows)
-            _publish_stats(ctx, len(keys), ip_addresses, processed_data_by_ip, print_data_all)
-            misses = _explain_misses(
-                ip_addresses, processed_data_by_ip, failed_ips, scope.scoped(NO_RECORD), scope.scoped(NO_RECORD_V6),
-                no_network_ips, scope.scoped(NO_NETWORK),
-            )
-            reasons.update({obj: misses[key] for obj, key in keys.items() if key in misses})
+            lookup = self.collect_lookup(ctx, prepared, scope)
+            failed_ips, ptr_failures = lookup.failed_ips, lookup.ptr_failures
+            print_data_all = lookup.rows
+            self._save_report(ctx, ip_addresses, lookup.processed_data_by_ip, lookup.save_rows)
+            _publish_stats(ctx, len(keys), ip_addresses, lookup.processed_data_by_ip, print_data_all)
+            reasons.update(lookup.misses)
+            reasons.update({obj: failed_ips[key] for obj, key in keys.items() if key in failed_ips})
 
         data = {
             "IP Information": print_data_all,
-            "not_found": [{"object": obj, "reason": reasons[obj]} for obj in objects if obj in reasons],
+            "not_found": [{"object": obj, "reason": reasons[obj]} for obj in prepared.originals if obj in reasons],
             "warnings": _ptr_warnings(ptr_failures),
         }
         failed = bool(failed_ips or ptr_failures)
         return CliResult(cli_exit_code(found=bool(print_data_all), invalid=invalid, failed=failed), data)
 
+    def collect_lookup(
+        self, ctx: ScriptContext, prepared: IPInputs, scope: ViewScope, *,
+        control: Optional[OperationControl] = None,
+    ) -> IPLookup:
+        ips = prepared.ip_addresses
+        started: Set[str] = set()
+        completed: Set[str] = set()
+        checked: Set[str] = set()
+        processed: Dict[str, List[Dict[str, Any]]] = {}
+        failed: Dict[str, str] = {}
+        no_network: Set[str] = set()
+        pairs: Dict[str, List[Tuple[str, str]]] = {}
+        ptr_failures: Dict[str, str] = {}
+        if ips:
+            try:
+                if control:
+                    control.stage("Fetching IP information")
+                    control.checkpoint()
+                views = scope.all_views()
+                processed, failed, no_network = self._fetch_ips(
+                    ctx, ips, scope.requested, views, control=control, started=started, completed=completed
+                )
+                eligible = _ptr_addresses([ip for ip in ips if ip in completed], processed)
+                if control:
+                    control.stage("Fetching PTR records")
+                pairs, ptr_failures = self._fetch_ptr_names(ctx, eligible, control=control, checked=checked)
+            except OperationCancelled:
+                pass
+        done = [ip for ip in ips if ip in completed]
+        eligible = _ptr_addresses(done, processed)
+        stopped = bool(control and control.stop.is_set())
+        try:
+            save_rows, rows = self._rows_for(ctx, scope, ips, processed, pairs, control=control)
+        except OperationCancelled:
+            stopped = True
+            labels = [str(d.get("general", [{}])[0].get(NETWORK_VIEW) or "") for ds in processed.values() for d in ds]
+            show_view = bool(scope.requested or (scope.json and any(labels)) or len(set(filter(None, labels))) > 1)
+            save_rows, rows = self._build_rows(ctx, ips, processed, pairs, row_view=show_view, save_view=show_view,
+                                                fallback_view=scope.requested, duid=any(_is_ipv6(ip) for ip in ips))
+        stopped = stopped or bool(control and control.stop.is_set())
+        canonical_misses = _explain_misses(
+            [ip for ip in done if ip not in failed], processed, failed, scope.scoped(NO_RECORD),
+            scope.scoped(NO_RECORD_V6), no_network, scope.scoped(NO_NETWORK),
+        )
+        misses = {original: canonical_misses[key] for original, key in prepared.keys.items() if key in canonical_misses}
+        return IPLookup(prepared, done, [ip for ip in ips if ip in started and ip not in completed],
+                        [ip for ip in ips if ip not in started], [ip for ip in eligible if ip not in checked],
+                        processed, failed, no_network, pairs, ptr_failures, save_rows, rows, misses, stopped)
+
     def _fetch_ips(
-        self, ctx: ScriptContext, ip_addresses: List[str], network_view: str = "", all_views: Sequence[str] = ()
+        self, ctx: ScriptContext, ip_addresses: List[str], network_view: str = "", all_views: Sequence[str] = (),
+        *, control: Optional[OperationControl] = None, started: Optional[Set[str]] = None, completed: Optional[Set[str]] = None,
     ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, str], Set[str]]:
         """
         Ask Infoblox about each address (``ipv4address`` or ``ipv6address`` by its family) and run the
@@ -393,8 +466,28 @@ class IPRequestModule(BaseModule):
         req_urls = {ip: (ADDRESS_URI_V6 if _is_ipv6(ip) else ADDRESS_URI).format(ip=ip) for ip in ip_addresses}
         views = (network_view,) if network_view else tuple(all_views)
 
+        started = started if started is not None else set()
+        completed = completed if completed is not None else set()
         with console.status(f"[{colors['description']}]Fetching IP information...[/]"):
-            answers = request_in_views(ctx, req_urls, views, request_fn=request_result)
+            if control is None:
+                answers = request_in_views(ctx, req_urls, views, request_fn=request_result)
+                started.update(ip_addresses)
+                completed.update(ip_addresses)
+            else:
+                answers = {}
+                workers = bound_infoblox_workers(ctx, max(1, len(ip_addresses)))
+                with ControlledExecutor(control, workers) as requests:
+                    def fetch(ip):
+                        control.checkpoint()
+                        def send(ctx, uri, **kwargs):
+                            started.add(ip)
+                            return request_result(ctx, uri, **kwargs)
+                        control.checkpoint()  # request_in_views sends a single request directly
+                        answer = request_in_views(ctx, {ip: req_urls[ip]}, views, request_fn=send, executor=requests)
+                        completed.add(ip)
+                        return answer[ip]
+                    for ip, answer in controlled_map(fetch, ip_addresses, control, workers):
+                        answers[ip] = answer
         results = {ip: merge_view_results([result for _, result in answered]) for ip, answered in answers.items()}
 
         processed_data_by_ip: Dict[str, List[Dict[str, Any]]] = {}
@@ -421,7 +514,8 @@ class IPRequestModule(BaseModule):
         return processed_data_by_ip, failed_ips, no_network_ips
 
     def _fetch_ptr_names(
-        self, ctx: ScriptContext, ips: List[str]
+        self, ctx: ScriptContext, ips: List[str], *, control: Optional[OperationControl] = None,
+        checked: Optional[Set[str]] = None,
     ) -> Tuple[Dict[str, List[Tuple[str, str]]], Dict[str, str]]:
         """
         Ask Infoblox for the PTR records at each address of ``ips``: one ``record:ptr`` request per
@@ -439,9 +533,20 @@ class IPRequestModule(BaseModule):
         colors = get_global_color_scheme(ctx.cfg)
         req_urls = {ip: (PTR_URI_V6 if _is_ipv6(ip) else PTR_URI).format(ip=ip) for ip in ips}
 
-        with ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(req_urls))) as executor, console.status(f"[{colors['description']}]Fetching PTR records...[/]"):
-            futures = {ip: executor.submit(request_result, ctx, uri, ensure_auth=False) for ip, uri in req_urls.items()}
-            results = {ip: future.result() for ip, future in futures.items()}
+        checked = checked if checked is not None else set()
+        workers = bound_infoblox_workers(ctx, len(req_urls))
+        with console.status(f"[{colors['description']}]Fetching PTR records...[/]"):
+            if control is None:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {ip: executor.submit(request_result, ctx, uri, ensure_auth=False) for ip, uri in req_urls.items()}
+                    results = {ip: future.result() for ip, future in futures.items()}
+                checked.update(ips)
+            else:
+                def fetch(ip):
+                    response = request_result(ctx, req_urls[ip], ensure_auth=False)
+                    checked.add(ip)
+                    return response
+                results = dict(controlled_map(fetch, ips, control, workers))
 
         pairs: Dict[str, List[Tuple[str, str]]] = {}
         failures: Dict[str, str] = {}
@@ -463,6 +568,7 @@ class IPRequestModule(BaseModule):
         ip_addresses: List[str],
         processed_data_by_ip: Dict[str, List[Dict[str, Any]]],
         ptr_pairs: Dict[str, List[Tuple[str, str]]],
+        *, control: Optional[OperationControl] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         The ``(save_rows, print_rows)`` of a run, with the ``Network view`` column where ``scope`` says it
@@ -482,10 +588,16 @@ class IPRequestModule(BaseModule):
         owner: Optional[OwnerFn] = None
         pairs_name_a_dns_view = any(dns_view for pairs in ptr_pairs.values() for dns_view, _ in pairs)
         if pairs_name_a_dns_view and any(label.strip() for label in labels):
+            if control and scope._grid is None:
+                control.checkpoint()
             grid = scope.grid()
             owner = None if grid.error else grid.owner
+        if control and scope._grid is None:
+            control.checkpoint()
         row_view = scope.result_column(labels)
         # The sheet is decided only when a report is saved; otherwise the hook sees the same row as pre_render.
+        if control and scope._grid is None and ctx.cfg["report_auto_save"]:
+            control.checkpoint()
         save_view = scope.column(labels) if ctx.cfg["report_auto_save"] else row_view
         return self._build_rows(
             ctx, ip_addresses, processed_data_by_ip, ptr_pairs,

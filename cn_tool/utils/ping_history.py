@@ -537,3 +537,101 @@ def icmp_error_result(output: Optional[str], target: Optional[str] = None) -> Op
         if senders:
             return UNREACHABLE
     return UNREACHABLE if local else None
+
+# Web history queries use compact, scoped continuation tokens. The actual page and
+# its anchor are checked together by PingStore in a single read transaction.
+def _history_int(value: object, minimum: int = 1) -> bool:
+    return type(value) is int and minimum <= value <= 2**63 - 1
+
+
+def _history_run_id(value: object) -> bool:
+    return isinstance(value, str) and 1 <= len(value) <= 128 and value.isascii() and value.isprintable()
+
+
+def _history_key(kind: str, value: object) -> bool:
+    import math
+
+    if kind in ("requests", "hosts"):
+        return _history_int(value, 0 if kind == "hosts" else 1)
+    if not isinstance(value, list) or len(value) != 2:
+        return False
+    timestamp, identifier = value
+    valid_time = (_history_int(timestamp, -(2**63)) or
+                  type(timestamp) is float and math.isfinite(timestamp))
+    return valid_time and (_history_run_id(identifier) if kind == "runs" else _history_int(identifier))
+
+
+def _history_cursor(kind: str, parent: object, after: object) -> str:
+    import base64
+
+    data = json.dumps([1, kind, parent, after], ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    return base64.urlsafe_b64encode(data.encode("ascii")).decode("ascii").rstrip("=")
+
+
+def _history_decode_cursor(cursor: object, kind: str, parent: object) -> object:
+    import base64
+    import binascii
+
+    if not isinstance(cursor, str) or not 1 <= len(cursor) <= 1024 or not re.fullmatch(r"[A-Za-z0-9_-]+", cursor):
+        raise ValueError("invalid cursor")
+    try:
+        raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+        data = json.loads(raw.decode("ascii"))
+        if (not isinstance(data, list) or len(data) != 4 or type(data[0]) is not int or data[0] != 1 or
+                data[1] != kind or type(data[2]) is not type(parent) or data[2] != parent or
+                not _history_key(kind, data[3]) or _history_cursor(kind, parent, data[3]) != cursor):
+            raise ValueError("invalid cursor")
+        return data[3]
+    except (ValueError, UnicodeError, binascii.Error, OverflowError, RecursionError) as error:
+        raise ValueError("invalid cursor") from error
+
+
+def read_monitor_history(ctx: object, query: Mapping[str, object]) -> Dict[str, object]:
+    """Read one live, bounded history page from the configured database.
+
+    ``query`` contains exactly ``kind``, ``parent``, ``cursor`` and ``limit``.
+    Invalid input and pruned anchors return respectively ``invalid`` and
+    ``expired``; a store failure returns its actionable message. No cursor
+    implies a snapshot across calls. The connection belongs to this call.
+    """
+    import math
+    from pathlib import Path
+    from cn_tool.utils.ping_store import HistoryExpired, PingStore, StoreError
+
+    def result(items: object = None, next_cursor: object = None, error: object = None) -> Dict[str, object]:
+        return {"items": [] if items is None else items, "next_cursor": next_cursor, "error": error}
+
+    if not isinstance(query, Mapping) or set(query) != {"kind", "parent", "cursor", "limit"}:
+        return result(error="invalid")
+    kind, parent, cursor, limit = (query["kind"], query["parent"], query["cursor"], query["limit"])
+    if (not isinstance(kind, str) or kind not in ("requests", "runs", "rounds", "hosts") or
+            not _history_int(limit) or limit > 100 or
+            (kind == "requests" and parent is not None) or
+            (kind in ("runs", "hosts") and not _history_int(parent)) or
+            (kind == "rounds" and not _history_run_id(parent))):
+        return result(error="invalid")
+    try:
+        after = None if cursor is None else _history_decode_cursor(cursor, kind, parent)
+    except ValueError:
+        return result(error="invalid")
+    configured = ctx.cfg.get("ping_history_file")
+    path = Path(configured if configured and str(configured) != "." else "~/.cn-ping-history.db").expanduser()
+    try:
+        store = PingStore.open(path, write=False)
+        if store is None:
+            return result(error="expired" if parent is not None or after is not None else None)
+        with store:
+            items, next_key = store.history_page(kind, parent, after=after, limit=limit)
+        # Invalid stored values must not escape as non-JSON numbers or produce unusable cursors.
+        if (any(type(value) is float and not math.isfinite(value) for item in items for value in item.values()) or
+                next_key is not None and not _history_key(
+                    kind, list(next_key) if isinstance(next_key, tuple) else next_key)):
+            raise StoreError(f"cannot read {path}: invalid history page data")
+        return result(items=items, next_cursor=None if next_key is None else _history_cursor(kind, parent, next_key))
+    except HistoryExpired:
+        return result(error="expired")
+    except StoreError as error:
+        logger = getattr(ctx, "logger", None)
+        if logger is not None:
+            logger.warning("Monitor history read failed: %s", error)
+        return result(error="Unable to read monitor history. Check the configured history file and application logs.")

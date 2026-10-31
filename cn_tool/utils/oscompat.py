@@ -1,8 +1,8 @@
 """One place that says which operating system cn runs on.
 
-Code asks ``oscompat.is_windows()`` or ``oscompat.is_macos()`` when it runs, through this module and never
-through ``from cn_tool.utils.oscompat import is_windows``: a test then flips the answer for one test with the
-``windows_host``, ``macos_host`` and ``posix_host`` fixtures. Both answers are read at every call, and neither
+Code asks ``oscompat.is_windows()``, ``oscompat.is_macos()`` or ``oscompat.is_linux()`` at runtime through
+this module, never through direct function imports. Tests use the ``windows_host``, ``macos_host`` and
+``posix_host`` fixtures to change the answers for one test. All answers are read at every call, and neither
 ``os.name`` nor ``sys.platform`` is ever patched (pathlib reads ``os.name`` on every ``Path()``).
 
 Standard library only, so any module may import it.
@@ -21,6 +21,11 @@ def is_windows() -> bool:
 def is_macos() -> bool:
     """True on macOS (``sys.platform == "darwin"``). Read at every call."""
     return sys.platform == "darwin"
+
+
+def is_linux() -> bool:
+    """True on Linux, read at every call."""
+    return sys.platform.startswith("linux")
 
 
 # What the Windows branch of pid_exists reads (winnt.h, winerror.h): the access right it asks for, the error

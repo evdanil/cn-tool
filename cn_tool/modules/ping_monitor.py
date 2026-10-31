@@ -22,14 +22,16 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Mapping, NamedTuple, Optional, Protocol, Sequence, Set, Tuple
 
 from rich.cells import cell_len, set_cell_size
 from rich.markup import escape
 
 from cn_tool.core.base import CliResult, ScriptContext, cli_exit_code
+from cn_tool.core.operation import OperationControl
 from cn_tool.modules import bulk_ping
 from cn_tool.utils import auth, oscompat, ping_grid, ping_live
 from cn_tool.utils import ping_history as ph
@@ -38,7 +40,7 @@ from cn_tool.utils.config_history import format_time, since_time
 from cn_tool.utils.display import console, get_global_color_scheme, print_table_data, table_columns
 from cn_tool.utils.file_io import queue_save
 from cn_tool.utils.ping_store import (
-    Deletion, PingStore, RequestInfo, ResultRow, RunInfo, StoreError, StoredRound, id_problem,
+    AlreadyRunning, Deletion, PingStore, RequestInfo, ResultRow, RunInfo, StoreError, StoredRound, id_problem,
 )
 from cn_tool.utils.user_input import press_any_key, read_user_input
 
@@ -195,6 +197,7 @@ class RunPlan:
     since: Optional[float] = None
     source: Optional[str] = None
     icmp: bool = True
+    require_history: bool = False  # a rerun depends on the history it read
 
 
 @dataclass
@@ -224,6 +227,14 @@ class RunOutcome:
         """Whether a period the last round saw goes on now: the run that recorded that round is still going on. Another
         run going on never saw the host (it may not have recorded a round yet), so the period ended there."""
         return self.last_run is not None and self.last_run in self.live_runs
+
+
+class MonitorObserver(Protocol):
+    """Callbacks run synchronously on the run thread; consumers copy values they retain."""
+
+    def on_started(self, run_id: str) -> None: ...
+    def on_status(self, stage: str, completed: int, total: int) -> None: ...
+    def on_round(self, run_id: str, revision: int, outcome: RunOutcome) -> None: ...
 
 
 def _stored_round(stored: StoredRound) -> ph.Round:
@@ -354,6 +365,13 @@ def _going_as_text(info: RequestInfo, request: Request, run: RunInfo, now: float
     under ``request``, which has ``run`` going on (the command line and the menu add their own ending)."""
     return (f"this cn expands {ph.short_id(info.key)}'s targets to another host list, recorded as {request.short_id}; "
             f"a run of {request.short_id} is going on ({_started_on(run, now)})")
+
+
+def _admission_text(request: Request, run: RunInfo, now: float, rerun_info: Optional[RequestInfo]) -> str:
+    """Explain the live owner, including a rerun whose expansion changed its request."""
+    if rerun_info is not None and rerun_info.key != request.key:
+        return _going_as_text(rerun_info, request, run, now)
+    return f"a run of {request.short_id} is going on ({_started_on(run, now)})"
 
 
 def _no_run() -> Dict[str, List[Row]]:
@@ -616,6 +634,7 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         self, ctx: ScriptContext, args: argparse.Namespace, lines: Iterable[str], ports: Tuple[int, ...], *,
         every: Optional[float], length: Optional[float], source: Optional[str],
         before: Optional[Callable[[Request], Optional[Tuple[int, str]]]] = None,
+        rerun_info: Optional[RequestInfo] = None,
     ) -> CliResult:
         """
         What a run does with the targets it has, typed (``_cli_run``) or recorded (``_cli_rerun``): the ICMP check, the
@@ -649,8 +668,17 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
             since=_since(args.since),
             source=source,
             icmp=icmp,
+            require_history=rerun_info is not None,
         )
-        outcome = self._track(ctx, request, plan)
+        try:
+            outcome = self._track(ctx, request, plan)
+        except AlreadyRunning as error:
+            text = _admission_text(request, error.run, time.time(), rerun_info)
+            _say(f"cn: monitor: {text}; --follow {request.short_id} shows it; nothing was started")
+            return CliResult(2, {**empty, "not_found": not_found})
+        except StoreError as error:
+            _say(_HISTORY.format(error))
+            return CliResult(3, {**empty, "not_found": not_found})
         if outcome.store_error:
             _say(_HISTORY.format(outcome.store_error))
         if not outcome.rounds:
@@ -722,7 +750,7 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
 
         return self._cli_track(
             ctx, args, info.targets, info.tcp_ports, every=rerun.every, length=rerun.length,
-            source=info.newest_run.source if info.newest_run is not None else None, before=announce,
+            source=info.newest_run.source if info.newest_run is not None else None, before=announce, rerun_info=info,
         )
 
     def _rerun_notice(
@@ -1047,6 +1075,11 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         recorded in the store and drawn in the live view (plan section 4.1). The menu and ``cn monitor`` share it."""
         return _Run(self, ctx, request, plan).go()
 
+    def track_controlled(self, ctx: ScriptContext, request: Request, plan: RunPlan,
+                         control: OperationControl, observer: MonitorObserver) -> RunOutcome:
+        """Run without terminal access, cooperatively stopping through ``control``."""
+        return _Run(self, ctx, request, plan, control=control, observer=observer).go()
+
     # --- output --------------------------------------------------------------------------------------
     def _sections(self, outcome: RunOutcome, fmt: str) -> Dict[str, List[Row]]:
         return {
@@ -1199,11 +1232,37 @@ class _RunClock:
         return reading
 
 
+class _ControlledTerminal:
+    """Event-backed stop and wait adapters; no terminal resources are opened."""
+
+    enabled = False
+
+    def __init__(self, control: OperationControl) -> None:
+        self.control = control
+
+    @property
+    def stopped(self) -> bool:
+        return self.control.stop.is_set()
+
+    @property
+    def reason(self) -> Optional[str]:
+        return "stop" if self.stopped else None
+
+    def poll(self, timeout: float) -> None:
+        self.control.stop.wait(timeout)
+        return None
+
+    def note(self, line: Any) -> None:
+        pass
+
+
 class _Run:
     """One run of a plan (plan section 4): the loop, its store writes and its live view. A store that fails is
     closed and the run goes on without it; the summary says so (exit 3)."""
 
-    def __init__(self, module: PingMonitorModule, ctx: ScriptContext, request: Request, plan: RunPlan) -> None:
+    def __init__(self, module: PingMonitorModule, ctx: ScriptContext, request: Request, plan: RunPlan,
+                 *, control: Optional[OperationControl] = None, observer: Optional[MonitorObserver] = None) -> None:
+        self.control, self.observer = control, observer
         self.module = module
         self.ctx = ctx
         self.request = request
@@ -1212,6 +1271,8 @@ class _Run:
         self.blocks = request.blocks()
         self.colors = get_global_color_scheme(ctx.cfg)
         self.store: Optional[PingStore] = None
+        self.admitted = False
+        self.probe_exception = False
         self.run_id = uuid.uuid4().hex
         self.view = "grid"
         self.clock = _RunClock()
@@ -1252,11 +1313,13 @@ class _Run:
         if known is not None:
             self._store_call(lambda store: self._earlier(store, known.id))
         # The request and the run in one transaction: another process's prune never finds the request without a run.
-        self._store_call(lambda store: store.begin_run(
-            request.key, request.tokens, request.ports, request.hosts, self.run_id, source=self.plan.source,
+        admitted = self._store_call(lambda store: store.admit_run(
+            request.key, request.tokens, request.ports, request.hosts, self.run_id, going_on=self.module._going_on,
+            source=self.plan.source,
             started=self.started, interval=self.plan.every, until=self.plan.until, host=socket.gethostname(),
             pid=os.getpid(), heartbeat=time.time(),
         ))
+        self.admitted = admitted is not None
 
     def _earlier(self, store: PingStore, request_id: int) -> None:
         """Fold the request's rounds from before this run (from ``since`` on) into a new tracker, from one snapshot (the
@@ -1307,21 +1370,29 @@ class _Run:
         try:
             # The stop handlers come first: a Ctrl+C while the history opens (a lock wait, a long history) only asks
             # the run to stop. The keys and the live view come after the start's warnings.
-            with ping_live.StopSignals() as stop:
+            terminal = _ControlledTerminal(self.control) if self.control is not None else None
+            with (nullcontext(terminal) if terminal is not None else ping_live.StopSignals()) as stop:
                 self.started = self.clock.now()
                 self._open()
+                if (self.control is not None or self.plan.require_history) and outcome.store_error:
+                    raise StoreError(outcome.store_error)
+                if self.observer is not None:
+                    self.observer.on_started(self.run_id)
                 every = self.plan.every
                 logger.info(
                     "Ping Monitor - run %s of %s: %d hosts, %s, %d earlier rounds", self.run_id,
                     self.request.short_id, len(self.request.hosts), f"every {_span(every)}" if every else "one round",
                     outcome.earlier,
                 )
-                self._warn_overrun()
-                with ping_live.Keys() as keys, ping_live.LiveScreen(self.colors) as screen:
-                    self._loop(stop, keys, screen)
+                if terminal is None:
+                    self._warn_overrun()
+                    with ping_live.Keys() as keys, ping_live.LiveScreen(self.colors) as screen:
+                        self._loop(stop, keys, screen)
+                else:
+                    self._loop(stop, terminal, terminal)
                 self._without_own_start()
             outcome.stop_reason = stop.reason
-            status = "stopped" if stop.reason else "finished"
+            status = "failed" if self.probe_exception else "stopped" if stop.reason else "finished"
         except (KeyboardInterrupt, SystemExit):  # the second Ctrl+C: main's handler exits; the run ends as stopped
             status = "stopped"
             raise
@@ -1329,7 +1400,8 @@ class _Run:
             outcome.running = False
             try:
                 try:
-                    self._end(status)
+                    if self.admitted:
+                        self._end(status)
                 except (KeyboardInterrupt, SystemExit):  # a second Ctrl+C while the end is written: written still
                     self._end(status)
                     raise
@@ -1359,11 +1431,16 @@ class _Run:
         while not stop.stopped:
             if self.plan.until is not None and self.clock.now() >= self.plan.until:
                 return  # past its end (a suspend, or a start that outlasted --for): it ends, no round more (4.2)
-            if not self._round(slot, stop, keys, screen) or every is None:
+            if not self._round(slot, stop, keys, screen):
                 return
-            following = max(slot + 1, math.ceil((self.clock.now() - self.started) / every))
-            last = following if self.plan.until is None else min(following, _slots(self.started, every, self.plan.until))
-            self.outcome.late += max(last - slot - 1, 0)  # the run's own slots it overran, never those past its end
+            if every is not None:
+                following = max(slot + 1, math.ceil((self.clock.now() - self.started) / every))
+                last = following if self.plan.until is None else min(following, _slots(self.started, every, self.plan.until))
+                self.outcome.late += max(last - slot - 1, 0)  # overrun slots, never those past the end
+            if self.observer is not None:
+                self.observer.on_round(self.run_id, self.outcome.rounds, self.outcome)
+            if every is None or self.probe_exception:
+                return
             slot = following
             next_at = self.started + slot * every
             if self.plan.until is not None and next_at >= self.plan.until:
@@ -1374,6 +1451,8 @@ class _Run:
         """Wait for the next slot in slices, minding the keys and the stop request, with the countdown drawn. The
         wait is at most one interval of the monotonic clock, and ends early when the run's clock jumps past the slot
         (a suspend)."""
+        if self.observer is not None:
+            self.observer.on_status("waiting", 0, 0)
         deadline = time.monotonic() + min(until - self.clock.now(), self.plan.every or 0.0)
         while not stop.stopped:
             remaining = min(deadline - time.monotonic(), until - self.clock.now())
@@ -1401,6 +1480,8 @@ class _Run:
         """
         targets: List[Tuple[str, str]] = []
         unresolvable: List[str] = []
+        if self.observer is not None:
+            self.observer.on_status("resolving", 0, len(hosts))
         beat = time.monotonic()
         for start in range(0, len(hosts), bulk_ping.BATCH_SIZE):
             lookups = _Background(self.module._address_targets, hosts[start:start + bulk_ping.BATCH_SIZE])
@@ -1421,6 +1502,8 @@ class _Run:
             found, gone = lookups.result()
             targets += found
             unresolvable += gone
+            if self.observer is not None:
+                self.observer.on_status("resolving", min(start + bulk_ping.BATCH_SIZE, len(hosts)), len(hosts))
         return targets, unresolvable
 
     def _round(self, slot: int, stop: Any, keys: Any, screen: Any) -> bool:
@@ -1438,20 +1521,43 @@ class _Run:
         if resolved is None:
             return False
         targets, unresolvable = resolved
-        outcome.unresolved.update(unresolvable)
-        outcome.resolved.update(host for host, address in targets if host != address)  # an address pairs with itself
         pending: Dict[int, str] = {self.index[name]: "?" for name in unresolvable}
         rows: Dict[str, Row] = {name: bulk_ping._row(name, "", ph.NO_SUCH_HOST, ports) for name in unresolvable}
         times: Dict[str, float] = {}
-        sweep = self.module._sweep(targets, logger, ports, self.plan.icmp)
+        if self.observer is not None:
+            self.observer.on_status("probing", 0, len(targets))
+        try:
+            if self.control is None:
+                sweep = self.module._sweep(targets, logger, ports, self.plan.icmp)
+            else:
+                sweep = self.module._sweep(targets, logger, ports, self.plan.icmp, control=self.control)
+        except bulk_ping.PingCleanupError:
+            raise  # An unreaped child is a distinct cleanup failure, not a finished sweep.
+        except OSError:
+            if self.control is None:
+                raise
+            self._controlled_probe_failure()
+            return False
         self._draw(screen, pending, done=0, total=len(targets))
         while True:
             if stop.stopped and len(times) < len(targets):  # its hosts not pinged yet would read as silent
                 sweep.close()
                 return False
             batch_started = self.clock.now()
-            batch = next(sweep, None)
+            try:
+                batch = next(sweep, None)
+            except bulk_ping.PingCleanupError:
+                raise  # Preserve the failure when a started child could not be reaped.
+            except OSError:
+                if self.control is None:
+                    raise
+                self._controlled_probe_failure()
+                if len(times) == len(targets):
+                    break  # Every probe crossed the existing complete-round boundary.
+                return False
             if batch is None:
+                if len(times) < len(targets):
+                    return False
                 break
             if stop.stopped:  # a signal while this batch pinged (keys are read after it): its pings got it too
                 sweep.close()
@@ -1462,7 +1568,11 @@ class _Run:
             self._store_call(lambda store: store.heartbeat(self.run_id, time.time()))
             self._key(keys.poll(0), stop)
             self._draw(screen, pending, done=len(times), total=len(targets), rows=rows, times=times)
+            if self.observer is not None:
+                self.observer.on_status("probing", len(times), len(targets))
 
+        outcome.unresolved.update(unresolvable)
+        outcome.resolved.update(host for host, address in targets if host != address)
         ordered = self.module.execute_hook("process_data", self.ctx, [rows[host] for host in hosts if host in rows])
         by_host = {row["Host"]: row for row in ordered}
         observations = "".join(ph.observation(by_host[host], ports) if host in by_host else "." for host in hosts)
@@ -1488,6 +1598,12 @@ class _Run:
         logger.debug("Ping Monitor - round %d (slot %d) of run %s: %d of %d seen in %.1f s", outcome.rounds, slot,
                      self.run_id, len(seen), len(hosts), ended - begun)
         return True
+
+    def _controlled_probe_failure(self) -> None:
+        """Keep earlier complete rounds after an in-flight controlled sweep fails."""
+        self.ctx.logger.exception("Ping Monitor probe failed")
+        self.outcome.probe_failed = True
+        self.probe_exception = True
 
     # -- the live view ---------------------------------------------------------------------------------
     def _draw(self, screen: Any, pending: Dict[int, str], *, next_in: Optional[float] = None,
@@ -1748,8 +1864,9 @@ class _Menu:
                 if not answer:
                     return True
                 if answer.lower() == "n":
-                    self.new_run(info)
-                    return False
+                    if self.new_run(info):
+                        return False
+                    continue
                 if answer.lower() == "r":
                     started = self._again(info)
                     if started is None:  # the request is gone or the history unreadable (said): back to the list
@@ -1938,7 +2055,7 @@ class _Menu:
         going = self.module._going([current])
         if going:
             self._say(f"A run of these targets is going on ({_started_on(going[0], time.time())}): f follows it, "
-                      "n starts another beside it.", "error")
+                      "wait until it ends to start another.", "error")
             return False
         return self.new_run(current, _rerun(ph.short_id(current.key), runs)[0])
 
@@ -2004,8 +2121,16 @@ class _Menu:
             run_for, every = self._period()
         now = time.time()
         plan = RunPlan(every=every, until=now + run_for if run_for else None, since=None if include else now,
-                       source=source)
-        outcome = self.module._track(self.ctx, request, plan)
+                       source=source, require_history=rerun is not None)
+        try:
+            outcome = self.module._track(self.ctx, request, plan)
+        except AlreadyRunning as error:
+            text = _admission_text(request, error.run, time.time(), stored if rerun is not None else None)
+            self._say(_capital(text) + "; nothing was started", "error")
+            return False
+        except StoreError as error:
+            self._say(f"Ping history: {error}", "error")
+            return False
         self._report(outcome)
         return True
 

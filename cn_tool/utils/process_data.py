@@ -400,6 +400,8 @@ def process_data(
     ctx: ScriptContext,
     type: str,
     content: Optional[bytes] = None,
+    *,
+    log_label: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Process raw API data by dispatching to the appropriate parser based on the 'type'.
@@ -416,11 +418,12 @@ def process_data(
              if processing fails or yields no data.
     """
     logger = ctx.logger
-    logger.info(f"Processing data - {type.upper()}")
+    label = type if log_label is None else log_label
+    logger.info(f"Processing data - {label.upper()}")
     payload_size = len(content or b"")
-    logger.debug(f"Processing data {type.upper()} payload size: {payload_size} bytes")
+    logger.debug(f"Processing data {label.upper()} payload size: {payload_size} bytes")
     if infoblox_debug_payloads_enabled(ctx):
-        logger.debug(f"Processing data {type.upper()} content: {content}")
+        logger.debug(f"Processing data {label.upper()} content: {content}")
 
     if not content:
         return defaultdict(list)
@@ -428,7 +431,7 @@ def process_data(
     try:
         raw_data = json.loads(content)
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON response for type '{type}': {e}")
+        logger.error(f"Failed to parse JSON response for type '{label}': {e}")
         # It's better to return empty data than to crash the entire application
         return defaultdict(list)
 
@@ -452,7 +455,7 @@ def process_data(
     if parser_func:
         return parser_func(raw_data)
     else:
-        logger.warning(f"No parser implemented for data type '{type}'.")
+        logger.warning(f"No parser implemented for data type '{label}'.")
         return defaultdict(list)
 
 

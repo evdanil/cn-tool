@@ -776,7 +776,7 @@ def _has_terminal() -> bool:
 
 # --- Start-up shared by the menu and the command line ---------------------------------------------
 def _startup(
-    args: argparse.Namespace, *, interaction=None, enabled_commands=None, presentation: bool = True,
+    args: argparse.Namespace, *, interaction=None, enabled_commands=None, enabled_module_names=(), presentation: bool = True,
 ) -> tuple[ScriptContext, Dict[str, BaseModule]]:
     """
     Logging, modules, plugins, configuration and the context: everything the menu and the command
@@ -864,17 +864,13 @@ def _startup(
     # without a target (statistics, email) and the command's own plugin connect as in the menu.
     wanted = _cli_module_name(loaded_modules, args.command) if cli_mode else None
     if enabled_commands is not None:
-        from cn_tool.core.runtime import SetupRequired
-        setup_path = (Path(args.config).expanduser() if args.config
-                      else next(reversed(cfg.get('config_files', [])), user_config_path()))
-        if no_config_file_found(cfg):
-            raise SetupRequired(f"No configuration file found: run cn init to create {user_config_path()}, then configure [api] endpoint in {setup_path}.")
-        if not cfg["infoblox_enabled"]:
-            raise SetupRequired(f"Infoblox API URL is not set: configure [api] endpoint in {setup_path}.")
         loaded_modules = {
             key: module for key, module in loaded_modules.items()
-            if getattr(module, "cli_name", None) in enabled_commands
+            if (getattr(module, "cli_name", None) in enabled_commands or
+                type(module).__module__.rsplit(".", 1)[-1] in enabled_module_names)
         }
+        # Non-CLI modules can be retained for dispatch without connecting their
+        # global repository plugins before the user starts an operation.
         targets = {_cli_module_name(loaded_modules, command) for command in enabled_commands}
         ctx.plugins = [
             plugin for plugin in all_plugins

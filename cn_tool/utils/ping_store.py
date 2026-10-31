@@ -14,6 +14,7 @@ whose text completes ``cn: monitor: history: <message>``.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from contextlib import contextmanager, suppress
@@ -94,6 +95,18 @@ class RunInfo:
     ended: Optional[float]
     status: str
     rounds: int
+
+
+class AlreadyRunning(Exception):
+    """Admission was refused because this request already has a live run."""
+
+    def __init__(self, run: RunInfo) -> None:
+        self.run = run
+        super().__init__(f"run {run.id} is already running")
+
+
+class HistoryExpired(Exception):
+    """A live history page's parent or cursor no longer exists."""
 
 
 @dataclass(frozen=True)
@@ -226,6 +239,98 @@ def _dump_tcp(tcp: Optional[Dict[int, str]]) -> Optional[str]:
 
 def _load_tcp(text: Optional[str]) -> Optional[Dict[int, str]]:
     return None if text is None else {int(port): state for port, state in json.loads(text).items()}
+
+
+def _host_names(text: str) -> Iterator[str]:
+    """Decode host names one at a time from the request's JSON array."""
+    decoder = json.JSONDecoder()
+    pos = 0
+
+    def whitespace(index: int) -> int:
+        while index < len(text) and text[index] in " \t\r\n":
+            index += 1
+        return index
+
+    pos = whitespace(pos)
+    if pos >= len(text) or text[pos] != "[":
+        raise ValueError("invalid hosts array")
+    pos = whitespace(pos + 1)
+    while pos < len(text) and text[pos] != "]":
+        host, pos = decoder.raw_decode(text, pos)
+        if not isinstance(host, str):
+            raise ValueError("invalid host")
+        yield host
+        pos = whitespace(pos)
+        if pos < len(text) and text[pos] == ",":
+            pos = whitespace(pos + 1)
+            if pos >= len(text) or text[pos] == "]":
+                raise ValueError("invalid hosts array")
+        elif pos >= len(text) or text[pos] != "]":
+            raise ValueError("invalid hosts array")
+    if pos >= len(text) or whitespace(pos + 1) != len(text):
+        raise ValueError("invalid hosts array")
+
+
+# Cap work per array as well as output size. Very large arrays have an unknown
+# count; the first few targets may still be useful to identify the request.
+_HISTORY_ARRAY_CHARS = 8192
+_HISTORY_PREVIEW_ITEMS = 3
+_HISTORY_PREVIEW_CHARS = 80
+
+
+def _request_array_summary(text: str, *, ports: bool = False, preview: bool = True) -> Tuple[list, Optional[int]]:
+    if not isinstance(text, str):
+        return [], None
+    large = len(text) > _HISTORY_ARRAY_CHARS
+    valid = (lambda value: type(value) is int and 1 <= value <= 65535) if ports else (
+        lambda value: isinstance(value, str))
+    try:
+        if large:
+            if not preview:
+                return [], None
+            decoder = json.JSONDecoder()
+            remainder = text.lstrip()
+            if not remainder.startswith("["):
+                return [], None
+            remainder = remainder[1:]
+            values = []
+            for index in range(_HISTORY_PREVIEW_ITEMS):
+                remainder = remainder.lstrip()
+                if index:
+                    if not remainder.startswith(","):
+                        return [], None
+                    remainder = remainder[1:].lstrip()
+                value, end = decoder.raw_decode(remainder)
+                if not valid(value):
+                    return [], None
+                values.append(value)
+                remainder = remainder[end:]
+            if not remainder.lstrip(" \t\r\n").startswith((",", "]")):
+                return [], None
+            count = None
+        else:
+            values = json.loads(text)
+            if not isinstance(values, list) or not all(valid(value) for value in values):
+                return [], None
+            count = len(values)
+        if not preview:
+            return [], count
+        if ports:
+            return values[:_HISTORY_PREVIEW_ITEMS], count
+        return [value if len(value) <= _HISTORY_PREVIEW_CHARS else value[:_HISTORY_PREVIEW_CHARS - 1] + "…"
+                for value in values[:_HISTORY_PREVIEW_ITEMS]], count
+    except (ValueError, TypeError, RecursionError):
+        return [], None
+
+
+def _history_integer(value: Any, minimum: int = 1) -> bool:
+    """An integer SQLite can bind, excluding booleans."""
+    return type(value) is int and minimum <= value <= 2**63 - 1
+
+
+def _history_timestamp(value: Any) -> bool:
+    return (type(value) is int and -(2**63) <= value <= 2**63 - 1 or
+            type(value) is float and math.isfinite(value))
 
 
 class PingStore:
@@ -404,6 +509,23 @@ class PingStore:
             _insert_run(connection, run_id, request_id, **run)
             return request_id
 
+    def admit_run(
+        self, key: str, targets: Sequence[str], tcp_ports: Sequence[int], hosts: Sequence[str], run_id: str,
+        *, going_on: Callable[[RunInfo], bool], **run: Any,
+    ) -> int:
+        """Atomically admit a run unless an existing running row is still live.
+
+        The caller supplies the existing host/PID/heartbeat predicate; it is evaluated under the writer lock.
+        Lost rows are preserved, and a refusal rolls back the whole transaction.
+        """
+        with self._transaction(write=True) as connection:
+            request_id = _request_id(connection, key, targets, tcp_ports, hosts)
+            for existing in _run_infos(connection, request_id, running=True):
+                if going_on(existing):
+                    raise AlreadyRunning(existing)
+            _insert_run(connection, run_id, request_id, **run)
+            return request_id
+
     def heartbeat(self, run_id: str, now: float, *, round_seconds: Optional[float] = None) -> None:
         """Refresh the run's heartbeat (after every batch), and its last round's length when one ended."""
         with self._transaction(write=True) as connection:
@@ -569,6 +691,119 @@ class PingStore:
             raise StoreError(f"cannot write {self.path}: no run {run_id}")
 
     # --- reader ----------------------------------------------------------------------------------
+
+    def history_page(
+        self, kind: str, parent: Any = None, *, after: Any = None, limit: int = 100,
+    ) -> Tuple[List[Dict[str, Any]], Any]:
+        """A bounded, changing view of requests, runs, rounds, or one round's hosts.
+
+        ``after`` is the last key returned, scoped by the caller to its kind and parent. No transaction or
+        snapshot survives the call. A removed parent or cursor raises ``HistoryExpired``.
+        """
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("history limit must be between 1 and 100")
+        if kind not in ("requests", "runs", "rounds", "hosts"):
+            raise ValueError("invalid history kind")
+        if (kind == "requests" and parent is not None or
+                kind in ("runs", "hosts") and not _history_integer(parent) or
+                kind == "rounds" and (not isinstance(parent, str) or not parent)):
+            raise ValueError("invalid history parent")
+        if after is not None:
+            valid = (_history_integer(after, 0 if kind == "hosts" else 1)
+                     if kind in ("requests", "hosts") else
+                     isinstance(after, (tuple, list)) and len(after) == 2
+                     and _history_timestamp(after[0])
+                     and ((isinstance(after[1], str) and bool(after[1])) if kind == "runs"
+                          else _history_integer(after[1])))
+            if not valid:
+                raise ValueError("invalid history cursor")
+        with self._transaction(write=False) as connection:
+            if kind == "requests":
+                if after is not None and not connection.execute("SELECT 1 FROM request WHERE id = ?", (after,)).fetchone():
+                    raise HistoryExpired()
+                rows = connection.execute(
+                    "SELECT id, substr(key, 1, 65), substr(targets, 1, ?), substr(tcp_ports, 1, ?), substr(hosts, 1, ?)"
+                    " FROM request WHERE id > ? ORDER BY id LIMIT ?",
+                    (_HISTORY_ARRAY_CHARS + 1,) * 3 + (after or 0, limit + 1),
+                )
+                items, keys = [], []
+                for request_id, key, targets, ports, hosts in rows:
+                    keys.append(request_id)
+                    if len(keys) > limit:
+                        break
+                    targets_preview, target_count = _request_array_summary(targets)
+                    ports_preview, port_count = _request_array_summary(ports, ports=True)
+                    _, host_count = _request_array_summary(hosts, preview=False)
+                    safe_key = key if isinstance(key, str) and len(key) <= 64 else ""
+                    items.append(dict(id=request_id, key=safe_key, targets_preview=targets_preview,
+                                      ports_preview=ports_preview, target_count=target_count,
+                                      port_count=port_count, host_count=host_count))
+                if len(keys) > limit:
+                    return items, keys[limit - 1]
+            elif kind == "runs":
+                if not connection.execute("SELECT 1 FROM request WHERE id = ?", (parent,)).fetchone():
+                    raise HistoryExpired()
+                if after is not None and not connection.execute(
+                    "SELECT 1 FROM run WHERE request_id = ? AND started = ? AND id = ?", (parent, *after)
+                ).fetchone():
+                    raise HistoryExpired()
+                where = " AND (run.started > ? OR (run.started = ? AND run.id > ?))" if after else ""
+                params = (parent, after[0], after[0], after[1], limit + 1) if after else (parent, limit + 1)
+                rows = connection.execute(
+                    f"SELECT {_RUN_COLUMNS} FROM run WHERE run.request_id = ?{where}"
+                    " ORDER BY run.started, run.id LIMIT ?", params
+                ).fetchall()
+                items = [dict(zip(RunInfo.__dataclass_fields__, row)) for row in rows]
+                keys = [(row[3], row[0]) for row in rows]
+            elif kind == "rounds":
+                if not connection.execute("SELECT 1 FROM run WHERE id = ?", (parent,)).fetchone():
+                    raise HistoryExpired()
+                if after is not None and not connection.execute(
+                    "SELECT 1 FROM round WHERE run_id = ? AND started = ? AND id = ?", (parent, *after)
+                ).fetchone():
+                    raise HistoryExpired()
+                where = " AND (started > ? OR (started = ? AND id > ?))" if after else ""
+                params = (parent, after[0], after[0], after[1], limit + 1) if after else (parent, limit + 1)
+                rows = connection.execute(
+                    f"SELECT id, started, answered FROM round WHERE run_id = ?{where} ORDER BY started, id LIMIT ?",
+                    params,
+                ).fetchall()
+                items = [dict(id=row[0], started=row[1], answered=row[2]) for row in rows]
+                keys = [(row[1], row[0]) for row in rows]
+            else:
+                found = connection.execute(
+                    "SELECT request.hosts, round.observations FROM round JOIN run ON run.id = round.run_id"
+                    " JOIN request ON request.id = run.request_id WHERE round.id = ?", (parent,)
+                ).fetchone()
+                if found is None:
+                    raise HistoryExpired()
+                selected = []
+                anchor_found = after is None
+                try:
+                    for index, host in enumerate(_host_names(found[0])):
+                        if index == after:
+                            anchor_found = True
+                        if after is None or index > after:
+                            selected.append((index, host))
+                            if len(selected) == limit + 1:
+                                break
+                except ValueError as error:
+                    raise StoreError(f"cannot read {self.path}: invalid hosts array") from error
+                if not anchor_found:
+                    raise HistoryExpired()
+                details = {}
+                if selected:
+                    names = [host for _, host in selected]
+                    rows = connection.execute(
+                        "SELECT host, address, result FROM result WHERE round_id = ?"
+                        f" AND host IN ({', '.join('?' * len(names))})", (parent, *names),
+                    ).fetchall()
+                    details = {host: (address, result) for host, address, result in rows}
+                items = [dict(index=index, host=host, observation=found[1][index:index + 1],
+                              address=details.get(host, (None, None))[0], result=details.get(host, (None, None))[1])
+                         for index, host in selected]
+                keys = [index for index, _ in selected]
+        return items[:limit], keys[limit - 1] if len(items) > limit else None
 
     def requests(self) -> List[RequestInfo]:
         """Every request with its counts and newest run, newest activity (last round or newest run start) first."""

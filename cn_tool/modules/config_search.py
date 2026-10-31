@@ -1,5 +1,10 @@
 import re
 import ipaddress
+import json
+import os
+import stat
+from dataclasses import dataclass, field
+from contextlib import closing
 from pathlib import Path
 from time import perf_counter
 from typing import List, Dict, Set, Optional, Tuple, Any
@@ -8,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from rich.markup import escape
 
 from cn_tool.core.base import BaseModule, ScriptContext
+from cn_tool.utils import oscompat
 from cn_tool.utils.user_input import press_any_key, read_user_input
 from cn_tool.utils.auth import ensure_infoblox_auth
 from cn_tool.utils.display import console, get_global_color_scheme, print_search_config_data, print_table_data
@@ -15,7 +21,7 @@ from cn_tool.utils.file_io import check_dir_accessibility, queue_save
 from cn_tool.utils.infoblox_ux import format_no_match_message, format_partial_results_message
 from cn_tool.utils.network_views import NETWORK_VIEW, present_rows, view_scope
 from cn_tool.utils.validation import is_valid_site, site_hostname_regex
-from cn_tool.utils.config import make_dir_list
+from cn_tool.utils.config import iter_config_dirs, make_dir_list
 from cn_tool.utils.process_data import remove_duplicate_rows_sorted_by_col
 from cn_tool.utils.api import fetch_network_data
 from cn_tool.utils.cache import CacheManager
@@ -28,6 +34,307 @@ from cn_tool.wordlists.keywords import stop_words
 
 # Module-specific regex
 ip_regexp = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
+CONFIG_SEARCH_CACHE_UNAVAILABLE_MESSAGE = (
+    "Cached configuration search is not yet available in the WebUI. "
+    "Use the menu or disable the cache using your existing configuration."
+)
+
+
+@dataclass(frozen=True)
+class ConfigSearchInputError:
+    line: int
+    reason: str
+
+
+@dataclass
+class ParsedConfigSearch:
+    networks: List[ipaddress.IPv4Network]
+    terms: List[str]
+    search_input: str
+    errors: List[ConfigSearchInputError]
+
+
+def parse_search_inputs(inputs: List[str], site_pattern: Optional[str]) -> ParsedConfigSearch:
+    """Parse independent lines using the configuration lookup's menu rules."""
+    networks: List[ipaddress.IPv4Network] = []
+    terms: List[str] = []
+    accepted: List[str] = []
+    errors: List[ConfigSearchInputError] = []
+    for line_number, raw_input in enumerate(inputs, 1):
+        value = raw_input.strip()
+        if not value:
+            continue
+        try:
+            if "/" in value or re.fullmatch(ip_regexp, value):
+                network = ipaddress.ip_network(value, strict=False)
+                if isinstance(network, ipaddress.IPv4Network):
+                    networks.append(network)
+                    accepted.append(str(network))
+                    continue
+        except (ValueError, TypeError):
+            pass
+
+        looks_like_site = bool(site_pattern) and is_valid_site(value, site_pattern)
+        if len(value) < 5 and not looks_like_site:
+            errors.append(ConfigSearchInputError(line_number, f"Input keyword is too short: {value}"))
+            continue
+        try:
+            re.compile(value, re.IGNORECASE)
+        except re.error as exc:
+            errors.append(ConfigSearchInputError(line_number, f"Invalid regular expression: {exc}"))
+            continue
+        terms.append(value)
+        accepted.append(value)
+    return ParsedConfigSearch(networks, terms, "\n".join(accepted), errors)
+
+
+def prepare_demob_terms(ctx: ScriptContext, sitecode: str, locations: List[Dict[str, Any]]) -> Tuple[List[ipaddress.IPv4Network], List[str]]:
+    """Build the menu's network and hostname searches from Infoblox rows."""
+    networks: List[ipaddress.IPv4Network] = []
+    country: Optional[str] = None
+    for location in locations:
+        try:
+            network = ipaddress.ip_network(location["network"])
+            if not isinstance(network, ipaddress.IPv4Network):
+                continue
+            if country is None:
+                country = location.get("comment", "XX")[:2].upper()
+            networks.append(network)
+        except ValueError:
+            ctx.logger.warning(f"Skipping invalid network from Infoblox: {location.get('network')}")
+    networks = list(dict.fromkeys(networks))
+    return networks, [site_hostname_regex(sitecode, ctx.cfg.get("site_hostname_pattern"), country)]
+
+
+@dataclass(frozen=True)
+class BoundedSearchLimits:
+    max_entries: int = 10000
+    max_work_bytes: int = 8 * 1024 * 1024
+    max_rows: int = 10000
+    max_result_bytes: int = 8 * 1024 * 1024
+    max_line_bytes: int = 16 * 1024
+
+
+@dataclass
+class BoundedSearchResult:
+    rows: List[List[Any]]
+    matched_nets: Set[ipaddress.IPv4Network]
+    status: str
+    message: str = ""
+    source_identities: Dict[str, Tuple[Any, ...]] = field(default_factory=dict)
+
+
+class _SearchLimit(Exception):
+    pass
+
+
+def config_search_mode(ctx: ScriptContext) -> str:
+    """Make the menu's cache decision without falling back on a cache error."""
+    try:
+        if not ctx.cache or not isinstance(ctx.cache, CacheManager) or ctx.cache.dc.get("indexing", False):
+            return "live"
+        return "cached_unavailable"
+    except Exception:
+        return "unavailable"
+
+
+def _match_config_line(line: str, vendor_stop_list: tuple, networks: List, terms: List[str]) -> Tuple[bool, Set]:
+    """Apply the menu's IP and stop-word-aware keyword rules to one line."""
+    matched: Set[ipaddress.IPv4Network] = set()
+    for match in re.finditer(ip_regexp, line) if networks else ():
+        try:
+            address = ipaddress.ip_address(match.group())
+        except (re.error, ValueError):
+            continue
+        if isinstance(address, ipaddress.IPv4Address):
+            for network in networks:
+                if address in network:
+                    matched.add(network)
+                    break
+    term_match = not line.startswith(vendor_stop_list) and any(
+        re.search(term, line, re.IGNORECASE) for term in terms
+    )
+    return bool(matched) or term_match, matched
+
+
+def _bounded_lines(stream, max_bytes, digest=None):
+    """Read UTF-8 lines with universal newlines and bounded raw byte buffers."""
+    line = bytearray()
+    after_cr = False
+    while True:
+        chunk = stream.read(4096)
+        if not chunk:
+            break
+        if digest is not None:
+            digest.update(chunk)
+        for byte in chunk:
+            if after_cr:
+                after_cr = False
+                if byte == 10:
+                    continue
+            if byte in (10, 13):
+                yield bytes(line).decode("utf-8", errors="ignore")
+                line.clear()
+                after_cr = byte == 13
+            else:
+                if len(line) >= max_bytes:
+                    raise _SearchLimit
+                line.append(byte)
+    if line:
+        yield bytes(line).decode("utf-8", errors="ignore")
+
+
+def _file_identity(info):
+    # Windows 3.14 can report different ctime values for stat and fstat.
+    # Birth time is stable between those interfaces; older Python uses ctime.
+    changed = getattr(info, "st_birthtime_ns", info.st_ctime_ns) if oscompat.is_windows() else info.st_ctime_ns
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, changed)
+
+
+def search_live_bounded(ctx: ScriptContext, networks: List, search_terms: List[str], search_input: str,
+                        *, limits: Optional[BoundedSearchLimits] = None) -> BoundedSearchResult:
+    """Search live files with bounded storage; run regex only in a killable child."""
+    import hashlib
+    limits = limits or BoundedSearchLimits()
+    entries = work_bytes = 0
+    result_bytes = 2  # JSON array brackets
+    rows: List[List[Any]] = []
+    matched_nets: Set[ipaddress.IPv4Network] = set()
+    source_identities: Dict[str, Tuple[Any, ...]] = {}
+    excluded = {str(item).strip().lower() for item in ctx.cfg.get("config_repo_excluded_dirs", []) if str(item).strip()}
+    history = str(ctx.cfg.get("config_repo_history_dir", "history")).strip().lower()
+    if history:
+        excluded.add(history)
+    vendors = {str(item).strip().lower() for item in ctx.cfg.get("config_repo_vendors", []) if str(item).strip()}
+    regions = {str(item).strip().lower() for item in ctx.cfg.get("config_repo_regions", []) if str(item).strip()}
+
+    def confined(path, *, strict=True, scope=None):
+        resolved = Path(path).resolve(strict=strict)
+        try:
+            relative = resolved.relative_to(repo_root)
+        except ValueError as exc:
+            raise OSError("Configuration source is outside the repository") from exc
+        parts = relative.parts
+        if not parts or parts[0].lower() not in vendors:
+            raise OSError("Configuration source is outside the selected vendors")
+        directories = parts if resolved.is_dir() else parts[:-1]
+        if any(part.lower() in excluded for part in directories[1:]):
+            raise OSError("Configuration source is in an excluded directory")
+        if regions and len(parts) >= 3 and parts[2].lower() not in regions:
+            raise OSError("Configuration source is outside the selected regions")
+        minimum = (3 if regions else 2) + (scope == "file")
+        if scope is not None and len(parts) < minimum:
+            raise OSError("Configuration source is outside the selected directory scope")
+        return resolved
+
+    def count_entry(path):
+        nonlocal entries, work_bytes
+        entries += 1
+        work_bytes += len(os.fsencode(path))
+        if entries > limits.max_entries or work_bytes > limits.max_work_bytes:
+            raise _SearchLimit
+        # Discovery counts excluded directories before skipping them.
+        if Path(path).name.lower() not in excluded:
+            confined(path, strict=False)
+
+    def scan_paths(path, *, scope=None):
+        # POSIX scandir accepts a directory descriptor. Verify the opened
+        # directory before enumeration so a replaced path cannot be listed.
+        resolved = confined(path, scope=scope)
+        before = path.stat()
+        expected = _file_identity(before)
+        if not stat.S_ISDIR(before.st_mode) or not expected[0] or not expected[1]:
+            raise OSError("Directory identity unavailable")
+        if oscompat.is_windows():
+            # Windows scandir is path-based. These checks detect observed
+            # changes, but cannot make enumeration an atomic snapshot.
+            with os.scandir(path) as entries:
+                if confined(path, scope=scope) != resolved or _file_identity(path.stat()) != expected:
+                    raise OSError("Directory changed")
+                for entry in entries:
+                    yield path / entry.name
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+            descriptor = os.open(path, flags)
+            try:
+                if (_file_identity(os.fstat(descriptor)) != expected or
+                        confined(path, scope=scope) != resolved or
+                        _file_identity(resolved.stat()) != expected):
+                    raise OSError("Directory changed")
+                with os.scandir(descriptor) as entries:
+                    for entry in entries:
+                        yield path / entry.name
+            finally:
+                os.close(descriptor)
+        if confined(path, scope=scope) != resolved or _file_identity(path.stat()) != expected:
+            raise OSError("Directory changed")
+
+    try:
+        repo_root = Path(ctx.cfg["config_repo_directory"]).resolve(strict=True)
+        with closing(iter_config_dirs(ctx, on_entry=count_entry, strict=True, strict_scan=scan_paths)) as folders:
+            for folder in folders:
+                with closing(scan_paths(folder, scope="folder")) as file_entries:
+                    for filename in file_entries:
+                        count_entry(filename)
+                        # These directory trees are not searched, but still consume budget.
+                        # Do not skip symlinks: aliases must pass containment checks.
+                        if filename.name.lower() in excluded:
+                            info = filename.lstat()
+                            # Windows junctions and other reparse points are aliases too.
+                            reparse = getattr(info, "st_file_attributes", 0) & getattr(
+                                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+                            )
+                            if stat.S_ISDIR(info.st_mode) and not reparse:
+                                continue
+                        resolved = confined(filename)
+                        before = filename.stat()
+                        if _file_identity(before) != _file_identity(resolved.stat()):
+                            raise OSError("File changed")
+                        if not stat.S_ISREG(before.st_mode):
+                            continue
+                        if confined(filename, scope="file") != resolved:
+                            raise OSError("File changed")
+                        if not _file_identity(before)[1]:
+                            raise OSError("File identifier unavailable")
+                        meta = parse_repo_metadata(ctx, filename)
+                        vendor = meta[0] if meta else str(folder.relative_to(ctx.cfg["config_repo_directory"]).parts[0]).lower()
+                        stop_list = stop_words.get(vendor, ("NEVERMATCHED",))
+                        first_row = len(rows)
+                        digest = hashlib.sha256()
+                        with open(filename, "rb") as stream:
+                            if (_file_identity(before) != _file_identity(os.fstat(stream.fileno())) or
+                                    confined(filename, scope="file") != resolved or
+                                    _file_identity(before) != _file_identity(resolved.stat())):
+                                raise OSError("File changed")
+                            for index, raw_line in enumerate(_bounded_lines(stream, limits.max_line_bytes, digest)):
+                                line = raw_line.strip()
+                                hit, matched = _match_config_line(line, stop_list, networks, search_terms)
+                                matched_nets.update(matched)
+                                if hit:
+                                    row = [search_input, filename.stem.upper(), index, line, str(filename)]
+                                    size = len(json.dumps(row, ensure_ascii=False).encode("utf-8")) + bool(rows)
+                                    if len(rows) >= limits.max_rows or result_bytes + size > limits.max_result_bytes:
+                                        raise _SearchLimit
+                                    rows.append(row)
+                                    result_bytes += size
+                            if _file_identity(before) != _file_identity(os.fstat(stream.fileno())):
+                                raise OSError("File changed")
+                        if (confined(filename, scope="file") != resolved or
+                                _file_identity(before) != _file_identity(filename.stat()) or
+                                _file_identity(before) != _file_identity(resolved.stat())):
+                            raise OSError("File changed")
+                        if len(rows) > first_row:
+                            identity = (str(resolved), *_file_identity(before), digest.hexdigest())
+                            identity_size = len(json.dumps([str(filename), *identity], ensure_ascii=False).encode("utf-8")) + 64
+                            if result_bytes + identity_size > limits.max_result_bytes:
+                                raise _SearchLimit
+                            result_bytes += identity_size
+                            source_identities[str(filename)] = identity
+    except _SearchLimit:
+        return BoundedSearchResult([], set(), "limit", "Search exceeded its limits. Narrow the search.")
+    except (OSError, UnicodeError, RuntimeError):
+        return BoundedSearchResult([], set(), "incomplete", "A configuration file or directory could not be read or changed during the search.")
+    return BoundedSearchResult(rows, matched_nets, "complete", source_identities=source_identities)
 
 
 class ConfigSearchModule(BaseModule):
@@ -92,39 +399,18 @@ class ConfigSearchModule(BaseModule):
         keyword_regexps: List[str] = []
         networks: List[ipaddress.IPv4Network] = []
         validated_search_input: List[str] = []
-        MIN_INPUT_LEN = 5
-
         while True:
             search_input = read_user_input(ctx, "").strip()
             if search_input == "":
                 break
 
-            is_network = False
-            try:
-                if "/" in search_input or re.fullmatch(ip_regexp, search_input):
-                    net = ipaddress.ip_network(search_input, strict=False)
-                    if isinstance(net, ipaddress.IPv4Network):
-                        networks.append(net)
-                        validated_search_input.append(str(net))
-                        is_network = True
-            except (ValueError, TypeError):
-                pass
-
-            if not is_network:
-                # Short inputs are refused as keywords unless the deployment defines a site-code
-                # shape ([site] code_pattern) and the input is a site code by that definition.
-                site_pattern = ctx.cfg.get("site_code_pattern")
-                looks_like_site = bool(site_pattern) and is_valid_site(search_input, site_pattern)
-                if len(search_input) < MIN_INPUT_LEN and not looks_like_site:
-                    console.print(f"[{colors['error']}]Input keyword is too short: {search_input}[/]")
-                    continue
-
-                try:
-                    re.compile(search_input, re.IGNORECASE)
-                    keyword_regexps.append(search_input)
-                    validated_search_input.append(search_input)
-                except re.error as e:
-                    console.print(f"[{colors['error']}]Invalid regular expression: {e}[/]")
+            parsed = parse_search_inputs([search_input], ctx.cfg.get("site_code_pattern"))
+            for error in parsed.errors:
+                console.print(f"[{colors['error']}]{error.reason}[/]")
+            networks.extend(parsed.networks)
+            keyword_regexps.extend(parsed.terms)
+            if parsed.networks or parsed.terms:
+                validated_search_input.append(parsed.search_input)
 
         if not networks and not keyword_regexps:
             return
@@ -267,26 +553,7 @@ class ConfigSearchModule(BaseModule):
             return
 
         # Step 2: Prepare search terms from the fetched network data
-        locations = processed_data["location"]
-        networks: List[ipaddress.IPv4Network] = []
-        country: Optional[str] = None
-        for location in locations:
-            try:
-                net = ipaddress.ip_network(location["network"])
-                if not isinstance(net, ipaddress.IPv4Network):
-                    continue
-                if country is None:
-                    country = location.get("comment", "XX")[:2].upper()
-                networks.append(net)
-            except ValueError:
-                logger.warning(f"Skipping invalid network from Infoblox: {location.get('network')}")
-        networks = list(dict.fromkeys(networks))  # a CIDR in several network views is searched once
-
-        # Device names are found with [site] hostname_pattern (default: names starting with the
-        # site code); the template may use {site}, {site_compact} and {country}.
-        search_terms: List[str] = [
-            site_hostname_regex(sitecode, ctx.cfg.get("site_hostname_pattern"), country)
-        ]
+        networks, search_terms = prepare_demob_terms(ctx, sitecode, processed_data["location"])
 
         # Step 3: Execute the search using the internal helper
         data_to_save, matched_nets, core_search_time = self._execute_search(
@@ -420,38 +687,10 @@ class ConfigSearchModule(BaseModule):
                 for index, line in enumerate(f):
                     line_strip = line.strip()
 
-                    # IP matching runs regardless of stop words: a routable IP
-                    # (e.g. a route-map "set ip next-hop ... 10.1.2.3") is a
-                    # legitimate hit even on a stop-word line. This mirrors the
-                    # cache indexer (utils.cache_helpers.get_device_facts), which
-                    # also extracts IPs before applying the stop-word skip, so
-                    # cached and --no-cache subnet searches stay consistent.
-                    if ip_nets:
-                        found_matches = re.finditer(ip_regexp, line_strip)
-                        for match in found_matches:
-                            try:
-                                found_ip = ipaddress.ip_address(match.group())
-                                if not isinstance(found_ip, ipaddress.IPv4Address):
-                                    continue
-                            except (re.error, ValueError):
-                                continue
-                            else:
-                                for net in ip_nets:
-                                    if found_ip in net:
-                                        matched_nets.add(net)
-                                        rows_to_save[index] = line_strip
-                                        break
-
-                    # Stop-word skip applies to free-text term search only, to
-                    # keep keyword noise down (parity with the keyword index).
-                    if line_strip.startswith(vendor_stop_list):
-                        continue
-
-                    if search_terms:
-                        for search_term in search_terms:
-                            if re.search(search_term, line_strip, re.IGNORECASE):
-                                rows_to_save[index] = line_strip
-                                break
+                    hit, line_nets = _match_config_line(line_strip, vendor_stop_list, ip_nets, search_terms)
+                    matched_nets.update(line_nets)
+                    if hit:
+                        rows_to_save[index] = line_strip
         except (IOError, OSError) as e:
             logger.error(f"Error reading file {filename} for device {device}: {e}")
 

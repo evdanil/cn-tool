@@ -47,7 +47,8 @@ class RuntimeSession:
         arguments = [] if config_file is None else ["-c", str(config_file)]
         args = main._build_parser().parse_args(arguments)
         ctx, modules = main._startup(
-            args, interaction=interaction, enabled_commands=frozenset({"subnet"}), presentation=False,
+            args, interaction=interaction, enabled_commands=frozenset({"subnet", "ip", "ping", "monitor"}),
+            enabled_module_names=frozenset({"config_search"}), presentation=False,
         )
         try:
             # Subnet lookup uses the cache but never indexes configuration repositories.

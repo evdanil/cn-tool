@@ -18,6 +18,11 @@ def create_app(controller, access):
     from nicegui import ui
     from .access import AccessMiddleware
     from .subnets import render_subnets
+    from .ip import render_ip
+    from .ping import render_ping
+    from .monitor import render_monitor
+    from .config_page import render_config_search
+    from .demob_page import render_demob
 
     parent = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     parent.add_middleware(AccessMiddleware, access=access)
@@ -56,6 +61,26 @@ def create_app(controller, access):
         return SnapshotResponse(path, filename=filename, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                                 headers={'Cache-Control': 'no-store'})
 
-    ui.run_with(parent, root=lambda: render_subnets(controller), title='Subnets',
+    @ui.page('/config-search')
+    def config_search_page():
+        render_config_search(controller)
+
+    @ui.page('/demobilization')
+    def demobilization_page():
+        render_demob(controller)
+
+    @ui.page('/ping')
+    def ping_page():
+        render_ping(controller)
+
+    @ui.page('/monitor')
+    def monitor_page():
+        render_monitor(controller)
+
+    @ui.page('/ip')
+    def ip_page():
+        render_ip(controller)
+
+    ui.run_with(parent, root=lambda: render_subnets(controller), title='CN Tool',
                 show_welcome_message=False, reconnect_timeout=15)
     return parent

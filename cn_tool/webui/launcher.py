@@ -5,6 +5,8 @@ import socket
 import sys
 import webbrowser
 
+from cn_tool.utils import oscompat
+
 _GRACEFUL_SHUTDOWN_TIMEOUT = 5
 
 
@@ -23,7 +25,19 @@ def _show_error(message):
             print(message, file=sys.stderr)
 
 
-async def serve(controller, *, config_file=None, no_browser=False, port=0):
+def _start_config_search_guardian():
+    # Search availability must not prevent the rest of the interface starting.
+    if not (oscompat.is_linux() or oscompat.is_windows()):
+        return None
+    try:
+        from .config_search_guardian import start_guardian
+        from .config_search_worker import run_search
+        return start_guardian(run_search)
+    except Exception:
+        return None
+
+
+async def serve(controller, *, config_file=None, no_browser=False, port=0, config_search_guardian=None):
     import uvicorn
     from .access import LocalAccess
     from .app import create_app
@@ -42,7 +56,14 @@ async def serve(controller, *, config_file=None, no_browser=False, port=0):
     interrupted = False
     try:
         startup_attempted = True
-        controller.start(config_file)
+        if config_search_guardian is None:
+            controller.start(config_file)
+        else:
+            try:
+                controller.start(config_file, config_search_connection=config_search_guardian.worker)
+            finally:
+                # Only the worker retains this endpoint after process spawn.
+                config_search_guardian.worker.close()
 
         async def supervise():
             while not server.started and not server.should_exit:
@@ -55,7 +76,7 @@ async def serve(controller, *, config_file=None, no_browser=False, port=0):
                 else:
                     webbrowser.open(url)
             while not server.should_exit:
-                if controller.snapshot().phase == 'closed':
+                if controller.current_phase() == 'closed':
                     server.should_exit = True
                 await asyncio.sleep(.1)
 
@@ -75,7 +96,7 @@ async def serve(controller, *, config_file=None, no_browser=False, port=0):
                 except (EOFError, OSError, RuntimeError):
                     pass
                 else:
-                    while controller.snapshot().phase not in {'closed', 'failed'}:
+                    while controller.current_phase() not in {'closed', 'failed'}:
                         await asyncio.sleep(.05)
         finally:
             if watcher is not None:
@@ -97,7 +118,15 @@ def main(argv=None):
             _show_error('Install the graphical interface: pip install "cn-tool[webui]"')
             raise SystemExit(2)
         from .controller import SessionController
-        asyncio.run(serve(SessionController(), config_file=args.config_file, no_browser=args.no_browser, port=args.port))
+        guardian = _start_config_search_guardian()
+        try:
+            options = dict(config_file=args.config_file, no_browser=args.no_browser, port=args.port)
+            if guardian is not None:
+                options['config_search_guardian'] = guardian
+            asyncio.run(serve(SessionController(), **options))
+        finally:
+            if guardian is not None:
+                guardian.close()
     except KeyboardInterrupt:
         raise SystemExit(130) from None
     except Exception:

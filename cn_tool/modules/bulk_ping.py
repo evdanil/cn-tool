@@ -6,6 +6,7 @@ import re
 import shutil
 import signal
 import socket
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from logging import Logger
 from subprocess import PIPE, STDOUT, Popen, TimeoutExpired
@@ -15,6 +16,7 @@ from typing import Callable, Dict, Iterable, Iterator, List, Mapping, Optional, 
 from rich.markup import escape
 
 from cn_tool.core.base import BaseModule, CliResult, ScriptContext, cli_exit_code
+from cn_tool.core.operation import OperationControl, controlled_map
 from cn_tool.utils.cli_input import read_objects
 from cn_tool.utils.user_input import press_any_key, read_user_input
 from cn_tool.utils.display import console, get_global_color_scheme, print_table_data, table_columns
@@ -66,6 +68,14 @@ Target = Tuple[str, str]
 Row = Dict[str, str]
 # (input type, the line as typed, its new hosts): what the menu summarises large subnets from.
 UserInput = Tuple[str, str, List[str]]
+
+
+class PingUnavailableError(OSError):
+    """The ping executable could not be started during a controlled sweep."""
+
+
+class PingCleanupError(OSError):
+    """A started ping could not be reaped within the cleanup deadline."""
 
 
 def tcp_probe(address: str, port: int, timeout: float = TCP_TIMEOUT) -> str:
@@ -217,7 +227,7 @@ def _interrupt(proc: Popen) -> None:
         proc.send_signal(signal.SIGINT)
 
 
-def _collect_pings(processes: Mapping[str, Popen], deadline_at: float) -> Tuple[Dict[str, str], Set[str]]:
+def _collect_pings(processes: Mapping[str, Popen], deadline_at: float, *, control: Optional[OperationControl] = None) -> Tuple[Dict[str, str], Set[str]]:
     """
     Read the output of every ping process, none of them for longer than until ``deadline_at`` (``monotonic`` time): one
     clock for the whole batch, so a batch of silent hosts costs one deadline and not one per host.
@@ -231,13 +241,27 @@ def _collect_pings(processes: Mapping[str, Popen], deadline_at: float) -> Tuple[
     outputs: Dict[str, str] = {}
     running: List[str] = []
     for host, proc in processes.items():
-        try:
-            outputs[host], _ = proc.communicate(timeout=max(0.0, deadline_at - monotonic()))
-        except TimeoutExpired:
-            if proc.poll() is None:
-                running.append(host)
-            else:
-                outputs[host], _ = proc.communicate()
+        while True:
+            if control is not None and control.stop.is_set():
+                # A later child may have already exited while we waited on this one.
+                for finished_host, finished_proc in processes.items():
+                    if finished_host not in outputs and finished_proc.poll() is not None:
+                        try:
+                            outputs[finished_host], _ = finished_proc.communicate(timeout=0.1)
+                        except TimeoutExpired:
+                            pass  # cleanup will handle any child whose output is not ready
+                return outputs, set()
+            remaining = max(0.0, deadline_at - monotonic())
+            try:
+                outputs[host], _ = proc.communicate(timeout=min(0.1, remaining) if control else remaining)
+                break
+            except TimeoutExpired:
+                if proc.poll() is not None:
+                    outputs[host], _ = proc.communicate()
+                    break
+                if monotonic() >= deadline_at:
+                    running.append(host)
+                    break
 
     for host in running:
         _interrupt(processes[host])
@@ -250,6 +274,49 @@ def _collect_pings(processes: Mapping[str, Popen], deadline_at: float) -> Tuple[
             proc.kill()
             outputs[host], _ = proc.communicate()
     return outputs, set(running)
+
+
+
+def _cleanup_pings(processes: Mapping[int, Popen]) -> Optional[BaseException]:
+    """Interrupt every child before waiting, then reap all even if one cleanup fails."""
+    failure: Optional[BaseException] = None
+    for proc in processes.values():
+        try:
+            if proc.poll() is None:
+                _interrupt(proc)
+        except OSError:
+            pass  # the child may have exited between poll and signal
+        except BaseException as exc:
+            failure = failure or exc
+    grace_at = monotonic() + _PING_GRACE
+    kill_grace_at = grace_at + _PING_GRACE
+    for proc in processes.values():
+        try:
+            proc.communicate(timeout=max(0.0, grace_at - monotonic()))
+            continue
+        except TimeoutExpired:
+            pass
+        except BaseException as exc:
+            failure = failure or exc
+        kill_error = None
+        try:
+            proc.kill()
+        except OSError as exc:
+            kill_error = exc  # a child may have exited while the signal was sent
+        except BaseException as exc:
+            kill_error = exc
+        try:
+            proc.communicate(timeout=max(0.0, kill_grace_at - monotonic()))
+        except BaseException as exc:
+            try:
+                proc.wait(timeout=max(0.0, kill_grace_at - monotonic()))
+            except BaseException as wait_exc:
+                detail = kill_error or wait_exc
+                failure = PingCleanupError(f"could not reap ping process: {detail}")
+            else:
+                if not isinstance(exc, TimeoutExpired):
+                    failure = failure or exc
+    return failure
 
 
 def _answer_from_counts(transmitted: int, received: int) -> str:
@@ -506,30 +573,38 @@ class BulkPingModule(BaseModule):
             return "single", [], _NOT_A_TARGET
         return ("list" if len(addresses) > 1 else "single"), addresses, None
 
-    def _resolve(self, names: List[str]) -> Tuple[Dict[str, str], List[str]]:
+    def _resolve(self, names: List[str], *, control: Optional[OperationControl] = None) -> Tuple[Dict[str, str], List[str]]:
         """
         Resolve host names to addresses, each name once (``_look_up``).
         A name gets its IPv4 address; only a name with none gets its IPv6 address (``_lookup_address``).
 
         Returns:
-            (name -> address for the names that resolve, the names that do not, in input order)
+            (name -> address for the names that resolve, the names that do not, in input order).
+            With control, unscheduled names appear in neither collection; running lookups drain.
         """
         if not names:
             return {}, []
-        answers = self._look_up(names)
-        addresses = {name: address for name, address in zip(names, answers) if address}
-        return addresses, [name for name, address in zip(names, answers) if not address]
+        if control is None:
+            pairs = list(zip(names, self._look_up(names)))
+        else:
+            pairs = list(controlled_map(_lookup_address, names, control, min(BATCH_SIZE, len(names))))
+        addresses = {name: address for name, address in pairs if address}
+        return addresses, [name for name, address in pairs if not address]
 
     def _look_up(self, names: List[str]) -> List[Optional[str]]:
         """``_lookup_address`` for each name, in input order, in a pool of at most a batch of workers."""
         with ThreadPoolExecutor(max_workers=min(BATCH_SIZE, len(names))) as pool:
             return list(pool.map(_lookup_address, names))
 
-    def _address_targets(self, hosts: List[str]) -> Tuple[List[Target], List[str]]:
+    def _address_targets(self, hosts: List[str], *, control: Optional[OperationControl] = None) -> Tuple[List[Target], List[str]]:
         """Pair every host with the address to test: its own, or the one its name resolves to."""
-        addresses, unresolvable = self._resolve([host for host in hosts if not _is_ip_literal(host)])
-        gone = set(unresolvable)
-        return [(host, addresses.get(host, host)) for host in hosts if host not in gone], unresolvable
+        names = [host for host in hosts if not _is_ip_literal(host)]
+        if control is None:
+            addresses, unresolvable = self._resolve(names)
+        else:
+            addresses, unresolvable = self._resolve(names, control=control)
+        return [(host, addresses.get(host, host)) for host in hosts
+                if _is_ip_literal(host) or host in addresses], unresolvable
 
     def _ping_all(
         self, ctx: ScriptContext, targets: List[Target], tcp_ports: Sequence[int], icmp: bool = True
@@ -554,25 +629,44 @@ class BulkPingModule(BaseModule):
         return self.execute_hook('process_data', ctx, results)
 
     def _sweep(
-        self, targets: List[Target], logger: Logger, tcp_ports: Sequence[int], icmp: bool = True
+        self, targets: List[Target], logger: Logger, tcp_ports: Sequence[int], icmp: bool = True,
+        *, control: Optional[OperationControl] = None, on_attempt: Optional[Callable[[str], None]] = None
     ) -> Iterator[Tuple[List[Target], List[Row]]]:
         """
         Test the targets a batch of ``BATCH_SIZE`` at a time, yielding each batch with its rows in the order given; a
-        target the batch did not report on is an ``ERROR (No Result)`` row.
+        target the batch did not report on is an ``ERROR (No Result)`` row without control. With control,
+        only completed target/row pairs are yielded; ``control.stop`` signals cancellation separately.
+        A missing ping executable raises ``PingUnavailableError`` after started children are reaped.
+        With control, ``on_attempt`` observes each host immediately before its ICMP launch or TCP
+        probe starts, potentially on a TCP worker thread; it may be called more than once per host.
 
         No spinner and no hook: ``_ping_all`` adds both, and the Ping Monitor drives the batches under its own live view.
         """
         for start in range(0, len(targets), BATCH_SIZE):
+            if control is not None and control.stop.is_set():
+                break
             batch = targets[start:start + BATCH_SIZE]
-            batch_rows = {row["Host"]: row for row in self._ping_batch(batch, logger, tcp_ports, icmp)}
-            # Ensure the results are added in the same order as the batch was given.
-            yield batch, [
-                batch_rows[host] if host in batch_rows else _row(host, address, "ERROR (No Result)", tcp_ports)
-                for host, address in batch
-            ]
+            if control is None:
+                rows = self._ping_batch(batch, logger, tcp_ports, icmp)
+            else:
+                if on_attempt is None:
+                    rows = self._ping_batch(batch, logger, tcp_ports, icmp, control=control)
+                else:
+                    rows = self._ping_batch(batch, logger, tcp_ports, icmp, control=control, on_attempt=on_attempt)
+            batch_rows = {row["Host"]: row for row in rows}
+            if control is not None:
+                completed = [(host, address) for host, address in batch if host in batch_rows]
+                if completed:
+                    yield completed, [batch_rows[host] for host, _ in completed]
+            else:
+                yield batch, [
+                    batch_rows[host] if host in batch_rows else _row(host, address, "ERROR (No Result)", tcp_ports)
+                    for host, address in batch
+                ]
 
     def _ping_batch(
-        self, batch: List[Target], logger: Logger, tcp_ports: Sequence[int] = (), icmp: bool = True
+        self, batch: List[Target], logger: Logger, tcp_ports: Sequence[int] = (), icmp: bool = True,
+        *, control: Optional[OperationControl] = None, on_attempt: Optional[Callable[[str], None]] = None
     ) -> List[Row]:
         """
         Pings a batch of hosts in parallel and, for each of ``tcp_ports``, connects to every
@@ -584,43 +678,68 @@ class BulkPingModule(BaseModule):
         (``_classify_stopped_ping``).
         """
         processes: Dict[str, Popen] = {}
+        outstanding: Dict[int, Popen] = {}
+        try:
+            if icmp:
+                for host, address in batch:
+                    if control is not None and control.stop.is_set():
+                        break
+                    try:
+                        if on_attempt is not None:
+                            on_attempt(host)
+                        proc = Popen(
+                            _ping_command(address), stdout=PIPE, stderr=STDOUT, text=True,
+                            encoding="utf-8", errors="replace",
+                        )
+                    except FileNotFoundError as exc:
+                        logger.error("'ping' command not found.")
+                        if control is not None:
+                            raise PingUnavailableError("'ping' command not found") from exc
+                        return []
+                    processes[host] = proc
+                    outstanding[id(proc)] = proc
+            deadline_at = monotonic() + PING_DEADLINE
 
-        if icmp:
-            for host, address in batch:
-                try:
-                    processes[host] = Popen(
-                        _ping_command(address),
-                        stdout=PIPE,
-                        stderr=STDOUT,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                    )
-                except FileNotFoundError:
-                    logger.error("'ping' command not found.")
-                    return []
-        deadline_at = monotonic() + PING_DEADLINE
+            outcomes: Dict[Tuple[str, int], str] = {}
+            if tcp_ports:
+                if control is None:
+                    with ThreadPoolExecutor(max_workers=min(BATCH_SIZE, len(batch) * len(tcp_ports))) as pool:
+                        probes = {(host, port): pool.submit(tcp_probe, address, port)
+                                  for host, address in batch for port in tcp_ports}
+                        outcomes = {key: probe.result() for key, probe in probes.items()}
+                else:
+                    tasks = [(host, address, port) for host, address in batch for port in tcp_ports]
+                    def probe(task):
+                        if on_attempt is not None:
+                            on_attempt(task[0])
+                        return tcp_probe(task[1], task[2])
+                    for (host, _, port), result in controlled_map(
+                        probe, tasks, control, min(BATCH_SIZE, len(tasks))
+                    ):
+                        outcomes[(host, port)] = result
 
-        outcomes: Dict[Tuple[str, int], str] = {}
-        if tcp_ports:
-            with ThreadPoolExecutor(max_workers=min(BATCH_SIZE, len(batch) * len(tcp_ports))) as pool:
-                probes = {
-                    (host, port): pool.submit(tcp_probe, address, port) for host, address in batch for port in tcp_ports
-                }
-                outcomes = {key: probe.result() for key, probe in probes.items()}
-
-        address_of = dict(batch)
-        statuses: Dict[str, str] = {}
-        outputs, stopped = _collect_pings(processes, deadline_at)
-        for host, proc in processes.items():
-            ipv6 = ":" in address_of[host]
-            if host in stopped:
-                statuses[host] = self._classify_stopped_ping(outputs[host], ipv6=ipv6)
-            else:
-                statuses[host] = self._classify_ping_result(proc.returncode, outputs[host], ipv6=ipv6)
-
-        # Without ICMP there is no process, so no status: the check was not run.
-        return [_row(host, address, statuses.get(host, NOT_RUN), tcp_ports, outcomes) for host, address in batch]
+            address_of = dict(batch)
+            statuses: Dict[str, str] = {}
+            outputs, stopped = _collect_pings(processes, deadline_at, control=control)
+            for host in outputs:
+                outstanding.pop(id(processes[host]), None)
+                ipv6 = ":" in address_of[host]
+                if host in stopped:
+                    statuses[host] = self._classify_stopped_ping(outputs[host], ipv6=ipv6)
+                else:
+                    statuses[host] = self._classify_ping_result(processes[host].returncode, outputs[host], ipv6=ipv6)
+            return [_row(host, address, statuses.get(host, NOT_RUN), tcp_ports, outcomes)
+                    for host, address in batch
+                    if (control is None or ((not icmp or host in statuses)
+                        and all((host, port) in outcomes for port in tcp_ports)))]
+        finally:
+            if outstanding:
+                already_failing = sys.exc_info()[0] is not None
+                cleanup_error = _cleanup_pings(outstanding)
+                if cleanup_error is not None and (
+                    not already_failing or isinstance(cleanup_error, PingCleanupError)
+                ):
+                    raise cleanup_error
 
     def _display_rows(
         self, user_inputs: List[UserInput], results: List[Row], tcp_ports: Sequence[int], display_threshold: int
