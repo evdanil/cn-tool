@@ -2,6 +2,44 @@
 
 [Documentation](README.md) · [Project README](../README.md)
 
+## Access and setup
+
+Infoblox lookups use the NIOS Web API (WAPI) over HTTPS. Before using them, ask
+your Infoblox administrator to confirm the following:
+
+1. **Account and API access:** You have an active Infoblox administrator account,
+   local or remotely authenticated, with a username and password accepted by WAPI.
+   Browser SSO/SAML sign-in alone cannot be used by cn-tool; ask your administrator
+   for credentials accepted by WAPI. The account's admin group must allow API access.
+   For a limited-access group in Grid Manager, check **Administration →
+   Administrators → Groups**, then the group's **Allowed Interfaces → API**
+   setting. GUI access alone does not grant API access. Group settings and labels
+   can vary by NIOS version; see Infoblox's [NIOS 9.0 admin-group documentation](https://infoblox-docs.atlassian.net/wiki/spaces/nios90/pages/1471316391/Creating%2BLimited-Access%2BAdmin%2BGroups).
+2. **Permissions:** The group or its roles grant read access to the relevant network
+   views and IPAM, DNS and DHCP objects. The data and details returned depend on
+   those permissions. cn-tool's Infoblox lookups read grid data, so a suitably
+   scoped read-only account is appropriate; superuser access is not required.
+3. **Connectivity:** Your computer can reach the grid's WAPI endpoint over HTTPS,
+   and any firewall or Infoblox access-control rules permit your connection.
+   Trust the server certificate using the appropriate CA for your environment.
+
+Run `cn init` if you do not already have a configuration, then set `[api] endpoint`
+to your grid's WAPI URL and supported version, for example:
+
+```ini
+[api]
+endpoint = https://gm.example.com/wapi/v2.12/
+verify_ssl = true
+```
+
+Configure the account and password using the [credentials guide](credentials.md),
+then run `cn doctor` to check the connection. A successful connection does not
+guarantee access to every view or object; try a lookup for data you expect the
+account to see. If authentication is refused, check the credentials and the
+group's API access with your administrator before retrying. If a lookup is empty
+or incomplete, also check the account's object permissions and network-view scope.
+Ping and local configuration tools can run without Infoblox.
+
 ## PTR, DHCP utilization and child containers
 
 `fqdn` returns one row per address: `ip`, `name`, `type` (`A`, `AAAA`, `HOST` or `CNAME`),

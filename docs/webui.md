@@ -6,6 +6,10 @@ The optional WebUI runs on your computer and shares cn-tool's configuration, loo
 logic, enrichment and accumulating Excel workbook. It binds only to `127.0.0.1` and
 serves its assets locally. It is intended for a local desktop session.
 
+Infoblox lookups in the browser require the same WAPI-enabled account as the
+command line. Grid Manager GUI access is not required. Check the [Infoblox access
+and setup](infoblox.md#access-and-setup) requirements before using them.
+
 ## Version scope
 
 | Version | Available browser tools |

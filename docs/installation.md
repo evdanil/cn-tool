@@ -53,6 +53,8 @@ on a shared dev host, measured with 0.4.1). A pip install compiles its files whe
 
 ## First run
 
+For Infoblox lookups, first check [Infoblox access and setup](infoblox.md#access-and-setup).
+
 ```bash
 cn init
 ```

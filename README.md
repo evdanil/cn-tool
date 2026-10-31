@@ -12,6 +12,24 @@ It runs on Linux, macOS and Windows 10/11 (x64), with Python 3.10 or newer.
 Infoblox is required for IPAM lookups; ping and local configuration tools can run
 independently.
 
+## Why use cn-tool with Infoblox?
+
+Grid Manager is useful for administering Infoblox. cn-tool brings common
+network-investigation tasks together around your existing Infoblox data:
+
+- **Work through a list:** paste addresses or subnets to see a summary and inspect
+  the results, including data from the network views available to your account.
+- **Continue the investigation:** combine IPAM lookups with ping, monitoring and
+  searches of your local device configurations in one tool.
+- **Use results elsewhere:** produce structured command-line output for scripts or
+  collect reportable results in an Excel workbook.
+- **Choose your interface:** use the local browser interface, interactive menu or
+  command line for the workflows each supports.
+
+Infoblox remains the source of IPAM data and enforces the account's permissions.
+See [Infoblox access and setup](https://github.com/evdanil/cn-tool/blob/main/docs/infoblox.md#access-and-setup)
+for the account and network requirements.
+
 <a id="included-features"></a>
 
 ## Features
@@ -60,7 +78,9 @@ Try a local reachability check without Infoblox or credentials. ICMP needs the s
 cn ping 127.0.0.1
 ```
 
-For Infoblox, create your user configuration:
+For Infoblox, you need an account whose admin group permits API access and has
+read access to the relevant data. See [Infoblox access and setup](https://github.com/evdanil/cn-tool/blob/main/docs/infoblox.md#access-and-setup),
+then create your user configuration:
 
 ```console
 cn init
@@ -133,7 +153,7 @@ explains version scope.
 | --- | --- |
 | <a id="windows"></a><a id="terminal-and-python"></a><a id="passwords-in-powershell"></a><a id="scheduled-tasks"></a><a id="output-and-encoding"></a><a id="files-reports-and-certificates"></a><a id="what-differs-from-linux"></a>[Windows](https://github.com/evdanil/cn-tool/blob/main/docs/windows.md) | PowerShell, encoding, scheduled tasks and platform differences |
 | <a id="output"></a><a id="exit-status"></a><a id="json-for-scripts"></a><a id="health-check-cn-doctor"></a>[Command line](https://github.com/evdanil/cn-tool/blob/main/docs/cli.md) | Commands, inputs, output, JSON, statuses and `cn doctor` |
-| <a id="ptr-dhcp-utilization-and-child-containers"></a><a id="network-views"></a><a id="ipv6"></a>[Infoblox](https://github.com/evdanil/cn-tool/blob/main/docs/infoblox.md) | Lookup behavior, network views, PTR/DHCP fields and IPv6 |
+| <a id="ptr-dhcp-utilization-and-child-containers"></a><a id="network-views"></a><a id="ipv6"></a>[Infoblox](https://github.com/evdanil/cn-tool/blob/main/docs/infoblox.md) | API access, setup, lookup behavior, network views and IPv6 |
 | <a id="bulk-ping-cn-ping"></a><a id="ping-monitor-cn-monitor"></a>[Ping and monitoring](https://github.com/evdanil/cn-tool/blob/main/docs/ping-monitor.md) | Probe limits, history, reruns and deletion |
 | <a id="configuration"></a>[Configuration](https://github.com/evdanil/cn-tool/blob/main/docs/configuration.md) | File precedence, settings, reports and Setup |
 | <a id="credentials"></a><a id="gpg-credentials-file"></a><a id="gpg-credentials-file-1"></a><a id="infoblox-account-file"></a>[Credentials](https://github.com/evdanil/cn-tool/blob/main/docs/credentials.md) | Infoblox and device accounts, environment variables and GPG |
