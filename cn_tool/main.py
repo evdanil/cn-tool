@@ -427,11 +427,12 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "when they stayed online. Targets, --tcp and the limits are cn ping's. Without --every and --for "
             "it records one round and adds the earlier rounds of the same targets to the summary. --list, "
             "--show and --follow read the history and ping nothing. --delete and --clear remove recorded "
-            "requests from it, after asking. --rerun ID runs a recorded request again."
+            "requests from it, after asking. --runs ID lists individual runs and --delete-run RUN_ID deletes one. "
+            "--rerun ID runs a recorded request again."
         ),
         "menu_line": 'Same as menu item m, "Ping Monitor".',
         "objects": "10.1.2.3, 2001:db8::5, a host name, or 10.1.2.0/24; '-' reads objects from stdin",
-        "objects_optional_with": ("list", "show", "follow", "delete", "clear", "rerun"),
+        "objects_optional_with": ("list", "show", "follow", "delete", "clear", "rerun", "runs", "delete_run"),
         "options": (
             {
                 "flags": ("--tcp",), "metavar": "PORTS", "type": _arg_type(parse_tcp_ports), "default": None,
@@ -466,6 +467,14 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
                         "interval and length; --every and --for change them",
             },
             {
+                "flags": ("--runs",), "metavar": "ID", "default": None,
+                "help": "list the full run IDs and states for a request ID from --list",
+            },
+            {
+                "flags": ("--delete-run",), "metavar": "RUN_ID", "default": None,
+                "help": "delete one run by its exact full ID from --runs; asks first, or use --yes",
+            },
+            {
                 "flags": ("--delete",), "metavar": "ID", "default": None,
                 "help": "delete a recorded request with all its runs and rounds (an ID or a prefix from --list); "
                         "asks first",
@@ -476,7 +485,7 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             },
             {
                 "flags": ("-y", "--yes"), "action": "store_true",
-                "help": "with --delete or --clear: do not ask (needed without a terminal)",
+                "help": "with --delete, --delete-run or --clear: do not ask (needed without a terminal)",
             },
         ),
         "examples": (
@@ -485,6 +494,8 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "cn monitor --list",
             "cn monitor --show a3f9 --since 24h --format md",
             "cn monitor --delete a3f9",
+            "cn monitor --runs a3f9",
+            "cn monitor --delete-run RUN_ID",
             "cn monitor --rerun a3f9 --for 8h",
         ),
         "exit": (
@@ -492,7 +503,8 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "options, no such ID, or --follow without a terminal, 3 a probe could not run, the history could not "
             "be read or written (the summary is still printed) or the report failed, 130 a second Ctrl+C. "
             "--delete and --clear: 0 deleted, 1 nothing deleted (not confirmed, or nothing recorded), 2 a run of it "
-            "is going on, or no terminal to ask on and no --yes. --rerun exits as a run, and 2 while a run of the "
+            "is going on, or no terminal to ask on and no --yes. --delete-run exits the same way. "
+            "--rerun exits as a run, and 2 while a run of the "
             "request is going on."
         ),
     },

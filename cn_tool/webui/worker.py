@@ -780,6 +780,42 @@ class MonitorInputError(ValueError):
     """A safe, user-facing Monitor validation problem."""
 
 
+def delete_monitor_history(ctx, action, run_id, request_id):
+    """Delete history with a thread-owned connection; retain committed results on cleanup failure."""
+    from cn_tool.modules.ping_monitor import PingMonitorModule
+    from cn_tool.utils.ping_store import DeletionTimedOut, PingStore
+    module = PingMonitorModule()
+    committed = False
+    try:
+        store = PingStore.open(module._history_path(ctx), write=True, create=False)
+        if store is None:
+            return 'missing', ''
+        with store:
+            if action == 'run':
+                status = store.delete_run(run_id, request_id, going_on=module._deletion_going_on)
+                if status != 'deleted':
+                    return status, ''
+                committed = True
+                store.sweep(vacuum=False)
+            else:
+                deletion = store.delete(None, going_on=module._deletion_going_on, guard_all=True)
+                if deletion.going_on:
+                    return 'running', ''
+                committed = bool(deletion.requests)
+                if not committed and not store.has_leftovers():
+                    return 'missing', ''
+                freed = store.sweep(vacuum=True)
+                if not committed and not freed:
+                    return 'missing', ''
+            return 'deleted', ''
+    except DeletionTimedOut:
+        return 'failed', 'This run is too large to delete within the safe database lock time. Nothing was deleted.'
+    except Exception:
+        if committed:
+            return 'deleted', 'History was deleted, but cleanup could not finish.'
+        return 'failed', 'Could not delete monitor history.'
+
+
 def run_monitor_lookup(runtime, module, payload, control, observer):
     """Run an admitted Monitor without terminal or Infoblox resources."""
     import time
@@ -1228,6 +1264,8 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
     history_queue = Queue(maxsize=8)
     history_stopped = Event()
     history_thread = None
+    delete_thread = None
+    delete_ids = set()
     def read_history(history_ctx, session_id):
         from cn_tool.utils.ping_history import read_monitor_history
         while True:
@@ -1244,6 +1282,8 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                                                       cache.job_id if cache else None, cache.run_id if cache else None)
                 page = classify_monitor_history_runs(page, query['kind'])
                 if (not isinstance(page.get('items'), list) or len(page['items']) > query['limit'] or
+                        (query['kind'] == 'template' and (page.get('next_cursor') is not None or
+                         len(page['items']) != (0 if page.get('error') else 1))) or
                         not all(valid_monitor_history_item(query['kind'], item) for item in page['items'])):
                     raise ValueError('Invalid history page')
             except Exception:
@@ -1324,6 +1364,27 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 if page is not None:
                     result.update(rows=page.rows, total=page.total, next_offset=page.next_offset, status='ready')
                 emit('demob_page_result', result)
+            elif kind == 'monitor_delete' and state['ready']:
+                if payload['query_id'] in delete_ids:
+                    continue
+                if len(delete_ids) >= 1024:
+                    emit('monitor_delete_result', dict(query_id=payload['query_id'], status='failed',
+                                                       warning='History deletion limit reached. Restart the application.'))
+                    continue
+                delete_ids.add(payload['query_id'])
+                if delete_thread is not None and delete_thread.is_alive():
+                    emit('monitor_delete_result', dict(query_id=payload['query_id'], status='failed',
+                                                       warning='History deletion is busy. Try again.'))
+                else:
+                    def delete_history(request=payload):
+                        try:
+                            status, warning = delete_monitor_history(state['runtime'].ctx, request['action'],
+                                                                      request['run_id'], request['request_id'])
+                        except Exception:
+                            status, warning = 'failed', 'Could not delete monitor history.'
+                        emit('monitor_delete_result', dict(query_id=request['query_id'], status=status, warning=warning))
+                    delete_thread = Thread(target=delete_history)
+                    delete_thread.start()
             elif kind == 'monitor_history' and state['ready']:
                 if history_thread is None:
                     from types import SimpleNamespace
@@ -1433,6 +1494,8 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 pass
         if snapshot_thread is not None:
             snapshot_thread.join()
+        if delete_thread is not None:
+            delete_thread.join()
         if history_thread is not None:
             while True:
                 try:

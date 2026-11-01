@@ -24,7 +24,7 @@ ln -s /path/to/main.py ~/bin/cn
 | `fqdn`   | names or name prefixes (at least three characters) | A, AAAA, host and CNAME records whose name contains the text, with type, DNS view (on a grid with several), zone, TTL and a PTR check |
 | `site`   | site codes; with `-k/--keyword`, keywords | the subnets of each site code, or matching each keyword, with DHCP utilization % and, on a grid with several network views, the network view |
 | `ping`   | IPv4 and IPv6 addresses, host names, `10.1.2.0/24` and `2001:db8::/120` networks | ICMP result per host and, with `--tcp 22,443`, the state of each port |
-| `monitor` | as `ping`; none with `--list`, `--show ID`, `--follow ID`, `--rerun ID`, `--delete ID` or `--clear` | pings round after round (`--every`, `--for`) and records each round in the ping history; then the hosts seen in the window (first and last seen, rounds seen, online periods), every host's result in the last round and a summary. `--list`: the recorded requests; `--show`, `--follow`: a recorded request's summary, from the history; `--rerun`: a new run of a recorded request, output as a run; `--delete`, `--clear`: one row per request deleted from the history, after asking |
+| `monitor` | as `ping`; none with `--list`, `--show ID`, `--follow ID`, `--rerun ID`, `--runs ID`, `--delete-run RUN_ID`, `--delete ID` or `--clear` | pings round after round (`--every`, `--for`) and records each round in the ping history; then the hosts seen in the window (first and last seen, rounds seen, online periods), every host's result in the last round and a summary. `--list`: the recorded requests; `--show`, `--follow`: a recorded request's summary, from the history; `--rerun`: a new run of a recorded request, output as a run; `--runs`: individual run IDs; `--delete-run`: delete one run; `--delete`, `--clear`: delete requests, after asking |
 | `diff`   | device names, as in `<name>.cfg` in the configuration repositories | configuration lines added or removed since the last change or `--since`, with the snapshot, author and time |
 | `doctor` | none | one row per configuration, credential and Infoblox check |
 | `init`   | none | nothing on stdout: it writes a commented starting configuration to `~/.cn` and never overwrites a file (exit 0 written, 2 the file exists, 3 it could not be written) |
@@ -36,9 +36,9 @@ CNAME) and its PTR search up to 10,000 rows.
 `ip`, `subnet`, `fqdn`, `site` and `doctor` add `--view NAME` and `--all-views` (see
 [Network views](infoblox.md#network-views)). `ping` adds `--tcp PORTS`; `monitor` adds `--tcp PORTS`,
 `--every INTERVAL`, `--for DURATION`, `--since WHEN`, `--list`, `--show ID`, `--follow ID`,
-`--rerun ID`, `--delete ID`, `--clear` and `-y/--yes`; and `diff` adds `--since WHEN` and
+`--rerun ID`, `--runs ID`, `--delete-run RUN_ID`, `--delete ID`, `--clear` and `-y/--yes`; and `diff` adds `--since WHEN` and
 `--line TEXT`. `doctor` and `init` take neither objects nor `--file`, and `monitor` takes no objects
-with `--list`, `--show`, `--follow`, `--rerun`, `--delete` or `--clear`. `diff`, `doctor` and `init`
+with `--list`, `--show`, `--follow`, `--rerun`, `--runs`, `--delete-run`, `--delete` or `--clear`. `diff`, `doctor` and `init`
 write no report: they have no `--report`, and `-r FILE` is refused with exit 2. An option name is
 never abbreviated (`--rep` is an error, not `--report`).
 

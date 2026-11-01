@@ -93,7 +93,7 @@ def render_monitor(controller):
     latest = {'result': None, 'result_revision': None, 'attempt_revision': None,
               'outcome': None, 'live_query': None, 'live_key': None, 'live_page': None,
               'live_offset': 0, 'history_query': None, 'history_page': None,
-              'history_dirty': True, 'download': None}
+              'history_dirty': True, 'download': None, 'template_query': None, 'delete_query': None}
     history = HistoryView()
     lock = asyncio.Lock()
 
@@ -124,6 +124,7 @@ def render_monitor(controller):
         duration_error = ui.label('').props('role=alert').classes('text-negative')
         ui.label('Leave duration blank to run until stopped. Both values must be at least 10 seconds.').classes('cn-muted')
         form_error = ui.label('').props('role=alert').classes('text-negative')
+        reuse_status = ui.label('').classes('cn-muted')
         fields = {'targets': (targets, target_error), 'ports': (ports, port_error),
                   'interval': (interval, interval_error), 'duration': (duration, duration_error)}
         for control, error_label in fields.values():
@@ -226,7 +227,63 @@ def render_monitor(controller):
             draw_live()
     with ui.column().classes('cn-panel'):
         ui.label('History').classes('text-h6')
-        ui.label('History can change while you browse. Refresh starts at the first page. Runs owned by another process are view-only.').classes('cn-muted')
+        ui.label('History can change while you browse. Refresh starts at the first page. You can load saved settings to start a new monitor.').classes('cn-muted')
+        history_reuse_status = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
+        history_delete_status = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
+        with ui.dialog().props('persistent') as delete_dialog, ui.card().classes('w-full max-w-lg'):
+            delete_title = ui.label('').classes('text-h6')
+            delete_description = ui.label('')
+            delete_error = ui.label('').props('role=alert').classes('text-negative')
+            with ui.row().classes('cn-monitor-actions'):
+                def cancel_delete():
+                    if latest['delete_query']:
+                        return
+                    delete_dialog.close()
+                    client.run_javascript('window.cnMonitorDeleteInvoker?.focus()')
+                delete_cancel = ui.button('Cancel', on_click=cancel_delete).props('outline autofocus')
+                async def confirm_delete():
+                    selection = latest['delete_selection']
+                    try:
+                        latest['delete_query'] = controller.request_monitor_delete(
+                            selection['action'], selection.get('run_id'), selection.get('request_id'))
+                    except (AttributeError, RuntimeError, ValueError):
+                        delete_error.set_text('Could not start deletion. Try again when the session is ready.')
+                        return
+                    delete_error.set_text('Deleting history…')
+                    delete_confirm.disable()
+                    delete_cancel.disable()
+                    await poll()
+                delete_confirm = ui.button('Delete run', on_click=confirm_delete).props('color=negative')
+        delete_dialog.props(f'aria-labelledby={delete_title.html_id}')
+        delete_dialog.on('keydown.escape', lambda _: cancel_delete())
+        def open_delete(action, item=None):
+            if latest['delete_query']:
+                return
+            latest['delete_selection'] = {'action': action}
+            if action == 'run':
+                latest['delete_selection'].update(run_id=item['id'], request_id=item.get('request_id'))
+                delete_title.set_text('Delete this run?')
+                count = item.get('rounds', 0)
+                description = (f"Started {history_value('started', item.get('started'))}; status {item.get('status', 'unknown')}; "
+                               f"{count} complete {'round' if count == 1 else 'rounds'}. "
+                               'This permanently deletes this run and its rounds. Other runs of this request remain.')
+                if item.get('status') == 'lost':
+                    description += ' A stale heartbeat can mean this run is still active on its host; check before deleting.'
+                delete_description.set_text(description)
+                delete_confirm.set_text('Delete run')
+            else:
+                delete_title.set_text('Delete all monitor history?')
+                delete_description.set_text('This permanently deletes every saved request, run and round at confirmation. This cannot be undone. A stale heartbeat can make a remote run appear lost; check remote monitors before deleting.')
+                delete_confirm.set_text('Delete all history')
+            delete_error.set_text('')
+            delete_confirm.enable()
+            delete_cancel.enable()
+            client.run_javascript('window.cnMonitorDeleteInvoker = document.activeElement')
+            delete_dialog.open()
+            client.run_javascript(f"setTimeout(() => document.getElementById({json.dumps(delete_cancel.html_id)})?.focus(), 100)")
+        def set_reuse_notice(message):
+            set_changed(reuse_status, message)
+            set_changed(history_reuse_status, message)
         history_area = ui.column().classes('w-full')
         @ui.refreshable
         def draw_history():
@@ -249,14 +306,42 @@ def render_monitor(controller):
             else:
                 for item in page['items']:
                     with ui.column().classes('cn-summary-row'):
-                        if history.kind == 'requests' and 'targets_preview' in item:
+                        if history.kind == 'requests':
                             for line in request_summary(item):
                                 ui.label(line)
-                        for key, value in item.items():
-                            if key != 'owned' and not (history.kind == 'requests' and key in {'key', 'targets_preview', 'ports_preview', 'target_count', 'port_count', 'host_count'}):
-                                ui.label(f"{key.replace('_', ' ').capitalize()}: {history_value(key, value)}")
-                        if history.kind == 'runs':
-                            ui.label('Owned by this session' if item.get('owned') else 'View only')
+                        elif history.kind == 'runs':
+                            for line in history_run_summary(item):
+                                ui.label(line)
+                            ui.label('Owned by this session' if item.get('owned') else 'View only').classes('cn-muted')
+                            with ui.expansion('Details'):
+                                for key in ('id', 'source', 'host', 'pid', 'heartbeat', 'round_seconds'):
+                                    if item.get(key) is not None:
+                                        ui.label(f"{key.replace('_', ' ').capitalize()}: {history_value(key, item[key])}")
+                            async def use_settings(_, run_id=item['id']):
+                                if latest['template_query']:
+                                    controller.release_monitor_history_page(latest['template_query'])
+                                latest['template_query'] = None
+                                latest['template_draft'] = tuple(control.value for control in (targets, ports, interval, duration))
+                                try:
+                                    latest['template_query'] = controller.request_monitor_history('template', run_id, None, 1)
+                                    set_reuse_notice('Loading saved settings…')
+                                except (AttributeError, RuntimeError, ValueError):
+                                    set_reuse_notice(history_template_error(None))
+                                await poll()
+                            ui.button('Use settings', on_click=use_settings).props('outline')
+                            remove_run = ui.button('Delete run', on_click=lambda _, run=dict(item): open_delete('run', run)).props('outline color=negative')
+                            remove_run.set_enabled(item.get('status') != 'running' and bool(item.get('request_id')))
+                            if item.get('status') == 'running':
+                                ui.label('A running monitor cannot be deleted.').classes('cn-muted')
+                        elif history.kind == 'rounds':
+                            ui.label(f"Started: {history_value('started', item.get('started'))}")
+                            ui.label(f"Answered: {item.get('answered', 0)}")
+                        elif history.kind == 'hosts':
+                            ui.label(str(item.get('host') or 'Unknown host')).classes('text-weight-bold')
+                            ui.label(history_value('observation', item.get('observation')))
+                            for key in ('address', 'result'):
+                                if item.get(key):
+                                    ui.label(f"{key.capitalize()}: {item[key]}")
                         if history.kind != 'hosts':
                             kinds = {'requests': 'runs', 'runs': 'rounds', 'rounds': 'hosts'}
                             kind = kinds[history.kind]
@@ -288,6 +373,8 @@ def render_monitor(controller):
                 button.set_enabled(bool(page and page.get('next_cursor')))
                 button = ui.button('Refresh history', on_click=refresh).props('outline')
                 button._props['data-monitor-history'] = 'refresh'
+            if history.kind == 'requests':
+                ui.button('Delete all history', on_click=lambda: open_delete('all')).props('outline color=negative')
         with history_area:
             draw_history()
 
@@ -377,11 +464,12 @@ def render_monitor(controller):
                 if previous_identity and previous_identity[:2] == identity[:2] and revision is not None:
                     set_changed(pending_live, f'Complete round revision {revision} is available; updating the displayed page.')
                 latest['live_user_request'] = None
-                if previous_identity and previous_identity[:2] != identity[:2]:
-                    latest['live_page'] = None
-                    await draw_live.refresh()
+                if not previous_identity or previous_identity[:2] != identity[:2]:
+                    latest['live_offset'] = 0
+                    if previous_identity:
+                        latest['live_page'] = None
+                        await draw_live.refresh()
                 latest['live_identity'] = identity
-                latest['live_offset'] = 0
             key = (job, run_id, revision, latest['live_offset']) if job and run_id is not None and revision is not None else None
             if key != latest['live_key']:
                 if key is None:
@@ -403,7 +491,9 @@ def render_monitor(controller):
                     controller.release_monitor_live_page(latest['live_query'])
                     latest['live_query'] = None
                     if result.get('status') == 'expired':
-                        latest['live_offset'] = 0
+                        latest['live_key'] = None
+                    elif result.get('status') == 'ready' and not result.get('rows') and latest['live_offset']:
+                        latest['live_offset'] = max(0, latest['live_offset'] - 50)
                         latest['live_key'] = None
                     else:
                         latest['pending_live'] = result
@@ -419,6 +509,57 @@ def render_monitor(controller):
                         client.run_javascript(f"(document.querySelector({selector}) || document.querySelector('[data-monitor-live]:not([disabled])'))?.focus()")
                 else:
                     set_changed(pending_live, f"Complete round revision {latest['pending_live'].get('revision', revision)} is available. Move focus away from these controls to show it.")
+            if latest['template_query']:
+                template_page = controller.monitor_history_page(latest['template_query'])
+                if template_page is not None:
+                    controller.release_monitor_history_page(latest['template_query'])
+                    latest['template_query'] = None
+                    if template_page.get('error') or len(template_page.get('items', [])) != 1:
+                        set_reuse_notice(history_template_error(template_page.get('error')))
+                    elif tuple(control.value for control in (targets, ports, interval, duration)) != latest['template_draft']:
+                        set_reuse_notice('Form changed while saved settings were loading. Your edits were kept; select Use settings again to replace them.')
+                    else:
+                        values, notice = history_template_form(template_page['items'][0])
+                        for control, suffix, value in zip((targets, ports, interval, duration),
+                                                          ('targets', 'ports', 'interval', 'duration'), values):
+                            control.set_value(value)
+                            key = json.dumps('cn-tool-draft-monitor-' + suffix)
+                            root = json.dumps(control.html_id)
+                            client.run_javascript(f"(() => {{ sessionStorage.setItem({key}, {json.dumps(value)}); const root = document.getElementById({root}); const input = root?.matches('input,textarea') ? root : root?.querySelector('input,textarea'); if (input) input.cnDraftEdited = true; }})()")
+                        for control, error_label in fields.values():
+                            control._props.pop('aria-invalid', None)
+                            control.update()
+                            error_label.set_text('')
+                        form_error.set_text('')
+                        set_reuse_notice(notice)
+                        root = json.dumps(targets.html_id)
+                        client.run_javascript(f"(() => {{ const root = document.getElementById({root}); (root?.matches('input,textarea') ? root : root?.querySelector('input,textarea'))?.focus(); }})()")
+            if latest['delete_query']:
+                deletion = controller.monitor_delete_result(latest['delete_query'])
+                if deletion is not None:
+                    controller.release_monitor_delete_result(latest['delete_query'])
+                    latest['delete_query'] = None
+                    deletion_status = deletion.get('status')
+                    if deletion_status == 'deleted':
+                        action = latest['delete_selection']['action']
+                        notice = 'Run deleted.' if action == 'run' else 'Monitor history deleted.'
+                        if deletion.get('warning'):
+                            notice += ' ' + deletion['warning']
+                        set_changed(history_delete_status, notice)
+                        delete_dialog.close()
+                        if latest['template_query']:
+                            controller.release_monitor_history_page(latest['template_query'])
+                            latest['template_query'] = None
+                        history.reset()
+                        await request_history('refresh')
+                    else:
+                        messages = {'running': 'A recorded monitor is active or its state cannot be verified. Wait for it to finish or check the process that owns it.',
+                                    'missing': 'The selected history no longer exists. Refresh history and try again.',
+                                    'failed': 'History could not be deleted. Check the history file and try again.'}
+                        delete_error.set_text(deletion.get('warning') if deletion_status == 'failed' and deletion.get('warning')
+                                              else messages.get(deletion_status, messages['failed']))
+                        delete_confirm.enable()
+                        delete_cancel.enable()
             if latest['history_dirty'] and phase in {'ready', 'running', 'stopping', 'saving'}:
                 latest['history_dirty'] = False
                 await request_history()
@@ -474,6 +615,12 @@ return true;
                 ui.timer(1, restore, once=True)
         ui.timer(0, restore, once=True)
     def release_queries():
+        if latest['delete_query']:
+            controller.release_monitor_delete_result(latest['delete_query'])
+            latest['delete_query'] = None
+        if latest['template_query']:
+            controller.release_monitor_history_page(latest['template_query'])
+            latest['template_query'] = None
         if latest['live_query']:
             controller.release_monitor_live_page(latest['live_query'])
             latest['live_query'] = None
@@ -490,6 +637,48 @@ def live_fields(row):
     tcp = ', '.join(f"{entry['port']}: {entry['result']}" for entry in row.get('tcp', [])) or 'Not checked'
     return [('Host', str(row.get('host') or 'Unknown')), ('Address', str(row.get('address') or 'Unknown')),
             ('Result', str(row.get('result') or 'Unknown')), ('TCP', tcp)]
+
+
+def history_run_summary(item):
+    status = f"Status: {item.get('status') or 'unknown'}"
+    count = item.get('rounds', 0)
+    lines = [status, f"Started: {history_value('started', item.get('started'))}",
+             f"{count} complete {'round' if count == 1 else 'rounds'}"]
+    every = item.get('interval')
+    lines.append('One round' if every is None else f'Every {every:g} seconds')
+    if item.get('until') is not None:
+        lines.append(f"Planned end: {history_value('until', item['until'])}")
+    elif every is not None:
+        lines.append('No planned end')
+    if item.get('ended') is not None:
+        lines.append(f"Ended: {history_value('ended', item['ended'])}")
+    return lines
+
+
+def history_template_error(error):
+    if error == 'too_large':
+        return 'This saved request is too large to load into the form. Enter its targets and ports manually.'
+    return 'Saved settings are unavailable. Refresh history and try again.'
+
+
+def history_template_form(item):
+    from math import ceil, isfinite
+
+    every = item.get('interval')
+    interval = (str(int(every)) if type(every) in (int, float) and isfinite(every)
+                and 10 <= every <= 999999999 and int(every) == every else '')
+    duration = ''
+    notice = 'Saved settings loaded. Review them before starting.'
+    if item.get('until') is not None:
+        seconds = item['until'] - item['started']
+        if isfinite(seconds) and 10 <= seconds <= 999999999 and interval:
+            duration = str(max(int(interval), ceil(seconds)))
+            notice = 'Duration is estimated from the saved schedule. Review it before starting.'
+        else:
+            notice = 'The saved duration could not be restored. Enter a duration or leave it blank to run until stopped.'
+    if not interval:
+        notice += ' Enter an interval of at least 10 seconds; this run used a different schedule.'
+    return ('\n'.join(item['targets']), ', '.join(str(port) for port in item['ports']), interval, duration), notice
 
 
 def history_value(key, value):
@@ -529,6 +718,8 @@ def set_changed(label, value):
 
 def operation_message(state, update, *, active):
     stage = ((update or {}).get('stage') if active else None) or state.progress_stage or 'Working…'
+    if active and update and stage in {'probing', 'resolving'} and update.get('total', 0) > 0:
+        return f"Monitor: {stage} {update.get('completed', 0)} of {update['total']} targets"
     return f"{'Monitor' if active else 'Another operation'}: {stage}"
 
 

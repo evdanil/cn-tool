@@ -32,6 +32,8 @@ SCHEMA_VERSION = 1
 RUN_STATUSES = ("running", "finished", "stopped", "failed")
 _FINAL_STATUSES = RUN_STATUSES[1:]
 _BUSY_TIMEOUT = 10  # seconds a connection waits for another one's write lock
+_DELETE_LOCK_SECONDS = 3.0  # leave time for other monitors to acquire the writer lock
+_DELETE_PROGRESS_OPCODES = 1000
 _DAY = 86400
 # sweep(): at most this many result rows in a batch, so that no write lock is held for long (22 batches, the longest
 # 0.44 s, for 30 days of the README's /24: 43,200 rounds, 4.3 million result rows); the pause between two batches is
@@ -105,8 +107,16 @@ class AlreadyRunning(Exception):
         super().__init__(f"run {run.id} is already running")
 
 
+class DeletionTimedOut(StoreError):
+    """Atomic deletion exceeded its write-lock budget and was rolled back."""
+
+
 class HistoryExpired(Exception):
     """A live history page's parent or cursor no longer exists."""
+
+
+class HistoryTooLarge(Exception):
+    """A saved request exceeds the bounded history template response."""
 
 
 @dataclass(frozen=True)
@@ -590,7 +600,9 @@ class PingStore:
             )
         return int(deleted)
 
-    def delete(self, keys: Optional[Sequence[str]], *, going_on: Callable[[RunInfo], bool]) -> Deletion:
+    def delete(
+        self, keys: Optional[Sequence[str]], *, going_on: Callable[[RunInfo], bool], guard_all: bool = False,
+    ) -> Deletion:
         """
         Delete the requests whose keys are ``keys`` (``None``: every one) with their runs, in one short transaction.
 
@@ -601,7 +613,8 @@ class PingStore:
         for this transaction (SQLite ignores the pragma inside one), and on again after, whatever happens.
 
         ``going_on`` is asked about every row of the requests that says ``running``, inside the lock: when it accepts
-        one, nothing is deleted and ``Deletion.going_on`` has those runs.
+        one, nothing is deleted and ``Deletion.going_on`` has those runs. With ``guard_all``, every
+        selected run is checked and invalid or absent parent request keys are refused.
         """
         if not self._write:
             raise StoreError(f"cannot write {self.path}: opened read-only")
@@ -613,7 +626,22 @@ class PingStore:
         try:
             with self._transaction(write=True):
                 infos = _request_infos(connection, where, params)
-                running = tuple(run for info in infos for run in info.running if going_on(run))
+                if guard_all:
+                    scoped_where = "" if keys is None else f"WHERE request.key IN ({', '.join('?' * len(keys))})"
+                    rows = connection.execute(
+                        f"SELECT {_RUN_COLUMNS}, request.key FROM run LEFT JOIN request ON request.id = run.request_id "
+                        f"{scoped_where}", params,
+                    )
+                    guarded = []
+                    for row in rows:
+                        run, key = RunInfo(*row[:-1]), row[-1]
+                        if not isinstance(key, str) or re.fullmatch(r"[0-9a-fA-F]{64}", key) is None:
+                            raise StoreError(f"cannot write {self.path}: invalid or missing parent request key")
+                        if going_on(run):
+                            guarded.append(run)
+                    running = tuple(guarded)
+                else:
+                    running = tuple(run for info in infos for run in info.running if going_on(run))
                 if running:
                     return Deletion(tuple(infos), going_on=running)  # nothing was written: the commit is a no-op
                 if keys is None:
@@ -627,6 +655,60 @@ class PingStore:
                 return Deletion(tuple(infos))
         finally:
             with suppress(sqlite3.Error):  # a closed connection has nothing to restore
+                connection.execute("PRAGMA foreign_keys = ON")
+
+    def delete_run(self, run_id: str, request_id: int, *, going_on: Callable[[RunInfo], bool]) -> str:
+        """Delete one inactive run, its rounds and results, and its empty request atomically.
+
+        The identity and liveness checks and deletes share one writer lock. Other runs,
+        including runs admitted while the caller was deciding, remain untouched.
+        """
+        if not self._write:
+            raise StoreError(f"cannot write {self.path}: opened read-only")
+        sqlite3 = _sqlite3()
+        connection = self._connection
+        with _reported("write", self.path):
+            connection.execute("PRAGMA foreign_keys = OFF")
+        timed_out = False
+        try:
+            with self._transaction(write=True):
+                deadline = time.monotonic() + _DELETE_LOCK_SECONDS
+                def check_deadline() -> int:
+                    nonlocal timed_out
+                    timed_out = time.monotonic() >= deadline
+                    return int(timed_out)
+                connection.set_progress_handler(check_deadline, _DELETE_PROGRESS_OPCODES)
+                row = connection.execute(
+                    f"SELECT {_RUN_COLUMNS}, request.key FROM run LEFT JOIN request ON request.id = run.request_id "
+                    "WHERE run.id = ? AND run.request_id = ?",
+                    (run_id, request_id),
+                ).fetchone()
+                if row is None:
+                    return "missing"
+                run, key = RunInfo(*row[:-1]), row[-1]
+                if not isinstance(key, str) or re.fullmatch(r"[0-9a-fA-F]{64}", key) is None:
+                    raise StoreError(f"cannot write {self.path}: invalid or missing parent request key")
+                if going_on(run):
+                    return "running"
+                connection.execute(
+                    "DELETE FROM result WHERE round_id IN (SELECT id FROM round WHERE run_id = ?)", (run_id,),
+                )
+                connection.execute("DELETE FROM round WHERE run_id = ?", (run_id,))
+                connection.execute("DELETE FROM run WHERE id = ? AND request_id = ?", (run_id, request_id))
+                connection.execute(
+                    "DELETE FROM request WHERE id = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM run WHERE request_id = ?)", (request_id, request_id),
+                )
+                return "deleted"
+        except StoreError as error:
+            if timed_out:
+                raise DeletionTimedOut(
+                    "run deletion exceeded its safe database lock time; nothing was deleted"
+                ) from error
+            raise
+        finally:
+            connection.set_progress_handler(None, 0)
+            with suppress(sqlite3.Error):
                 connection.execute("PRAGMA foreign_keys = ON")
 
     def sweep(self, *, vacuum: bool = False) -> int:
@@ -702,11 +784,12 @@ class PingStore:
         """
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("history limit must be between 1 and 100")
-        if kind not in ("requests", "runs", "rounds", "hosts"):
+        if kind not in ("requests", "runs", "rounds", "hosts", "template"):
             raise ValueError("invalid history kind")
         if (kind == "requests" and parent is not None or
                 kind in ("runs", "hosts") and not _history_integer(parent) or
-                kind == "rounds" and (not isinstance(parent, str) or not parent)):
+                kind in ("rounds", "template") and (not isinstance(parent, str) or not parent) or
+                kind == "template" and (after is not None or limit != 1)):
             raise ValueError("invalid history parent")
         if after is not None:
             valid = (_history_integer(after, 0 if kind == "hosts" else 1)
@@ -718,6 +801,34 @@ class PingStore:
             if not valid:
                 raise ValueError("invalid history cursor")
         with self._transaction(write=False) as connection:
+            if kind == "template":
+                row = connection.execute(
+                    "SELECT substr(request.targets, 1, 8193), substr(request.tcp_ports, 1, 8193),"
+                    " run.interval, run.until, run.started FROM run JOIN request ON request.id = run.request_id"
+                    " WHERE run.id = ?", (parent,),
+                ).fetchone()
+                if row is None:
+                    raise HistoryExpired()
+                targets_json, ports_json, interval, until, started = row
+                try:
+                    if not isinstance(targets_json, str) or not isinstance(ports_json, str):
+                        raise ValueError("invalid template")
+                    if len(targets_json) > 8192 or len(ports_json) > 8192:
+                        raise HistoryTooLarge()
+                    targets, ports = json.loads(targets_json), json.loads(ports_json)
+                    if (not isinstance(targets, list) or not targets or not all(isinstance(t, str) and t.splitlines() == [t] for t in targets) or
+                            not isinstance(ports, list) or len(ports) > 5 or
+                            any(type(port) is not int or not 1 <= port <= 65535 for port in ports) or
+                            len(set(ports)) != len(ports) or
+                            (interval is not None and (type(interval) not in (int, float) or
+                             not math.isfinite(interval) or
+                             not -(2**63) <= interval <= 2**63 - 1))):
+                        raise ValueError("invalid template")
+                except (ValueError, TypeError, RecursionError) as error:
+                    raise StoreError(f"cannot read {self.path}: invalid monitor template") from error
+                whole_interval = int(interval) if interval is not None and int(interval) == interval else None
+                return [dict(targets=targets, ports=ports, interval=whole_interval,
+                             until=until, started=started)], None
             if kind == "requests":
                 if after is not None and not connection.execute("SELECT 1 FROM request WHERE id = ?", (after,)).fetchone():
                     raise HistoryExpired()
@@ -836,6 +947,27 @@ class PingStore:
                 "SELECT targets, tcp_ports FROM request WHERE key != ? ORDER BY id", (key,)
             ).fetchall()
         return [tuple(json.loads(ports)) for stored, ports in rows if json.loads(stored) == wanted]
+
+    def request_brief(self, request_id: int) -> Optional[Dict[str, Any]]:
+        """A bounded request description for a confirmation, without reading its host list."""
+        with self._transaction(write=False) as connection:
+            row = connection.execute(
+                "SELECT substr(key, 1, 65), substr(targets, 1, ?), substr(tcp_ports, 1, ?) "
+                "FROM request WHERE id = ?", (_HISTORY_ARRAY_CHARS + 1, _HISTORY_ARRAY_CHARS + 1, request_id),
+            ).fetchone()
+        if row is None:
+            return None
+        key, targets, ports = row
+        target_preview, target_count = _request_array_summary(targets)
+        port_preview, port_count = _request_array_summary(ports, ports=True)
+        return dict(key=key if isinstance(key, str) and len(key) <= 64 else "", targets_preview=target_preview,
+                    target_count=target_count, ports_preview=port_preview, port_count=port_count)
+
+    def run(self, run_id: str) -> Optional[RunInfo]:
+        """The run with exactly this ID and its current round count, or None."""
+        with self._transaction(write=False) as connection:
+            row = connection.execute(f"SELECT {_RUN_COLUMNS} FROM run WHERE run.id = ?", (run_id,)).fetchone()
+        return RunInfo(*row) if row is not None else None
 
     def runs(self, request_id: int) -> List[RunInfo]:
         """The request's runs, newest first (by ``started``)."""

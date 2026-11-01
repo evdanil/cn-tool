@@ -63,6 +63,41 @@ def pid_exists(pid: int) -> bool:
     return True
 
 
+def pid_definitely_dead(pid: int) -> bool:
+    """True only when the operating system confirms that this PID has exited.
+
+    Unknown errors and invalid IDs are not proof of death. This stricter check is for
+    destructive history operations; ``pid_exists`` keeps its existing semantics.
+    """
+    if type(pid) is not int or pid <= 0:
+        return False
+    if is_windows():
+        if pid > _MAX_WINDOWS_PID:
+            return False
+        import ctypes
+        from ctypes import wintypes
+
+        try:
+            kernel32 = _kernel32()
+            handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return _last_error() == 87  # ERROR_INVALID_PARAMETER: no process with that PID
+            try:
+                exit_code = wintypes.DWORD()
+                return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))) and exit_code.value != _STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
 def _windows_pid_exists(pid: int) -> bool:
     if pid > _MAX_WINDOWS_PID:
         return False  # it would wrap around to another process in the DWORD argument

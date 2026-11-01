@@ -16,6 +16,8 @@ FIELDS = {
     'demob_page_result': {'query_id', 'offset', 'rows', 'total', 'next_offset', 'status'},
     'config_search_page': {'job_id', 'offset', 'limit', 'query_id'},
     'config_search_page_result': {'job_id', 'offset', 'rows', 'total', 'next_offset', 'status', 'query_id'},
+    'monitor_delete': {'action', 'run_id', 'request_id', 'query_id'},
+    'monitor_delete_result': {'query_id', 'status', 'warning'},
     'monitor_history': {'kind', 'parent', 'cursor', 'limit', 'query_id'},
     'monitor_history_result': {'items', 'next_cursor', 'error', 'query_id'},
     'monitor_live_page': {'job_id', 'run_id', 'revision', 'offset', 'limit', 'query_id'},
@@ -25,7 +27,7 @@ FIELDS = {
     'lookup_context': {'lookup_type', 'username', 'scope'},
     'error': {'message', 'lookup_type'}, 'report_snapshot': {'request_id', 'path', 'error', 'filename'}, 'closed': set(),
 }
-COMMANDS = frozenset(('initialize', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_history', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
+COMMANDS = frozenset(('initialize', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_history', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
 
 
 def envelope(session_id, job_id, kind, payload):
@@ -62,6 +64,18 @@ def valid_monitor_history_item(kind, item):
         return isinstance(value, str) and len(value) <= 8192
     if kind == 'requests':
         return valid_monitor_request_summary(item)
+    if kind == 'template':
+        if not isinstance(item, dict) or set(item) != {'targets', 'ports', 'interval', 'until', 'started'}:
+            return False
+        targets, ports = item['targets'], item['ports']
+        if (not isinstance(targets, list) or not targets or not all(isinstance(t, str) and t.splitlines() == [t] for t in targets) or
+                not isinstance(ports, list) or len(ports) > 5 or
+                any(type(p) is not int or not 1 <= p <= 65535 for p in ports) or len(set(ports)) != len(ports)):
+            return False
+        return (len(json.dumps(targets, ensure_ascii=False, separators=(',', ':'))) <= 8192 and
+                len(json.dumps(ports, ensure_ascii=False, separators=(',', ':'))) <= 8192 and
+                (item['interval'] is None or integer(item['interval'], -(2**63))) and
+                optional_number(item['until']) and number(item['started']))
     if not isinstance(item, dict):
         return False
     if kind == 'runs':
@@ -69,8 +83,9 @@ def valid_monitor_history_item(kind, item):
                   'round_seconds', 'ended', 'status', 'rounds', 'owned'}
         if set(item) != fields:
             return False
+        from cn_tool.utils.ping_history import _history_run_id
         run_id = item['id']
-        return (isinstance(run_id, str) and 1 <= len(run_id) <= 128 and run_id.isascii() and run_id.isprintable() and
+        return (_history_run_id(run_id) and
                 integer(item['request_id'], 1) and (item['source'] is None or text(item['source'])) and
                 number(item['started']) and optional_number(item['interval']) and optional_number(item['until']) and
                 text(item['host']) and integer(item['pid']) and number(item['heartbeat']) and
@@ -99,6 +114,23 @@ def validate(message):
     kind, payload = message['kind'], message['payload']
     if not isinstance(kind, str) or kind not in FIELDS or not isinstance(payload, dict) or set(payload) - FIELDS[kind]:
         raise ValueError('Invalid message kind or payload fields')
+    if kind in {'monitor_delete', 'monitor_delete_result'}:
+        if message['job_id'] is not None or set(payload) != FIELDS[kind]:
+            raise ValueError('Invalid deletion envelope')
+        query_id = payload['query_id']
+        if (not isinstance(query_id, str) or not 1 <= len(query_id) <= 128 or
+                not query_id.isascii() or not query_id.isprintable()):
+            raise ValueError('Invalid deletion query ID')
+        if kind == 'monitor_delete':
+            from cn_tool.utils.ping_history import _history_int, _history_run_id
+            action, run_id, request_id = payload['action'], payload['run_id'], payload['request_id']
+            if not ((action == 'run' and _history_run_id(run_id) and _history_int(request_id)) or
+                    (action == 'all' and run_id is None and request_id is None)):
+                raise ValueError('Invalid deletion scope')
+        elif (payload['status'] not in ('deleted', 'missing', 'running', 'failed') or
+              not isinstance(payload['warning'], str) or len(payload['warning']) > 512):
+            raise ValueError('Invalid deletion result')
+        return message
     if kind.startswith('demob_'):
         if set(payload) != FIELDS[kind]:
             raise ValueError('Invalid demobilization payload')
@@ -175,10 +207,11 @@ def validate(message):
         if kind == 'monitor_history':
             from cn_tool.utils.ping_history import _history_decode_cursor, _history_int, _history_run_id
             page_kind, parent, limit = payload['kind'], payload['parent'], payload['limit']
-            if (page_kind not in ('requests', 'runs', 'rounds', 'hosts') or not _history_int(limit) or limit > 100 or
+            if (page_kind not in ('requests', 'runs', 'rounds', 'hosts', 'template') or not _history_int(limit) or limit > 100 or
                     (page_kind == 'requests' and parent is not None) or
                     (page_kind in ('runs', 'hosts') and not _history_int(parent)) or
-                    (page_kind == 'rounds' and not _history_run_id(parent))):
+                    (page_kind in ('rounds', 'template') and not _history_run_id(parent)) or
+                    (page_kind == 'template' and (cursor is not None or limit != 1))):
                 raise ValueError('Invalid history query')
             if cursor is not None:
                 _history_decode_cursor(cursor, page_kind, parent)
@@ -189,7 +222,7 @@ def validate(message):
                 raise ValueError('Invalid history result')
             for item in items:
                 if not any(valid_monitor_history_item(item_kind, item)
-                           for item_kind in ('requests', 'runs', 'rounds', 'hosts')):
+                           for item_kind in ('requests', 'runs', 'rounds', 'hosts', 'template')):
                     raise ValueError('Invalid history item')
         return message
     if kind in {'monitor_live_page', 'monitor_live_page_result'}:

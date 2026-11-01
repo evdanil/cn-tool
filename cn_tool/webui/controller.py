@@ -6,7 +6,7 @@ from threading import RLock, Thread
 from time import monotonic
 from uuid import uuid4
 
-from .protocol import decode, encode, envelope, valid_monitor_history_item
+from .protocol import decode, encode, envelope, validate, valid_monitor_history_item
 
 
 @dataclass
@@ -66,6 +66,9 @@ class SessionController:
         self._config_file = None
         self._disconnected = False
         self._reader_finished = False
+        self._delete_pending = None
+        self._delete_abandoned = False
+        self._delete_results = {}
         self._history_requests = {}
         self._history_pages = {}
         self._monitor_requests = {}
@@ -360,6 +363,32 @@ class SessionController:
         with self._lock:
             return self._state.phase
 
+    def request_monitor_delete(self, action, run_id=None, request_id=None):
+        with self._lock:
+            if self._state.phase not in {'ready', 'running', 'stopping', 'saving'}:
+                raise RuntimeError('Session unavailable')
+            if self._delete_pending is not None:
+                raise RuntimeError('A history deletion is already in progress')
+            if len(self._delete_results) >= 32:
+                raise RuntimeError('Too many unclaimed history deletion results')
+            query_id = uuid4().hex
+            payload = dict(action=action, run_id=run_id, request_id=request_id, query_id=query_id)
+            validate(envelope(self.session_id, None, 'monitor_delete', payload))
+            self._send('monitor_delete', None, payload)
+            self._delete_pending = query_id
+            self._delete_abandoned = False
+            return query_id
+
+    def monitor_delete_result(self, query_id):
+        with self._lock:
+            return deepcopy(self._delete_results.get(query_id))
+
+    def release_monitor_delete_result(self, query_id):
+        with self._lock:
+            if self._delete_pending == query_id:
+                self._delete_abandoned = True
+            self._delete_results.pop(query_id, None)
+
     def request_monitor_history(self, kind, parent=None, cursor=None, limit=100):
         with self._lock:
             if self._state.phase not in {'ready', 'running', 'stopping', 'saving'}:
@@ -543,9 +572,22 @@ class SessionController:
                 self._state.progress_stage = payload['stage']
                 self._state.progress_completed = payload['completed']
                 self._state.progress_total = payload['total']
+            elif kind == 'monitor_delete_result':
+                try:
+                    validate(event)
+                except (ValueError, TypeError):
+                    return
+                if payload['query_id'] != self._delete_pending:
+                    return
+                self._delete_pending = None
+                if not self._delete_abandoned:
+                    self._delete_results[payload['query_id']] = deepcopy(payload)
+                self._delete_abandoned = False
             elif kind == 'monitor_history_result':
                 request = self._history_requests.get(payload['query_id'])
                 if (request is None or len(payload['items']) > request[1] or
+                        (request[0] == 'template' and (payload['next_cursor'] is not None or
+                         len(payload['items']) != (0 if payload['error'] else 1))) or
                         not all(valid_monitor_history_item(request[0], item) for item in payload['items'])):
                     return
                 self._history_requests.pop(payload['query_id'], None)
@@ -690,6 +732,8 @@ class SessionController:
                 self._config_requests.clear()
                 self._config_pages.clear()
                 self._state.results_by_type['config_search'] = None
+                self._delete_pending = None
+                self._delete_results.clear()
                 self._history_requests.clear()
                 self._history_pages.clear()
                 self._state.monitor_update = None

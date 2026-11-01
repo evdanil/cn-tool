@@ -16,6 +16,7 @@ and setup](infoblox.md#access-and-setup) requirements before using them.
 | --- | --- |
 | Released 0.8.4 | Subnets |
 | 0.9.0 | Subnets, IP, Ping, Monitor, Configuration Search and Site Demobilization |
+| 0.9.1 | The same tools, with live Monitor progress and history management |
 
 The browser tools beyond Subnets are available in 0.9.0 and are not part of 0.8.4.
 The menu and CLI have their own established workflows.
@@ -122,7 +123,13 @@ The latest complete round uses bounded pages. This run's and earlier round count
 shown separately; an incomplete first round is not an outage. History is a changing view
 of recorded requests, runs, rounds and hosts, and refreshing it starts at page one.
 It uses `[ping] history_file` and `[ping] history_days`; viewing history never prunes it.
-Other processes' runs are view-only.
+Starting with 0.9.1, the live view shows progress during a round. Under a request's runs, **Use settings** loads the saved targets and TCP ports into the
+form without starting a monitor. Review the interval and duration before starting: a
+finite duration is estimated from the saved schedule, and some older schedules need a
+new interval. Very large saved requests may need to be entered manually. **Delete run**
+removes one saved run; **Delete all history** clears all requests and runs. Each action
+asks for confirmation. A recorded active run cannot be deleted, and it blocks clearing
+all history.
 
 Closing a tab or navigating away leaves this session's monitor running. **Stop monitor**
 ends its own run; Quit stops it and waits for cleanup. History and workbook failures are

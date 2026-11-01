@@ -64,7 +64,7 @@ RUNS_SHOWN = 5  # runs a summary's header names one by one; one-round runs are c
 DISPLAY_THRESHOLD = 32  # item 6's: a subnet with more hosts shows the seen ones and one line for the rest
 _HISTORY = "cn: monitor: history: {}"
 _NO_ROUND = "No round finished."
-_MODES = ("list", "show", "follow", "rerun", "delete", "clear")
+_MODES = ("list", "show", "follow", "rerun", "delete", "clear", "runs", "delete_run")
 _NOTHING_DELETED = "cn: monitor: nothing was deleted"
 _NOTHING_RECORDED = "cn: monitor: nothing is recorded; nothing was deleted"
 _KEEPS_SPACE = "the deleted rounds keep their space until the next --delete or --clear"
@@ -84,24 +84,28 @@ def usage_problem(args: argparse.Namespace) -> Optional[str]:
     modes = [name for name in _MODES if getattr(args, name, None) not in (None, False)]  # even ''
     since = getattr(args, "since", None)
     if len(modes) > 1:
-        return " and ".join(f"--{mode}" for mode in modes) + " cannot be combined"
-    if getattr(args, "yes", False) and not {"delete", "clear"} & set(modes):
-        return "--yes goes with --delete or --clear"
+        return " and ".join("--" + mode.replace("_", "-") for mode in modes) + " cannot be combined"
+    if getattr(args, "yes", False) and not {"delete", "clear", "delete_run"} & set(modes):
+        return "--yes goes with --delete, --delete-run or --clear"
     if modes:
         mode = modes[0]
+        flag_mode = mode.replace("_", "-")
         if getattr(args, "objects", None) or getattr(args, "file", None) is not None:
-            return f"--{mode} takes no targets"
+            return f"--{flag_mode} takes no targets"
         for name, flag in (("tcp", "--tcp"), ("every", "--every"), ("run_for", "--for")):
             if mode == "rerun" and name != "tcp":
                 continue  # a rerun's --every and --for override the plan it reuses
             if getattr(args, name, None) is not None:
-                return f"{flag} goes with targets, not with --{mode}"
-        if mode in ("list", "delete", "clear") and since is not None:
-            return f"--since does not go with --{mode}"
-        if mode in ("show", "follow", "rerun", "delete"):
+                return f"{flag} goes with targets, not with --{flag_mode}"
+        if mode in ("list", "delete", "clear", "runs", "delete_run") and since is not None:
+            return f"--since does not go with --{flag_mode}"
+        if mode in ("show", "follow", "rerun", "delete", "runs"):
             problem = id_problem(getattr(args, mode))
             if problem:
                 return problem
+    run_id = getattr(args, "delete_run", None)
+    if run_id is not None and not ph._history_run_id(run_id):
+        return "--delete-run needs a full run ID from --runs"
     every, run_for = getattr(args, "every", None), getattr(args, "run_for", None)
     if every is not None and every.total_seconds() < MIN_INTERVAL:
         return f"--every must be at least {int(MIN_INTERVAL)}s"
@@ -569,9 +573,32 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         """Whether a run whose row says ``running`` is going on: live, not lost (``PingStore.delete`` asks this)."""
         return self._state(run)[0] == "running"
 
+    def _deletion_going_on(self, run: RunInfo) -> bool:
+        """Allow deletion only for well-formed, finished runs or a confirmed dead local process."""
+        if run.status == "running":
+            if run.ended is not None or run.host != socket.gethostname():
+                return True
+            return not oscompat.pid_definitely_dead(run.pid)
+        if run.status not in ("finished", "stopped", "failed"):
+            return True
+        ended = run.ended
+        return not (type(ended) is int and -(2**63) <= ended <= 2**63 - 1 or
+                    type(ended) is float and math.isfinite(ended))
+
     def _going(self, infos: Sequence[RequestInfo]) -> List[RunInfo]:
         """The runs of these requests that are going on, each request's newest first."""
         return [run for info in infos for run in info.running if self._going_on(run)]
+
+    def _deletion_going(self, infos: Sequence[RequestInfo]) -> List[RunInfo]:
+        """Runs protected from deletion, including local processes with a stale heartbeat."""
+        return [run for info in infos for run in info.running if self._deletion_going_on(run)]
+
+    def _deletion_text(self, infos: Sequence[RequestInfo], runs: Sequence[RunInfo]) -> str:
+        """Explain conservative refusals without presenting uncertain owners as definitely alive."""
+        known_live = {run.id for run in self._going(infos)}
+        if any(run.id not in known_live for run in runs):
+            return "a run is active or its state cannot be verified; nothing was deleted"
+        return self._going_text(infos, runs)
 
     def _going_text(self, infos: Sequence[RequestInfo], runs: Sequence[RunInfo]) -> str:
         """Why nothing is deleted: ``a run of a3f9c2e1 is going on (since 09:00:00 on host01, pid 4242); stop it or let
@@ -603,6 +630,10 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         ctx.logger.info("Request Type - Ping Monitor (command line)")
         if args.list:
             return self._cli_list(ctx, args.format)
+        if getattr(args, "runs", None) is not None:
+            return self._cli_runs(ctx, args.runs)
+        if getattr(args, "delete_run", None) is not None:
+            return self._cli_delete_run(ctx, args.delete_run, args.yes)
         if args.delete or args.clear:
             return self._cli_delete(ctx, args)
         if args.rerun:
@@ -901,6 +932,94 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         found = outcome.tcp_open if outcome.request.ports else bool(data["seen"])
         return CliResult(0 if found else 1, data)
 
+    def _cli_runs(self, ctx: ScriptContext, prefix: str) -> CliResult:
+        empty: Dict[str, List[Row]] = {"runs": []}
+        store, error = self._open_store(ctx, write=False)
+        if error:
+            _say(_HISTORY.format(error))
+            return CliResult(3, empty)
+        if store is None:
+            _say(f"cn: monitor: no recorded request has the ID '{prefix}': nothing is recorded yet")
+            return CliResult(2, empty)
+        try:
+            with store:
+                info, problem, runs = self._request_and_runs(store, prefix)
+                if info is None:
+                    _say(f"cn: monitor: {problem}")
+                    return CliResult(2, empty)
+                rows = []
+                for run in runs:
+                    state, _ = self._state(run)
+                    if state == "lost" and self._deletion_going_on(run):
+                        if run.host != socket.gethostname():
+                            state = "stale heartbeat; remote owner unverified"
+                        elif oscompat.pid_exists(run.pid):
+                            state = "stale heartbeat; local process alive"
+                        else:
+                            state = "stale heartbeat; local process unverified"
+                    rows.append({"Run ID": run.id, "Started": _when(run.started), "State": state,
+                                 "Rounds": run.rounds, "Ended": _when(run.ended)})
+            return CliResult(0 if rows else 1, {"runs": rows})
+        except StoreError as exc:
+            _say(_HISTORY.format(exc))
+            return CliResult(3, empty)
+
+    def _cli_delete_run(self, ctx: ScriptContext, run_id: str, yes: bool) -> CliResult:
+        empty: Dict[str, List[Row]] = {"deleted": []}
+        if not yes and not auth._can_prompt():
+            _say("cn: monitor: --delete-run asks before deleting and there is no terminal to ask on; "
+                 "add --yes to delete without asking")
+            return CliResult(2, empty)
+        store, error = self._open_store(ctx, write=True, create=False)
+        if error:
+            _say(_HISTORY.format(error))
+            return CliResult(3, empty)
+        if store is None:
+            _say(f"cn: monitor: no recorded run has ID '{run_id}': nothing is recorded yet")
+            return CliResult(2, empty)
+        try:
+            with store:
+                run = store.run(run_id)
+                if run is None:
+                    _say(f"cn: monitor: no recorded run has ID '{run_id}'; see cn monitor --runs REQUEST_ID")
+                    return CliResult(2, empty)
+                if self._deletion_going_on(run):
+                    _say("cn: monitor: this run is active or its state cannot be verified; nothing was deleted")
+                    return CliResult(2, empty)
+                if not yes:
+                    brief = store.request_brief(run.request_id)
+                    if brief is None:
+                        _say("cn: monitor: this run is no longer in the ping history; nothing was deleted")
+                        return CliResult(1, empty)
+                    targets = ", ".join(brief["targets_preview"]) or "unavailable"
+                    if brief["target_count"] is None or brief["target_count"] > len(brief["targets_preview"]):
+                        targets += " …"
+                    ports = ",".join(str(port) for port in brief["ports_preview"]) or "none"
+                    if brief["port_count"] is None or brief["port_count"] > len(brief["ports_preview"]):
+                        ports += " …"
+                    _say(f"Request {ph.short_id(brief['key'])} · targets: {targets} · TCP {ports}")
+                    _say(f"Run {run.id} · started {_when(run.started)} · {_rounds(run.rounds)}")
+                if not yes and not _confirmed(ctx, f"Delete run {run.id} from {store.path}? This cannot be undone. [y/N] "):
+                    _say(_NOTHING_DELETED)
+                    return CliResult(1, empty)
+                status = store.delete_run(run.id, run.request_id, going_on=self._deletion_going_on)
+                if status == "running":
+                    _say("cn: monitor: this run is active or its state cannot be verified; nothing was deleted")
+                    return CliResult(2, empty)
+                if status == "missing":
+                    _say("cn: monitor: this run is no longer in the ping history; nothing was deleted")
+                    return CliResult(1, empty)
+                try:
+                    store.sweep()
+                except Exception:
+                    ctx.logger.exception("Ping Monitor - run deleted, but history cleanup failed")
+                    _say(_HISTORY.format(f"cleanup failed; {_KEEPS_SPACE}"))
+            ctx.logger.info("Ping Monitor - deleted run %s from the ping history", run.id)
+            return CliResult(0, {"deleted": [{"Run ID": run.id, "Started": _when(run.started), "Rounds": run.rounds}]})
+        except StoreError as exc:
+            _say(_HISTORY.format(exc))
+            return CliResult(3, empty)
+
     # --- deleting from the history -------------------------------------------------------------------
     def _delete(
         self, store: PingStore, keys: Optional[Sequence[str]], *, whole: bool
@@ -912,13 +1031,15 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
 
         @raise StoreError: the delete failed, nothing was deleted.
         """
-        deletion = store.delete(keys, going_on=self._going_on)
+        deletion = store.delete(keys, going_on=self._deletion_going_on, guard_all=True)
         if not deletion.requests or deletion.going_on:
             return deletion, None
         try:
             store.sweep(vacuum=whole)
         except StoreError as error:
             return deletion, str(error)
+        except Exception:
+            return deletion, "cleanup failed"
         return deletion, None
 
     def _deleted_row(self, info: RequestInfo) -> Row:
@@ -988,9 +1109,9 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
                 _say(f"cn: monitor: {problem}")
                 return CliResult(2, refused)
             infos = [info]
-        going = self._going(infos)
+        going = self._deletion_going(infos)
         if going:
-            _say(f"cn: monitor: {self._going_text(infos, going)}")
+            _say(f"cn: monitor: {self._deletion_text(infos, going)}")
             return CliResult(2, refused)
         if not args.yes:
             lines, question = _asking(store.path, infos, whole=whole)
@@ -1001,7 +1122,7 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
                 return CliResult(1, refused)
         deletion, warning = self._delete(store, None if whole else [infos[0].key], whole=whole)
         if deletion.going_on:  # a run started while the question waited
-            _say(f"cn: monitor: {self._going_text(deletion.requests, deletion.going_on)}")
+            _say(f"cn: monitor: {self._deletion_text(deletion.requests, deletion.going_on)}")
             return CliResult(2, refused)
         if not deletion.requests:  # another cn deleted it meanwhile
             _say(_NOTHING_RECORDED if whole
@@ -1971,11 +2092,14 @@ class _Menu:
     def _delete(self, info: RequestInfo) -> bool:
         """``d``: the request deleted from the history after a question. True when it is gone (back to the list), False
         when it stays (the summary asks again)."""
-        going = self.module._going([info])
+        going = self.module._deletion_going([info])
         if going:
             run = going[0]
-            self._say(f"A run of these targets is going on ({_started_on(run, time.time())}): stop it or let it end, "
-                      "then delete it.", "error")
+            if self.module._going_on(run):
+                self._say(f"A run of these targets is going on ({_started_on(run, time.time())}): stop it or let it end, "
+                          "then delete it.", "error")
+            else:
+                self._say(_capital(self.module._deletion_text([info], going)), "error")
             return False
         deletion = self._remove([info], whole=False)
         if deletion is None:
@@ -1991,9 +2115,9 @@ class _Menu:
     def _clear(self, infos: List[RequestInfo]) -> bool:
         """``c``: the whole history deleted after a question. True when it is (the list is read again), False when it
         stays (the list asks again)."""
-        going = self.module._going(infos)
+        going = self.module._deletion_going(infos)
         if going:
-            self._say(_capital(self.module._going_text(infos, going)), "error")
+            self._say(_capital(self.module._deletion_text(infos, going)), "error")
             return False
         return self._remove(infos, whole=True) is not None
 
@@ -2021,7 +2145,7 @@ class _Menu:
                 self._say(f"Ping history: {exc}", "error")
                 return None
         if deletion.going_on:  # a run started while the question waited
-            self._say(_capital(self.module._going_text(deletion.requests, deletion.going_on)), "error")
+            self._say(_capital(self.module._deletion_text(deletion.requests, deletion.going_on)), "error")
             return None
         self.deleted = True
         if warning:

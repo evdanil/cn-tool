@@ -16,6 +16,15 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
+## 0.9.1
+
+Monitor shows live round progress and clearer run history in the browser. Use a
+past run's targets and TCP ports to fill the form, delete an individual run, or
+clear history. The CLI adds `cn monitor --runs REQUEST_ID` and
+`cn monitor --delete-run RUN_ID`. The SQLite schema remains compatible with
+cn-mon. See the [Monitor guide](ping-monitor.md#ping-monitor-cn-monitor) and
+[WebUI guide](webui.md).
+
 ## 0.9.0
 
 Version 0.9.0 adds IP, Ping, Monitor, Configuration Search and Site Demobilization

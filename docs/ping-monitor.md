@@ -46,6 +46,8 @@ cn monitor --list                                 # the recorded requests, runni
 cn monitor --show a3f9 --since 24h --format md    # a summary from the history; nothing is pinged
 cn monitor --follow a3f9                          # the live view of a run another process records
 cn monitor --rerun a3f9 --for 8h                  # a3f9's targets and ports again, its interval, 8 hours
+cn monitor --runs a3f9                            # list the full run IDs for a request
+cn monitor --delete-run RUN_ID                    # delete one run (asks first)
 cn monitor --delete a3f9                          # delete a recorded request (asks first)
 cn monitor --clear --yes                          # empty the history, without asking
 ```
@@ -123,13 +125,18 @@ hosts were seen, when first and last, in how many rounds, and when they stayed o
   --rerun a3f9 --for 8h --format json > /var/tmp/a3f9.json` never starts a second run. An override
   sticks: the run a rerun starts is the newest run that pinged round after round, so it is the next
   template, and `--rerun ID --for 8h` makes a later plain `--rerun ID` run for 8 hours too (the
-  one-round runs that cron feeds never replace it). **`--delete ID`** deletes one recorded request, a
+  one-round runs that cron feeds never replace it). **`--runs ID`** lists the full run IDs for a
+  request; **`--delete-run RUN_ID`** removes one exact run and its rounds, preserving other runs of
+  the request. If deletion exceeds its SQLite execution budget, it rolls back and leaves the run
+  intact; stop other monitors and use `cn-mon --delete-run RUN_ID` for an oversized run.
+  **`--delete ID`** deletes one recorded request, a
   row of `--list`, with every run, round and result of it, and **`--clear`** deletes every request.
-  Both ask first (`... Delete it from <file>? This cannot be undone. [y/N]`): only `y` or `yes`
+  All three ask first (`... Delete it from <file>? This cannot be undone. [y/N]`): only `y` or `yes`
   deletes, anything else leaves the history alone (exit 1). Without a terminal they exit 2 and say so;
-  `--yes` (`-y`) deletes without asking, and goes with `--delete` or `--clear` only. A request with a
-  run going on is refused (`--clear`: any run), exit 2; a run that is only `lost` does not block.
-  Neither creates the history file, and `--clear` gives the space back but keeps the file (`--list`
+  `--yes` (`-y`) deletes without asking, and goes with `--delete-run`, `--delete` or `--clear` only.
+  Deletion is refused (exit 2) if a selected run is active or its owner cannot be verified. A stale
+  heartbeat alone does not establish that a local or remote process has stopped.
+  None creates the history file, and `--clear` gives the space back but keeps the file (`--list`
   then exits 1).
 - **The menu.** Item `m` opens at the list of recorded requests (at the target prompt when nothing
   is recorded). A number shows that request's summary, where a window (`24h`, `2026-10-08`) narrows

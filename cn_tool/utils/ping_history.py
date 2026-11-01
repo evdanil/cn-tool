@@ -545,7 +545,8 @@ def _history_int(value: object, minimum: int = 1) -> bool:
 
 
 def _history_run_id(value: object) -> bool:
-    return isinstance(value, str) and 1 <= len(value) <= 128 and value.isascii() and value.isprintable()
+    # Byte bound also keeps the escaped continuation cursor under its 1 KiB limit.
+    return isinstance(value, str) and bool(value) and value.isprintable() and len(value.encode("utf-8")) <= 128
 
 
 def _history_key(kind: str, value: object) -> bool:
@@ -596,7 +597,7 @@ def read_monitor_history(ctx: object, query: Mapping[str, object]) -> Dict[str, 
     """
     import math
     from pathlib import Path
-    from cn_tool.utils.ping_store import HistoryExpired, PingStore, StoreError
+    from cn_tool.utils.ping_store import HistoryExpired, HistoryTooLarge, PingStore, StoreError
 
     def result(items: object = None, next_cursor: object = None, error: object = None) -> Dict[str, object]:
         return {"items": [] if items is None else items, "next_cursor": next_cursor, "error": error}
@@ -604,11 +605,12 @@ def read_monitor_history(ctx: object, query: Mapping[str, object]) -> Dict[str, 
     if not isinstance(query, Mapping) or set(query) != {"kind", "parent", "cursor", "limit"}:
         return result(error="invalid")
     kind, parent, cursor, limit = (query["kind"], query["parent"], query["cursor"], query["limit"])
-    if (not isinstance(kind, str) or kind not in ("requests", "runs", "rounds", "hosts") or
+    if (not isinstance(kind, str) or kind not in ("requests", "runs", "rounds", "hosts", "template") or
             not _history_int(limit) or limit > 100 or
             (kind == "requests" and parent is not None) or
             (kind in ("runs", "hosts") and not _history_int(parent)) or
-            (kind == "rounds" and not _history_run_id(parent))):
+            (kind in ("rounds", "template") and not _history_run_id(parent)) or
+            (kind == "template" and (cursor is not None or limit != 1))):
         return result(error="invalid")
     try:
         after = None if cursor is None else _history_decode_cursor(cursor, kind, parent)
@@ -630,6 +632,8 @@ def read_monitor_history(ctx: object, query: Mapping[str, object]) -> Dict[str, 
         return result(items=items, next_cursor=None if next_key is None else _history_cursor(kind, parent, next_key))
     except HistoryExpired:
         return result(error="expired")
+    except HistoryTooLarge:
+        return result(error="too_large")
     except StoreError as error:
         logger = getattr(ctx, "logger", None)
         if logger is not None:
