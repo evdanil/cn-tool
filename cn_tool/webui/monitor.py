@@ -84,16 +84,46 @@ def render_monitor(controller):
     ui.add_css(CSS + '''
 .cn-monitor-row { width:100%; min-width:0; overflow-wrap:anywhere; }
 .cn-monitor-row .q-field { min-width:0; }
-.cn-monitor-table { width:100%; border-collapse:collapse; table-layout:fixed; }
-.cn-monitor-table th, .cn-monitor-table td { text-align:left; vertical-align:top; padding:8px; border-bottom:1px solid #CBD5DF; overflow-wrap:anywhere; }
-.cn-monitor-table th { background:#EDF2F6; }
-@media(max-width:600px) { .cn-monitor-actions { flex-wrap:wrap; } }
+.cn-monitor-scroll { max-height: min(60vh, 620px); width:100%; min-width:0; overflow:auto; border:1px solid #CBD5DF; border-radius:4px; }
+.cn-monitor-table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+.cn-monitor-table th, .cn-monitor-table td { text-align:left; vertical-align:middle; padding:7px 10px; border-bottom:1px solid #E2E8ED; }
+.cn-monitor-history [role=status]:empty { display:none; }
+.cn-monitor-table th { position:sticky; top:0; z-index:1; background:#EDF2F6; color:#334D60; font-weight:600; white-space:nowrap; }
+.cn-monitor-table tbody tr:hover { background:#F4F8FB; }
+.cn-monitor-table tr:last-child td { border-bottom:0; }
+.cn-monitor-table .q-btn { text-transform:none; }
+.cn-monitor-hosts { table-layout:fixed; min-width:680px; }
+.cn-monitor-hosts th:first-child { width:320px; }
+.cn-monitor-hosts th:nth-child(2) { width:170px; }
+.cn-monitor-target { overflow-wrap:anywhere; white-space:normal; }
+.cn-monitor-round-select { display:none; }
+.cn-monitor-history { gap:8px; }
+.cn-monitor-rounds-desktop { width:100%; }
+.cn-monitor-state { display:inline-block; white-space:nowrap; font-size:13px; line-height:22px; padding:0 6px; border-radius:3px; background:#EDF2F6; color:#334D60; }
+.cn-monitor-state.ok { background:#E8F4ED; color:#205E3C; }
+.cn-monitor-state.problem { background:#FBEAEA; color:#922D2D; }
+.cn-monitor-state.warning { background:#FFF3D8; color:#775110; }
+.cn-monitor-inspector { display:grid; grid-template-columns:240px minmax(0,1fr); gap:20px; width:100%; }
+.cn-monitor-rounds { min-width:0; }
+.cn-monitor-round-list { max-height:480px; overflow:auto; border:1px solid #CBD5DF; border-radius:4px; }
+.cn-monitor-round-choice { display:flex; justify-content:space-between; gap:8px; width:100%; padding:9px 10px; text-align:left; border:0; border-bottom:1px solid #E2E8ED; background:white; cursor:pointer; font:inherit; font-variant-numeric:tabular-nums; }
+.cn-monitor-round-choice:hover { background:#F4F8FB; }
+.cn-monitor-round-choice[aria-pressed=true] { background:#E5F0F7; box-shadow:inset 3px 0 #145C87; color:#10496B; font-weight:600; }
+.cn-monitor-round-choice:focus-visible, .cn-monitor-scroll:focus-visible { outline:2px solid #145C87; outline-offset:-2px; }
+.cn-monitor-detail { min-width:0; width:100%; }
+.cn-monitor-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:8px; width:100%; }
+.cn-monitor-context { min-width:0; overflow-wrap:anywhere; }
+.cn-monitor-pages { margin-left:auto; display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+@media(max-width:900px) { .cn-monitor-inspector { grid-template-columns:1fr; } .cn-monitor-selected-title { display:none; } .cn-monitor-rounds-desktop { display:none; } .cn-monitor-round-select { display:block; width:100%; } }
+@media(max-width:600px) { .cn-monitor-actions { flex-wrap:wrap; } .cn-monitor-hosts th:first-child { width:185px; } .cn-monitor-hosts th:nth-child(2) { width:140px; } .cn-monitor-table th, .cn-monitor-table td { padding:7px; } .cn-monitor-pages { margin-left:0; } }
 ''')
     ui.colors(primary='#145C87')
     latest = {'result': None, 'result_revision': None, 'attempt_revision': None,
               'outcome': None, 'live_query': None, 'live_key': None, 'live_page': None,
               'live_offset': 0, 'history_query': None, 'history_page': None,
-              'history_dirty': True, 'download': None, 'template_query': None, 'delete_query': None}
+              'history_dirty': True, 'download': None, 'template_query': None, 'delete_query': None,
+              'round_query': None, 'round_hosts': None, 'selected_round': None,
+              'host_cursors': [None], 'round_pick': 'first', 'request_context': None, 'run_context': None}
     history = HistoryView()
     lock = asyncio.Lock()
 
@@ -107,10 +137,22 @@ def render_monitor(controller):
         ui.link('Monitor', '/monitor').props('aria-current=page')
         ui.link('Configuration Search', '/config-search')
         ui.link('Site Demobilization', '/demobilization')
-    ui.label('Monitoring continues when you navigate away or close this tab. Stop ends this session’s run; Quit stops it and waits for cleanup and configured exit actions. DNS and probe cleanup can take time.').classes('cn-muted')
-    status = ui.label('Attaching…').props('role=status aria-live=polite').classes('text-weight-bold')
-    with ui.column().classes('cn-panel'):
+    with ui.row().classes('cn-monitor-toolbar'):
+        status = ui.label('Attaching…').props('role=status aria-live=polite').classes('text-weight-bold grow')
+        def stop_owned():
+            state = controller.snapshot()
+            if state.active_lookup_type == 'monitor' and state.active_job_id and state.phase == 'running':
+                controller.cancel(state.active_job_id)
+        stop = ui.button('Stop this session’s monitor', on_click=stop_owned).props('outline')
+    with ui.tabs().classes('w-full').props('align=left no-caps') as tabs:
+        live_tab = ui.tab('Live monitor')
+        history_tab = ui.tab('History')
+    with ui.tab_panels(tabs, value=live_tab).classes('w-full').props('keep-alive'):
+        live_panel = ui.tab_panel(live_tab).classes('p-0')
+        history_panel = ui.tab_panel(history_tab).classes('p-0')
+    with live_panel, ui.column().classes('cn-panel'):
         ui.label('Start a monitor').classes('text-h6')
+        ui.label('Monitoring continues when you close this tab. Use Stop to end the active run.').classes('cn-muted').tooltip('Quit waits for DNS, probe cleanup and configured exit actions.')
         targets = ui.textarea('Targets', placeholder='192.0.2.1\nexample.com').props('outlined autogrow').classes('w-full')
         target_error = ui.label('').props('role=alert').classes('text-negative')
         ui.label('One IP address, hostname or subnet per line. Hostnames use system DNS.').classes('cn-muted')
@@ -156,12 +198,7 @@ def render_monitor(controller):
         with ui.row().classes('cn-monitor-actions'):
             run = ui.button('Run monitor', on_click=submit)
             run.disable()
-            def stop_owned():
-                state = controller.snapshot()
-                if state.active_lookup_type == 'monitor' and state.active_job_id and state.phase == 'running':
-                    controller.cancel(state.active_job_id)
-            stop = ui.button('Stop this session’s monitor', on_click=stop_owned).props('outline')
-    with ui.column().classes('cn-panel'):
+    with live_panel, ui.column().classes('cn-panel'):
         ui.label('Latest complete round').classes('text-h6')
         summary = ui.label('No complete round yet.').props('role=status aria-live=polite')
         outcome_status = ui.label('').props('role=status').classes('text-negative')
@@ -191,21 +228,17 @@ def render_monitor(controller):
                 return
             rows = page.get('rows', [])
             ui.label(f"Showing hosts {page['offset'] + 1}–{page['offset'] + len(rows)}" if rows else 'No host results in this round.')
-            with ui.column().classes('cn-compact-summary w-full'):
-                for row in rows:
-                    with ui.column().classes('cn-summary-row'):
-                        for label, value in live_fields(row):
-                            ui.label(f'{label}: {value}')
-            with ui.element('table').classes('cn-monitor-table cn-desktop-summary'):
+            with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 aria-label="Latest round results"'), ui.element('table').classes('cn-monitor-table cn-monitor-hosts').props('aria-label="Latest round host results"'):
                 with ui.element('thead'), ui.element('tr'):
-                    for label in ('Host', 'Address', 'Result', 'TCP'):
+                    for label in ('Target', 'Result', 'Address', 'TCP'):
                         ui.element('th').props('scope=col').add_slot('default', label)
                 with ui.element('tbody'):
                     for row in rows:
                         with ui.element('tr'):
-                            for _, value in live_fields(row):
+                            values = dict(live_fields(row))
+                            for key in ('Host', 'Result', 'Address', 'TCP'):
                                 with ui.element('td'):
-                                    ui.label(value)
+                                    ui.label(values[key]).classes('cn-monitor-target' if key == 'Host' else '').props('title=' + json.dumps(values[key]))
             with ui.element('nav').props('aria-label="Latest round pages"').classes('row cn-monitor-actions'):
                 async def prev():
                     latest['live_offset'] = max(0, latest['live_offset'] - 50)
@@ -225,9 +258,7 @@ def render_monitor(controller):
                 following.set_enabled(page.get('next_offset') is not None)
         with live_area:
             draw_live()
-    with ui.column().classes('cn-panel'):
-        ui.label('History').classes('text-h6')
-        ui.label('History can change while you browse. Refresh starts at the first page. You can load saved settings to start a new monitor.').classes('cn-muted')
+    with history_panel, ui.column().classes('cn-panel cn-monitor-history gap-3'):
         history_reuse_status = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
         history_delete_status = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
         with ui.dialog().props('persistent') as delete_dialog, ui.card().classes('w-full max-w-lg'):
@@ -284,114 +315,290 @@ def render_monitor(controller):
         def set_reuse_notice(message):
             set_changed(reuse_status, message)
             set_changed(history_reuse_status, message)
+        def cancel_round_query():
+            if latest['round_query']:
+                controller.release_monitor_history_page(latest['round_query'])
+            latest['round_query'] = None
+            latest['round_hosts'] = None
+
+        async def request_round_hosts(focus=None, *, refresh='hosts'):
+            cancel_round_query()
+            latest['detail_focus'] = focus
+            try:
+                latest['round_query'] = controller.request_monitor_history(
+                    'hosts', latest['selected_round']['id'], latest['host_cursors'][-1], 50)
+            except (AttributeError, RuntimeError, ValueError):
+                latest['round_hosts'] = {'error': 'Round results are unavailable. Refresh history to try again.'}
+            if refresh == 'all':
+                await draw_history.refresh()
+            elif refresh == 'hosts':
+                await draw_round_hosts.refresh()
+            if refresh == 'all' and focus:
+                selector = '.cn-monitor-round-choice[aria-pressed=true]' if focus == 'round' else f'[data-monitor-detail="{focus}"]:not([disabled])'
+                client.run_javascript(f'(() => {{ const control = document.querySelector({json.dumps(selector)}); (control?.querySelector("input") || control)?.focus({{preventScroll:true}}); }})()')
+
+        async def select_round(item, focus='round', *, refresh='all'):
+            latest['selected_round'] = item
+            latest['host_cursors'] = [None]
+            await request_round_hosts(focus, refresh=refresh)
+
+        async def step_round(direction):
+            items = (latest['history_page'] or {}).get('items', [])
+            selected = latest['selected_round']
+            if not selected or selected not in items:
+                return
+            index = items.index(selected) + direction
+            if 0 <= index < len(items):
+                await select_round(items[index], 'earlier' if direction < 0 else 'later')
+            elif direction < 0 and len(history.cursors) > 1:
+                history.previous()
+                await request_history('previous', round_pick='last')
+            elif direction > 0 and latest['history_page'].get('next_cursor'):
+                history.next(latest['history_page']['next_cursor'])
+                await request_history('next')
+
+        async def use_settings(run_id):
+            if latest['template_query']:
+                controller.release_monitor_history_page(latest['template_query'])
+            latest['template_query'] = None
+            latest['template_draft'] = tuple(control.value for control in (targets, ports, interval, duration))
+            try:
+                latest['template_query'] = controller.request_monitor_history('template', run_id, None, 1)
+                set_reuse_notice('Loading saved settings…')
+            except (AttributeError, RuntimeError, ValueError):
+                set_reuse_notice(history_template_error(None))
+            await poll()
+
+        def table_head(labels):
+            with ui.element('thead'), ui.element('tr'):
+                for label in labels:
+                    with ui.element('th').props('scope=col'):
+                        ui.label(label)
+
+        def cell(text, *, target=False):
+            with ui.element('td'):
+                ui.label(str(text)).classes('cn-monitor-target' if target else '').props('title=' + json.dumps(str(text)))
+
+        def state_cell(text, observation=None):
+            tone = ('ok' if observation in {'!', 'T', 'R'} or text == 'finished' else
+                    'problem' if observation in {'E', '?', 'U'} or text == 'failed' else
+                    'warning' if text in {'running', 'lost'} else '')
+            with ui.element('td'):
+                label = {'DNS name did not resolve': 'DNS failed', 'Answered on TCP': 'TCP reply'}.get(text, text)
+                ui.label(label).classes('cn-monitor-state ' + tone).props('title=' + json.dumps(text))
+
+        @ui.refreshable
+        def draw_round_hosts():
+            hosts_page = latest['round_hosts']
+            if hosts_page is None:
+                ui.label('Loading round results…').props('role=status').classes('cn-muted')
+            elif hosts_page.get('error'):
+                ui.label('This round changed or was deleted. Refresh history to select an available round.' if hosts_page['error'] == 'expired' else str(hosts_page['error'])).props('role=alert').classes('text-negative')
+            else:
+                rows = hosts_page.get('items', [])
+                with ui.element('nav').props('aria-label="Round host pages"').classes('cn-monitor-toolbar'):
+                    async def previous_hosts():
+                        if len(latest['host_cursors']) > 1:
+                            latest['host_cursors'].pop()
+                            await request_round_hosts('previous-hosts')
+                    async def next_hosts():
+                        cursor = (latest['round_hosts'] or {}).get('next_cursor')
+                        if cursor:
+                            latest['host_cursors'].append(cursor)
+                            await request_round_hosts('next-hosts')
+                    for label, callback, enabled, marker in [
+                            ('Previous hosts', previous_hosts, len(latest['host_cursors']) > 1, 'previous-hosts'),
+                            ('Next hosts', next_hosts, bool(hosts_page.get('next_cursor')), 'next-hosts')]:
+                        button = ui.button(label, on_click=callback).props('outline dense no-caps')
+                        button._props['data-monitor-detail'] = marker
+                        button.set_enabled(enabled)
+                    if rows:
+                        ui.label(f"Targets {rows[0]['index'] + 1}–{rows[-1]['index'] + 1}; {latest['selected_round'].get('answered', 0)} answered in round").classes('cn-muted')
+                with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 aria-label="Round results"'), ui.element('table').classes('cn-monitor-table cn-monitor-hosts').props('aria-label="Round host results"'):
+                    table_head(('Target', 'Status', 'Address', 'Probe result'))
+                    with ui.element('tbody'):
+                        for row in rows:
+                            with ui.element('tr'):
+                                cell(row.get('host') or 'Unknown host', target=True)
+                                state_cell(history_value('observation', row.get('observation')), row.get('observation'))
+                                cell(row.get('address') or '—', target=True)
+                                cell(row.get('result') or '—')
+                if not rows:
+                    ui.label('No host results on this page.').classes('cn-muted')
+
         history_area = ui.column().classes('w-full')
+        @ui.refreshable
+        def draw_history_controls():
+            page = latest['history_page']
+            async def back():
+                history.back()
+                await request_history('back')
+            async def root():
+                history.reset()
+                await request_history('refresh')
+            async def previous():
+                history.previous()
+                await request_history('previous')
+            async def next_page():
+                history.next((latest['history_page'] or {}).get('next_cursor'))
+                await request_history('next')
+            async def refresh():
+                history.refresh()
+                await request_history('refresh')
+            with ui.element('nav').props('aria-label="History location"').classes('cn-monitor-toolbar'):
+                if history.kind == 'requests':
+                    ui.label('Saved targets').classes('text-h6')
+                else:
+                    ui.button('Saved targets', on_click=root).props('flat dense no-caps')
+                    ui.label('/').classes('cn-muted')
+                    request = latest['request_context'] or {}
+                    ui.label(request_summary(request)[0].removeprefix('Targets: ')).classes('cn-monitor-context text-weight-bold')
+                    if history.kind == 'rounds':
+                        ui.label('/').classes('cn-muted')
+                        ui.label('Run started ' + history_value('started', (latest['run_context'] or {}).get('started'))).classes('cn-monitor-context')
+                        if history.view_only:
+                            ui.label('Saved run').classes('cn-monitor-state').tooltip('Viewing another run’s history only. Stop controls your session’s active monitor.')
+            with ui.element('nav').props('aria-label="History pages"').classes('cn-monitor-toolbar'):
+                if history.ancestors:
+                    button = ui.button('Back to runs' if history.kind == 'rounds' else 'Back to targets', on_click=back).props('outline dense no-caps')
+                    button._props['data-monitor-history'] = 'back'
+                button = ui.button('Refresh history', on_click=refresh).props('flat dense no-caps')
+                button._props['data-monitor-history'] = 'refresh'
+                if history.kind == 'requests':
+                    ui.button('Delete all history', on_click=lambda: open_delete('all')).props('flat dense no-caps color=negative')
+                with ui.element('div').classes('cn-monitor-pages'):
+                    noun = 'round page' if history.kind == 'rounds' else 'page'
+                    button = ui.button('Previous ' + noun, on_click=previous).props('outline dense no-caps')
+                    button._props['data-monitor-history'] = 'previous'
+                    latest['history_previous_button'] = button
+                    button.set_enabled(len(history.cursors) > 1 and page is not None)
+                    ui.label(f'Page {len(history.cursors)}').classes('cn-muted')
+                    button = ui.button('Next ' + noun, on_click=next_page).props('outline dense no-caps')
+                    button._props['data-monitor-history'] = 'next'
+                    latest['history_next_button'] = button
+                    button.set_enabled(bool(page and page.get('next_cursor')))
+
         @ui.refreshable
         def draw_history():
             page = latest['history_page']
-            ui.label(history.breadcrumbs()).classes('text-weight-bold')
-            ui.label(history.kind.capitalize()).classes('text-weight-bold')
-            if history.view_only:
-                ui.label('Viewing another run’s history only. Stop this session’s monitor controls your session’s run.').classes('cn-muted')
             if page is None:
-                ui.label('Loading history…').classes('cn-muted')
-            elif page.get('error'):
+                ui.label('Loading history…').props('role=status').classes('cn-muted')
+                return
+            if page.get('error'):
                 ui.label('History changed or expired. Return to requests to browse available records.' if page['error'] == 'expired' else str(page['error'])).props('role=alert').classes('text-negative')
                 if page['error'] == 'expired':
                     async def return_to_requests():
                         history.reset()
                         await request_history('refresh')
                     ui.button('Return to requests', on_click=return_to_requests).props('outline')
-            elif not page.get('items'):
-                ui.label('No records on this page.').classes('cn-muted')
-            else:
-                for item in page['items']:
-                    with ui.column().classes('cn-summary-row'):
-                        if history.kind == 'requests':
-                            for line in request_summary(item):
-                                ui.label(line)
-                        elif history.kind == 'runs':
-                            for line in history_run_summary(item):
-                                ui.label(line)
-                            ui.label('Owned by this session' if item.get('owned') else 'View only').classes('cn-muted')
-                            with ui.expansion('Details'):
-                                for key in ('id', 'source', 'host', 'pid', 'heartbeat', 'round_seconds'):
-                                    if item.get(key) is not None:
-                                        ui.label(f"{key.replace('_', ' ').capitalize()}: {history_value(key, item[key])}")
-                            async def use_settings(_, run_id=item['id']):
-                                if latest['template_query']:
-                                    controller.release_monitor_history_page(latest['template_query'])
-                                latest['template_query'] = None
-                                latest['template_draft'] = tuple(control.value for control in (targets, ports, interval, duration))
-                                try:
-                                    latest['template_query'] = controller.request_monitor_history('template', run_id, None, 1)
-                                    set_reuse_notice('Loading saved settings…')
-                                except (AttributeError, RuntimeError, ValueError):
-                                    set_reuse_notice(history_template_error(None))
-                                await poll()
-                            ui.button('Use settings', on_click=use_settings).props('outline')
-                            remove_run = ui.button('Delete run', on_click=lambda _, run=dict(item): open_delete('run', run)).props('outline color=negative')
-                            remove_run.set_enabled(item.get('status') != 'running' and bool(item.get('request_id')))
-                            if item.get('status') == 'running':
-                                ui.label('A running monitor cannot be deleted.').classes('cn-muted')
-                        elif history.kind == 'rounds':
-                            ui.label(f"Started: {history_value('started', item.get('started'))}")
-                            ui.label(f"Answered: {item.get('answered', 0)}")
-                        elif history.kind == 'hosts':
-                            ui.label(str(item.get('host') or 'Unknown host')).classes('text-weight-bold')
-                            ui.label(history_value('observation', item.get('observation')))
-                            for key in ('address', 'result'):
-                                if item.get(key):
-                                    ui.label(f"{key.capitalize()}: {item[key]}")
-                        if history.kind != 'hosts':
-                            kinds = {'requests': 'runs', 'runs': 'rounds', 'rounds': 'hosts'}
-                            kind = kinds[history.kind]
-                            async def open_item(_, target=kind, identity=item['id'], view_only=(not item.get('owned') if history.kind == 'runs' else None)):
-                                history.open(target, identity, view_only=view_only)
-                                await request_history('back')
-                            ui.button(f'View {kind}', on_click=open_item).props('outline')
-            with ui.element('nav').props('aria-label="History pages"').classes('row cn-monitor-actions'):
-                async def back():
-                    history.back()
-                    await request_history('back')
-                async def previous():
-                    history.previous()
-                    await request_history('previous')
-                async def next_page():
-                    history.next(page.get('next_cursor'))
-                    await request_history('next')
-                async def refresh():
-                    history.refresh()
-                    await request_history('refresh')
-                button = ui.button('Back', on_click=back).props('outline')
-                button._props['data-monitor-history'] = 'back'
-                button.set_enabled(bool(history.ancestors))
-                button = ui.button('Previous page', on_click=previous).props('outline')
-                button._props['data-monitor-history'] = 'previous'
-                button.set_enabled(len(history.cursors) > 1)
-                button = ui.button('Next page', on_click=next_page).props('outline')
-                button._props['data-monitor-history'] = 'next'
-                button.set_enabled(bool(page and page.get('next_cursor')))
-                button = ui.button('Refresh history', on_click=refresh).props('outline')
-                button._props['data-monitor-history'] = 'refresh'
-            if history.kind == 'requests':
-                ui.button('Delete all history', on_click=lambda: open_delete('all')).props('outline color=negative')
+                return
+            if not page.get('items'):
+                ui.label('No saved monitor history. Start a monitor to record results.' if history.kind == 'requests' else
+                         'No complete rounds in this run.' if history.kind == 'rounds' else 'No runs on this page.').classes('cn-muted')
+                return
+            items = page['items']
+            if history.kind == 'rounds':
+                with ui.element('div').classes('cn-monitor-inspector'):
+                    with ui.column().classes('cn-monitor-rounds gap-2'):
+                        choices = {item['id']: history_value('started', item.get('started')) for item in items}
+                        async def choose_round(event):
+                            chosen = next((item for item in items if item['id'] == event.value), None)
+                            if chosen and chosen != latest['selected_round']:
+                                await select_round(chosen, 'round-select')
+                        picker = ui.select(choices, value=(latest['selected_round'] or {}).get('id'), label='Round (UTC)', on_change=choose_round).props('outlined dense').classes('cn-monitor-round-select')
+                        picker._props['data-monitor-detail'] = 'round-select'
+                        with ui.column().classes('cn-monitor-rounds-desktop gap-2'):
+                            with ui.row().classes('w-full justify-between'):
+                                ui.label('Rounds (oldest first)').classes('text-weight-bold')
+                                ui.label('Answered').classes('text-weight-bold')
+                            with ui.element('div').classes('cn-monitor-round-list w-full'):
+                                for item in items:
+                                    stamp = history_value('started', item.get('started'))
+                                    chosen = latest['selected_round'] == item
+                                    with ui.element('button').classes('cn-monitor-round-choice').props(
+                                            'type=button aria-pressed=' + str(chosen).lower() + ' aria-label=' + json.dumps('Select round ' + stamp)) as choice:
+                                        ui.label(stamp.removesuffix(' UTC')).classes('pointer-events-none')
+                                        ui.label(str(item.get('answered', 0))).classes('pointer-events-none')
+                                    choice.on('click', lambda _, row=dict(item): select_round(row))
+                    with ui.column().classes('cn-monitor-detail gap-2'):
+                        selected = latest['selected_round']
+                        with ui.row().classes('cn-monitor-toolbar'):
+                            if selected:
+                                ui.label(history_value('started', selected.get('started'))).props('role=heading aria-level=3').classes('text-weight-bold grow cn-monitor-selected-title')
+                            for label, direction, marker in [('Earlier round', -1, 'earlier'), ('Later round', 1, 'later')]:
+                                button = ui.button(label, on_click=lambda _, step=direction: step_round(step)).props('outline dense no-caps')
+                                button._props['data-monitor-detail'] = marker
+                                index = items.index(selected) if selected in items else -1
+                                button.set_enabled(index >= 0 and (index > 0 or len(history.cursors) > 1) if direction < 0 else
+                                                   index >= 0 and (index < len(items) - 1 or bool(page.get('next_cursor'))))
+                        draw_round_hosts()
+                return
+            name = 'Saved monitor targets' if history.kind == 'requests' else 'Monitor runs'
+            with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 aria-label=' + json.dumps(name)), ui.element('table').classes('cn-monitor-table').style('min-width:680px' if history.kind == 'requests' else 'min-width:1000px').props('aria-label=' + json.dumps(name)):
+                table_head(('Targets', 'TCP ports', 'Hosts', 'Actions') if history.kind == 'requests' else
+                           ('Started (UTC)', 'Status', 'Rounds', 'Interval', 'Actions'))
+                with ui.element('tbody'):
+                    for item in items:
+                        with ui.element('tr'):
+                            if history.kind == 'requests':
+                                for line in request_summary(item):
+                                    cell(line.split(': ', 1)[1])
+                            else:
+                                cell(history_value('started', item.get('started')).removesuffix(' UTC'))
+                                state_cell(item.get('status') or 'unknown')
+                                cell(item.get('rounds', 0))
+                                every = item.get('interval')
+                                cell('One round' if every is None else f'{every:g}s')
+                            with ui.element('td'), ui.row().classes('items-center gap-1 no-wrap'):
+                                async def open_item(_, row=dict(item), target='runs' if history.kind == 'requests' else 'rounds'):
+                                    latest['request_context' if target == 'runs' else 'run_context'] = row
+                                    history.open(target, row['id'], view_only=(not row.get('owned') if target == 'rounds' else None))
+                                    await request_history('back')
+                                ui.button('View runs' if history.kind == 'requests' else 'View rounds', on_click=open_item).props('outline dense no-caps')
+                                if history.kind == 'runs':
+                                    ui.button('Use settings', on_click=lambda _, run_id=item['id']: use_settings(run_id)).props('flat dense no-caps')
+                                    with ui.button('Details').props('flat dense no-caps'), ui.menu():
+                                        ui.label('Owned by this session' if item.get('owned') else 'View only').classes('text-weight-bold')
+                                        for line in history_run_summary(item):
+                                            ui.label(line)
+                                        for key in ('id', 'source', 'host', 'pid', 'heartbeat', 'round_seconds'):
+                                            if item.get(key) is not None:
+                                                ui.label(f"{key.replace('_', ' ').capitalize()}: {history_value(key, item[key])}")
+                                    remove = ui.button('Delete run', on_click=lambda _, row=dict(item): open_delete('run', row)).props('flat dense no-caps color=negative')
+                                    remove.set_enabled(item.get('status') != 'running' and bool(item.get('request_id')))
+                                    if item.get('status') == 'running':
+                                        remove.tooltip('A running monitor cannot be deleted.')
         with history_area:
+            draw_history_controls()
             draw_history()
 
     def focus_history(target):
         selector = json.dumps(f'[data-monitor-history="{target}"]:not([disabled])')
-        client.run_javascript(f"(document.querySelector({selector}) || document.querySelector('[data-monitor-history=refresh]'))?.focus()")
+        client.run_javascript(f'''(() => {{
+const requested = document.querySelector({selector});
+const fallback = document.querySelector('[data-monitor-history=refresh]');
+(requested || fallback)?.focus();
+if (!requested && fallback) {{
+  fallback.cnHistoryPendingFocus = {json.dumps(target)};
+  const clearPending = () => {{ delete fallback.cnHistoryPendingFocus; }};
+  for (const event of ['blur', 'pointerdown', 'keydown']) fallback.addEventListener(event, clearPending, {{once:true}});
+}}
+}})()''')
 
-    async def request_history(focus=None):
+    async def request_history(focus=None, *, round_pick='first'):
+        latest['round_pick'] = round_pick
+        cancel_round_query()
+        latest['selected_round'] = None
+        latest['host_cursors'] = [None]
         if latest['history_query']:
             controller.release_monitor_history_page(latest['history_query'])
         latest['history_query'] = None
         latest['history_page'] = None
-        latest['history_focus'] = focus
         try:
             latest['history_query'] = controller.request_monitor_history(history.kind, history.parent, history.cursor, 50)
         except (AttributeError, RuntimeError, ValueError):
             latest['history_page'] = {'error': 'History is unavailable. Try refreshing.'}
+        await draw_history_controls.refresh()
         await draw_history.refresh()
         if focus:
             focus_history(focus)
@@ -519,6 +726,7 @@ def render_monitor(controller):
                     elif tuple(control.value for control in (targets, ports, interval, duration)) != latest['template_draft']:
                         set_reuse_notice('Form changed while saved settings were loading. Your edits were kept; select Use settings again to replace them.')
                     else:
+                        tabs.set_value(live_tab)
                         values, notice = history_template_form(template_page['items'][0])
                         for control, suffix, value in zip((targets, ports, interval, duration),
                                                           ('targets', 'ports', 'interval', 'duration'), values):
@@ -569,15 +777,47 @@ def render_monitor(controller):
                     controller.release_monitor_history_page(latest['history_query'])
                     latest['history_query'] = None
                     latest['history_page'] = result
-                    focused = False
-                    if client.has_socket_connection:
-                        try:
-                            focused = bool(await client.run_javascript(f"document.getElementById({json.dumps(history_area.html_id)})?.contains(document.activeElement)", timeout=1))
-                        except TimeoutError:
-                            pass
+                    latest['history_previous_button'].set_enabled(len(history.cursors) > 1)
+                    latest['history_next_button'].set_enabled(bool(result.get('next_cursor')))
+                    if history.kind == 'rounds' and not result.get('error') and result.get('items'):
+                        pick = -1 if latest['round_pick'] == 'last' else 0
+                        latest['round_pick'] = 'first'
+                        await select_round(result['items'][pick], 'round', refresh='none')
                     await draw_history.refresh()
-                    if focused:
-                        focus_history(latest.get('history_focus') or 'refresh')
+                    # Restore a temporarily disabled pager only while its fallback
+                    # still owns focus and the user has not interacted elsewhere.
+                    client.run_javascript('''(() => {
+const fallback = document.querySelector('[data-monitor-history=refresh]');
+const marker = fallback?.cnHistoryPendingFocus;
+if (marker && document.activeElement === fallback && fallback.offsetParent !== null) {
+  document.querySelector(`[data-monitor-history="${marker}"]:not([disabled])`)?.focus();
+}
+if (fallback) delete fallback.cnHistoryPendingFocus;
+})()''')
+
+            if latest['round_query']:
+                result = controller.monitor_history_page(latest['round_query'])
+                if result is not None:
+                    controller.release_monitor_history_page(latest['round_query'])
+                    latest['round_query'] = None
+                    latest['round_hosts'] = result
+                    await draw_round_hosts.refresh()
+                    marker = latest.pop('detail_focus', None)
+                    if marker:
+                        selector = '.cn-monitor-round-choice[aria-pressed=true]' if marker == 'round' else f'[data-monitor-detail="{marker}"]:not([disabled])'
+                        client.run_javascript(f'''(() => {{
+const selected = document.querySelector('.cn-monitor-round-choice[aria-pressed=true]');
+const list = selected?.parentElement;
+if (selected && selected.offsetParent !== null && list) list.scrollTop += selected.getBoundingClientRect().top - list.getBoundingClientRect().top - list.clientHeight / 2 + selected.offsetHeight / 2;
+if (document.activeElement === document.body && document.querySelector('.cn-monitor-detail')?.offsetParent !== null) {{
+  const opposite = {{'next-hosts':'previous-hosts', 'previous-hosts':'next-hosts', 'earlier':'later', 'later':'earlier'}}[{json.dumps(marker)}];
+  const candidates = [document.querySelector({json.dumps(selector)}),
+    opposite ? document.querySelector(`[data-monitor-detail="${{opposite}}"]:not([disabled])`) : null,
+    selected, document.querySelector('[data-monitor-detail="round-select"]')];
+  const control = candidates.find(element => element && element.offsetParent !== null && !element.matches('[disabled]'));
+  (control?.querySelector('input') || control)?.focus({{preventScroll:true}});
+}}
+}})()''')
 
     for control, suffix, default in [(targets, 'targets', ''), (ports, 'ports', ''),
                                      (interval, 'interval', '60'), (duration, 'duration', '')]:
@@ -615,6 +855,7 @@ return true;
                 ui.timer(1, restore, once=True)
         ui.timer(0, restore, once=True)
     def release_queries():
+        cancel_round_query()
         if latest['delete_query']:
             controller.release_monitor_delete_result(latest['delete_query'])
             latest['delete_query'] = None

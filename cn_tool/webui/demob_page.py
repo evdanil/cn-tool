@@ -17,16 +17,67 @@ def render_demob(controller):
     ui.add_css(CSS + '''
 .cn-demob { min-width:0; overflow-wrap:anywhere; }
 .cn-demob .q-btn, .cn-demob .q-field { max-width:100%; min-width:0; }
-.cn-demob-list { list-style:none; margin:0; padding:0; width:100%; }
-.cn-demob-row { width:100%; border-bottom:1px solid #CBD5DF; padding:12px 0; gap:3px; }
-.cn-demob-line { white-space:pre-wrap; overflow-wrap:anywhere; font-family:ui-monospace,monospace; }
+.nicegui-content:has(.cn-demob) { gap:12px; }
+.cn-demob-empty:empty { display:none; }
+.cn-demob h2 { margin:0; }
+.cn-demob.cn-panel:not(.cn-demob-setup) { display:flex; flex-direction:column; gap:10px; }
+.cn-demob-setup { display:flex; align-items:center; flex-wrap:wrap; gap:12px; padding:14px 18px; }
+.cn-demob .cn-demob-site { flex:1 1 200px; max-width:420px; }
+.cn-demob-help { font-size:14px; color:#526675; }
+.cn-demob-help summary, .cn-demob-source summary { cursor:pointer; width:fit-content; color:#145C87; }
+.cn-demob summary::before { content:"▸ "; }
+.cn-demob details[open] > summary::before, details.cn-demob[open] > summary::before { content:"▾ "; }
+.cn-demob-help > .cn-muted { margin-top:8px; }
+.cn-demob-consent { width:100%; display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+.cn-demob-consent .cn-muted { flex:1 1 280px; font-size:14px; }
+.cn-demob-toolbar { width:100%; display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; }
+.cn-demob-pager { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.cn-demob-scroll { width:100%; max-height:390px; overflow:auto; border:1px solid #CBD5DF; border-radius:4px; }
+.cn-demob-scroll.matches { max-height:460px; }
+.cn-demob-table { width:100%; border-collapse:separate; border-spacing:0; text-align:left; font-size:14px; }
+.cn-demob-table th { position:sticky; top:0; z-index:1; background:#EDF2F6; color:#172B3A; font-weight:650; }
+.cn-demob-table th, .cn-demob-table td { padding:9px 12px; border-bottom:1px solid #CBD5DF; vertical-align:top; }
+.cn-demob-table tr:last-child td { border-bottom:0; }
+.cn-demob-table tbody tr:nth-child(even) { background:#F5F7FA; }
+.cn-demob-networks { min-width:640px; }
+.cn-demob-networks td { min-width:130px; max-width:360px; overflow-wrap:anywhere; }
+.cn-demob-matches { min-width:560px; table-layout:fixed; }
+.cn-demob-matches th:nth-child(1) { width:150px; }
+.cn-demob-matches th:nth-child(2) { width:65px; }
+.cn-demob-matches td:nth-child(1) { font-weight:600; overflow-wrap:anywhere; }
+.cn-demob-line { white-space:pre-wrap; overflow-wrap:anywhere; font:13px/1.5 ui-monospace,monospace; }
+.cn-demob-source { margin-top:4px; font-size:12px; color:#526675; }
+.cn-demob-source dl { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; margin:8px 0 0; }
+.cn-demob-source dt { font-weight:600; }
+.cn-demob-source dd { margin:0; overflow-wrap:anywhere; }
+.cn-demob-report { display:flex; width:100%; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; }
+.cn-demob-scroll-help { display:none; font-size:12px; }
+@media(max-width:600px) {
+  .cn-demob-setup { padding:12px; }
+  .cn-demob .cn-demob-site { max-width:none; flex-basis:100%; }
+  .cn-demob-scroll-help { display:block; }
+  .cn-demob-table th, .cn-demob-table td { padding:8px; }
+  .cn-demob-pager .q-btn { font-size:12px; }
+}
+@media(max-width:700px) {
+  .cn-demob-matches { min-width:0; }
+  .cn-demob-matches thead { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); }
+  .cn-demob-matches tbody, .cn-demob-matches tr { display:block; }
+  .cn-demob-matches tbody tr { display:grid; grid-template-columns:minmax(0,1fr) auto; border-bottom:1px solid #CBD5DF; }
+  .cn-demob-matches tbody tr:last-child { border:0; }
+  .cn-demob-matches td { border:0; min-width:0; }
+  .cn-demob-matches td:nth-child(1), .cn-demob-matches td:nth-child(2) { padding-bottom:0; }
+  .cn-demob-matches td:nth-child(2) .cn-demob-line-number::before { content:"Line "; color:#526675; font:12px system-ui,sans-serif; }
+  .cn-demob-matches td:nth-child(3) { grid-column:1 / -1; }
+  .cn-demob-scroll-help.matches { display:none; }
+}
 ''')
     ui.colors(primary='#145C87')
     latest = dict(preview=None, preview_page=None, preview_query=None, preview_offsets=[0],
                   result_job=None, result_page=None, result_query=None, result_offsets=[0],
                   result_revision=None, attempt_revision=None, outcome=None, attempt_result=None,
                   download=None, download_error='', prompt=None, dialog=None, note='', discovery=None,
-                  preview_focus=None, result_focus=None)
+                  preview_focus=None, result_focus=None, result_site=None, previous_results=False, result_heading=None)
     lock, prompt_lock = asyncio.Lock(), asyncio.Lock()
     with ui.row().classes('w-full items-center justify-between cn-demob'):
         ui.label('Site Demobilization').mark('title').classes('text-h4')
@@ -38,19 +89,22 @@ def render_demob(controller):
         ui.link('Monitor', '/monitor')
         ui.link('Configuration Search', '/config-search')
         ui.link('Site Demobilization', '/demobilization').props('aria-current=page')
-    ui.label('First look up this site’s networks in Infoblox. Review the networks, then choose whether to search the configured live configuration repository.').classes('cn-muted')
+    with ui.element('details').classes('cn-demob-help cn-demob'):
+        with ui.element('summary'):
+            ui.label('How this check works').classes('inline')
+        ui.label('Look up the site’s networks in Infoblox, review them, then choose whether to search the configured live configuration repository.').classes('cn-muted')
+        ui.label('A search can include up to 200 distinct IPv4 networks. Cached configuration search is unavailable here.').classes('cn-muted')
     if oscompat.is_macos():
         ui.label('The configuration scan is currently unavailable on macOS. You can still look up site networks.').props('role=status').classes('text-warning')
-    ui.label('A search can include up to 200 distinct IPv4 networks. Cached configuration search is unavailable here.').classes('cn-muted')
-    scope_label = ui.label('Configured scope pending').classes('cn-muted')
-    with ui.row().classes('items-center'):
-        forget = ui.button('Forget saved credentials', on_click=controller.forget_credentials).props('outline')
-        store_status = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
+    with ui.row().classes('w-full items-center cn-demob'):
+        scope_label = ui.label('Configured scope pending').classes('cn-muted')
+        forget = ui.button('Forget saved credentials', on_click=controller.forget_credentials).props('flat dense')
+        store_status = ui.label('').props('role=status aria-live=polite').classes('cn-muted cn-demob-empty')
     status = ui.label('Attaching…').props('role=status aria-live=polite').classes('text-weight-bold')
-    report_warning = ui.label('').props('role=status aria-live=polite').classes('text-warning')
-    with ui.column().classes('cn-panel cn-demob'):
-        site = ui.input('Site code', placeholder='SITE1').props('outlined maxlength=1024').classes('w-full')
-        error = ui.label('').props('role=alert').classes('text-negative')
+    report_warning = ui.label('').props('role=status aria-live=polite').classes('text-warning cn-demob-empty')
+    with ui.element('div').classes('cn-panel cn-demob cn-demob-setup'):
+        site = ui.input('Site code', placeholder='SITE1').props('outlined dense maxlength=1024').classes('cn-demob-site')
+        error = ui.label('').props('role=alert').classes('text-negative cn-demob-empty')
         async def lookup():
             value = (site.value or '').strip()
             if not value:
@@ -86,10 +140,11 @@ def render_demob(controller):
             run.disable()
             stop = ui.button('Stop', on_click=stop_work).props('outline')
             stop.set_visibility(False)
-    discovery_announcement = ui.label('').props('role=status aria-live=polite aria-atomic=true').classes('text-warning')
+    discovery_announcement = ui.label('').props('role=status aria-live=polite aria-atomic=true').classes('text-warning cn-demob-empty')
     discovery_announcement._props['data-demob-announcement'] = 'true'
-    preview_message = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
+    preview_message = ui.label('').props('role=status aria-live=polite').classes('cn-muted cn-demob-empty')
     preview_area = ui.column().classes('w-full cn-demob')
+    preview_area.set_visibility(False)
 
     async def request_preview_page():
         if latest['preview_query']:
@@ -104,7 +159,7 @@ def render_demob(controller):
         except (ValueError, RuntimeError, OSError, EOFError):
             preview_message.set_text('Preview expired or is unavailable. Look up the site again.')
 
-    async def preview_move(direction):
+    async def preview_move(direction, position='top'):
         if direction == 'previous' and len(latest['preview_offsets']) > 1:
             latest['preview_offsets'].pop()
         elif direction == 'next' and latest['preview_page'] and latest['preview_page'].get('next_offset') is not None:
@@ -112,7 +167,7 @@ def render_demob(controller):
         else:
             return
         latest['preview_page'] = None
-        latest['preview_focus'] = direction
+        latest['preview_focus'] = (direction, position)
         await request_preview_page()
         await draw_preview.refresh()
 
@@ -130,52 +185,70 @@ def render_demob(controller):
         latest['note'] = 'Search declined. Look up the site again to start a new check.'
         await poll()
 
+    def draw_pager(kind, page, position='top'):
+        network = kind == 'network'
+        offsets = latest['preview_offsets' if network else 'result_offsets']
+        move = preview_move if network else result_move
+        title = 'Site network pages' if network else 'Configuration result pages'
+        with ui.element('nav').props(f'aria-label="{title}{" (bottom)" if position == "bottom" else ""}"').classes('cn-demob-pager'):
+            for direction, enabled in [('previous', len(offsets) > 1), ('next', page['next_offset'] is not None)]:
+                button = ui.button(f'{direction.title()} {kind} page',
+                                   on_click=lambda direction=direction: move(direction, position)).props('outline dense')
+                button._props[f'data-demob-{kind}-page'] = direction
+                button._props['data-demob-pager-position'] = position
+                button.set_enabled(enabled)
+
     @ui.refreshable
     def draw_preview():
         preview = latest['preview']
         if not preview:
             return
         with ui.element('section').props('aria-label="Site network preview"').classes('cn-panel cn-demob'):
-            ui.label('Review site networks').classes('text-h6')
-            ui.label(f"Site: {preview['site']}")
+            with ui.element('h2'):
+                ui.label(f"Review site networks for {preview['site']}")
             page = latest['preview_page']
-            if page and page['status'] == 'ready':
-                with ui.element('ul').props('aria-label="Site networks"').classes('cn-demob-list'):
-                    for row in page['rows']:
-                        with ui.element('li').classes('cn-demob-row'):
-                            keys = list(row)
-                            preferred = [key for key in keys if key.lower() in ('network', 'network view')]
-                            for key in preferred + [key for key in keys if key not in preferred]:
-                                label = ui.label(f'{key}: {row[key]}')
-                                if key in preferred:
-                                    label.classes('text-weight-bold')
-                with ui.element('nav').props('aria-label="Site network pages"').classes('row flex-wrap'):
-                    previous = ui.button('Previous network page', on_click=lambda: preview_move('previous')).props('outline')
-                    previous._props['data-demob-network-page'] = 'previous'
-                    previous.set_enabled(len(latest['preview_offsets']) > 1)
-                    next_button = ui.button('Next network page', on_click=lambda: preview_move('next')).props('outline')
-                    next_button._props['data-demob-network-page'] = 'next'
-                    next_button.set_enabled(page['next_offset'] is not None)
-            elif page:
-                ui.label('Preview expired or is unavailable. Look up the site again.').props('role=alert')
             if preview.get('token'):
-                ui.label('Continue only if these are the networks you want to check. Configuration files will be read after you choose Search configurations.').classes('cn-muted')
-                if oscompat.is_macos():
-                    ui.label('Configuration scans are unavailable on macOS.').classes('text-warning')
-                with ui.row().classes('flex-wrap'):
+                with ui.element('div').classes('cn-demob-consent'):
+                    ui.label('Review the networks below before allowing the configuration search.').classes('cn-muted')
                     search = ui.button('Search configurations', on_click=lambda: confirm(preview['token']))
                     search.set_enabled(not oscompat.is_macos() and bool(page and page.get('status') == 'ready'))
                     ui.button('Decline', on_click=lambda: decline(preview['token'])).props('outline')
+                if oscompat.is_macos():
+                    ui.label('Configuration scans are unavailable on macOS.').classes('text-warning')
+            if page and page['status'] == 'ready':
+                with ui.element('div').classes('cn-demob-toolbar'):
+                    ui.label('Site networks').classes('text-weight-bold')
+                    draw_pager('network', page)
+                ui.label('Scroll the table to see all columns.').classes('cn-muted cn-demob-scroll-help')
+                columns = list(dict.fromkeys(key for row in page['rows'] for key in row))
+                preferred = [key for key in columns if key.lower() in ('network', 'network view')]
+                columns = preferred + [key for key in columns if key not in preferred]
+                with ui.element('div').props('role=region aria-label="Site networks table" tabindex=0').classes('cn-demob-scroll'):
+                    with ui.element('table').props('aria-label="Site networks"').classes('cn-demob-table cn-demob-networks'):
+                        with ui.element('thead'), ui.element('tr'):
+                            for key in columns:
+                                with ui.element('th').props('scope=col'):
+                                    ui.label(key)
+                        with ui.element('tbody'):
+                            for row in page['rows']:
+                                with ui.element('tr'):
+                                    for key in columns:
+                                        with ui.element('td'):
+                                            ui.label(str(row.get(key, '')))
+                if len(page['rows']) > 10:
+                    draw_pager('network', page, 'bottom')
+            elif page:
+                ui.label('Preview expired or is unavailable. Look up the site again.').props('role=alert')
     with preview_area:
         draw_preview()
 
-    with ui.column().classes('cn-panel cn-demob'):
-        ui.label('Latest check').classes('text-h6')
-        outcome = ui.label('No check yet.').props('role=status aria-live=polite')
-        discovery_area = ui.column().props('role=status aria-live=polite').classes('w-full cn-demob')
-        diagnostics = ui.column().classes('w-full cn-demob')
-        report = ui.html('').props('role=status aria-live=polite').classes('cn-muted')
-        ui.label('The accumulated workbook can contain full device configurations, including sensitive information. Handle downloads accordingly.').classes('cn-muted')
+    with ui.column().classes('cn-panel cn-demob') as check_panel:
+        with ui.element('div').classes('cn-demob-toolbar'):
+            with ui.element('h2'):
+                ui.label('Latest check')
+            outcome = ui.label('No check yet.').props('role=status aria-live=polite')
+        discovery_area = ui.column().props('role=status aria-live=polite').classes('w-full cn-demob cn-demob-empty')
+        diagnostics = ui.column().classes('w-full cn-demob cn-demob-empty')
         def download_report():
             try:
                 latest['download'] = controller.request_report_snapshot()
@@ -183,10 +256,17 @@ def render_demob(controller):
                 download.disable()
             except (RuntimeError, OSError, EOFError):
                 latest['download_error'] = 'Report download is unavailable.'
-        download = ui.button('Download accumulated report', on_click=download_report).props('outline')
-        download.disable()
-    result_message = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
-    result_area = ui.column().classes('w-full cn-demob')
+        with ui.element('div').classes('cn-demob-report'):
+            report = ui.html('').props('role=status aria-live=polite').classes('cn-muted')
+            download = ui.button('Download accumulated report', on_click=download_report).props('outline dense')
+            download.disable()
+        with ui.element('details').classes('cn-demob-help'):
+            with ui.element('summary'):
+                ui.label('About report contents').classes('inline')
+            ui.label('The accumulated workbook can contain full device configurations, including sensitive information. Handle downloads accordingly.').classes('cn-muted')
+    check_panel.set_visibility(False)
+    result_message = ui.label('').props('role=status aria-live=polite').classes('cn-muted cn-demob-empty')
+    result_area = ui.column().props('role=region aria-label="Configuration results" tabindex=-1').classes('w-full cn-demob')
 
     async def request_result_page():
         if latest['result_query']:
@@ -202,7 +282,7 @@ def render_demob(controller):
             latest['result_page'] = {'status': 'unavailable'}
             result_message.set_text('Results are unavailable. Run the check again.')
 
-    async def result_move(direction):
+    async def result_move(direction, position='top'):
         if direction == 'previous' and len(latest['result_offsets']) > 1:
             latest['result_offsets'].pop()
         elif direction == 'next' and latest['result_page'] and latest['result_page'].get('next_offset') is not None:
@@ -210,34 +290,57 @@ def render_demob(controller):
         else:
             return
         latest['result_page'] = None
-        latest['result_focus'] = direction
+        latest['result_focus'] = (direction, position)
         await request_result_page()
         await draw_results.refresh()
 
+    def result_title():
+        title = 'Previous configuration matches' if latest['previous_results'] else 'Configuration matches'
+        return f"{title} for {latest['result_site']}" if latest['result_site'] else title
+
     @ui.refreshable
     def draw_results():
+        latest['result_heading'] = None
         page = latest['result_page']
         if not page:
             return
         with ui.element('section').props('aria-label="Configuration matches"').classes('cn-panel cn-demob'):
-            ui.label('Configuration matches').classes('text-h6')
-            ui.label('Line numbers start at 0.').classes('cn-muted')
+            with ui.element('h2'):
+                latest['result_heading'] = ui.label(result_title())
             if page['status'] != 'ready':
                 ui.label('Results are unavailable. Run the check again.').props('role=alert')
             else:
-                for row in page['rows']:
-                    with ui.column().classes('cn-demob-row'):
-                        ui.label(f'{row[1]} · line {row[2]}').classes('text-weight-bold')
-                        ui.label(f'Search: {row[0]}').classes('cn-muted')
-                        ui.label(row[3]).classes('cn-demob-line')
-                        ui.label(f'File: {row[4]}').classes('cn-muted')
-                with ui.element('nav').props('aria-label="Configuration result pages"').classes('row flex-wrap'):
-                    previous = ui.button('Previous result page', on_click=lambda: result_move('previous')).props('outline')
-                    previous._props['data-demob-result-page'] = 'previous'
-                    previous.set_enabled(len(latest['result_offsets']) > 1)
-                    next_button = ui.button('Next result page', on_click=lambda: result_move('next')).props('outline')
-                    next_button._props['data-demob-result-page'] = 'next'
-                    next_button.set_enabled(page['next_offset'] is not None)
+                with ui.element('div').classes('cn-demob-toolbar'):
+                    ui.label('Line numbers start at 0.').classes('cn-muted')
+                    draw_pager('result', page)
+                ui.label('Scroll the table to see all columns.').classes('cn-muted cn-demob-scroll-help matches')
+                with ui.element('div').props('role=region aria-label="Configuration matches table" tabindex=0').classes('cn-demob-scroll matches'):
+                    with ui.element('table').props('aria-label="Configuration matches"').classes('cn-demob-table cn-demob-matches'):
+                        with ui.element('thead'), ui.element('tr'):
+                            for name in ('Device', 'Line', 'Matching configuration'):
+                                with ui.element('th').props('scope=col'):
+                                    ui.label(name)
+                        with ui.element('tbody'):
+                            for row in page['rows']:
+                                with ui.element('tr'):
+                                    with ui.element('td'):
+                                        ui.label(str(row[1]))
+                                    with ui.element('td'):
+                                        ui.label(str(row[2])).classes('cn-demob-line-number')
+                                    with ui.element('td'):
+                                        ui.label(str(row[3])).classes('cn-demob-line')
+                                        with ui.element('details').classes('cn-demob-source'):
+                                            with ui.element('summary') as source_summary:
+                                                source_summary._props['aria-label'] = f'Source details for {row[1]}, line {row[2]}'
+                                                ui.label('Details').classes('inline')
+                                            with ui.element('dl'):
+                                                for name, value in [('Search', row[0]), ('File', row[4])]:
+                                                    with ui.element('dt'):
+                                                        ui.label(name)
+                                                    with ui.element('dd'):
+                                                        ui.label(str(value))
+                if len(page['rows']) > 10:
+                    draw_pager('result', page, 'bottom')
     with result_area:
         draw_results()
 
@@ -348,6 +451,7 @@ u.value = ''; if (p) p.value = ''; emit(reply);
                     if request and await credentials(request):
                         latest['prompt'] = request['request_id']
             preview = state.demob_preview
+            preview_area.set_visibility(bool(preview))
             if preview != latest['preview']:
                 announcement = []
                 if preview:
@@ -362,7 +466,7 @@ u.value = ''; if (p) p.value = ''; emit(reply);
                     latest['note'] = 'Preview expired or is unavailable. Look up the site again.'
                 if latest['preview_query']:
                     controller.release_demob_page(latest['preview_query'])
-                latest.update(preview=preview, preview_query=None, preview_page=None, preview_offsets=[0])
+                latest.update(preview=preview, preview_query=None, preview_page=None, preview_offsets=[0], preview_focus=None)
                 if preview and preview.get('token'):
                     latest['note'] = ''
                     await request_preview_page()
@@ -384,8 +488,13 @@ u.value = ''; if (p) p.value = ''; emit(reply);
                         preview_message.set_text('Preview expired or is unavailable. Look up the site again.')
                     await draw_preview.refresh()
                     if latest['preview_focus']:
-                        selector = json.dumps(f"[data-demob-network-page='{latest['preview_focus']}']:not([disabled])")
-                        client.run_javascript(f"(document.querySelector({selector}) || document.querySelector('[data-demob-network-page]:not([disabled])'))?.focus()")
+                        direction, position = latest['preview_focus']
+                        selector = json.dumps(f"[data-demob-network-page='{direction}'][data-demob-pager-position='{position}']:not([disabled])")
+                        fallback = json.dumps(f"[data-demob-network-page][data-demob-pager-position='{position}']:not([disabled])")
+                        client.run_javascript(
+                            "if (document.activeElement === document.body || document.activeElement?.matches('[data-demob-network-page]')) {"
+                            f"(document.querySelector({selector}) || document.querySelector({fallback}) || document.querySelector('[data-demob-network-page]:not([disabled])'))?.focus();"
+                            "}")
                         latest['preview_focus'] = None
             discovery = state.demob_discovery
             if discovery != latest['discovery']:
@@ -416,6 +525,8 @@ u.value = ''; if (p) p.value = ''; emit(reply);
             if page_state.result_changed:
                 latest['result_revision'] = page_state.result_revision
             previous = bool(page_state.result_job_id and page_state.attempt_job_id != page_state.result_job_id)
+            previous_changed = previous != latest['previous_results']
+            latest['previous_results'] = previous
             title = str((latest['outcome'] or {}).get('message') or ('Check in progress.' if active else 'No check yet.'))
             if previous:
                 title += ' Showing results from an earlier completed check.'
@@ -423,6 +534,7 @@ u.value = ''; if (p) p.value = ''; emit(reply);
             display = report_display(replace(state, latest_report_state=page_state.attempt_report_state or state.latest_report_state))
             report.set_content(escape(latest['download_error']) if latest['download_error'] else display['text'])
             download.set_enabled(display['available'] and latest['download'] is None)
+            check_panel.set_visibility(bool(latest['outcome'] or discovery or page_state.result_job_id or display['available']))
             if latest['download']:
                 completion = controller.report_completion(latest['download']) or {}
                 if completion.get('status') == 'ready':
@@ -434,9 +546,23 @@ u.value = ''; if (p) p.value = ''; emit(reply);
                     latest['download'] = None
                     latest['download_error'] = 'Report download failed.'
             if page_state.result_job_id != latest['result_job']:
-                latest.update(result_job=page_state.result_job_id, result_page=None, result_offsets=[0])
+                # Keep keyboard focus in a stable region when a newer result removes its source details.
+                if latest['result_job']:
+                    target = result_area.html_id if page_state.result_job_id else site.html_id
+                    try:
+                        await client.run_javascript(
+                            '(() => { const area = document.getElementById(' + json.dumps(result_area.html_id) + ');'
+                            'if (area?.contains(document.activeElement)) {'
+                            'const target = document.getElementById(' + json.dumps(target) + ');'
+                            '(target?.querySelector("input") || target)?.focus(); } return true; })()', timeout=2)
+                    except (TimeoutError, RuntimeError):
+                        pass  # A disconnected browser cannot retain focus.
+                latest.update(result_job=page_state.result_job_id, result_page=None, result_offsets=[0], result_focus=None,
+                              result_site=(discovery or {}).get('site') if not previous else None)
                 await request_result_page()
                 await draw_results.refresh()
+            elif previous_changed and latest['result_heading']:
+                latest['result_heading'].set_text(result_title())
             if latest['result_query']:
                 page = controller.config_search_page(latest['result_query'])
                 if page is not None:
@@ -450,8 +576,13 @@ u.value = ''; if (p) p.value = ''; emit(reply);
                         result_message.set_text('Results are unavailable. Run the check again.')
                     await draw_results.refresh()
                     if latest['result_focus']:
-                        selector = json.dumps(f"[data-demob-result-page='{latest['result_focus']}']:not([disabled])")
-                        client.run_javascript(f"(document.querySelector({selector}) || document.querySelector('[data-demob-result-page]:not([disabled])'))?.focus()")
+                        direction, position = latest['result_focus']
+                        selector = json.dumps(f"[data-demob-result-page='{direction}'][data-demob-pager-position='{position}']:not([disabled])")
+                        fallback = json.dumps(f"[data-demob-result-page][data-demob-pager-position='{position}']:not([disabled])")
+                        client.run_javascript(
+                            "if (document.activeElement === document.body || document.activeElement?.matches('[data-demob-result-page]')) {"
+                            f"(document.querySelector({selector}) || document.querySelector({fallback}) || document.querySelector('[data-demob-result-page]:not([disabled])'))?.focus();"
+                            "}")
                         latest['result_focus'] = None
 
     def release_queries():

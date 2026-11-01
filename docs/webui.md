@@ -17,6 +17,7 @@ and setup](infoblox.md#access-and-setup) requirements before using them.
 | Released 0.8.4 | Subnets |
 | 0.9.0 | Subnets, IP, Ping, Monitor, Configuration Search and Site Demobilization |
 | 0.9.1 | The same tools, with live Monitor progress and history management |
+| 0.9.2 (this source) | The same tools, with compact results and improved navigation |
 
 The browser tools beyond Subnets are available in 0.9.0 and are not part of 0.8.4.
 The menu and CLI have their own established workflows.
@@ -93,10 +94,12 @@ including Ping ports. A new independent tab starts with empty drafts.
 
 Subnets keeps the summary and detail workflow described above. Both lookup tools follow
 the configured network-view scope and existing IPv4/IPv6 validation and enrichment.
+Subnets summaries keep network, status, view and **Details** together in a paged table;
+returning from details restores the summary position. **View results** jumps past setup.
 
 IP accepts individual IPv4/IPv6 addresses, one per line. Results show address, network
-view, status and available data and plugin columns; narrow screens expose remaining
-values through **More fields**. Invalid inputs, misses, request failures, PTR warnings
+status, network view and available data and plugin columns in a compact paged table.
+Narrow screens scroll within the table to reach remaining fields. Invalid inputs, misses, request failures, PTR warnings
 and unchecked work are shown separately. The latest attempt remains visible if it
 produces no rows, alongside labelled previous useful results. Switching tools or
 refreshing does not run a lookup again.
@@ -113,6 +116,13 @@ lists use pages of up to 50 items, with controls and page-number entry to reach 
 item. Stop waits for DNS and active probes to drain and distinguishes incomplete from
 unattempted hosts. Earlier useful results remain available when a new attempt yields none.
 
+Ping results use one compact table on desktop and narrow screens, with the target,
+ICMP result and TCP results grouped together. Scroll inside the table for additional
+columns, or use **View results** to jump past setup. The target input scrolls when a
+large list is pasted. Diagnostic sections show their counts and can be expanded; they
+open automatically when the latest attempt has no completed results. Expanding or
+paging diagnostics preserves the other sections' state.
+
 ### Monitor
 
 Monitor repeatedly probes the same kinds of targets. Interval defaults to 60 seconds;
@@ -122,9 +132,18 @@ leave duration blank to continue until stopped. Both supplied values must be at 
 The latest complete round uses bounded pages. This run's and earlier round counts are
 shown separately; an incomplete first round is not an outage. History is a changing view
 of recorded requests, runs, rounds and hosts, and refreshing it starts at page one.
+
+Use the **Live monitor** tab for setup and current results, or **History** to browse saved
+targets and runs in compact tables. **View rounds** opens a round selector alongside the
+selected round's target/status table. **Earlier round** and **Later round** move through
+rounds without returning to the run list, including across round pages. Host pages have
+separate controls. On narrow screens, choose a round from **Round (UTC)**; targets and
+statuses stay in adjacent columns. Rounds are ordered oldest first, and all timestamps
+are UTC. **Back to runs** returns to the same run-list page.
+
 It uses `[ping] history_file` and `[ping] history_days`; viewing history never prunes it.
 Starting with 0.9.1, the live view shows progress during a round. Under a request's runs, **Use settings** loads the saved targets and TCP ports into the
-form without starting a monitor. Review the interval and duration before starting: a
+form on the Live monitor tab without starting a monitor. Review the interval and duration before starting: a
 finite duration is estimated from the saved schedule, and some older schedules need a
 new interval. Very large saved requests may need to be entered manually. **Delete run**
 removes one saved run; **Delete all history** clears all requests and runs. Each action
@@ -164,7 +183,12 @@ the WebUI. Use the menu to include YAML results. Site Demobilization follows the
 core search and does not include YAML results. Inputs are limited to 200 lines, 1,024
 characters per line and 64 KiB total. Search work is bounded to 10,000 entries and matches, 8 MiB of work and results, and 16 KiB per line. A limit, unreadable
 file or detected source change makes the search incomplete. Narrow the search and retry.
-Matches use pages of at most 50; line numbers start at zero.
+Matches use pages of at most 50; line numbers start at zero. The compact match table
+keeps device, line and configuration text together. On narrow screens the configuration
+text spans the row below its device and line number. **Details** exposes the exact search
+term and full file path. Page controls sit above the results, and **View matches** jumps
+past setup. **Search help** explains syntax and limits. Diagnostic counts expand into
+invalid-input and unmatched-network lists; they start open when there are no matches.
 
 Source identity and containment are checked, and detected changes are rejected. The
 search does not take an atomic filesystem snapshot or protect against another local
@@ -185,6 +209,9 @@ A check can search at most 200 distinct IPv4 networks. IPv6 and invalid network 
 are skipped with notices. If discovery is incomplete, the warning remains visible during
 the search and with the results; the check is partial and its report is not saved.
 Preview and result pages show at most 50 rows; matching line numbers start at zero.
+The preview uses aligned network/view columns, and result headings identify the site
+and earlier results when available. Matched configuration rows keep device and line beside the text,
+with search terms and full paths in **Details**. Page controls sit above the data.
 Cached configuration mode is unavailable in this interface and is refused on confirmation.
 
 The configured network view applies. If no view is configured, the search uses the

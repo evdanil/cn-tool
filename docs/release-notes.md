@@ -16,6 +16,14 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
+## 0.9.2 (this source)
+
+The browser interface uses compact, paged results for Monitor, Ping, IP,
+Subnets, Configuration Search and Site Demobilization. Monitor separates live
+and history views and adds a round inspector. An interrupted browser asset
+request no longer triggers a `No response returned` error. See the
+[WebUI guide](webui.md).
+
 ## 0.9.1
 
 Monitor shows live round progress and clearer run history in the browser. Use a

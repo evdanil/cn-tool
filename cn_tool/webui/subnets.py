@@ -9,7 +9,7 @@ from html import escape
 class Presentation:
     selection: object = None
     result_identity: object = None
-    summary_scroll: tuple = (0, 0)
+    summary_scroll: tuple = (0, 0, 0)
     return_selection: object = None
     ping_page: int = 0
     pagination: dict = field(default_factory=lambda: {"rowsPerPage": 25, "page": 1})
@@ -21,7 +21,7 @@ class Presentation:
         if changed or self.result_identity is None:
             self.ping_page = 0
             self.pagination = {"rowsPerPage": 25, "page": 1}
-            self.summary_scroll = (0, 0)
+            self.summary_scroll = (0, 0, 0)
             self.selection = identity[0] if len(identity) == 1 else None
         self.result_identity = result_identity
 
@@ -126,11 +126,36 @@ h3 { font-size:17px; font-weight:600; margin:12px 0 6px; }
 '''
 
 
+LOOKUP_CSS = '''
+.nicegui-content:has(.cn-lookup-form) { gap:12px; }
+.cn-lookup-empty:empty { display:none; }
+.cn-lookup-form, .cn-lookup-outcome { gap:8px; }
+.cn-lookup-outcome h2 { margin-top:0; }
+.cn-lookup-table { min-width:0; max-width:100%; max-height:min(65vh,620px); overflow:auto; --cn-lookup-target-width:280px; --cn-lookup-status-width:140px; }
+.cn-lookup-table .q-table th { position:sticky; top:0; z-index:1; }
+.cn-lookup-table .q-table th, .cn-lookup-table .q-table td { padding:7px 10px; height:auto; font-size:14px; vertical-align:middle; }
+.cn-lookup-table .q-table td { overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+.cn-lookup-table .q-table__bottom { position:sticky; bottom:0; left:0; background:white; z-index:1; }
+.cn-lookup-table .q-table__control { flex-wrap:wrap; max-width:100%; }
+.cn-lookup-table .q-table__bottom { flex-wrap:wrap; height:auto; min-height:48px; gap:4px; }
+.cn-lookup-primary .q-table { table-layout:fixed; min-width:calc(var(--cn-lookup-target-width) + var(--cn-lookup-status-width) + var(--cn-lookup-extra-columns) * 160px); }
+.cn-lookup-primary td:first-child { font-family:ui-monospace,monospace; font-weight:600; }
+.cn-lookup-primary td:nth-child(2) { font-weight:600; }
+@media(max-width:600px) {
+  .cn-lookup-table { --cn-lookup-target-width:185px; --cn-lookup-status-width:125px; }
+  .cn-lookup-table .q-table th, .cn-lookup-table .q-table td { padding:7px; }
+}
+'''
+
+
 def render_subnets(controller, lookup_type='subnet'):
     from nicegui import ui
     from cn_tool.core.interaction import CredentialReply
 
     ui.add_css(CSS)
+    if lookup_type != 'ping':
+        ui.add_css(LOOKUP_CSS)
+    empty_class = ' cn-ping-empty' if lookup_type == 'ping' else ' cn-lookup-empty'
     ui.colors(primary='#145C87')
     view = Presentation()
     prompt_lock = asyncio.Lock()
@@ -147,24 +172,27 @@ def render_subnets(controller, lookup_type='subnet'):
         ui.link('Configuration Search', '/config-search')
         ui.link('Site Demobilization', '/demobilization')
     scope_label = ui.label('Attaching to the application…').classes('cn-muted')
-    with ui.row().classes('items-center'):
+    with ui.row().classes('items-center') as credentials_row:
         forget = ui.button('Forget saved credentials', on_click=controller.forget_credentials).props('outline')
-        store_status = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
+        store_status = ui.label('').props('role=status aria-live=polite').classes('cn-muted' + empty_class)
     recovery = ui.label('If saved credentials are refused, forget them and run the lookup again to enter a different login.').classes('cn-muted text-sm')
     recovery.set_visibility(False)
-    ui.label('Closing this tab keeps the application running. Quit finishes active work and saves, then runs configured exit actions.').classes('cn-muted text-sm')
+    exit_help = 'Closing this tab keeps the application running. Quit finishes active work and saves, then runs configured exit actions.'
+    quit_button.tooltip(exit_help)
+    quit_button._props['aria-description'] = exit_help
     status = ui.label('Attaching…').props('role=status aria-live=polite')
-    report_warning = ui.label('').props('role=status').classes('text-warning')
-    elapsed = ui.label('').classes('cn-muted')
-    with ui.column().classes('cn-panel'):
-        ui.label('Targets')
-        targets = ui.textarea(placeholder='192.0.2.1\n2001:db8::1' if lookup_type == 'ip' else '192.0.2.1\n2001:db8::/64').props('outlined autogrow aria-label=Targets').classes('w-full')
-        ui.label({'ip': 'One IP address per line', 'ping': 'One IP address, hostname or subnet per line. Hostnames use system DNS.'}.get(lookup_type, 'One IP address or subnet per line')).classes('cn-muted')
-        ports = ui.input('TCP ports', placeholder='22, 443').props('outlined aria-label="TCP ports"').classes('w-full') if lookup_type == 'ping' else None
+    report_warning = ui.label('').props('role=status').classes('text-warning' + empty_class)
+    elapsed = ui.label('').classes('cn-muted' + empty_class)
+    with ui.column().classes('cn-panel cn-ping-form' if lookup_type == 'ping' else 'cn-panel cn-lookup-form'):
+        ui.label('Targets').classes('cn-ping-target-label')
+        target_props = 'outlined rows=3 aria-label=Targets'
+        targets = ui.textarea(placeholder='192.0.2.1\n2001:db8::1' if lookup_type == 'ip' else '192.0.2.1\n2001:db8::/64').props(target_props).classes('w-full cn-ping-targets')
+        ui.label({'ip': 'One IP address per line', 'ping': 'One IP address, hostname or subnet per line. Hostnames use system DNS.'}.get(lookup_type, 'One IP address or subnet per line')).classes('cn-muted cn-ping-target-help')
+        ports = ui.input('TCP ports', placeholder='22, 443').props('outlined dense aria-label="TCP ports"').classes('w-full cn-ping-ports') if lookup_type == 'ping' else None
         if ports:
-            ui.label('Optional: up to five comma-separated ports. ICMP is used when available.').classes('cn-muted')
-        port_error = ui.label('').props('role=alert').classes('text-negative')
-        with ui.row():
+            ui.label('Optional: up to five comma-separated ports. ICMP is used when available.').classes('cn-muted cn-ping-port-help')
+        port_error = ui.label('').props('role=alert').classes('text-negative cn-ping-port-error' + empty_class)
+        with ui.row().classes('cn-ping-run-controls'):
             async def submit():
                 if lookup_type == 'ping':
                     from .ping import parse_ports
@@ -180,6 +208,13 @@ def render_subnets(controller, lookup_type='subnet'):
                 await refresh_now()
             run = ui.button('Run Ping' if lookup_type == 'ping' else 'Look up', on_click=submit)
             stop = ui.button('Stop', on_click=controller.cancel_active).props('outline')
+            async def jump_to_results():
+                if lookup_type == 'subnet' and view.selection == 'input':
+                    view.return_to_results()
+                    await draw_results.refresh()
+                ui.run_javascript(f'document.getElementById({json.dumps(results.html_id)})?.focus()')
+            show_results = ui.button('View results', on_click=jump_to_results).props('outline')
+            show_results.set_visibility(False)
     @ui.refreshable
     def draw_outcome():
         snapshot = latest.get('displayed_outcome_snapshot') if lookup_type == 'ping' else latest['snapshot']
@@ -191,7 +226,12 @@ def render_subnets(controller, lookup_type='subnet'):
                 with ui.element('h2').props('tabindex=-1') as heading:
                     ui.label(outcome['title'])
                 latest['outcome_heading'] = heading.html_id
-                ui.label(' '.join((outcome['message'], outcome['summary']))).props('role=status aria-live=polite')
+                message = outcome['message'].strip()
+                if message.casefold().removeprefix('ping ').rstrip('. ') == outcome['title'].casefold().removeprefix('ping ').rstrip('. '):
+                    message = ''
+                if message and not message.endswith(('.', '!', '?')):
+                    message += '.'
+                ui.label(' '.join(part for part in (message, outcome['summary']) if part)).props('role=status aria-live=polite')
                 for key, title in [('input_errors', 'Invalid inputs'), ('resolution_errors', 'DNS errors'), ('incomplete', 'Attempted but incomplete'), ('unattempted', 'Not attempted')]:
                     if outcome[key]:
                         entries = outcome[key]
@@ -201,17 +241,20 @@ def render_subnets(controller, lookup_type='subnet'):
                         shown = entries[start:start + 50]
                         with ui.element('section').classes('w-full') as section:
                             section._props['aria-label'] = title
-                            with ui.element('h3'):
-                                ui.label(title)
-                            ui.label(f'Showing {start + 1}–{start + len(shown)} of {len(entries)}')
-                            if pages > 1:
-                                render_pager(key, title, current, pages,
-                                             lambda value, category=key: latest['diagnostic_pages'].__setitem__(category, value),
-                                             draw_outcome.refresh, interaction_lock=poll_lock)
-                            with ui.element('ul'):
-                                for item in shown:
-                                    with ui.element('li'):
-                                        ui.label(format_diagnostic(key, item))
+                            expanded = latest['diagnostic_expanded'].get(key,
+                                not bool((snapshot.latest_outcome or {}).get('matched_count')))
+                            with ui.expansion(f'{title} ({len(entries)})', value=expanded,
+                                    on_value_change=lambda event, category=key: latest['diagnostic_expanded'].__setitem__(category, event.value)
+                                    ).classes('cn-ping-diagnostics').props('dense header-class=text-weight-bold'):
+                                ui.label(f'Showing {start + 1}–{start + len(shown)} of {len(entries)}')
+                                if pages > 1:
+                                    render_pager(key, title, current, pages,
+                                                 lambda value, category=key: latest['diagnostic_pages'].__setitem__(category, value),
+                                                 draw_outcome.refresh, interaction_lock=poll_lock)
+                                with ui.element('ul'):
+                                    for item in shown:
+                                        with ui.element('li'):
+                                            ui.label(format_diagnostic(key, item))
             return
         outcome = outcome_display(snapshot) if snapshot else None
         if outcome and lookup_type == 'ip':
@@ -226,15 +269,18 @@ def render_subnets(controller, lookup_type='subnet'):
                     for line in outcome['details']:
                         ui.html(line)
 
-    with ui.column().classes('cn-panel cn-outcome-report'):
+    with ui.column().classes('cn-panel cn-outcome-report' + (' cn-ping-outcome' if lookup_type == 'ping' else ' cn-lookup-outcome')):
         with ui.column().classes('w-full') as outcome_area:
             draw_outcome()
         announcement = ui.html('').props('role=status aria-live=polite').classes('cn-sr-only')
-        report = ui.html('').props('role=status aria-live=polite').classes('cn-muted')
-        ui.label('Download copies the existing accumulated report after pending saves finish. A failed lookup save may leave only earlier data.').classes('cn-muted text-sm')
+        report = ui.html('').props('role=status aria-live=polite').classes('cn-muted' + empty_class)
+        download_help = 'Download copies the existing accumulated report after pending saves finish. A failed lookup save may leave only earlier data.'
         download = ui.button('Download accumulated report', on_click=lambda: request_download()).props('outline')
-    pending_results = ui.label('').classes('cn-muted')
+        download.tooltip(download_help)
+        download._props['aria-description'] = download_help
+    pending_results = ui.label('').classes('cn-muted' + empty_class)
     results = ui.column().classes('w-full')
+    results.props('tabindex=-1')
 
     def request_download():
         if latest['download'] is None:
@@ -253,35 +299,31 @@ def render_subnets(controller, lookup_type='subnet'):
             ui.label('No rows.').classes('cn-muted')
             return
         keys = list(dict.fromkeys(key for row in rows for key in row if key not in {'id', '__row'}))
-        columns = [dict(name=key, label='ICMP result' if lookup_type == 'ping' and key == 'Result' else key,
+        if lookup_type == 'ping':
+            leading = [key for key in ['Host', 'Result', *(key for key in keys if key.startswith('TCP ')), 'Address'] if key in keys]
+            keys = leading + [key for key in keys if key not in leading]
+        elif lookup_type == 'ip' or summary:
+            identity_key = 'IP' if lookup_type == 'ip' else 'Resolved Subnet'
+            leading = [key for key in (identity_key, 'Status', 'Network view') if key in keys]
+            keys = leading + [key for key in keys if key not in leading]
+        columns = [dict(name=key, label={'Host': 'Target', 'Result': 'ICMP result'}.get(key, key) if lookup_type == 'ping' else key,
                         field=key, align='left', sortable=lookup_type != 'ping') for key in keys]
+        if lookup_type == 'ping':
+            for column in columns:
+                width = {'Host': 'var(--cn-ping-target-width)', 'Result': 'var(--cn-ping-icmp-width)'}.get(column['name'], '150px')
+                column['headerStyle'] = f'width:{width}'
         if summary:
-            columns.append(dict(name='action', label='Details', field='id', align='left'))
+            columns.insert(min(3, len(columns)), dict(name='action', label='Details', field='id', align='left'))
+        if lookup_type == 'ip' or summary:
+            for column in columns:
+                width = {identity_key: 'var(--cn-lookup-target-width)', 'Status': 'var(--cn-lookup-status-width)'}.get(column['name'], '160px')
+                column['headerStyle'] = f'width:{width}'
         display_rows = [{key: str(value) if isinstance(value, (dict, list, tuple)) else value for key, value in row.items()} for row in rows]
-        if summary:
-            with ui.column().classes('cn-compact-summary w-full'):
-                for row in display_rows:
-                    with ui.column().classes('cn-summary-row'):
-                        network = row.get('Resolved Subnet') or row.get('Network') or row.get('Original Input(s)') or row.get('Original Input') or ''
-                        network_view = row.get('Network view') or row.get('View') or ''
-                        status = row.get('Status') or row.get('State') or ''
-                        ui.label(f'Network: {network}').classes('cn-network cn-summary-network')
-                        if network_view:
-                            ui.label(f'View: {network_view}').classes('cn-muted')
-                        if status:
-                            ui.label(f'Status: {status}').classes('cn-summary-status')
-                        identity_label = ', '.join(str(value) for value in (network, network_view) if value)
-                        if row.get('id'):
-                            button = ui.button('View details', on_click=lambda _, identity=row['id']: navigate(identity)).props('outline')
-                            button._props['aria-label'] = f'View details for {identity_label}'
-                            button._props['data-detail-id'] = row['id']
-                        secondary = [(key, value) for key, value in row.items() if key not in {
-                            'id', '__row', 'Resolved Subnet', 'Network', 'Network view', 'View', 'Status', 'State'}]
-                        if secondary:
-                            with ui.expansion(f'More fields for {identity_label}').classes('w-full'):
-                                for key, value in secondary:
-                                    ui.label(f'{key}: {value}')
-        with ui.column().classes('cn-desktop-summary w-full' if summary else 'w-full'):
+        if summary and 'Resolved Subnet' in keys:
+            columns[0]['label'] = 'Network / target'
+            for row in display_rows:
+                row['Resolved Subnet'] = row.get('Resolved Subnet') or row.get('Original Input(s)') or row.get('Original Input') or ''
+        with ui.column().classes('w-full'):
             desktop_table(display_rows, columns, summary)
 
     def desktop_table(display_rows, columns, summary):
@@ -293,18 +335,23 @@ def render_subnets(controller, lookup_type='subnet'):
         table_name = {'ip': 'IP', 'ping': 'Ping'}.get(lookup_type, 'Subnet')
         widget.props(f'role=region tabindex=0 aria-label="{table_name} result table"')
         if lookup_type == 'ping':
-            widget.props('hide-bottom')
-        ui.label(f'{len(rows)} ' + ('row' if len(rows) == 1 else 'rows')).classes('cn-muted text-sm')
+            widget.props('hide-bottom dense').classes('cn-ping-table').style(f'--cn-ping-extra-columns:{max(0, len(columns) - 2)}')
+        else:
+            widget.props('dense').classes('cn-lookup-table')
+            if summary or lookup_type == 'ip':
+                widget.classes('cn-lookup-primary').style(f'--cn-lookup-extra-columns:{max(0, len(columns) - 2)}')
+        if lookup_type != 'ping':
+            ui.label(f'{len(rows)} ' + ('row' if len(rows) == 1 else 'rows')).classes('cn-muted text-sm')
         if summary:
             latest['summary_table'] = widget.html_id
-            widget.add_slot('body-cell-action', '''<q-td :props="props"><q-btn v-if="props.row.id" flat color="primary" label="View details" :data-detail-id="props.row.id" :aria-label="'View details for ' + [props.row['Resolved Subnet'] || props.row.Network || props.row['Original Input(s)'], props.row['Network view'] || props.row.View].filter(Boolean).join(', ')" @click="$parent.$emit('details', props.row.id)" /></q-td>''')
+            widget.add_slot('body-cell-action', '''<q-td :props="props"><q-btn v-if="props.row.id" flat dense color="primary" label="View details" :data-detail-id="props.row.id" :aria-label="'View details for ' + [props.row['Resolved Subnet'] || props.row.Network || props.row['Original Input(s)'], props.row['Network view'] || props.row.View].filter(Boolean).join(', ')" @click="$parent.$emit('details', props.row.id)" /></q-td>''')
             widget.on('details', lambda event: navigate(event.args))
 
     async def navigate(identity):
         client = ui.context.client
         if view.selection is None and latest.get('summary_table'):
             table_id = json.dumps(latest['summary_table'])
-            view.summary_scroll = await client.run_javascript(f'[window.scrollY, document.getElementById({table_id})?.scrollLeft || 0]')
+            view.summary_scroll = await client.run_javascript(f'[window.scrollY, document.getElementById({table_id})?.scrollLeft || 0, document.getElementById({table_id})?.scrollTop || 0]')
             latest['summary_origin'] = identity
         view.select(identity)
         await draw_results.refresh()
@@ -313,15 +360,41 @@ def render_subnets(controller, lookup_type='subnet'):
             client.run_javascript(f'document.getElementById({heading_id})?.focus()')
         if identity is None and latest.get('summary_table'):
             table_id = json.dumps(latest['summary_table'])
-            vertical, horizontal = view.summary_scroll
+            vertical, horizontal, table_vertical = view.summary_scroll
             origin = json.dumps(latest.get('summary_origin'))
-            client.run_javascript(f'''const id = {origin}; const target = [...document.querySelectorAll('[data-detail-id]')].find(el => el.dataset.detailId === id && el.getClientRects().length); target?.focus({{preventScroll:true}}); window.scrollTo(0, {int(vertical)}); const table = document.getElementById({table_id}); if(table) table.scrollLeft = {int(horizontal)};''')
+            # NiceGUI can remount QTable's slotted buttons in a later update.
+            # Preserve the requested focus through those mounts, until the user acts.
+            client.run_javascript(f'''(() => {{
+const root = document.getElementById({json.dumps(results.html_id)});
+root?.cnRestoreFocus?.();
+if (!root || (document.activeElement !== document.body && !root.contains(document.activeElement))) return;
+let target = null;
+const stop = () => {{ observer.disconnect(); for (const event of ['pointerdown', 'keydown', 'wheel']) document.removeEventListener(event, stop, true); document.removeEventListener('focusin', moved, true); delete root.cnRestoreFocus; }};
+const moved = event => {{ if (event.target !== target) stop(); }};
+const restore = () => {{
+  const table = document.getElementById({table_id});
+  if (!table) {{ stop(); return; }}
+  if (target?.isConnected && document.activeElement === target) return;
+  if (document.activeElement !== document.body && document.activeElement !== target) {{ stop(); return; }}
+  target = [...root.querySelectorAll('[data-detail-id]')].find(el => el.dataset.detailId === {origin} && el.getClientRects().length);
+  target?.focus({{preventScroll:true}});
+  window.scrollTo(0, {int(vertical)});
+  table.scrollLeft = {int(horizontal)};
+  table.scrollTop = {int(table_vertical)};
+}};
+const observer = new MutationObserver(restore);
+root.cnRestoreFocus = stop;
+observer.observe(root, {{childList:true, subtree:true}});
+for (const event of ['pointerdown', 'keydown', 'wheel']) document.addEventListener(event, stop, {{capture:true, passive:true}});
+document.addEventListener('focusin', moved, true);
+restore();
+}})();''')
 
     async def new_lookup():
         latest['lookup_scroll'] = await ui.context.client.run_javascript('window.scrollY')
         if view.selection is None and latest.get('summary_table'):
             table_id = json.dumps(latest['summary_table'])
-            view.summary_scroll = await ui.context.client.run_javascript(f'[window.scrollY, document.getElementById({table_id})?.scrollLeft || 0]')
+            view.summary_scroll = await ui.context.client.run_javascript(f'[window.scrollY, document.getElementById({table_id})?.scrollLeft || 0, document.getElementById({table_id})?.scrollTop || 0]')
         view.new_lookup()
         draw_results.refresh()
         targets.run_method('focus')
@@ -332,9 +405,9 @@ def render_subnets(controller, lookup_type='subnet'):
         button_id = json.dumps(latest.get('new_lookup_button'))
         vertical = int(latest.get('lookup_scroll', 0))
         if view.selection is None and latest.get('summary_table'):
-            _, horizontal = view.summary_scroll
+            _, horizontal, table_vertical = view.summary_scroll
             table_id = json.dumps(latest['summary_table'])
-            ui.run_javascript(f'document.getElementById({button_id})?.focus({{preventScroll:true}}); window.scrollTo(0, {vertical}); const table = document.getElementById({table_id}); if(table) table.scrollLeft = {int(horizontal)};')
+            ui.run_javascript(f'requestAnimationFrame(() => {{ document.getElementById({button_id})?.focus({{preventScroll:true}}); window.scrollTo(0, {vertical}); const table = document.getElementById({table_id}); if(table) {{ table.scrollLeft = {int(horizontal)}; table.scrollTop = {int(table_vertical)}; }} }});')
         else:
             ui.run_javascript(f'document.getElementById({button_id})?.focus({{preventScroll:true}}); window.scrollTo(0, {vertical});')
 
@@ -539,6 +612,9 @@ u.value = ''; if (p) p.value = ''; emit(reply);
         forget.set_enabled(snapshot.phase not in {'closing', 'closed', 'failed'})
         storage = snapshot.credential_store or {}
         store_status.set_text(storage.get('message', ''))
+        if lookup_type == 'ping':
+            credentials_row.set_visibility(bool(snapshot.saved_login_restored or storage.get('message')))
+        show_results.set_visibility(bool((snapshot.result or {}).get('rows') or (snapshot.result or {}).get('detail_groups')))
         recovery.set_visibility(snapshot.saved_login_restored)
         if latest.get('dialog_status') is not None:
             latest['dialog_status'].set_text(storage.get('message', ''))
@@ -624,6 +700,7 @@ return !!(active?.closest(interactive) && document.getElementById({json.dumps(co
                     latest['displayed_outcome_snapshot'] = snapshot
                     latest['displayed_outcome_result'] = latest.get('received_attempt_result')
                     latest['diagnostic_pages'] = {}
+                    latest['diagnostic_expanded'] = {}
                 await draw_outcome.refresh()
                 if snapshot.latest_outcome and snapshot.latest_attempt_id != latest.get('focused_attempt'):
                     latest['focused_attempt'] = snapshot.latest_attempt_id

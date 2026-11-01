@@ -81,6 +81,8 @@ def create_app(controller, access):
     def ip_page():
         render_ip(controller)
 
+    # Gzip buffers headers until the first body chunk; a cancelled file
+    # transfer can then look like a missing response to NiceGUI's middleware.
     ui.run_with(parent, root=lambda: render_subnets(controller), title='CN Tool',
-                show_welcome_message=False, reconnect_timeout=15)
+                show_welcome_message=False, reconnect_timeout=15, gzip_middleware_factory=None)
     return parent
