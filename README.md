@@ -134,7 +134,8 @@ It binds to `127.0.0.1` and uses your existing `.cn` configuration.
 
 **Version scope:** release **0.9.0** provides Subnets, IP, Ping, Monitor,
 Configuration Search and Site Demobilization. Release 0.8.4 provides Subnets.
-The two configuration scans run on Linux and Windows; on macOS, Site Demobilization
+Release 0.9.3 adds column sorting, field filters and compact Ping and Monitor
+outcome summaries across result pages. The two configuration scans run on Linux and Windows; on macOS, Site Demobilization
 network preview and the other tools remain available. Windows-native verification
 for the 0.9.0 additions remains deferred.
 See the [WebUI guide](https://github.com/evdanil/cn-tool/blob/main/docs/webui.md) for details.

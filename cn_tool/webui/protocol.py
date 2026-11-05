@@ -18,20 +18,44 @@ FIELDS = {
     'config_search_page_result': {'job_id', 'offset', 'rows', 'total', 'next_offset', 'status', 'query_id'},
     'monitor_delete': {'action', 'run_id', 'request_id', 'query_id'},
     'monitor_delete_result': {'query_id', 'status', 'warning'},
-    'monitor_history': {'kind', 'parent', 'cursor', 'limit', 'query_id'},
-    'monitor_history_result': {'items', 'next_cursor', 'error', 'query_id'},
-    'monitor_live_page': {'job_id', 'run_id', 'revision', 'offset', 'limit', 'query_id'},
-    'monitor_live_page_result': {'job_id', 'run_id', 'revision', 'offset', 'rows', 'next_offset', 'status', 'current_revision', 'query_id'},
+    'monitor_history': {'kind', 'parent', 'cursor', 'limit', 'query_id', 'sort', 'descending', 'group', 'filter_field', 'filter_text'},
+    'monitor_history_result': {'items', 'next_cursor', 'error', 'query_id', 'counts', 'total'},
+    'monitor_live_page': {'job_id', 'run_id', 'revision', 'offset', 'limit', 'query_id', 'sort', 'descending', 'group', 'filter_field', 'filter_text'},
+    'monitor_live_page_result': {'job_id', 'run_id', 'revision', 'offset', 'rows', 'next_offset', 'status', 'current_revision', 'query_id', 'total', 'counts'},
     'monitor_update': {'lookup_type', 'run_id', 'revision', 'stage', 'completed', 'total', 'current_rounds', 'earlier_rounds', 'skipped_slots', 'history_error'},
     'progress': {'stage', 'lookup_type', 'completed', 'total'}, 'result': {'result', 'outcome', 'lookup_type'}, 'report_state': {'state', 'lookup_type'},
     'lookup_context': {'lookup_type', 'username', 'scope'},
     'error': {'message', 'lookup_type'}, 'report_snapshot': {'request_id', 'path', 'error', 'filename'}, 'closed': set(),
 }
+_PAGE_OPTIONS = {'sort_by', 'descending', 'filter_by', 'filter_text'}
+for _kind in ('demob_page', 'demob_page_result', 'config_search_page', 'config_search_page_result'):
+    FIELDS[_kind] |= _PAGE_OPTIONS
+FIELDS['demob_page_result'] |= {'columns', 'overall_total'}
+FIELDS['config_search_page_result'] |= {'overall_total'}
 COMMANDS = frozenset(('initialize', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_history', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
 
 
 def envelope(session_id, job_id, kind, payload):
     return dict(version=1, session_id=session_id, job_id=job_id, kind=kind, payload=payload)
+
+
+def _valid_page_options(payload, *, dynamic=False):
+    if not _PAGE_OPTIONS <= set(payload):
+        return False
+    keys = (payload['sort_by'], payload['filter_by'])
+    def valid(key):
+        return key is None or (type(key) is str and 0 < len(key) <= 1024 and
+                               (dynamic or key in ('device', 'line', 'configuration')))
+    return (all(valid(key) for key in keys) and type(payload['descending']) is bool and
+            type(payload['filter_text']) is str and len(payload['filter_text']) <= 256 and
+            (not payload['filter_text'] or payload['filter_by'] is not None))
+
+
+def _valid_page_progress(payload):
+    offset, rows, total, following = (payload[k] for k in ('offset', 'rows', 'total', 'next_offset'))
+    end = offset + len(rows)
+    return (offset <= total and end <= total and
+            (following is None and end == total or following == end and offset < end < total))
 
 
 
@@ -132,8 +156,16 @@ def validate(message):
             raise ValueError('Invalid deletion result')
         return message
     if kind.startswith('demob_'):
-        if set(payload) != FIELDS[kind]:
+        optional = (_PAGE_OPTIONS if kind == 'demob_page' else
+                    _PAGE_OPTIONS | {'columns', 'overall_total'} if kind == 'demob_page_result' else set())
+        base = FIELDS[kind] - optional
+        sets = (base, base | _PAGE_OPTIONS) if kind == 'demob_page' else (
+            (base, base | {'columns', 'overall_total'}, base | {'columns', 'overall_total'} | _PAGE_OPTIONS)
+            if kind == 'demob_page_result' else (base,))
+        if set(payload) not in sets:
             raise ValueError('Invalid demobilization payload')
+        if 'sort_by' in payload and not _valid_page_options(payload, dynamic=True):
+            raise ValueError('Invalid demobilization page options')
         if (kind in {'demob_lookup', 'demob_confirm', 'demob_preview'} and not message['job_id'] or
                 kind in {'demob_decline', 'demob_page', 'demob_page_result'} and message['job_id'] is not None):
             raise ValueError('Invalid demobilization job')
@@ -164,13 +196,27 @@ def validate(message):
                    not 0 <= payload['next_offset'] <= payload['total'])) or
                   (payload['status'] == 'unavailable' and (payload['rows'] or payload['total'] or payload['next_offset'] is not None))):
                 raise ValueError('Invalid preview page result')
+            if kind == 'demob_page_result' and 'columns' in payload:
+                columns, overall = payload['columns'], payload['overall_total']
+                if (type(columns) is not list or any(type(key) is not str or not 0 < len(key) <= 1024 for key in columns)
+                        or len(columns) != len(set(columns)) or type(overall) is not int
+                        or not payload['total'] <= overall <= 10000
+                        or payload['status'] == 'unavailable' and (columns or overall)):
+                    raise ValueError('Invalid preview metadata')
+            if kind == 'demob_page_result' and payload['status'] == 'ready' and not _valid_page_progress(payload):
+                raise ValueError('Invalid preview page progress')
         limit = 257 * 1024 if kind == 'demob_page_result' else 256 * 1024
         if len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode('utf-8')) > limit:
             raise ValueError('Demobilization message exceeds limit')
         return message
     if kind in {'config_search_page', 'config_search_page_result'}:
-        if message['job_id'] is not None or set(payload) != FIELDS[kind]:
+        optional = _PAGE_OPTIONS | ({'overall_total'} if kind == 'config_search_page_result' else set())
+        base = FIELDS[kind] - optional
+        allowed = (base, base | _PAGE_OPTIONS) if kind == 'config_search_page' else (base, base | _PAGE_OPTIONS | {'overall_total'})
+        if message['job_id'] is not None or set(payload) not in allowed:
             raise ValueError('Invalid configuration page envelope')
+        if 'sort_by' in payload and not _valid_page_options(payload):
+            raise ValueError('Invalid configuration page options')
         if any(not isinstance(payload[k], str) or not payload[k] or len(payload[k]) > 128 or
                not payload[k].isascii() or not payload[k].isprintable() for k in ('job_id', 'query_id')):
             raise ValueError('Invalid configuration page identifier')
@@ -194,9 +240,18 @@ def validate(message):
                 raise ValueError('Configuration page exceeds limit')
             if payload['status'] == 'unavailable' and (rows or total or position is not None):
                 raise ValueError('Unavailable page contains data')
+            if payload['status'] == 'ready' and not _valid_page_progress(payload):
+                raise ValueError('Invalid configuration page progress')
+            if 'overall_total' in payload and (type(payload['overall_total']) is not int or
+                    not total <= payload['overall_total'] <= 10000 or
+                    payload['status'] == 'unavailable' and payload['overall_total']):
+                raise ValueError('Invalid configuration page total')
         return message
     if kind in {'monitor_history', 'monitor_history_result'}:
-        if message['job_id'] is not None or set(payload) != FIELDS[kind]:
+        optional = {'sort', 'descending', 'group', 'filter_field', 'filter_text'} if kind == 'monitor_history' else {'counts', 'total'}
+        base = FIELDS[kind] - optional
+        allowed = (base, base | optional) if kind == 'monitor_history' else (base, base | {'total'}, base | optional)
+        if message['job_id'] is not None or set(payload) not in allowed:
             raise ValueError('Invalid history envelope')
         query_id = payload['query_id']
         if not isinstance(query_id, str) or not query_id or len(query_id) > 128 or not query_id.isascii() or not query_id.isprintable():
@@ -205,7 +260,7 @@ def validate(message):
         if cursor is not None and (not isinstance(cursor, str) or len(cursor) > 1024 or not re.fullmatch(r'[A-Za-z0-9_-]+', cursor)):
             raise ValueError('Invalid history cursor')
         if kind == 'monitor_history':
-            from cn_tool.utils.ping_history import _history_decode_cursor, _history_int, _history_run_id
+            from cn_tool.utils.ping_history import _history_decode_cursor, _history_int, _history_run_id, _sorted_history_decode
             page_kind, parent, limit = payload['kind'], payload['parent'], payload['limit']
             if (page_kind not in ('requests', 'runs', 'rounds', 'hosts', 'template') or not _history_int(limit) or limit > 100 or
                     (page_kind == 'requests' and parent is not None) or
@@ -213,10 +268,33 @@ def validate(message):
                     (page_kind in ('rounds', 'template') and not _history_run_id(parent)) or
                     (page_kind == 'template' and (cursor is not None or limit != 1))):
                 raise ValueError('Invalid history query')
-            if cursor is not None:
+            if 'sort' in payload:
+                fields = {'hosts': ('host', 'status', 'address', 'result'),
+                          'requests': ('targets', 'ports', 'hosts'),
+                          'runs': ('started', 'status', 'rounds', 'interval')}.get(page_kind, ())
+                groups = ('all', 'answered', 'no_response', 'problem', 'other') if page_kind == 'hosts' else ('all',)
+                if (not fields or payload['sort'] not in ('', *fields) or
+                        type(payload['descending']) is not bool or payload['group'] not in groups or
+                        payload['filter_field'] not in fields or
+                        not isinstance(payload['filter_text'], str) or len(payload['filter_text']) > 256):
+                    raise ValueError('Invalid history ordering')
+                options = [payload[k] for k in ('sort', 'descending', 'group', 'filter_field', 'filter_text')]
+                if cursor is not None:
+                    if page_kind == 'hosts':
+                        _sorted_history_decode(cursor, parent, options)
+                    else:
+                        _sorted_history_decode(cursor, parent, [page_kind, *options], kind=page_kind)
+            elif cursor is not None:
                 _history_decode_cursor(cursor, page_kind, parent)
         else:
             items, error = payload['items'], payload['error']
+            if 'total' in payload and (type(payload['total']) is not int or payload['total'] < 0):
+                raise ValueError('Invalid history total')
+            if 'counts' in payload and (
+                    not isinstance(payload['counts'], dict) or set(payload['counts']) != {'answered', 'no_response', 'problem', 'other'} or
+                    any(type(n) is not int or n < 0 for n in payload['counts'].values()) or
+                    payload['total'] > sum(payload['counts'].values())):
+                raise ValueError('Invalid history counts')
             if (not isinstance(items, list) or len(items) > 100 or
                     (error is not None and not isinstance(error, str))):
                 raise ValueError('Invalid history result')
@@ -226,7 +304,12 @@ def validate(message):
                     raise ValueError('Invalid history item')
         return message
     if kind in {'monitor_live_page', 'monitor_live_page_result'}:
-        if message['job_id'] is not None or set(payload) != FIELDS[kind]:
+        optional = {'sort', 'descending', 'group', 'filter_field', 'filter_text'} if kind == 'monitor_live_page' else {'total', 'counts'}
+        base = FIELDS[kind] - optional
+        allowed = (base, base | optional)
+        if kind == 'monitor_live_page':
+            allowed += (base | {'sort', 'descending', 'group'},)
+        if message['job_id'] is not None or set(payload) not in allowed:
             raise ValueError('Invalid live page envelope')
         if any(not isinstance(payload[k], str) or not payload[k] or len(payload[k]) > 128 or
                    not payload[k].isascii() or not payload[k].isprintable()
@@ -237,8 +320,21 @@ def validate(message):
         if kind == 'monitor_live_page':
             if type(payload['limit']) is not int or not 1 <= payload['limit'] <= 100:
                 raise ValueError('Invalid live page limit')
+            if 'sort' in payload and (payload['sort'] not in ('', 'host', 'address', 'result', 'tcp') or
+                                      type(payload['descending']) is not bool or
+                                      payload['group'] not in ('all', 'answered', 'no_response', 'problem', 'other')):
+                raise ValueError('Invalid live page ordering')
+            if 'filter_field' in payload and (payload['filter_field'] not in ('host', 'address', 'result', 'tcp') or
+                    not isinstance(payload['filter_text'], str) or len(payload['filter_text']) > 256):
+                raise ValueError('Invalid live page filter')
         else:
             rows = payload['rows']
+            if 'total' in payload and (type(payload['total']) is not int or payload['total'] < 0 or
+                    not isinstance(payload['counts'], dict) or
+                    set(payload['counts']) != {'answered', 'no_response', 'problem', 'other'} or
+                    any(type(n) is not int or n < 0 for n in payload['counts'].values()) or
+                    payload['total'] > sum(payload['counts'].values())):
+                raise ValueError('Invalid live page counts')
             if (payload['status'] not in ('ready', 'not_ready', 'expired', 'unavailable') or
                     type(payload['current_revision']) is not int or payload['current_revision'] < 0 or
                     (payload['next_offset'] is not None and

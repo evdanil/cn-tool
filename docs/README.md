@@ -4,7 +4,7 @@
 
 These guides describe the current source tree. Check `cn --version` before following
 instructions for an installed package. The menu and CLI features described here are
-available in 0.8.4. The WebUI guide covers changes through this source's 0.9.2,
+available in 0.8.4. The WebUI guide covers changes through this source's 0.9.3,
 including the browser tools added in 0.9.0 beyond Subnets that are not part of
 0.8.4. Check the installed version before using newer result layouts and navigation.
 

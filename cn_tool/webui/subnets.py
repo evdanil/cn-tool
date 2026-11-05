@@ -3,6 +3,84 @@ from dataclasses import dataclass, field, replace
 import asyncio
 import json
 from html import escape
+import ipaddress
+import math
+
+
+def order_rows(rows, key, descending=False):
+    """Order a copy of a complete result; missing values stay last in both directions."""
+    address_fields = {'ip', 'ip address', 'address', 'resolved subnet', 'network', 'subnet',
+                      'container', 'host', 'start address', 'end address'}
+    numeric_fields = {'count', 'port', 'interval', 'line', 'line number', 'prefix length',
+                      'utilization', 'utilization %', 'dhcp utilization %', 'leases', 'static', 'total'}
+    field_name = key.casefold()
+
+    def sort_key(row):
+        value = row.get(key)
+        text = str(value).strip()
+        if field_name in address_fields:
+            try:
+                network = ipaddress.ip_network(text, strict=False)
+                return (0, network.version, int(network.network_address), network.prefixlen)
+            except ValueError:
+                return (1, text.casefold())
+        if field_name in numeric_fields:
+            try:
+                return (0, float(text.removesuffix('%').strip()))
+            except ValueError:
+                return (1, text.casefold())
+        return (0, text.casefold())
+
+    def absent(row):
+        value = row.get(key)
+        if value is None or not str(value).strip():
+            return True
+        if field_name in numeric_fields:
+            try:
+                return not math.isfinite(float(str(value).strip().removesuffix('%').strip()))
+            except ValueError:
+                pass
+        return False
+
+    present = [row for row in rows if not absent(row)]
+    missing = [row for row in rows if absent(row)]
+    return sorted(present, key=sort_key, reverse=descending) + missing
+
+
+def filter_rows(rows, key, query):
+    """Filter a complete result by a literal, case-insensitive field value."""
+    if not isinstance(query, str) or len(query) > 256:
+        raise ValueError('Filter text must be 256 characters or fewer.')
+    if not query or not key:
+        return list(rows)
+    needle = str(query).casefold()
+    return [row for row in rows if row.get(key) is not None and needle in str(row[key]).casefold()]
+
+
+async def restore_result_focus(client, root_id, attribute, value, table_identity=None):
+    """Follow a control through QTable's deferred remount, until the user acts."""
+    root, attribute, value, identity = map(json.dumps, (root_id, attribute, value, table_identity))
+    await client.run_javascript(f'''(() => {{
+const root = document.getElementById({root});
+if (!root) return;
+root.cnSortRestore?.();
+let target = null;
+const stop = () => {{ observer.disconnect(); for (const e of ['pointerdown', 'keydown', 'wheel']) document.removeEventListener(e, stop, true); document.removeEventListener('focusin', moved, true); delete root.cnSortRestore; }};
+const moved = event => {{ if (event.target !== target) stop(); }};
+const restore = () => {{
+ if (target?.isConnected && document.activeElement === target) return;
+ const next = [...root.querySelectorAll('[' + {attribute} + ']')].find(el => el.getAttribute({attribute}) === {value} && ({identity} === null || el.dataset.sortTable === {identity}));
+ if (document.activeElement !== document.body && document.activeElement !== target && document.activeElement !== next) {{ stop(); return; }}
+ target = next;
+ target?.focus({{preventScroll:true}});
+}};
+const observer = new MutationObserver(restore);
+root.cnSortRestore = stop;
+observer.observe(root, {{childList:true, subtree:true}});
+for (const e of ['pointerdown', 'keydown', 'wheel']) document.addEventListener(e, stop, {{capture:true, passive:true}});
+document.addEventListener('focusin', moved, true);
+restore();
+}})()''', timeout=1)
 
 
 @dataclass
@@ -12,6 +90,10 @@ class Presentation:
     summary_scroll: tuple = (0, 0, 0)
     return_selection: object = None
     ping_page: int = 0
+    ping_group: str = 'All'
+    sorts: dict = field(default_factory=dict)
+    filters: dict = field(default_factory=dict)
+    table_pagination: dict = field(default_factory=dict)
     pagination: dict = field(default_factory=lambda: {"rowsPerPage": 25, "page": 1})
 
     def attach(self, result, operation_id=None):
@@ -20,6 +102,10 @@ class Presentation:
         changed = result_identity != self.result_identity if operation_id is not None else set(identity) != set(self.result_identity or ())
         if changed or self.result_identity is None:
             self.ping_page = 0
+            self.ping_group = 'All'
+            self.sorts.clear()
+            self.filters.clear()
+            self.table_pagination.clear()
             self.pagination = {"rowsPerPage": 25, "page": 1}
             self.summary_scroll = (0, 0, 0)
             self.selection = identity[0] if len(identity) == 1 else None
@@ -108,6 +194,12 @@ h3 { font-size:17px; font-weight:600; margin:12px 0 6px; }
 .cn-muted { color:#526675; max-width:78ch; }
 .cn-table { width:100%; overflow-x:auto; border:1px solid #CBD5DF; border-radius:4px; }
 .cn-table th { background:#EDF2F6; color:#172B3A; font-weight:650; }
+.cn-sort-button { border:0; background:transparent; color:inherit; font:inherit; text-align:left; cursor:pointer; padding:4px 2px; }
+.cn-sort-button:focus-visible { outline:2px solid #145C87; outline-offset:2px; }
+.cn-field-filter { display:flex; flex-wrap:wrap; align-items:center; gap:8px; width:100%; }
+.cn-field-filter .q-field { min-width:130px; max-width:100%; }
+.cn-field-filter .q-select__dropdown-icon.material-icons { overflow:hidden; }
+.cn-field-filter [role=alert]:empty { display:none; }
 .cn-table td { white-space:normal; min-width:100px; max-width:420px; overflow-wrap:anywhere; }
 .cn-table .q-table { min-width:650px; }
 .cn-table .q-table__middle { overflow:visible; }
@@ -294,11 +386,66 @@ def render_subnets(controller, lookup_type='subnet'):
                 return
             report.set_content('Preparing a consistent report download…')
 
-    def table(rows, *, summary=False):
+    def render_filter(rows, table_id):
+        keys = list(dict.fromkeys(key for row in rows for key in row if key not in {'id', '__row'}))
+        if not keys:
+            return rows
+        selected, text = view.filters.get(table_id, (keys[0], ''))
+        if selected not in keys:
+            selected = keys[0]
+        label = table_id[1] if isinstance(table_id, tuple) else {'ip': 'IP', 'ping': 'Ping', 'summary': 'Subnets', 'containers': 'Child containers'}.get(table_id, str(table_id))
+        with ui.element('div').props('role=group').classes('cn-field-filter') as controls:
+            controls._props['aria-label'] = f'Filter {label} results'
+            labels = {key: ({'Host': 'Target', 'Result': 'ICMP result'}.get(key, key) if table_id == 'ping'
+                            else 'Network / target' if table_id == 'summary' and key == 'Resolved Subnet' else key)
+                      for key in keys}
+            field_input = ui.select(labels, value=selected, label='Filter field').props('outlined dense')
+            query_input = ui.input('Filter text', value=text).props('outlined dense maxlength=256')
+            filter_error = ui.label('').props('role=alert').classes('text-negative')
+
+            async def update_filter(clear):
+                client = ui.context.client
+                async with poll_lock:
+                    query = '' if clear else query_input.value or ''
+                    if not isinstance(query, str) or len(query) > 256:
+                        filter_error.set_text('Filter text must be 256 characters or fewer.')
+                        return
+                    view.filters[table_id] = (field_input.value, query)
+                    if table_id == 'ping':
+                        view.ping_page = 0
+                    elif table_id == 'summary':
+                        view.pagination = dict(view.pagination, page=1)
+                    else:
+                        pagination = view.table_pagination.get(table_id, {"rowsPerPage": 25, "page": 1})
+                        view.table_pagination[table_id] = dict(pagination, page=1)
+                    await draw_results.refresh()
+                    await restore_result_focus(client, results.html_id, 'data-filter-clear' if clear else 'data-filter-apply', repr(table_id))
+
+            async def apply_filter():
+                await update_filter(False)
+
+            async def clear_filter():
+                await update_filter(True)
+
+            query_input.on('keydown.enter', apply_filter)
+            apply = ui.button('Apply filter', on_click=apply_filter).props('outline dense')
+            apply._props['data-filter-apply'] = repr(table_id)
+            clear = ui.button('Clear filter', on_click=clear_filter).props('outline dense')
+            clear._props['data-filter-clear'] = repr(table_id)
+        return filter_rows(rows, selected, text)
+
+    def table(rows, *, summary=False, table_id='ip', all_rows=None):
         if not rows:
             ui.label('No rows.').classes('cn-muted')
             return
-        keys = list(dict.fromkeys(key for row in rows for key in row if key not in {'id', '__row'}))
+        keys = list(dict.fromkeys(key for row in (all_rows if all_rows is not None else rows) for key in row if key not in {'id', '__row'}))
+        if summary and 'Resolved Subnet' in keys:
+            rows = [dict(row, **{'Resolved Subnet': row.get('Resolved Subnet') or row.get('Original Input(s)') or row.get('Original Input') or ''}) for row in rows]
+        if table_id != 'ping':
+            rows = render_filter(rows, table_id)
+            if not rows:
+                ui.label('No rows match this filter.').props('role=status')
+                return
         if lookup_type == 'ping':
             leading = [key for key in ['Host', 'Result', *(key for key in keys if key.startswith('TCP ')), 'Address'] if key in keys]
             keys = leading + [key for key in keys if key not in leading]
@@ -307,7 +454,7 @@ def render_subnets(controller, lookup_type='subnet'):
             leading = [key for key in (identity_key, 'Status', 'Network view') if key in keys]
             keys = leading + [key for key in keys if key not in leading]
         columns = [dict(name=key, label={'Host': 'Target', 'Result': 'ICMP result'}.get(key, key) if lookup_type == 'ping' else key,
-                        field=key, align='left', sortable=lookup_type != 'ping') for key in keys]
+                        field=key, align='left', sortable=False) for key in keys]
         if lookup_type == 'ping':
             for column in columns:
                 width = {'Host': 'var(--cn-ping-target-width)', 'Result': 'var(--cn-ping-icmp-width)'}.get(column['name'], '150px')
@@ -318,20 +465,50 @@ def render_subnets(controller, lookup_type='subnet'):
             for column in columns:
                 width = {identity_key: 'var(--cn-lookup-target-width)', 'Status': 'var(--cn-lookup-status-width)'}.get(column['name'], '160px')
                 column['headerStyle'] = f'width:{width}'
+        sort = view.sorts.get(table_id)
+        if sort and lookup_type != 'ping':
+            rows = order_rows(rows, *sort)
         display_rows = [{key: str(value) if isinstance(value, (dict, list, tuple)) else value for key, value in row.items()} for row in rows]
         if summary and 'Resolved Subnet' in keys:
             columns[0]['label'] = 'Network / target'
-            for row in display_rows:
-                row['Resolved Subnet'] = row.get('Resolved Subnet') or row.get('Original Input(s)') or row.get('Original Input') or ''
         with ui.column().classes('w-full'):
-            desktop_table(display_rows, columns, summary)
+            desktop_table(display_rows, columns, summary, table_id)
 
-    def desktop_table(display_rows, columns, summary):
+    def desktop_table(display_rows, columns, summary, table_id):
         rows = display_rows
         ui.label('Scroll the table horizontally to see all columns' + (' and View details.' if summary else '.')).classes('cn-muted text-sm')
+        pagination = view.pagination if summary else view.table_pagination.get(table_id, {"rowsPerPage": 25, "page": 1})
+        def save_pagination(event):
+            if summary:
+                view.pagination = event.value
+            else:
+                view.table_pagination[table_id] = event.value
+        active = view.sorts.get(table_id)
+        for column in columns:
+            column['sortDirection'] = ('descending' if active[1] else 'ascending') if active and active[0] == column['name'] else ''
+            column['tableIdentity'] = repr(table_id)
         widget = ui.table(columns=columns, rows=[dict(row, __row=row.get('__row', row.get('id', f'row-{index}'))) for index, row in enumerate(display_rows)], row_key='__row',
-                          pagination=view.pagination if summary else (0 if lookup_type == 'ping' else 25),
-                          on_pagination_change=(lambda event: setattr(view, 'pagination', event.value)) if summary else None).classes('cn-table').props('flat bordered wrap-cells')
+                          pagination=0 if lookup_type == 'ping' else pagination,
+                          on_pagination_change=None if lookup_type == 'ping' else save_pagination).classes('cn-table').props('flat bordered wrap-cells')
+        widget.add_slot('header', '''<q-tr :props="props"><q-th v-for="col in props.cols" :key="col.name" :props="props" :aria-sort="col.sortDirection || null"><button v-if="col.name !== 'action'" type="button" class="cn-sort-button" :data-sort-key="col.name" :data-sort-table="col.tableIdentity" :aria-label="col.label + (col.sortDirection ? ', sorted ' + col.sortDirection : '')" @click="$parent.$emit('sort-column', col.name)">{{ col.label }}<span v-if="col.sortDirection" aria-hidden="true"> {{ col.sortDirection === 'ascending' ? '▲' : '▼' }}</span></button><span v-else>{{ col.label }}</span></q-th></q-tr>''')
+
+        async def change_sort(event):
+            key = event.args
+            if key not in {column['name'] for column in columns if column['name'] != 'action'}:
+                return
+            client = ui.context.client
+            async with poll_lock:
+                previous_sort = view.sorts.get(table_id)
+                view.sorts[table_id] = (key, not previous_sort[1] if previous_sort and previous_sort[0] == key else False)
+                if lookup_type == 'ping':
+                    view.ping_page = 0
+                elif summary:
+                    view.pagination = dict(view.pagination, page=1)
+                else:
+                    view.table_pagination[table_id] = dict(pagination, page=1)
+                await draw_results.refresh()
+                await restore_result_focus(client, results.html_id, 'data-sort-key', key, repr(table_id))
+        widget.on('sort-column', change_sort)
         table_name = {'ip': 'IP', 'ping': 'Ping'}.get(lookup_type, 'Subnet')
         widget.props(f'role=region tabindex=0 aria-label="{table_name} result table"')
         if lookup_type == 'ping':
@@ -421,7 +598,7 @@ restore();
         result = snapshot.result
         if lookup_type == 'ping':
             from .ping import render_ping_results
-            render_ping_results(snapshot, table, view, draw_results.refresh, poll_lock)
+            render_ping_results(snapshot, table, view, draw_results.refresh, poll_lock, results.html_id, render_filter)
             return
         if lookup_type == 'ip':
             from .ip import render_ip_results
@@ -451,7 +628,7 @@ restore();
             with ui.element('h2').props('tabindex=-1') as summary_heading:
                 ui.label(f'{len(groups)} networks').classes('text-h6')
             latest['summary_heading'] = summary_heading.html_id
-            table(result.get('summary', []), summary=True)
+            table(result.get('summary', []), summary=True, table_id='summary')
         else:
             for group in view.groups(result):
                 with ui.column().classes('cn-panel'):
@@ -477,16 +654,16 @@ restore();
                             if rows:
                                 with ui.element('h3'):
                                     ui.label(f'{name} ({len(rows)})')
-                                table(rows)
+                                table(rows, table_id=(group['id'], name))
                             else:
                                 with ui.expansion(f'{name} (0)').classes('w-full'):
-                                    table(rows)
+                                    table(rows, table_id=(group['id'], name))
         if result.get('containers'):
             containers = result['containers']
             with ui.element('section').props('id=child-containers').classes('w-full'):
                 with ui.element('h2'):
                     ui.label(f'Child containers ({len(containers)})')
-                table(containers)
+                table(containers, table_id='containers')
 
     with results:
         draw_results()

@@ -32,11 +32,16 @@ def render_demob(controller):
 .cn-demob-consent .cn-muted { flex:1 1 280px; font-size:14px; }
 .cn-demob-toolbar { width:100%; display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; }
 .cn-demob-pager { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.cn-demob-filter { display:flex; flex-wrap:wrap; align-items:center; gap:8px; width:100%; }
+.cn-demob-filter .q-field { flex:1 1 145px; min-width:0; }
 .cn-demob-scroll { width:100%; max-height:390px; overflow:auto; border:1px solid #CBD5DF; border-radius:4px; }
 .cn-demob-scroll.matches { max-height:460px; }
 .cn-demob-table { width:100%; border-collapse:separate; border-spacing:0; text-align:left; font-size:14px; }
 .cn-demob-table th { position:sticky; top:0; z-index:1; background:#EDF2F6; color:#172B3A; font-weight:650; }
 .cn-demob-table th, .cn-demob-table td { padding:9px 12px; border-bottom:1px solid #CBD5DF; vertical-align:top; }
+.cn-demob-sort .q-btn__content { white-space:normal; }
+.cn-demob-table th[aria-sort=ascending] .cn-demob-sort::after { content:' ▲'; }
+.cn-demob-table th[aria-sort=descending] .cn-demob-sort::after { content:' ▼'; }
 .cn-demob-table tr:last-child td { border-bottom:0; }
 .cn-demob-table tbody tr:nth-child(even) { background:#F5F7FA; }
 .cn-demob-networks { min-width:640px; }
@@ -61,7 +66,9 @@ def render_demob(controller):
 }
 @media(max-width:700px) {
   .cn-demob-matches { min-width:0; }
-  .cn-demob-matches thead { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); }
+  .cn-demob-matches thead, .cn-demob-matches thead tr { display:block; }
+  .cn-demob-matches thead tr { display:flex; flex-wrap:wrap; }
+  .cn-demob-matches th { position:static; width:auto !important; max-width:100%; min-width:0; padding:3px; }
   .cn-demob-matches tbody, .cn-demob-matches tr { display:block; }
   .cn-demob-matches tbody tr { display:grid; grid-template-columns:minmax(0,1fr) auto; border-bottom:1px solid #CBD5DF; }
   .cn-demob-matches tbody tr:last-child { border:0; }
@@ -77,7 +84,12 @@ def render_demob(controller):
                   result_job=None, result_page=None, result_query=None, result_offsets=[0],
                   result_revision=None, attempt_revision=None, outcome=None, attempt_result=None,
                   download=None, download_error='', prompt=None, dialog=None, note='', discovery=None,
-                  preview_focus=None, result_focus=None, result_site=None, previous_results=False, result_heading=None)
+                  preview_focus=None, result_focus=None, result_site=None, previous_results=False, result_heading=None,
+                  preview_sort=None, preview_descending=False, preview_sort_focus=None,
+                  result_sort=None, result_descending=False, result_sort_focus=None,
+                  preview_filter_by=None, preview_filter_text='', preview_draft_by=None, preview_draft_text='',
+                  result_filter_by=None, result_filter_text='', result_draft_by='device', result_draft_text='',
+                  preview_filter_focus=None, result_filter_focus=None)
     lock, prompt_lock = asyncio.Lock(), asyncio.Lock()
     with ui.row().classes('w-full items-center justify-between cn-demob'):
         ui.label('Site Demobilization').mark('title').classes('text-h4')
@@ -154,7 +166,9 @@ def render_demob(controller):
         if not preview.get('token'):
             return
         try:
-            latest['preview_query'] = controller.request_demob_page(preview['token'], latest['preview_offsets'][-1], 50)
+            sort = dict(sort_by=latest['preview_sort'], descending=latest['preview_descending']) if latest['preview_sort'] else {}
+            filtering = dict(filter_by=latest['preview_filter_by'], filter_text=latest['preview_filter_text']) if latest['preview_filter_by'] else {}
+            latest['preview_query'] = controller.request_demob_page(preview['token'], latest['preview_offsets'][-1], 50, **sort, **filtering)
             preview_message.set_text('Loading site networks…')
         except (ValueError, RuntimeError, OSError, EOFError):
             preview_message.set_text('Preview expired or is unavailable. Look up the site again.')
@@ -170,6 +184,75 @@ def render_demob(controller):
         latest['preview_focus'] = (direction, position)
         await request_preview_page()
         await draw_preview.refresh()
+
+    async def change_sort(kind, key):
+        sort_key, descending = kind + '_sort', kind + '_descending'
+        latest[descending] = not latest[descending] if latest[sort_key] == key else False
+        latest[sort_key] = key
+        latest[kind + '_sort_focus'] = key
+        latest[kind + '_offsets'] = [0]
+        latest[kind + '_page'] = None
+        if kind == 'preview':
+            await request_preview_page()
+            await draw_preview.refresh()
+        else:
+            await request_result_page()
+            await draw_results.refresh()
+
+    def sort_header(kind, label, key):
+        direction = ('descending' if latest[kind + '_descending'] else 'ascending') if latest[kind + '_sort'] == key else None
+        with ui.element('th').props('scope=col' + (f' aria-sort={direction}' if direction else '')) as header:
+            header._props['aria-label'] = label
+            button = ui.button(label, on_click=lambda _, column=key: change_sort(kind, column)).props('flat dense no-caps').classes('cn-demob-sort')
+            button._props['aria-label'] = f'Sort by {label}' + (f', {direction}' if direction else '')
+            button._props['data-demob-sort-kind'] = kind
+            button._props['data-demob-sort-key'] = key
+
+    def restore_sort_focus(kind):
+        key = latest[kind + '_sort_focus']
+        if key is not None:
+            client.run_javascript(
+                "if (document.activeElement === document.body) {"
+                "const buttons = document.querySelectorAll('[data-demob-sort-kind]');"
+                f"Array.from(buttons).find(b => b.dataset.demobSortKind === {json.dumps(kind)} && b.dataset.demobSortKey === {json.dumps(key)})?.focus();"
+                "}")
+            latest[kind + '_sort_focus'] = None
+
+    def filter_controls(kind, options):
+        prefix = 'Network' if kind == 'preview' else 'Match'
+        draft_by, draft_text = kind + '_draft_by', kind + '_draft_text'
+        selected = latest[draft_by] if latest[draft_by] in options else next(iter(options), None)
+        latest[draft_by] = selected
+        async def apply(clear=False):
+            if clear:
+                latest[draft_text] = ''
+            latest[kind + '_filter_text'] = latest[draft_text]
+            latest[kind + '_filter_by'] = latest[draft_by] if latest[draft_text] else None
+            latest[kind + '_filter_focus'] = 'clear' if clear else 'apply'
+            latest[kind + '_offsets'] = [0]
+            latest[kind + '_page'] = None
+            if kind == 'preview':
+                await request_preview_page()
+                await draw_preview.refresh()
+            else:
+                await request_result_page()
+                await draw_results.refresh()
+        with ui.element('div').classes('cn-demob-filter'):
+            ui.select(options, value=selected, label=f'{prefix} filter field',
+                      on_change=lambda event: latest.__setitem__(draft_by, event.value)).props('outlined dense')
+            ui.input(f'{prefix} filter value', value=latest[draft_text],
+                     on_change=lambda event: latest.__setitem__(draft_text, event.value or '')).props('outlined dense maxlength=256')
+            apply_button = ui.button(f'Apply {prefix.lower()} filter', on_click=lambda: apply()).props('outline dense')
+            clear_button = ui.button(f'Clear {prefix.lower()} filter', on_click=lambda: apply(clear=True)).props('flat dense')
+            for button, action in ((apply_button, 'apply'), (clear_button, 'clear')):
+                button._props['data-demob-filter'] = kind + '-' + action
+
+    def restore_filter_focus(kind):
+        action = latest[kind + '_filter_focus']
+        if action:
+            selector = json.dumps(f'[data-demob-filter="{kind}-{action}"]')
+            client.run_javascript(f'if (document.activeElement === document.body) document.querySelector({selector})?.focus();')
+            latest[kind + '_filter_focus'] = None
 
     async def confirm(token):
         try:
@@ -210,6 +293,8 @@ def render_demob(controller):
             if preview.get('token'):
                 with ui.element('div').classes('cn-demob-consent'):
                     ui.label('Review the networks below before allowing the configuration search.').classes('cn-muted')
+                    if latest['preview_filter_by']:
+                        ui.label('Filtering changes only the display. Search covers all discovered networks.').classes('cn-muted')
                     search = ui.button('Search configurations', on_click=lambda: confirm(preview['token']))
                     search.set_enabled(not oscompat.is_macos() and bool(page and page.get('status') == 'ready'))
                     ui.button('Decline', on_click=lambda: decline(preview['token'])).props('outline')
@@ -220,15 +305,15 @@ def render_demob(controller):
                     ui.label('Site networks').classes('text-weight-bold')
                     draw_pager('network', page)
                 ui.label('Scroll the table to see all columns.').classes('cn-muted cn-demob-scroll-help')
-                columns = list(dict.fromkeys(key for row in page['rows'] for key in row))
+                columns = page.get('columns') or list(dict.fromkeys(key for row in page['rows'] for key in row))
                 preferred = [key for key in columns if key.lower() in ('network', 'network view')]
                 columns = preferred + [key for key in columns if key not in preferred]
+                filter_controls('preview', {key: key for key in columns})
                 with ui.element('div').props('role=region aria-label="Site networks table" tabindex=0').classes('cn-demob-scroll'):
                     with ui.element('table').props('aria-label="Site networks"').classes('cn-demob-table cn-demob-networks'):
                         with ui.element('thead'), ui.element('tr'):
                             for key in columns:
-                                with ui.element('th').props('scope=col'):
-                                    ui.label(key)
+                                sort_header('preview', key, key)
                         with ui.element('tbody'):
                             for row in page['rows']:
                                 with ui.element('tr'):
@@ -276,7 +361,9 @@ def render_demob(controller):
             result_message.set_text('')
             return
         try:
-            latest['result_query'] = controller.request_config_search_page(latest['result_job'], latest['result_offsets'][-1], 50)
+            sort = dict(sort_by=latest['result_sort'], descending=latest['result_descending']) if latest['result_sort'] else {}
+            filtering = dict(filter_by=latest['result_filter_by'], filter_text=latest['result_filter_text']) if latest['result_filter_by'] else {}
+            latest['result_query'] = controller.request_config_search_page(latest['result_job'], latest['result_offsets'][-1], 50, **sort, **filtering)
             result_message.set_text('Loading matches…')
         except (ValueError, RuntimeError, OSError, EOFError):
             latest['result_page'] = {'status': 'unavailable'}
@@ -314,12 +401,12 @@ def render_demob(controller):
                     ui.label('Line numbers start at 0.').classes('cn-muted')
                     draw_pager('result', page)
                 ui.label('Scroll the table to see all columns.').classes('cn-muted cn-demob-scroll-help matches')
+                filter_controls('result', {'device': 'Device', 'line': 'Line', 'configuration': 'Matching configuration'})
                 with ui.element('div').props('role=region aria-label="Configuration matches table" tabindex=0').classes('cn-demob-scroll matches'):
                     with ui.element('table').props('aria-label="Configuration matches"').classes('cn-demob-table cn-demob-matches'):
                         with ui.element('thead'), ui.element('tr'):
-                            for name in ('Device', 'Line', 'Matching configuration'):
-                                with ui.element('th').props('scope=col'):
-                                    ui.label(name)
+                            for name, key in (('Device', 'device'), ('Line', 'line'), ('Matching configuration', 'configuration')):
+                                sort_header('result', name, key)
                         with ui.element('tbody'):
                             for row in page['rows']:
                                 with ui.element('tr'):
@@ -466,7 +553,9 @@ u.value = ''; if (p) p.value = ''; emit(reply);
                     latest['note'] = 'Preview expired or is unavailable. Look up the site again.'
                 if latest['preview_query']:
                     controller.release_demob_page(latest['preview_query'])
-                latest.update(preview=preview, preview_query=None, preview_page=None, preview_offsets=[0], preview_focus=None)
+                latest.update(preview=preview, preview_query=None, preview_page=None, preview_offsets=[0], preview_focus=None,
+                              preview_sort=None, preview_descending=False, preview_sort_focus=None,
+                              preview_filter_by=None, preview_filter_text='', preview_draft_by=None, preview_draft_text='', preview_filter_focus=None)
                 if preview and preview.get('token'):
                     latest['note'] = ''
                     await request_preview_page()
@@ -483,10 +572,18 @@ u.value = ''; if (p) p.value = ''; emit(reply);
                     latest['preview_page'] = page
                     rows = page['rows']
                     if page['status'] == 'ready':
-                        preview_message.set_text(f"Showing {page['offset'] + 1}–{page['offset'] + len(rows)} of {page['total']} site networks." if rows else 'No site networks to show.')
+                        if rows:
+                            scope = f" (of {page['overall_total']} total)" if latest['preview_filter_by'] and 'overall_total' in page else ''
+                            preview_message.set_text(f"Showing {page['offset'] + 1}–{page['offset'] + len(rows)} of {page['total']} site networks{scope}.")
+                        else:
+                            total = page.get('overall_total')
+                            message = (f"No networks match this filter (of {total} total)." if total is not None else 'No networks match this filter.') + ' Clear filter to see all results.'
+                            preview_message.set_text(message if latest['preview_filter_by'] else 'No site networks to show.')
                     else:
                         preview_message.set_text('Preview expired or is unavailable. Look up the site again.')
                     await draw_preview.refresh()
+                    restore_sort_focus('preview')
+                    restore_filter_focus('preview')
                     if latest['preview_focus']:
                         direction, position = latest['preview_focus']
                         selector = json.dumps(f"[data-demob-network-page='{direction}'][data-demob-pager-position='{position}']:not([disabled])")
@@ -549,15 +646,18 @@ u.value = ''; if (p) p.value = ''; emit(reply);
                 # Keep keyboard focus in a stable region when a newer result removes its source details.
                 if latest['result_job']:
                     target = result_area.html_id if page_state.result_job_id else site.html_id
+                    focus_target = 'target' if page_state.result_job_id else '(target?.querySelector("input") || target)'
                     try:
                         await client.run_javascript(
                             '(() => { const area = document.getElementById(' + json.dumps(result_area.html_id) + ');'
                             'if (area?.contains(document.activeElement)) {'
                             'const target = document.getElementById(' + json.dumps(target) + ');'
-                            '(target?.querySelector("input") || target)?.focus(); } return true; })()', timeout=2)
+                            + focus_target + '?.focus(); } return true; })()', timeout=2)
                     except (TimeoutError, RuntimeError):
                         pass  # A disconnected browser cannot retain focus.
                 latest.update(result_job=page_state.result_job_id, result_page=None, result_offsets=[0], result_focus=None,
+                              result_sort=None, result_descending=False, result_sort_focus=None,
+                              result_filter_by=None, result_filter_text='', result_draft_by='device', result_draft_text='', result_filter_focus=None,
                               result_site=(discovery or {}).get('site') if not previous else None)
                 await request_result_page()
                 await draw_results.refresh()
@@ -571,10 +671,18 @@ u.value = ''; if (p) p.value = ''; emit(reply);
                     latest['result_page'] = page
                     rows = page['rows']
                     if page['status'] == 'ready':
-                        result_message.set_text(f"Showing {page['offset'] + 1}–{page['offset'] + len(rows)} of {page['total']} matches." if rows else 'No configuration matches.')
+                        if rows:
+                            scope = f" (of {page['overall_total']} total)" if latest['result_filter_by'] and 'overall_total' in page else ''
+                            result_message.set_text(f"Showing {page['offset'] + 1}–{page['offset'] + len(rows)} of {page['total']} matches{scope}.")
+                        else:
+                            total = page.get('overall_total')
+                            message = (f"No matches for this filter (of {total} total)." if total is not None else 'No matches for this filter.') + ' Clear filter to see all results.'
+                            result_message.set_text(message if latest['result_filter_by'] else 'No configuration matches.')
                     else:
                         result_message.set_text('Results are unavailable. Run the check again.')
                     await draw_results.refresh()
+                    restore_sort_focus('result')
+                    restore_filter_focus('result')
                     if latest['result_focus']:
                         direction, position = latest['result_focus']
                         selector = json.dumps(f"[data-demob-result-page='{direction}'][data-demob-pager-position='{position}']:not([disabled])")

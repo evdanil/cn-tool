@@ -254,7 +254,7 @@ class SessionController:
             if self._state.phase not in {'closing', 'closed', 'failed'}:
                 self._send('demob_decline', None, {})
 
-    def request_demob_page(self, token, offset, limit=50):
+    def request_demob_page(self, token, offset, limit=50, *, sort_by=None, descending=False, filter_by=None, filter_text=''):
         with self._lock:
             preview = self._state.demob_preview
             if not preview or monotonic() >= self._demob_expires or preview['token'] != token:
@@ -265,6 +265,8 @@ class SessionController:
                 raise RuntimeError('Too many outstanding preview pages')
             query_id = uuid4().hex
             payload = dict(token=token, offset=offset, limit=limit, query_id=query_id)
+            if sort_by is not None or filter_by is not None or filter_text or descending:
+                payload.update(sort_by=sort_by, descending=descending, filter_by=filter_by, filter_text=filter_text)
             self._send('demob_page', None, payload)
             self._demob_requests[query_id] = payload
             return query_id
@@ -389,12 +391,14 @@ class SessionController:
                 self._delete_abandoned = True
             self._delete_results.pop(query_id, None)
 
-    def request_monitor_history(self, kind, parent=None, cursor=None, limit=100):
+    def request_monitor_history(self, kind, parent=None, cursor=None, limit=100, sort=None, descending=False, group='all', filter_field='host', filter_text=''):
         with self._lock:
             if self._state.phase not in {'ready', 'running', 'stopping', 'saving'}:
                 raise RuntimeError('Session unavailable')
             query_id = uuid4().hex
             payload = dict(kind=kind, parent=parent, cursor=cursor, limit=limit, query_id=query_id)
+            if sort is not None:
+                payload.update(sort=sort, descending=descending, group=group, filter_field=filter_field, filter_text=filter_text)
             self._send('monitor_history', None, payload)
             self._history_requests[query_id] = (kind, limit)
             return query_id
@@ -413,7 +417,7 @@ class SessionController:
             self._monitor_requests.pop(query_id, None)
             self._monitor_pages.pop(query_id, None)
 
-    def request_monitor_live_page(self, job_id, run_id, revision, offset, limit=100):
+    def request_monitor_live_page(self, job_id, run_id, revision, offset, limit=100, sort=None, descending=False, group='all', filter_field='host', filter_text=''):
         with self._lock:
             update = self._state.monitor_update
             selected = self._state.attempts_by_type['monitor'] or {}
@@ -422,6 +426,8 @@ class SessionController:
                 raise RuntimeError('Monitor snapshot is unavailable or expired')
             query_id = uuid4().hex
             payload = dict(job_id=job_id, run_id=run_id, revision=revision, offset=offset, limit=limit, query_id=query_id)
+            if sort is not None:
+                payload.update(sort=sort, descending=descending, group=group, filter_field=filter_field, filter_text=filter_text)
             self._send('monitor_live_page', None, payload)
             self._monitor_requests[query_id] = payload
             return query_id
@@ -430,7 +436,7 @@ class SessionController:
         with self._lock:
             return deepcopy(self._monitor_pages.get(query_id))
 
-    def request_config_search_page(self, job_id, offset, limit=50):
+    def request_config_search_page(self, job_id, offset, limit=50, *, sort_by=None, descending=False, filter_by=None, filter_text=''):
         with self._lock:
             result = (self._state.results_by_type['config_search'] or {})
             demob = self._state.results_by_type['demob'] or {}
@@ -442,6 +448,8 @@ class SessionController:
                 raise RuntimeError('Too many outstanding configuration pages')
             query_id = uuid4().hex
             payload = dict(job_id=job_id, offset=offset, limit=limit, query_id=query_id)
+            if sort_by is not None or filter_by is not None or filter_text or descending:
+                payload.update(sort_by=sort_by, descending=descending, filter_by=filter_by, filter_text=filter_text)
             self._send('config_search_page', None, payload)
             self._config_requests[query_id] = payload
             return query_id
@@ -629,7 +637,9 @@ class SessionController:
                 if (not expected or not preview or monotonic() >= self._demob_expires or
                         expected['token'] != preview['token'] or expected['offset'] != payload['offset'] or
                         len(payload['rows']) > expected['limit'] or
-                        payload['status'] == 'ready' and payload['total'] != preview['row_count']):
+                        any((k in payload) != (k in expected) or k in expected and payload[k] != expected[k]
+                            for k in ('sort_by', 'descending', 'filter_by', 'filter_text')) or
+                        payload['status'] == 'ready' and payload.get('overall_total', payload['total']) != preview['row_count']):
                     return
                 self._demob_requests.pop(payload['query_id'], None)
                 self._demob_pages[payload['query_id']] = deepcopy(payload)
@@ -642,7 +652,9 @@ class SessionController:
                 if (not expected or selected.get('job_id') != payload['job_id'] or
                         any(payload[k] != expected[k] for k in ('job_id', 'offset')) or
                         len(payload['rows']) > expected['limit'] or
-                        (payload['status'] == 'ready' and payload['total'] != selected['result']['total'])):
+                        any((k in payload) != (k in expected) or k in expected and payload[k] != expected[k]
+                            for k in ('sort_by', 'descending', 'filter_by', 'filter_text')) or
+                        (payload['status'] == 'ready' and payload.get('overall_total', payload['total']) != selected['result']['total'])):
                     return
                 self._config_requests.pop(payload['query_id'], None)
                 self._config_pages[payload['query_id']] = deepcopy(payload)

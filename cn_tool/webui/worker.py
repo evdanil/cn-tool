@@ -712,6 +712,44 @@ def monitor_history_error(error):
     return 'Ping history is unavailable. Check its availability and permissions.' if error else ''
 
 
+def config_search_page(rows, query):
+    """Return a bounded configuration page without reordering the retained result."""
+    import json
+    from .config_demob import ordered_page_rows
+
+    page = dict(job_id=query['job_id'], offset=query['offset'], query_id=query['query_id'],
+                rows=[], total=0, next_offset=None, status='unavailable')
+    if 'sort_by' in query:
+        page.update({key: query[key] for key in ('sort_by', 'descending', 'filter_by', 'filter_text')})
+        page['overall_total'] = 0
+    if rows is None:
+        return page
+    columns = {'device': 1, 'line': 2, 'configuration': 3}
+    ordered = ordered_page_rows(rows, value=lambda row, key: row[columns[key]],
+                                sort_by=query.get('sort_by'), descending=query.get('descending', False),
+                                filter_by=query.get('filter_by'), filter_text=query.get('filter_text', ''),
+                                numeric=('line',))
+    if query['offset'] > len(ordered):
+        return page
+    page.update(total=len(ordered), status='ready')
+    if 'overall_total' in page:
+        page['overall_total'] = len(rows)
+    index = query['offset']
+    while index < len(ordered) and len(page['rows']) < query['limit']:
+        page['rows'].append(ordered[index])
+        if len(json.dumps(page, ensure_ascii=False).encode('utf-8')) > 1024 * 1024 - 1024:
+            page['rows'].pop()
+            if not page['rows']:
+                page.update(total=0, next_offset=None, status='unavailable')
+                if 'overall_total' in page:
+                    page['overall_total'] = 0
+                return page
+            break
+        index += 1
+    page['next_offset'] = index if index < len(ordered) else None
+    return page
+
+
 class MonitorLiveCache:
     """Latest complete round copied on the run thread and paged without SQLite."""
     def __init__(self, job_id, emit, logger=None):
@@ -757,23 +795,72 @@ class MonitorLiveCache:
     def page(self, query):
         with self.lock:
             revision = self.update['revision']
-            result = {key: query[key] for key in ('job_id', 'run_id', 'revision', 'offset', 'query_id')}
-            result.update(rows=[], next_offset=None, current_revision=revision)
-            if query['job_id'] != self.job_id or query['run_id'] != self.run_id:
-                result['status'] = 'unavailable'
-            elif query['revision'] != revision:
-                result['status'] = 'expired'
-            elif revision == 0:
-                result['status'] = 'not_ready'
-            else:
-                result['status'] = 'ready'
-                start = query['offset']
-                end = min(start + query['limit'], len(self.rows))
-                result['rows'] = [dict(host=host, address=address, result=value,
-                                       tcp=[dict(port=port, result=text) for port, text in tcp])
-                                  for host, address, value, tcp in self.rows[start:end]]
-                result['next_offset'] = end if end < len(self.rows) else None
-            return result
+            rows = self.rows
+            run_id = self.run_id
+        result = {key: query[key] for key in ('job_id', 'run_id', 'revision', 'offset', 'query_id')}
+        result.update(rows=[], next_offset=None, current_revision=revision)
+        if query['job_id'] != self.job_id or query['run_id'] != run_id:
+            result['status'] = 'unavailable'
+        elif query['revision'] != revision:
+            result['status'] = 'expired'
+        elif revision == 0:
+            result['status'] = 'not_ready'
+        else:
+            result['status'] = 'ready'
+            if 'group' in query:
+                from collections import Counter
+                from cn_tool.utils.ping_history import observation
+                def group(row):
+                    host, address, value, tcp = row
+                    values = {'Result': value, **{f'TCP {port}': text for port, text in tcp}}
+                    flag = observation(values, [port for port, _ in tcp])
+                    if flag in '!RT':
+                        return 'answered'
+                    if value in ('unknown', 'not run'):
+                        if any(text in ('error', 'unreachable') for _, text in tcp):
+                            return 'problem'
+                        if any(text == 'timeout' for _, text in tcp):
+                            return 'no_response'
+                        return 'other'
+                    if flag != '.':
+                        return 'problem'
+                    return 'no_response' if value == 'NO RESPONSE' else 'other'
+                counts = Counter(group(row) for row in rows)
+                result['counts'] = {key: counts[key] for key in ('answered', 'no_response', 'problem', 'other')}
+                selected = query['group']
+                if selected != 'all':
+                    rows = tuple(row for row in rows if group(row) == selected)
+                field, pattern = query.get('filter_field', 'host'), query.get('filter_text', '').casefold()
+                if pattern:
+                    def filter_value(row):
+                        return {'host': row[0] or 'Unknown', 'address': row[1] or 'Unknown',
+                                'result': row[2] or 'Unknown',
+                                'tcp': ', '.join(f'{port}: {text}' for port, text in row[3]) or 'Not checked'}[field]
+                    rows = tuple(row for row in rows if pattern in filter_value(row).casefold())
+                sort = query['sort']
+                if sort:
+                    import ipaddress
+                    def key(row):
+                        value = {'host': row[0], 'address': row[1], 'result': row[2],
+                                 'tcp': ', '.join(f'{port}: {text}' for port, text in row[3])}[sort]
+                        if sort in ('host', 'address'):
+                            try:
+                                address = ipaddress.ip_address(value)
+                                return (0, address.version, int(address))
+                            except ValueError:
+                                pass
+                        return (1, value.casefold())
+                    present = [row for row in rows if row[{'host': 0, 'address': 1, 'result': 2, 'tcp': 3}[sort]]]
+                    missing = [row for row in rows if not row[{'host': 0, 'address': 1, 'result': 2, 'tcp': 3}[sort]]]
+                    rows = sorted(present, key=key, reverse=query['descending']) + missing
+                result['total'] = len(rows)
+            start = query['offset']
+            end = min(start + query['limit'], len(rows))
+            result['rows'] = [dict(host=host, address=address, result=value,
+                                   tcp=[dict(port=port, result=text) for port, text in tcp])
+                              for host, address, value, tcp in rows[start:end]]
+            result['next_offset'] = end if end < len(rows) else None
+        return result
 
 
 class MonitorInputError(ValueError):
@@ -1273,7 +1360,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             if payload is None or history_stopped.is_set():
                 return
             try:
-                query = {key: payload[key] for key in ('kind', 'parent', 'cursor', 'limit')}
+                query = {key: payload[key] for key in ('kind', 'parent', 'cursor', 'limit', 'sort', 'descending', 'group', 'filter_field', 'filter_text') if key in payload}
                 page = read_monitor_history(history_ctx, query)
                 if history_stopped.is_set():
                     return
@@ -1358,11 +1445,17 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 demob_vault.invalidate()
                 state['demob_preview_job'] = None
             elif kind == 'demob_page':
-                page = demob_vault.page(payload['token'], offset=payload['offset'], limit=payload['limit'])
+                from .config_demob import page_reserve
+                options = {key: payload[key] for key in ('sort_by', 'descending', 'filter_by', 'filter_text') if key in payload}
+                extra = dict(query_id=payload['query_id'], offset=payload['offset'], status='ready', **options)
+                reserve = page_reserve(extra)
+                page = demob_vault.page(payload['token'], offset=payload['offset'], limit=payload['limit'],
+                                        include_metadata=True, reserve_bytes=reserve, **options)
                 result = dict(query_id=payload['query_id'], offset=payload['offset'], rows=[], total=0,
-                              next_offset=None, status='unavailable')
+                              next_offset=None, status='unavailable', columns=[], overall_total=0, **options)
                 if page is not None:
-                    result.update(rows=page.rows, total=page.total, next_offset=page.next_offset, status='ready')
+                    result.update(rows=page.rows, total=page.total, next_offset=page.next_offset, status='ready',
+                                  columns=page.columns, overall_total=page.overall_total)
                 emit('demob_page_result', result)
             elif kind == 'monitor_delete' and state['ready']:
                 if payload['query_id'] in delete_ids:
@@ -1397,23 +1490,9 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                     emit('monitor_history_result', dict(query_id=payload['query_id'], items=[], next_cursor=None,
                                                         error='History reader is busy. Try again.'))
             elif kind == 'config_search_page':
-                import json
                 cache = next((item for item in state['config_cache'].values()
                               if item is not None and item[0] == payload['job_id']), None)
-                page = dict(job_id=payload['job_id'], offset=payload['offset'], query_id=payload['query_id'],
-                            rows=[], total=0, next_offset=None, status='unavailable')
-                if cache is not None and cache[0] == payload['job_id']:
-                    rows = cache[1]
-                    page.update(total=len(rows), status='ready')
-                    index = payload['offset']
-                    while index < len(rows) and len(page['rows']) < payload['limit']:
-                        page['rows'].append(rows[index])
-                        if len(json.dumps(page, ensure_ascii=False).encode('utf-8')) > 1024 * 1024 - 1024:
-                            page['rows'].pop()
-                            break
-                        index += 1
-                    page['next_offset'] = index if index < len(rows) else None
-                emit('config_search_page_result', page)
+                emit('config_search_page_result', config_search_page(cache[1] if cache else None, payload))
             elif kind == 'monitor_live_page':
                 cache = state['monitor_cache']
                 if cache is None:

@@ -587,6 +587,30 @@ def _history_decode_cursor(cursor: object, kind: str, parent: object) -> object:
         raise ValueError("invalid cursor") from error
 
 
+def _sorted_history_cursor(parent, options, after):
+    import base64
+    binding = hashlib.sha256(json.dumps(options, ensure_ascii=True, separators=(',', ':')).encode('ascii')).hexdigest()
+    raw = json.dumps([2, parent, binding, *after], ensure_ascii=True, separators=(',', ':'))
+    return base64.urlsafe_b64encode(raw.encode('ascii')).decode('ascii').rstrip('=')
+
+
+def _sorted_history_decode(cursor, parent, options, kind="hosts"):
+    import base64
+    import binascii
+    if not isinstance(cursor, str) or not 1 <= len(cursor) <= 1024 or not re.fullmatch(r'[A-Za-z0-9_-]+', cursor):
+        raise ValueError('invalid cursor')
+    try:
+        data = json.loads(base64.b64decode(cursor + '=' * (-len(cursor) % 4), altchars=b'-_', validate=True))
+        if (not isinstance(data, list) or len(data) != 5 or data[0] != 2 or type(data[1]) is not type(parent) or
+                data[1] != parent or not (_history_run_id(data[3]) if kind == 'runs' else _history_int(data[3], 0 if kind == 'hosts' else 1)) or not isinstance(data[4], str) or
+                not re.fullmatch(r'[0-9a-f]{64}', data[4]) or
+                _sorted_history_cursor(parent, options, data[3:]) != cursor):
+            raise ValueError('invalid cursor')
+        return data[3:]
+    except (ValueError, TypeError, UnicodeError, binascii.Error, RecursionError) as error:
+        raise ValueError('invalid cursor') from error
+
+
 def read_monitor_history(ctx: object, query: Mapping[str, object]) -> Dict[str, object]:
     """Read one live, bounded history page from the configured database.
 
@@ -602,8 +626,14 @@ def read_monitor_history(ctx: object, query: Mapping[str, object]) -> Dict[str, 
     def result(items: object = None, next_cursor: object = None, error: object = None) -> Dict[str, object]:
         return {"items": [] if items is None else items, "next_cursor": next_cursor, "error": error}
 
-    if not isinstance(query, Mapping) or set(query) != {"kind", "parent", "cursor", "limit"}:
+    base = {"kind", "parent", "cursor", "limit"}
+    extended = {"sort", "descending", "group", "filter_field", "filter_text"}
+    if not isinstance(query, Mapping) or set(query) not in (base, base | extended):
         return result(error="invalid")
+    ordered = set(query) == base | extended
+    options = [query[key] for key in ("sort", "descending", "group", "filter_field", "filter_text")] if ordered else None
+    if ordered and query['kind'] != 'hosts':
+        options.insert(0, query['kind'])
     kind, parent, cursor, limit = (query["kind"], query["parent"], query["cursor"], query["limit"])
     if (not isinstance(kind, str) or kind not in ("requests", "runs", "rounds", "hosts", "template") or
             not _history_int(limit) or limit > 100 or
@@ -612,8 +642,16 @@ def read_monitor_history(ctx: object, query: Mapping[str, object]) -> Dict[str, 
             (kind in ("rounds", "template") and not _history_run_id(parent)) or
             (kind == "template" and (cursor is not None or limit != 1))):
         return result(error="invalid")
+    allowed_fields = {'hosts': ('host', 'status', 'address', 'result'),
+                      'requests': ('targets', 'ports', 'hosts'), 'runs': ('started', 'status', 'rounds', 'interval')}
+    if ordered and (kind not in allowed_fields or query['sort'] not in ('', *allowed_fields[kind]) or
+                    type(query['descending']) is not bool or query['group'] not in
+                    (('all', 'answered', 'no_response', 'problem', 'other') if kind == 'hosts' else ('all',)) or
+                    query['filter_field'] not in allowed_fields[kind] or
+                    not isinstance(query['filter_text'], str) or len(query['filter_text']) > 256):
+        return result(error='invalid')
     try:
-        after = None if cursor is None else _history_decode_cursor(cursor, kind, parent)
+        after = None if cursor is None else (_sorted_history_decode(cursor, parent, options, kind) if ordered else _history_decode_cursor(cursor, kind, parent))
     except ValueError:
         return result(error="invalid")
     configured = ctx.cfg.get("ping_history_file")
@@ -623,6 +661,24 @@ def read_monitor_history(ctx: object, query: Mapping[str, object]) -> Dict[str, 
         if store is None:
             return result(error="expired" if parent is not None or after is not None else None)
         with store:
+            if ordered:
+                if kind == 'hosts':
+                    page = store.sorted_round_hosts(parent, sort=query['sort'], descending=query['descending'],
+                        group=query['group'], filter_field=query['filter_field'], filter_text=query['filter_text'],
+                        limit=limit, after=after)
+                else:
+                    import socket
+                    import time
+                    now, hostname = time.time(), socket.gethostname()
+                    def transform(item):
+                        return dict(item, status=run_state(item['status'], heartbeat=item['heartbeat'],
+                            interval=item['interval'], host=item['host'], pid=item['pid'], now=now,
+                            this_host=hostname, pid_alive=oscompat.pid_exists))
+                    page = store.sorted_history_page(kind, parent, sort=query['sort'], descending=query['descending'],
+                        filter_field=query['filter_field'], filter_text=query['filter_text'], limit=limit, after=after,
+                        transform=transform if kind == 'runs' else None)
+                next_key = page.pop('next_cursor')
+                return dict(page, next_cursor=None if next_key is None else _sorted_history_cursor(parent, options, next_key), error=None)
             items, next_key = store.history_page(kind, parent, after=after, limit=limit)
         # Invalid stored values must not escape as non-JSON numbers or produce unusable cursors.
         if (any(type(value) is float and not math.isfinite(value) for item in items for value in item.values()) or

@@ -1,5 +1,6 @@
 """Local, bounded presentation for live configuration search."""
 import asyncio
+import json
 from dataclasses import replace
 
 from cn_tool.utils import oscompat
@@ -22,6 +23,10 @@ def render_config_search(controller):
 .cn-config-table { width:100%; min-width:540px; border-collapse:separate; border-spacing:0; table-layout:fixed; }
 .cn-config-table th { position:sticky; top:0; z-index:1; background:#EDF2F6; text-align:left; font-weight:600; }
 .cn-config-table th, .cn-config-table td { padding:8px 12px; border-bottom:1px solid #CBD5DF; vertical-align:top; }
+.cn-config-sort { text-align:left; max-width:100%; }
+.cn-config-sort .q-btn__content { white-space:normal; }
+.cn-config-table th[aria-sort=ascending] .cn-config-sort::after { content:' ▲'; }
+.cn-config-table th[aria-sort=descending] .cn-config-sort::after { content:' ▼'; }
 .cn-config-table th:first-child { width:160px; }
 .cn-config-table th:nth-child(2) { width:64px; }
 .cn-config-table tbody tr:last-child td { border-bottom:0; }
@@ -36,7 +41,9 @@ def render_config_search(controller):
 @media(max-width:700px) {
   .cn-config-form { grid-template-columns:minmax(0,1fr); }
   .cn-config-table { min-width:0; }
-  .cn-config-table thead { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); }
+  .cn-config-table thead, .cn-config-table thead tr { display:block; }
+  .cn-config-table thead tr { display:flex; flex-wrap:wrap; }
+  .cn-config-table th { position:static; width:auto !important; max-width:100%; min-width:0; padding:3px; }
   .cn-config-table tbody, .cn-config-table tr { display:block; }
   .cn-config-table tbody tr { display:grid; grid-template-columns:minmax(0,1fr) auto; border-bottom:1px solid #CBD5DF; }
   .cn-config-table tbody tr:last-child { border:0; }
@@ -48,11 +55,13 @@ def render_config_search(controller):
 
 .cn-config-line { white-space:pre-wrap; overflow-wrap:anywhere; font-family:ui-monospace,monospace; }
 .cn-config-actions { flex-wrap:wrap; min-width:0; gap:8px; }
+.cn-config-filter { display:flex; flex-wrap:wrap; align-items:center; gap:8px; width:100%; }
+.cn-config-filter .q-field { flex:1 1 145px; min-width:0; }
 ''')
     ui.colors(primary='#145C87')
     latest = dict(job=None, result=None, page=None, query=None, offsets=[0], download=None, download_error='',
                   attempt=None, outcome=None, result_revision=None, attempt_revision=None,
-                  attempt_result=None)
+                  attempt_result=None, sort_by=None, descending=False, sort_focus=None, filter_by=None, filter_text='')
     lock = asyncio.Lock()
     with ui.row().classes('w-full items-center justify-between cn-config'):
         ui.label('Configuration Search').mark('title').classes('text-h4')
@@ -138,6 +147,12 @@ def render_config_search(controller):
                 previous_button = ui.button('Previous page', on_click=lambda: change_page('previous')).props('outline dense aria-disabled=true')
                 next_button = ui.button('Next page', on_click=lambda: change_page('next')).props('outline dense aria-disabled=true')
         results_message = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
+        with ui.element('div').classes('cn-config-filter'):
+            filter_field = ui.select({'device': 'Device', 'line': 'Line', 'configuration': 'Matching configuration'},
+                                     value='device', label='Filter field').props('outlined dense')
+            filter_value = ui.input('Filter value').props('outlined dense maxlength=256')
+            ui.button('Apply filter', on_click=lambda: apply_filter()).props('outline dense')
+            ui.button('Clear filter', on_click=lambda: apply_filter(clear=True)).props('flat dense')
         ui.label('Line numbers start at 0.').classes('cn-muted text-xs')
         results_body = ui.column().props('data-config-results-body').classes('w-full cn-config')
     results_area.set_visibility(False)
@@ -163,6 +178,25 @@ def render_config_search(controller):
         await request_page()
         await draw_results.refresh()
 
+    async def change_sort(key):
+        latest['descending'] = not latest['descending'] if latest['sort_by'] == key else False
+        latest['sort_by'] = key
+        latest['sort_focus'] = key
+        latest['offsets'] = [0]
+        latest['page'] = None
+        await request_page()
+        await draw_results.refresh()
+
+    async def apply_filter(*, clear=False):
+        if clear:
+            filter_value.set_value('')
+        latest['filter_text'] = filter_value.value or ''
+        latest['filter_by'] = filter_field.value if latest['filter_text'] else None
+        latest['offsets'] = [0]
+        latest['page'] = None
+        await request_page()
+        await draw_results.refresh()
+
     @ui.refreshable
     def draw_results():
         page = latest['page']
@@ -178,9 +212,13 @@ def render_config_search(controller):
             with ui.element('table').props('aria-label="Configuration matches"').classes('cn-config-table'):
                 with ui.element('thead'):
                     with ui.element('tr'):
-                        for heading in ('Device', 'Line', 'Matching configuration'):
-                            with ui.element('th').props('scope=col'):
-                                ui.label(heading)
+                        for heading, key in (('Device', 'device'), ('Line', 'line'), ('Matching configuration', 'configuration')):
+                            direction = ('descending' if latest['descending'] else 'ascending') if latest['sort_by'] == key else None
+                            with ui.element('th').props('scope=col' + (f' aria-sort={direction}' if direction else '')) as header:
+                                header._props['aria-label'] = heading
+                                button = ui.button(heading, on_click=lambda _, column=key: change_sort(column)).props('flat dense no-caps').classes('cn-config-sort')
+                                button._props['aria-label'] = f'Sort by {heading}' + (f', {direction}' if direction else '')
+                                button._props['data-config-sort'] = key
                 with ui.element('tbody'):
                     for row in rows:
                         with ui.element('tr'):
@@ -208,7 +246,9 @@ def render_config_search(controller):
             update_navigation()
             return
         try:
-            latest['query'] = controller.request_config_search_page(latest['job'], latest['offsets'][-1], 50)
+            sort = dict(sort_by=latest['sort_by'], descending=latest['descending']) if latest['sort_by'] else {}
+            filtering = dict(filter_by=latest['filter_by'], filter_text=latest['filter_text']) if latest['filter_by'] else {}
+            latest['query'] = controller.request_config_search_page(latest['job'], latest['offsets'][-1], 50, **sort, **filtering)
             results_message.set_text('Loading matches…')
         except (ValueError, RuntimeError, OSError, EOFError):
             latest['page'] = {'status': 'unavailable'}
@@ -317,7 +357,10 @@ def render_config_search(controller):
                 focus_target = ("document.querySelector('[data-config-results]')" if job else
                                 f"document.getElementById('{terms.html_id}')?.querySelector('textarea')")
                 await preserve_replaced_focus('data-config-results-body', focus_target)
-                latest.update(job=job, page=None, offsets=[0])
+                latest.update(job=job, page=None, offsets=[0], sort_by=None, descending=False, sort_focus=None,
+                              filter_by=None, filter_text='')
+                filter_value.set_value('')
+                filter_field.set_value('device')
                 await request_page()
                 await draw_results.refresh()
             if latest['query']:
@@ -328,10 +371,20 @@ def render_config_search(controller):
                     latest['page'] = page
                     if page.get('status') == 'ready':
                         rows = page['rows']
-                        results_message.set_text(f"Showing {page['offset'] + 1}–{page['offset'] + len(rows)} of {page['total']} matches." if rows else 'No configuration matches.')
+                        if rows:
+                            scope = f" (of {page['overall_total']} total)" if latest['filter_by'] and 'overall_total' in page else ''
+                            results_message.set_text(f"Showing {page['offset'] + 1}–{page['offset'] + len(rows)} of {page['total']} matches{scope}.")
+                        else:
+                            total = page.get('overall_total')
+                            message = (f"No matches for this filter (of {total} total)." if total is not None else 'No matches for this filter.') + ' Clear filter to see all results.'
+                            results_message.set_text(message if latest['filter_by'] else 'No configuration matches.')
                     else:
                         results_message.set_text('Results are unavailable. Run the search again.')
                     await draw_results.refresh()
+                    if latest['sort_focus']:
+                        selector = json.dumps(f"[data-config-sort='{latest['sort_focus']}']")
+                        client.run_javascript(f"if (document.activeElement === document.body) document.querySelector({selector})?.focus();")
+                        latest['sort_focus'] = None
                     update_navigation()
 
     def release_query():

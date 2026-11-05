@@ -53,6 +53,46 @@ class DemobPreviewPage:
     next_offset: Optional[int]
 
 
+def ordered_page_rows(rows, *, value, sort_by=None, descending=False, filter_by=None, filter_text='',
+                      numeric=(), addresses=()):
+    """Filter and stably sort a copy, keeping absent values last in either direction."""
+    selected = list(rows)
+    if filter_by is not None and filter_text:
+        needle = filter_text.casefold()
+        selected = [row for row in selected if needle in str('' if value(row, filter_by) is None else value(row, filter_by)).casefold()]
+    if sort_by is None:
+        return selected
+    present = [row for row in selected if value(row, sort_by) not in (None, '')]
+    absent = [row for row in selected if value(row, sort_by) in (None, '')]
+    if sort_by in numeric:
+        numbers, other = [], []
+        for row in present:
+            try:
+                number = float(value(row, sort_by))
+                if not math.isfinite(number):
+                    raise ValueError('not finite')
+                numbers.append((row, number))
+            except (ValueError, TypeError, OverflowError):
+                other.append(row)
+        return ([row for row, _ in sorted(numbers, key=lambda pair: pair[1], reverse=descending)] +
+                sorted(other, key=lambda row: str(value(row, sort_by)).casefold(), reverse=descending) + absent)
+    def key(row):
+        item = value(row, sort_by)
+        if sort_by in addresses:
+            try:
+                net = ipaddress.ip_network(str(item), strict=False)
+                return (0, net.version, int(net.network_address), net.prefixlen)
+            except ValueError:
+                return (1, str(item).casefold())
+        return str(item).casefold()
+    return sorted(present, key=key, reverse=descending) + absent
+
+
+def page_reserve(extra):
+    """Reserve bytes when the outer response exceeds its 1 KiB allowance."""
+    return max(0, len(json.dumps(extra, ensure_ascii=False).encode('utf-8')) - 1024 + 8)
+
+
 def demob_scope_within_limits(scope: DemobSearchScope) -> bool:
     """Apply the same admission limits before preview and before scanning."""
     from .config_search import _valid_inputs
@@ -106,15 +146,32 @@ class DemobPreviewVault:
             return None
         return entry if hmac.compare_digest(candidate, digest) else None
 
-    def page(self, token: str, *, offset: int, limit: int) -> Optional[DemobPreviewPage]:
+    def page(self, token: str, *, offset: int, limit: int, sort_by=None, descending=False,
+             filter_by=None, filter_text='', include_metadata=False, reserve_bytes=0) -> Optional[DemobPreviewPage]:
         """Return a bounded copy without consuming it, including page-envelope bytes."""
-        if type(offset) is not int or type(limit) is not int or offset < 0 or not 1 <= limit <= self._max_page_rows:
+        if (type(offset) is not int or type(limit) is not int or offset < 0 or not 1 <= limit <= self._max_page_rows
+                or type(descending) is not bool or type(filter_text) is not str or len(filter_text) > 256
+                or type(reserve_bytes) is not int or reserve_bytes < 0):
+            return None
+        byte_budget = self._max_page_bytes - reserve_bytes
+        if byte_budget <= 0:
             return None
         with self._lock:
             entry = self._match(token)
             if entry is None:
                 return None
-            rows = entry[3]
+            original = entry[3]
+            columns = list(dict.fromkeys(key for row in original for key in row))
+            if (sort_by is not None and sort_by not in columns or filter_by is not None and filter_by not in columns
+                    or filter_text and filter_by is None):
+                return None
+            rows = ordered_page_rows(original, value=lambda row, key: row.get(key), sort_by=sort_by,
+                                     descending=descending, filter_by=filter_by, filter_text=filter_text,
+                                     numeric=('DHCP utilization %',), addresses=('network',))
+            if include_metadata and len(json.dumps(dict(rows=[], total=len(rows), next_offset=None,
+                                                       columns=columns, overall_total=len(original)),
+                                                   ensure_ascii=False).encode('utf-8')) > byte_budget:
+                return None
             if offset > len(rows):
                 return None
             page = []
@@ -125,13 +182,19 @@ class DemobPreviewVault:
                 end = offset + len(page) + 1
                 next_offset = end if end < len(rows) else None
                 envelope = {'rows': [], 'total': len(rows), 'next_offset': next_offset}
+                if include_metadata:
+                    envelope.update(columns=columns, overall_total=len(original))
                 envelope_size = len(json.dumps(envelope, ensure_ascii=False).encode('utf-8'))
-                if envelope_size + candidate_size > self._max_page_bytes:
+                if envelope_size + candidate_size > byte_budget:
                     break
                 page.append(dict(row))
                 rows_size = candidate_size
             end = offset + len(page)
-            return DemobPreviewPage(page, len(rows), end if end < len(rows) else None)
+            if include_metadata and not page and end < len(rows):
+                return None
+            result = DemobPreviewPage(page, len(rows), end if end < len(rows) else None)
+            result.columns, result.overall_total = columns, len(original)
+            return result
 
     def consume(self, token: str) -> Optional[DemobSearchScope]:
         with self._lock:
@@ -278,12 +341,17 @@ class DemobPreviewVault:
         except UnicodeEncodeError:
             return DemobPreview(site, 'invalid', 'Subnet lookup returned an invalid record.')
         total = len(shown_rows)
-        page_sizes = [size + len(json.dumps({'rows': [], 'total': total,
-                                            'next_offset': i + 1 if i + 1 < total else None},
-                                           ensure_ascii=False).encode('utf-8'))
-                      for i, size in enumerate(shown_sizes)]
+        columns = list(dict.fromkeys(key for row in shown_rows for key in row))
+        if any(not 0 < len(key) <= 1024 for key in columns):
+            return DemobPreview(site, 'limit', 'Subnet lookup exceeds the preview limit; narrow the lookup.')
+        largest = max(columns, key=lambda key: len(json.dumps(key, ensure_ascii=False).encode('utf-8')), default='')
+        reserve = page_reserve(dict(query_id='\\' * 128, offset=10000, status='ready', sort_by=largest,
+                                    descending=False, filter_by=largest, filter_text='\0' * 256))
+        longest_next = total if len(str(total)) > 4 else None
+        page_overhead = len(json.dumps({'rows': [], 'total': total, 'overall_total': total, 'columns': columns,
+                                        'next_offset': longest_next}, ensure_ascii=False).encode('utf-8'))
         shown_bytes = 2 + sum(shown_sizes) + 2 * max(total - 1, 0)
-        if any(size > self._max_page_bytes for size in page_sizes) or shown_bytes + notice_bytes > self._max_bytes:
+        if any(size + page_overhead + reserve > self._max_page_bytes for size in shown_sizes) or shown_bytes + notice_bytes > self._max_bytes:
             return DemobPreview(site, 'limit', 'Subnet lookup exceeds the preview limit; narrow the lookup.')
         if control is not None:
             control.checkpoint()

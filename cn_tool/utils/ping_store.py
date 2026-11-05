@@ -284,6 +284,11 @@ def _host_names(text: str) -> Iterator[str]:
 # Cap work per array as well as output size. Very large arrays have an unknown
 # count; the first few targets may still be useful to identify the request.
 _HISTORY_ARRAY_CHARS = 8192
+# Full-value searches and round scans may handle normal /112-sized rounds, but
+# never pull unbounded legacy/corrupt JSON from SQLite into the web worker.
+_HISTORY_SEARCH_CHARS = 8 * 1024 * 1024
+_HISTORY_ROUND_CHARS = 8 * 1024 * 1024
+_HISTORY_SORT_WORK_CHARS = 16 * 1024 * 1024
 _HISTORY_PREVIEW_ITEMS = 3
 _HISTORY_PREVIEW_CHARS = 80
 
@@ -773,6 +778,250 @@ class PingStore:
             raise StoreError(f"cannot write {self.path}: no run {run_id}")
 
     # --- reader ----------------------------------------------------------------------------------
+
+    def sorted_history_page(self, kind, parent, *, sort, descending, filter_field, filter_text='',
+                            limit=50, after=None, transform=None):
+        """Return a bounded page over saved requests or runs, expiring cursors on changes."""
+        import functools
+        import hashlib
+        import heapq
+        from datetime import datetime, timezone
+
+        fields = {'requests': ('targets', 'ports', 'hosts'), 'runs': ('started', 'status', 'rounds', 'interval')}
+        if (kind not in fields or sort not in ('', *fields[kind]) or filter_field not in fields[kind] or
+                type(descending) is not bool or not isinstance(filter_text, str) or len(filter_text) > 256 or
+                type(limit) is not int or not 1 <= limit <= 100 or
+                (kind == 'requests' and parent is not None) or
+                (kind == 'runs' and not _history_integer(parent)) or
+                (after is not None and (not isinstance(after, (list, tuple)) or len(after) != 2 or
+                 (not _history_integer(after[0]) if kind == 'requests' else not isinstance(after[0], str)) or
+                 not isinstance(after[1], str) or not re.fullmatch(r'[0-9a-f]{64}', after[1])))):
+            raise ValueError('invalid sorted history request')
+        with self._transaction(write=False) as connection:
+            if kind == 'runs' and not connection.execute('SELECT 1 FROM request WHERE id = ?', (parent,)).fetchone():
+                raise HistoryExpired()
+            def rows():
+                if kind == 'requests':
+                    needed = {field for field in ('targets', 'ports')
+                              if sort == field or (filter_text and filter_field == field)}
+                    query = connection.execute(
+                        'SELECT id, substr(key, 1, 65), substr(targets, 1, ?), substr(tcp_ports, 1, ?), length(hosts),'
+                        ' CASE WHEN ? THEN substr(targets, 1, ?) END, CASE WHEN ? THEN substr(tcp_ports, 1, ?) END'
+                        ' FROM request ORDER BY id',
+                        (_HISTORY_ARRAY_CHARS + 1, _HISTORY_ARRAY_CHARS + 1) + tuple(value for field in ('targets', 'ports')
+                            for value in (field in needed, _HISTORY_SEARCH_CHARS + 1)))
+                    sort_work = 0
+                    for request_id, key, targets, ports, hosts_length, full_targets, full_ports in query:
+                        for data in (full_targets, full_ports):
+                            if isinstance(data, (str, bytes)):
+                                sort_work += len(data)
+                            if sort_work > _HISTORY_SORT_WORK_CHARS:
+                                raise HistoryTooLarge()
+                        for name, data in (('targets', full_targets), ('ports', full_ports)):
+                            if name in needed and isinstance(data, (str, bytes)) and len(data) > _HISTORY_SEARCH_CHARS:
+                                raise HistoryTooLarge()
+                        targets_preview, target_count = _request_array_summary(targets)
+                        ports_preview, port_count = _request_array_summary(ports, ports=True)
+                        host_count = None
+                        if isinstance(hosts_length, int):
+                            host_too_large = (hosts_length > _HISTORY_ROUND_CHARS or
+                                              sort_work + hosts_length > _HISTORY_SORT_WORK_CHARS)
+                            if host_too_large and (sort == 'hosts' or (filter_text and filter_field == 'hosts')):
+                                raise HistoryTooLarge()
+                            if not host_too_large:
+                                sort_work += hosts_length
+                                hosts = connection.execute('SELECT hosts FROM request WHERE id = ?', (request_id,)).fetchone()[0]
+                                try:
+                                    host_count = sum(1 for _ in _host_names(hosts))
+                                except (ValueError, TypeError, RecursionError):
+                                    pass
+                        item = dict(id=request_id, key=key if isinstance(key, str) and len(key) <= 64 else '',
+                                    targets_preview=targets_preview, ports_preview=ports_preview,
+                                    target_count=target_count, port_count=port_count, host_count=host_count)
+                        target_values = tuple(targets_preview) if target_count is not None else None
+                        if 'targets' in needed and isinstance(full_targets, str):
+                            try:
+                                target_values = tuple(_host_names(full_targets))
+                            except ValueError:
+                                target_values = None
+                        port_values = tuple(ports_preview) if port_count is not None else None
+                        if 'ports' in needed and isinstance(full_ports, str):
+                            try:
+                                decoded = json.loads(full_ports)
+                                if not isinstance(decoded, list) or any(type(port) is not int or not 1 <= port <= 65535 for port in decoded):
+                                    raise ValueError('invalid ports')
+                                port_values = tuple(decoded)
+                            except (ValueError, TypeError, RecursionError):
+                                port_values = None
+                        values = dict(targets=target_values, ports=port_values, hosts=host_count)
+                        yield item, values
+                else:
+                    query = connection.execute(f'SELECT {_RUN_COLUMNS} FROM run WHERE run.request_id = ? ORDER BY run.started, run.id', (parent,))
+                    for row in query:
+                        item = dict(zip(RunInfo.__dataclass_fields__, row))
+                        if transform is not None:
+                            item = transform(item)
+                        yield item, {key: item[key] for key in fields[kind]}
+            def display(value, field, item):
+                if kind == 'requests' and field == 'hosts' and item['host_count'] is None:
+                    return 'unavailable'
+                if kind == 'requests' and field in ('targets', 'ports'):
+                    count = item['target_count' if field == 'targets' else 'port_count']
+                    preview = item['targets_preview' if field == 'targets' else 'ports_preview']
+                    if value is None:
+                        return (', '.join(str(part) for part in preview) + ' (total unavailable)') if preview else 'unavailable'
+                    text = ', '.join(str(part) for part in value) if value else 'None'
+                    return text + (' (total unavailable)' if count is None and preview else '')
+                if value is None:
+                    return 'One round' if field == 'interval' else 'unavailable' if kind == 'requests' else ''
+                if field == 'started':
+                    try:
+                        return datetime.fromtimestamp(value, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+                    except (OverflowError, OSError, ValueError):
+                        return str(value)
+                if field == 'interval':
+                    return f'{value:g}s'
+                return str(value)
+            def key(pair):
+                item, values = pair
+                return values[sort] if sort else ((item['started'], item['id']) if kind == 'runs' else item['id'])
+            def compare(left, right):
+                a, b = key(left), key(right)
+                if (a is None) != (b is None):
+                    return 1 if a is None else -1
+                if isinstance(a, str):
+                    a, b = a.casefold(), b.casefold()
+                elif kind == 'requests' and sort == 'targets' and a is not None:
+                    a, b = tuple(part.casefold() for part in a), tuple(part.casefold() for part in b)
+                order = 0 if a is None else (a > b) - (a < b)
+                if descending:
+                    order = -order
+                left_tie = (left[0]['started'], left[0]['id']) if kind == 'runs' else left[0]['id']
+                right_tie = (right[0]['started'], right[0]['id']) if kind == 'runs' else right[0]['id']
+                return order or ((left_tie > right_tie) - (left_tie < right_tie))
+            digest = hashlib.sha256()
+            anchor = None
+            for item, values in rows():
+                digest.update(json.dumps([item, values], ensure_ascii=True, separators=(',', ':'), allow_nan=False).encode('ascii'))
+                if after is not None and item['id'] == after[0]:
+                    anchor = (item, values)
+            signature = digest.hexdigest()
+            if after is not None and (anchor is None or after[1] != signature):
+                raise HistoryExpired()
+            total = 0
+            pattern = filter_text.casefold()
+            def selected():
+                nonlocal total
+                for pair in rows():
+                    if pattern not in display(pair[1][filter_field], filter_field, pair[0]).casefold():
+                        continue
+                    total += 1
+                    if anchor is None or compare(pair, anchor) > 0:
+                        yield pair
+            items = heapq.nsmallest(limit + 1, selected(), key=functools.cmp_to_key(compare))
+            cursor = (items[limit - 1][0]['id'], signature) if len(items) > limit else None
+            return dict(items=[item for item, _ in items[:limit]], next_cursor=cursor, total=total)
+
+    def sorted_round_hosts(self, round_id, *, sort, descending, group='all', filter_field='host',
+                           filter_text='', limit=50, after=None):
+        """Scan a round with bounded page memory; a changed source invalidates continuation."""
+        import functools
+        import hashlib
+        import heapq
+        import ipaddress
+
+        fields = ('host', 'status', 'address', 'result')
+        if (not _history_integer(round_id) or sort not in ('', *fields) or type(descending) is not bool or
+                group not in ('all', 'answered', 'no_response', 'problem', 'other') or
+                filter_field not in fields or not isinstance(filter_text, str) or len(filter_text) > 256 or
+                type(limit) is not int or not 1 <= limit <= 100 or
+                (after is not None and (not isinstance(after, (list, tuple)) or len(after) != 2 or
+                 not _history_integer(after[0], 0) or not isinstance(after[1], str) or
+                 not re.fullmatch(r'[0-9a-f]{64}', after[1])))):
+            raise ValueError('invalid sorted history request')
+        with self._transaction(write=False) as connection:
+            found = connection.execute(
+                "SELECT substr(request.hosts, 1, ?), substr(round.observations, 1, ?)"
+                " FROM round JOIN run ON run.id = round.run_id"
+                " JOIN request ON request.id = run.request_id WHERE round.id = ?",
+                (_HISTORY_ROUND_CHARS + 1, _HISTORY_ROUND_CHARS + 1, round_id)
+            ).fetchone()
+            if found is None:
+                raise HistoryExpired()
+            hosts, observations = found
+            if not isinstance(hosts, str) or not isinstance(observations, str):
+                raise StoreError(f'cannot read {self.path}: invalid round arrays')
+            if len(hosts) > _HISTORY_ROUND_CHARS or len(observations) > _HISTORY_ROUND_CHARS:
+                raise HistoryTooLarge()
+            def rows():
+                try:
+                    for index, host in enumerate(_host_names(hosts)):
+                        detail = connection.execute(
+                            'SELECT substr(address, 1, ?), substr(result, 1, ?) FROM result WHERE round_id = ? AND host = ?',
+                            (_HISTORY_ARRAY_CHARS + 1, _HISTORY_ARRAY_CHARS + 1, round_id, host)).fetchone()
+                        if detail and any(isinstance(part, (str, bytes)) and len(part) > _HISTORY_ARRAY_CHARS for part in detail):
+                            raise HistoryTooLarge()
+                        yield dict(index=index, host=host, observation=observations[index:index + 1],
+                                   address=detail[0] if detail else None, result=detail[1] if detail else None)
+                except (TypeError, ValueError) as error:
+                    raise StoreError(f'cannot read {self.path}: invalid hosts array') from error
+            def category(row):
+                flag = row['observation']
+                return ('answered' if flag in ('!', 'R', 'T') else 'no_response' if flag == '.' else
+                        'problem' if flag in ('E', '?', 'U') else 'other')
+            def value(row, field):
+                if field == 'status':
+                    return {'!': 'Replied', 'R': 'Rejected', 'T': 'TCP reply', 'U': 'Unreachable',
+                            '.': 'No response', 'E': 'Probe error', '?': 'DNS failed'}.get(row['observation'], 'Unknown')
+                return row.get(field) or ('—' if field in ('address', 'result') else '')
+            def sort_value(row):
+                raw = value(row, sort) if sort else row['index']
+                if sort in ('host', 'address') and raw:
+                    try:
+                        address = ipaddress.ip_address(raw)
+                        return (0, address.version, int(address))
+                    except ValueError:
+                        pass
+                return (1, str(raw).casefold()) if sort else (0, raw)
+            def compare(left, right):
+                if sort:
+                    lm, rm = (not left.get(sort), not right.get(sort)) if sort in ('address', 'result') else (not value(left, sort), not value(right, sort))
+                    if lm != rm:
+                        return 1 if lm else -1
+                a, b = sort_value(left), sort_value(right)
+                ordering = (a > b) - (a < b)
+                if descending:
+                    ordering = -ordering
+                return ordering or ((left['index'] > right['index']) - (left['index'] < right['index']))
+            digest = hashlib.sha256()
+            anchor = None
+            counts = dict(answered=0, no_response=0, problem=0, other=0)
+            for row in rows():
+                digest.update(json.dumps(row, ensure_ascii=True, separators=(',', ':')).encode('ascii'))
+                counts[category(row)] += 1
+                if after is not None and row['index'] == after[0]:
+                    anchor = row
+            signature = digest.hexdigest()
+            if after is not None and (anchor is None or after[1] != signature):
+                raise HistoryExpired()
+            pattern = filter_text.casefold()
+            total = 0
+            def selected():
+                nonlocal total
+                for row in rows():
+                    if group != 'all' and category(row) != group:
+                        continue
+                    text = str(value(row, filter_field)).casefold()
+                    explanation = ({'T': 'Answered on TCP', '?': 'DNS name did not resolve'}
+                                   .get(row['observation'], '').casefold() if filter_field == 'status' else '')
+                    if pattern not in text and pattern not in explanation:
+                        continue
+                    total += 1
+                    if anchor is None or compare(row, anchor) > 0:
+                        yield row
+            items = heapq.nsmallest(limit + 1, selected(), key=functools.cmp_to_key(compare))
+            next_cursor = (items[limit - 1]['index'], signature) if len(items) > limit else None
+            return dict(items=items[:limit], next_cursor=next_cursor, counts=counts, total=total)
 
     def history_page(
         self, kind: str, parent: Any = None, *, after: Any = None, limit: int = 100,

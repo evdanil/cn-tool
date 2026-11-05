@@ -17,10 +17,20 @@ and setup](infoblox.md#access-and-setup) requirements before using them.
 | Released 0.8.4 | Subnets |
 | 0.9.0 | Subnets, IP, Ping, Monitor, Configuration Search and Site Demobilization |
 | 0.9.1 | The same tools, with live Monitor progress and history management |
-| 0.9.2 (this source) | The same tools, with compact results and improved navigation |
+| 0.9.2 | The same tools, with compact results and improved navigation |
+| 0.9.3 (this source) | Column sorting and field filters, with Ping and Monitor outcome summaries |
 
 The browser tools beyond Subnets are available in 0.9.0 and are not part of 0.8.4.
 The menu and CLI have their own established workflows.
+
+## Sorting and filtering results in 0.9.3
+
+Select a column heading to sort and select it again to reverse the order. Use the
+field filter to match text without regard to case; clear the filter to restore the
+rows. Sorting and filtering apply across all result pages without changing reports.
+Ping and Monitor offer outcome counts to narrow host results. Filtering a Site
+Demobilization preview changes only the display; the configuration scan still uses
+all eligible discovered networks.
 
 ## Installation and launch
 

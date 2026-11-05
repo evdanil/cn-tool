@@ -16,7 +16,14 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
-## 0.9.2 (this source)
+## 0.9.3 (this source)
+
+Result tables support column sorting and case-insensitive field filtering across
+all pages. Ping and Monitor offer compact outcome summaries. Filtering a Site
+Demobilization preview does not change the networks included in its scan. See the
+[WebUI guide](webui.md).
+
+## 0.9.2
 
 The browser interface uses compact, paged results for Monitor, Ping, IP,
 Subnets, Configuration Search and Site Demobilization. Monitor separates live
