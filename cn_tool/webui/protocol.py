@@ -4,6 +4,8 @@ import math
 import re
 
 FIELDS = {
+    'delete_report': {'request_id'},
+    'report_delete_result': {'request_id', 'status', 'message', 'report_state'},
     'initialize': {'config_file'}, 'credentials_reply': {'request_id', 'reply', 'remember'}, 'forget_credentials': set(),
     'lookup': {'inputs', 'lookup_type', 'tcp_ports', 'interval_seconds', 'duration_seconds'}, 'cancel': set(), 'snapshot_report': {'request_id'}, 'shutdown': {'interrupted'},
     'ready': {'scope', 'username', 'report_warning', 'report_state'}, 'setup_required': {'message', 'code'},
@@ -33,7 +35,7 @@ for _kind in ('demob_page', 'demob_page_result', 'config_search_page', 'config_s
     FIELDS[_kind] |= _PAGE_OPTIONS
 FIELDS['demob_page_result'] |= {'columns', 'overall_total'}
 FIELDS['config_search_page_result'] |= {'overall_total'}
-COMMANDS = frozenset(('initialize', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_history', 'monitor_coverage_export', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
+COMMANDS = frozenset(('delete_report', 'initialize', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_history', 'monitor_coverage_export', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
 
 
 def envelope(session_id, job_id, kind, payload):
@@ -148,6 +150,13 @@ def valid_monitor_history_item(kind, item):
                 text(item['note']))
     return False
 
+def _valid_report_state(report):
+    fields = {'state', 'status', 'filename', 'message', 'available', 'saved_for_attempt'}
+    return (isinstance(report, dict) and set(report) == fields
+            and all(isinstance(report[key], str) for key in fields - {'available', 'saved_for_attempt'})
+            and all(type(report[key]) is bool for key in {'available', 'saved_for_attempt'}))
+
+
 def validate(message):
     if not isinstance(message, dict) or set(message) != {'version', 'session_id', 'job_id', 'kind', 'payload'}:
         raise ValueError('Invalid envelope')
@@ -160,6 +169,19 @@ def validate(message):
     kind, payload = message['kind'], message['payload']
     if not isinstance(kind, str) or kind not in FIELDS or not isinstance(payload, dict) or set(payload) - FIELDS[kind]:
         raise ValueError('Invalid message kind or payload fields')
+    if kind in {'delete_report', 'report_delete_result'}:
+        if message['job_id'] is not None or set(payload) != FIELDS[kind]:
+            raise ValueError('Invalid report deletion envelope')
+        request_id = payload['request_id']
+        if (not isinstance(request_id, str) or not 1 <= len(request_id) <= 128 or
+                not request_id.isascii() or not request_id.isprintable()):
+            raise ValueError('Invalid report deletion request ID')
+        if kind == 'report_delete_result' and (
+                payload['status'] not in ('deleted', 'missing', 'busy', 'failed', 'cancelled') or
+                not isinstance(payload['message'], str) or len(payload['message']) > 512 or
+                not _valid_report_state(payload['report_state'])):
+            raise ValueError('Invalid report deletion result')
+        return message
     if kind in {'monitor_delete', 'monitor_delete_result'}:
         if message['job_id'] is not None or set(payload) != FIELDS[kind]:
             raise ValueError('Invalid deletion envelope')
@@ -556,10 +578,7 @@ def validate(message):
             raise ValueError('Invalid outcome details') from exc
     report = payload.get('report_state') if kind == 'ready' else payload.get('state') if kind == 'report_state' else None
     if kind == 'report_state' or (kind == 'ready' and 'report_state' in payload):
-        fields = {'state', 'status', 'filename', 'message', 'available', 'saved_for_attempt'}
-        if (not isinstance(report, dict) or set(report) != fields
-                or any(not isinstance(report[key], str) for key in fields - {'available', 'saved_for_attempt'})
-                or any(type(report[key]) is not bool for key in {'available', 'saved_for_attempt'})):
+        if not _valid_report_state(report):
             raise ValueError('Invalid report state')
     if (kind in {'lookup', 'cancel', 'result', 'progress', 'report_state', 'lookup_context', 'credentials_required', 'monitor_update'}
             or (kind == 'error' and message['job_id'] is not None)) and not message['job_id']:

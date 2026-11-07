@@ -7,6 +7,8 @@ from html import escape
 from cn_tool.utils import oscompat
 
 from .subnets import CSS, report_display
+from .controller import ReportDeletionInProgress
+from .report_actions import render_report_delete
 
 
 def render_demob(controller):
@@ -55,7 +57,7 @@ def render_demob(controller):
 .cn-demob-source dl { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; margin:8px 0 0; }
 .cn-demob-source dt { font-weight:600; }
 .cn-demob-source dd { margin:0; overflow-wrap:anywhere; }
-.cn-demob-report { display:flex; width:100%; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; }
+.cn-demob-report { display:flex; width:100%; align-items:center; justify-content:flex-start; flex-wrap:wrap; gap:16px; }
 .cn-demob-scroll-help { display:none; font-size:12px; }
 @media(max-width:600px) {
   .cn-demob-setup { padding:12px; }
@@ -131,6 +133,9 @@ def render_demob(controller):
                 return
             try:
                 controller.submit_demob_lookup(value)
+            except ReportDeletionInProgress as refusal:
+                error.set_text(str(refusal))
+                return
             except RuntimeError:
                 error.set_text('Another operation is running or the session is unavailable. Wait for it to finish or relaunch the application.')
                 return
@@ -257,9 +262,14 @@ def render_demob(controller):
     async def confirm(token):
         try:
             controller.confirm_demob_search(token)
-        except (ValueError, RuntimeError, OSError, EOFError):
+        except RuntimeError as refusal:
+            # A refusal (a running deletion, another tab's work) leaves the preview untouched, and a note would be
+            # hidden behind it: say what is wrong, not that the preview expired.
+            error.set_text(str(refusal) or 'Another operation is running. Try again when it finishes.')
+        except (ValueError, OSError, EOFError):
             latest['note'] = 'Preview expired or is unavailable. Look up the site again.'
         else:
+            error.set_text('')
             latest['note'] = ''
         await poll()
 
@@ -281,6 +291,11 @@ def render_demob(controller):
                 button._props['data-demob-pager-position'] = position
                 button.set_enabled(enabled)
 
+    def search_enabled():
+        # A running deletion disables confirmation without discarding the preview it would use.
+        page = latest['preview_page']
+        return not latest.get('delete_pending') and not oscompat.is_macos() and bool(page and page.get('status') == 'ready')
+
     @ui.refreshable
     def draw_preview():
         preview = latest['preview']
@@ -296,7 +311,8 @@ def render_demob(controller):
                     if latest['preview_filter_by']:
                         ui.label('Filtering changes only the display. Search covers all discovered networks.').classes('cn-muted')
                     search = ui.button('Search configurations', on_click=lambda: confirm(preview['token']))
-                    search.set_enabled(not oscompat.is_macos() and bool(page and page.get('status') == 'ready'))
+                    latest['search_button'] = search
+                    search.set_enabled(search_enabled())
                     ui.button('Decline', on_click=lambda: decline(preview['token'])).props('outline')
                 if oscompat.is_macos():
                     ui.label('Configuration scans are unavailable on macOS.').classes('text-warning')
@@ -342,9 +358,12 @@ def render_demob(controller):
             except (RuntimeError, OSError, EOFError):
                 latest['download_error'] = 'Report download is unavailable.'
         with ui.element('div').classes('cn-demob-report'):
-            report = ui.html('').props('role=status aria-live=polite').classes('cn-muted')
-            download = ui.button('Download accumulated report', on_click=download_report).props('outline dense')
-            download.disable()
+            report = ui.html('').props('role=status aria-live=polite tabindex=-1 data-report-status').classes('cn-muted')
+            # One group: the buttons and the delete status stay together, after the report text.
+            with ui.row().classes('items-center'):
+                download = ui.button('Download accumulated report', on_click=download_report).props('outline dense')
+                download.disable()
+                report_delete = render_report_delete(controller, dense=True)
         with ui.element('details').classes('cn-demob-help'):
             with ui.element('summary'):
                 ui.label('About report contents').classes('inline')
@@ -507,6 +526,9 @@ u.value = ''; if (p) p.value = ''; emit(reply);
             page_state = controller.page_snapshot('demob', result_revision=latest['result_revision'],
                                                   attempt_revision=latest['attempt_revision'])
             state = page_state.state
+            await report_delete.update(state)
+            deleting = state.report_delete_pending
+            latest['delete_pending'] = deleting
             phase = state.phase
             active = bool(state.active_job_id and state.active_lookup_type == 'demob')
             message = {'ready': 'Ready', 'starting': 'Starting application…', 'stopping': 'Stopping…',
@@ -523,7 +545,7 @@ u.value = ''; if (p) p.value = ''; emit(reply);
             scope_label.set_text(f"{state.scope or 'Configured scope pending'} | Account: {state.username or 'pending'}")
             report_warning.set_text(state.report_warning or '')
             store_status.set_text((state.credential_store or {}).get('message', ''))
-            run.set_enabled(phase == 'ready' and not state.active_job_id)
+            run.set_enabled(not deleting and phase == 'ready' and not state.active_job_id)
             stop.set_visibility(active and phase in {'running', 'stopping', 'saving'})
             stop.set_enabled(active and phase == 'running')
             forget.set_enabled(phase not in {'closing', 'closed', 'failed'})
@@ -593,6 +615,9 @@ u.value = ''; if (p) p.value = ''; emit(reply);
                             f"(document.querySelector({selector}) || document.querySelector({fallback}) || document.querySelector('[data-demob-network-page]:not([disabled])'))?.focus();"
                             "}")
                         latest['preview_focus'] = None
+            search = latest.get('search_button')
+            if search and not search.is_deleted:
+                search.set_enabled(search_enabled())
             discovery = state.demob_discovery
             if discovery != latest['discovery']:
                 latest['discovery'] = discovery
@@ -630,8 +655,11 @@ u.value = ''; if (p) p.value = ''; emit(reply);
             outcome.set_text(title)
             display = report_display(replace(state, latest_report_state=page_state.attempt_report_state or state.latest_report_state))
             report.set_content(escape(latest['download_error']) if latest['download_error'] else display['text'])
-            download.set_enabled(display['available'] and latest['download'] is None)
-            check_panel.set_visibility(bool(latest['outcome'] or discovery or page_state.result_job_id or display['available']))
+            download.set_enabled(not deleting and display['available'] and latest['download'] is None)
+            # A deletion in progress, or its outcome, is shown here even before any check has run.
+            check_panel.set_visibility(bool(latest['outcome'] or discovery or page_state.result_job_id
+                                            or display['available'] or deleting
+                                            or (state.report_state or {}).get('state') == 'deleted'))
             if latest['download']:
                 completion = controller.report_completion(latest['download']) or {}
                 if completion.get('status') == 'ready':
@@ -698,6 +726,9 @@ u.value = ''; if (p) p.value = ''; emit(reply);
             controller.release_demob_page(latest['preview_query'])
         if latest['result_query']:
             controller.release_config_search_page(latest['result_query'])
+        if latest['download']:
+            controller.release_report_request(latest['download'])
+            latest['download'] = None
     client.on_delete(release_queries)
     ui.timer(0, poll, once=True)
     ui.timer(.5, poll)

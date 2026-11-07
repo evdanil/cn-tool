@@ -9,6 +9,22 @@ from uuid import uuid4
 from .protocol import decode, encode, envelope, validate, valid_monitor_history_item
 
 
+def _remove_file(path):
+    """Remove a temporary download the worker prepared; one that is already gone, or locked, is not an error here."""
+    from pathlib import Path
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+class ReportDeletionInProgress(RuntimeError):
+    """Work refused only because a report deletion is running; the text is written for the user."""
+
+    def __init__(self):
+        super().__init__('Report deletion is in progress. Try again when it finishes.')
+
+
 @dataclass
 class SessionSnapshot:
     session_id: str
@@ -35,6 +51,8 @@ class SessionSnapshot:
     saved_login_restored: bool = False
     error: object = None
     report_snapshot: object = None
+    report_delete_pending: bool = False
+    report_snapshot_pending: bool = False
     scope: str = ''
     username: str = ''
     report_warning: str = ''
@@ -78,9 +96,15 @@ class SessionController:
         self._demob_requests = {}
         self._demob_pages = {}
         self._demob_expires = 0
+        self._report_delete_request = None
+        self._report_delete_abandoned = False
+        self._report_delete_results = {}
         self._report_requests = set()
+        # The workbook's own preparations: the CSV of Show Available is a request too, but it never reads the workbook.
+        self._workbook_snapshots = set()
         self._report_paths = {}
         self._report_completions = {}
+        self._report_streams = set()
         self._result_revisions = dict.fromkeys(('subnet', 'ip', 'ping', 'monitor', 'config_search', 'demob'), 0)
         self._attempt_revisions = dict.fromkeys(('subnet', 'ip', 'ping', 'monitor', 'config_search', 'demob'), 0)
 
@@ -140,14 +164,19 @@ class SessionController:
     def _send(self, kind, job_id, payload):
         if self._connection is None:
             raise RuntimeError('Session not started')
-        self._connection.send_bytes(encode(envelope(self.session_id, job_id, kind, payload)))
+        try:
+            self._connection.send_bytes(encode(envelope(self.session_id, job_id, kind, payload)))
+        except (OSError, EOFError):
+            with self._lock:
+                self._clear_report_requests()
+            raise
 
     def submit(self, inputs, lookup_type='subnet', *, tcp_ports=(), interval_seconds=60, duration_seconds=None):
         if lookup_type not in ('subnet', 'ip', 'ping', 'monitor', 'config_search'):
             raise ValueError('Invalid lookup type')
         with self._lock:
-            if self._state.phase != 'ready' or self._state.active_job_id:
-                raise RuntimeError('A lookup is already active or session is unavailable')
+            if self._state.phase != 'ready' or self._state.active_job_id or self._state.report_delete_pending:
+                raise self._lookup_refusal()
             job = uuid4().hex
             payload = {'inputs': inputs, 'lookup_type': lookup_type}
             if lookup_type in ('ping', 'monitor'):
@@ -191,9 +220,15 @@ class SessionController:
         self._demob_requests.clear()
         self._demob_pages.clear()
 
+    def _lookup_refusal(self):
+        """Why a lookup cannot start now; the caller holds the lock."""
+        if self._state.phase == 'ready' and not self._state.active_job_id and self._state.report_delete_pending:
+            return ReportDeletionInProgress()
+        return RuntimeError('A lookup is already active or session is unavailable')
+
     def _start_demob(self, kind, payload):
-        if self._state.phase != 'ready' or self._state.active_job_id:
-            raise RuntimeError('A lookup is already active or session is unavailable')
+        if self._state.phase != 'ready' or self._state.active_job_id or self._state.report_delete_pending:
+            raise self._lookup_refusal()
         job = uuid4().hex
         self._send(kind, job, payload)
         self._state.active_job_id = job
@@ -214,8 +249,8 @@ class SessionController:
 
     def submit_demob_lookup(self, site):
         with self._lock:
-            if self._state.phase != 'ready' or self._state.active_job_id:
-                raise RuntimeError('A lookup is already active or session is unavailable')
+            if self._state.phase != 'ready' or self._state.active_job_id or self._state.report_delete_pending:
+                raise self._lookup_refusal()
             # Invalidate the old preview even if the new input is invalid.
             if self._state.demob_preview and self._state.demob_preview['token']:
                 self._send('demob_decline', None, {})
@@ -225,6 +260,8 @@ class SessionController:
 
     def confirm_demob_search(self, token):
         with self._lock:
+            if self._state.report_delete_pending:
+                raise ReportDeletionInProgress()
             preview = self._state.demob_preview
             if not preview or monotonic() >= self._demob_expires or preview['token'] != token:
                 if preview and monotonic() >= self._demob_expires:
@@ -238,8 +275,8 @@ class SessionController:
     def discard_demob_for_replacement(self):
         """Invalidate the current preview for a replacement attempt, including blank input."""
         with self._lock:
-            if self._state.phase != 'ready' or self._state.active_job_id:
-                raise RuntimeError('A lookup is already active or session is unavailable')
+            if self._state.phase != 'ready' or self._state.active_job_id or self._state.report_delete_pending:
+                raise self._lookup_refusal()
             preview = self._state.demob_preview
             self._clear_demob()
             if preview and preview['token']:
@@ -463,13 +500,65 @@ class SessionController:
             self._config_requests.pop(query_id, None)
             self._config_pages.pop(query_id, None)
 
+    def request_report_delete(self) -> str:
+        """Reserve the shared workbook before sending a path-free deletion request."""
+        with self._lock:
+            if self._state.report_delete_pending:
+                raise ReportDeletionInProgress()
+            if (self._state.phase != 'ready' or self._state.active_job_id or self._state.report_snapshot_pending):
+                raise RuntimeError('The report is busy or the session is unavailable. Try again when it is ready.')
+            if not (self._state.report_state or {}).get('available'):
+                raise RuntimeError('No accumulated report exists.')
+            request_id = uuid4().hex
+            self._report_delete_request = request_id
+            self._report_delete_abandoned = False
+            self._state.report_delete_pending = True
+            try:
+                self._send('delete_report', None, {'request_id': request_id})
+            except BaseException:
+                self._report_delete_request = None
+                self._state.report_delete_pending = False
+                raise
+            return request_id
+
+    def report_delete_result(self, request_id: str) -> dict | None:
+        """Return a detached completion for the tab that requested deletion."""
+        with self._lock:
+            return deepcopy(self._report_delete_results.get(request_id))
+
+    def release_report_delete_result(self, request_id: str) -> None:
+        """Abandon local presentation without cancelling the shared operation."""
+        with self._lock:
+            self._report_delete_results.pop(request_id, None)
+            if request_id == self._report_delete_request:
+                self._report_delete_abandoned = True
+
+    def _clear_report_requests(self):
+        self._report_requests.clear()
+        self._workbook_snapshots.clear()
+        self._state.report_snapshot_pending = False
+        self._report_delete_request = None
+        self._state.report_delete_pending = False
+        self._report_delete_abandoned = False
+        self._report_delete_results.clear()
+
     def request_report_snapshot(self):
         with self._lock:
+            if self._state.report_delete_pending:
+                raise ReportDeletionInProgress()
             if self._state.phase not in {'ready', 'running', 'stopping', 'saving'}:
                 raise RuntimeError('Session unavailable')
             request_id = uuid4().hex
             self._report_requests.add(request_id)
-            self._send('snapshot_report', None, {'request_id': request_id})
+            self._workbook_snapshots.add(request_id)
+            self._state.report_snapshot_pending = True
+            try:
+                self._send('snapshot_report', None, {'request_id': request_id})
+            except BaseException:
+                self._report_requests.discard(request_id)
+                self._workbook_snapshots.discard(request_id)
+                self._state.report_snapshot_pending = bool(self._workbook_snapshots)
+                raise
             return request_id
 
     def request_coverage_export(self, parent):
@@ -498,12 +587,31 @@ class SessionController:
     def resolve_snapshot(self, request_id):
         """Private server download accessor; paths never enter browser snapshots."""
         with self._lock:
-            return self._report_paths[request_id]
+            path = self._report_paths[request_id]
+            self._report_streams.add(request_id)
+            return path
+
+    def release_report_request(self, request_id):
+        """A page that no longer wants a snapshot (a reset, or the page closing) gives it up. Its late completion is
+        dropped and its file removed on arrival. A file the browser is streaming is left to that stream's
+        ``release_snapshot``. The worker is still preparing a released workbook download, so
+        ``report_snapshot_pending`` stays true: its late reply clears it, not this call."""
+        with self._lock:
+            self._report_requests.discard(request_id)
+            if request_id not in self._report_streams:
+                self._remove_snapshot(request_id)
+
+    def _remove_snapshot(self, request_id):
+        path = self._report_paths.pop(request_id, None)
+        self._report_completions.pop(request_id, None)
+        if path is not None:
+            _remove_file(path)
 
     def release_snapshot(self, request_id):
         """Server calls after streaming finishes; the configured workbook is untouched."""
         from pathlib import Path
         with self._lock:
+            self._report_streams.discard(request_id)
             path = self._report_paths.get(request_id)
             if path is not None:
                 try:
@@ -541,7 +649,11 @@ class SessionController:
         if self._state.phase in {'setup_required', 'closing', 'failed', 'closed'}:
             report = dict(report, available=False)
         self._state.latest_report_state = report
-        self._state.report_state = report
+        # The current workbook and the latest attempt have independent lifetimes.
+        # A no-write attempt must not revive an older tool's saved-workbook label.
+        current = self._state.report_state or {}
+        if current.get('state') != 'deleted' or report.get('available'):
+            self._state.report_state = report
         lookup_type = self._state.active_lookup_type
         if lookup_type is not None:
             attempt = self._state.attempts_by_type[lookup_type]
@@ -593,6 +705,19 @@ class SessionController:
                 self._state.progress_stage = payload['stage']
                 self._state.progress_completed = payload['completed']
                 self._state.progress_total = payload['total']
+            elif kind == 'report_delete_result':
+                try:
+                    validate(event)
+                except (ValueError, TypeError):
+                    return
+                if payload['request_id'] != self._report_delete_request:
+                    return
+                self._report_delete_request = None
+                self._state.report_delete_pending = False
+                self._set_report_state(deepcopy(payload['report_state']))
+                if not self._report_delete_abandoned:
+                    self._report_delete_results[payload['request_id']] = deepcopy(payload)
+                self._report_delete_abandoned = False
             elif kind == 'monitor_delete_result':
                 try:
                     validate(event)
@@ -730,13 +855,23 @@ class SessionController:
                 if self._state.phase != 'closing':
                     self._state.phase = 'ready' if job else 'failed'
                     if not job:
+                        self._clear_report_requests()
                         self._clear_report_availability()
             elif kind == 'report_state':
                 self._set_report_state(payload['state'])
                 if payload['state'].get('state') == 'saving' and self._state.phase not in {'closing', 'stopping'}:
                     self._state.phase = 'saving'
-            elif kind == 'report_snapshot' and payload['request_id'] in self._report_requests:
+            elif kind == 'report_snapshot' and payload['request_id'] not in self._report_requests:
+                # Released before it was ready: nobody will download it, so the file goes now. The worker has
+                # finished preparing it, though, which is what report_snapshot_pending stands for.
+                self._workbook_snapshots.discard(payload['request_id'])
+                self._state.report_snapshot_pending = bool(self._workbook_snapshots)
+                if 'path' in payload:
+                    _remove_file(payload['path'])
+            elif kind == 'report_snapshot':
                 self._report_requests.remove(payload['request_id'])
+                self._workbook_snapshots.discard(payload['request_id'])
+                self._state.report_snapshot_pending = bool(self._workbook_snapshots)
                 public = {'request_id': payload['request_id']}
                 if 'path' in payload:
                     from pathlib import Path
@@ -747,6 +882,7 @@ class SessionController:
                 self._state.report_snapshot = public
                 self._report_completions[payload["request_id"]] = deepcopy(public)
             elif kind == 'closed':
+                self._clear_report_requests()
                 self._clear_demob()
                 self._state.demob_discovery = None
                 self._state.results_by_type['demob'] = None
@@ -766,6 +902,7 @@ class SessionController:
                 self._state.monitor_update = None
                 self._report_paths.clear()
                 self._report_completions.clear()
+                self._report_streams.clear()
                 self._state.active_job_id = None
                 self._state.active_lookup_type = None
 
@@ -779,6 +916,7 @@ class SessionController:
         except (EOFError, OSError, ValueError):
             with self._lock:
                 self._disconnected = True
+                self._clear_report_requests()
                 self._clear_demob()
                 self._state.demob_discovery = None
                 self._state.results_by_type['demob'] = None

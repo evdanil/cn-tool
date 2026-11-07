@@ -1039,13 +1039,14 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
     operation_lock = Lock()
     operation_stop = Event()
     snapshot_stop = Event()
+    report_delete_stop = Event()
     state = {'session': None, 'job': None, 'runtime': None, 'scope': None,
              'closing': False, 'initializing': False, 'initialization_failed': False, 'interrupted': False,
              'orphaned': False, 'thread': None, 'ready': False, 'saving': False,
              'report': None, 'job_type': None, 'monitor_cache': None,
              # Each slot is one independently bounded (10,000 rows / 8 MiB) completed search.
              'config_cache': {'config_search': None, 'demob': None},
-             'waiting_snapshot': False, 'demob_preview_job': None}
+             'waiting_snapshot': False, 'demob_preview_job': None, 'report_deleting': None, 'snapshot_active': False}
     def emit(kind, payload, job_id=None):
         try:
             with write_lock:
@@ -1054,6 +1055,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             state['orphaned'] = True
             operation_stop.set()
             snapshot_stop.set()
+            report_delete_stop.set()
     interaction = WorkerInteraction(lambda kind, payload: emit(kind, payload, state['job']), operation_stop)
     if interrupt is not None:
         def watch_for_interrupt():
@@ -1062,8 +1064,60 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             state['orphaned'] = True
             operation_stop.set()
             snapshot_stop.set()
+            report_delete_stop.set()
             interaction.close()
         Thread(target=watch_for_interrupt, daemon=True).start()
+
+    def update_report(report):
+        current = state['report'] or {}
+        if current.get('state') != 'deleted' or report['available']:
+            state['report'] = report
+
+    def report_delete_result(request, status, message):
+        """Emit the one terminal reply of an accepted request; reading the workbook's metadata never prevents it."""
+        runtime = state['runtime']
+        report_file = runtime.ctx.cfg.get('report_file') if runtime is not None else None
+        last_known = state['report'] or dict(state='idle', status='idle', filename='', message='',
+                                             available=False, saved_for_attempt=False)
+        if status in ('deleted', 'missing'):
+            # The workbook is gone: nothing to probe, and nothing a probe could say would change this.
+            report = dict(state='deleted', status='deleted', filename=Path(report_file).name if report_file else '',
+                          message=message, available=False, saved_for_attempt=False)
+            state['report'] = report
+        elif runtime is None:
+            report = dict(last_known)
+        else:
+            try:
+                report = report_state_for_context(runtime.ctx, last_known)
+            except Exception:
+                # An unreadable directory must not cost the user the reply: keep what was known before.
+                report = dict(last_known)
+                message = (message + ' The availability of the report could not be checked.')[:512]
+        emit('report_delete_result', dict(request_id=request['request_id'], status=status,
+                                          message=message, report_state=report))
+
+    def delete_report(request):
+        from .reports import delete_report as delete
+        try:
+            deleted = delete(state['runtime'].ctx, report_delete_stop)
+            status = 'deleted' if deleted else 'missing'
+            message = 'Accumulated report deleted.' if deleted else 'No accumulated report exists.'
+        except InterruptedError:
+            status, message = 'cancelled', 'Report deletion cancelled because the session is closing.'
+        except TimeoutError:
+            status, message = 'busy', 'The report is busy. Try again when saving or downloading finishes.'
+        except PermissionError:
+            status, message = 'failed', 'Close the report if it is open in Excel or another program, and check its permissions, then try again.'
+        except OSError:
+            status, message = 'failed', 'Could not delete the report. Check its directory and permissions, then try again.'
+        except Exception:
+            status, message = 'failed', 'Could not delete the report. Try again.'
+        # Publish completion before releasing admission to the next producer.
+        with operation_lock:
+            try:
+                report_delete_result(request, status, message)
+            finally:
+                state['report_deleting'] = None
 
     def initialize(payload):
         try:
@@ -1142,7 +1196,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 outcome = classify_lookup_outcome(result)
             report = report_state_for_context(state['runtime'].ctx, {
                 'state': 'idle', 'status': 'idle', 'message': 'Stopped lookup was not saved.'})
-            state['report'] = report
+            update_report(report)
             emit('report_state', {'state': report, 'lookup_type': lookup_type}, job)
             state['job'] = None
             emit('result', {'result': result, 'outcome': outcome, 'lookup_type': lookup_type}, job)
@@ -1218,7 +1272,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                             outcome['kind'] = 'partial'
                             outcome['message'] = 'Search completed with incomplete subnet discovery.'
                     report = report_state_for_context(runtime.ctx, report)
-                    state['report'] = report
+                    update_report(report)
                     emit('report_state', {'state': report, 'lookup_type': lookup_type}, job)
                     state['job'] = None
                     emit('result', {'result': result, 'outcome': outcome, 'lookup_type': lookup_type}, job)
@@ -1259,7 +1313,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                                miss_count=0, warning_count=int(bool(report.get('hook_error'))), stopped=stopped,
                                details={'hook_error': report['hook_error']} if report.get('hook_error') else {})
                 report = report_state_for_context(runtime.ctx, report)
-                state['report'] = report
+                update_report(report)
                 emit('report_state', {'state': report, 'lookup_type': lookup_type}, job)
                 state['job'] = None
                 emit('result', {'result': result, 'outcome': summary, 'lookup_type': lookup_type}, job)
@@ -1268,7 +1322,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 result, report = run_ping_lookup(runtime, module, payload['inputs'], payload['tcp_ports'], control)
                 outcome = classify_ping_outcome(result, report)
                 report = report_state_for_context(runtime.ctx, report)
-                state['report'] = report
+                update_report(report)
                 emit('report_state', {'state': report, 'lookup_type': lookup_type}, job)
                 state['job'] = None
                 emit('result', {'result': result, 'outcome': outcome, 'lookup_type': lookup_type}, job)
@@ -1360,7 +1414,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 interaction.discard()
                 rollback()
             report = report_state_for_context(runtime.ctx, report)
-            state['report'] = report
+            update_report(report)
             emit('report_state', {'state': report, 'lookup_type': payload['lookup_type']}, job)
             state['job'] = None
             emit('result', {'result': result, 'outcome': outcome, 'lookup_type': lookup_type}, job)
@@ -1393,9 +1447,15 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
     def report_snapshot(payload):
         try:
             path = snapshot_report(state['runtime'].ctx, Path(report_directory.name), snapshot_stop)
-            emit('report_snapshot', {'request_id': payload['request_id'], 'path': str(path), 'filename': Path(state['runtime'].ctx.cfg.get('report_file', path)).name})
+            result = {'request_id': payload['request_id'], 'path': str(path),
+                      'filename': Path(state['runtime'].ctx.cfg.get('report_file', path)).name}
         except Exception:
-            emit('report_snapshot', {'request_id': payload['request_id'], 'error': 'Could not prepare report download.'})
+            result = {'request_id': payload['request_id'], 'error': 'Could not prepare report download.'}
+        with operation_lock:
+            try:
+                emit('report_snapshot', result)
+            finally:
+                state['snapshot_active'] = False
 
     history_queue = Queue(maxsize=8)
     # The whole-history fold of Show Available can take long: it reads on a thread of its own, so that the other
@@ -1408,7 +1468,10 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
     delete_ids = set()
     def history_context():
         from types import SimpleNamespace
-        return SimpleNamespace(cfg={'ping_history_file': state['runtime'].ctx.cfg.get('ping_history_file')})
+        ctx = state['runtime'].ctx
+        # the logger is how ``read_monitor_history`` keeps the detail of a StoreError, which the browser is not told
+        return SimpleNamespace(cfg={'ping_history_file': ctx.cfg.get('ping_history_file')},
+                               logger=getattr(ctx, 'logger', None))
     def export_coverage(history_ctx, payload):
         from cn_tool.utils.ping_coverage import CoverageStopped
         try:
@@ -1471,6 +1534,8 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                     operation_stop.set()
                     return
 
+    report_delete_thread = None
+    report_delete_ids = set()
     pending_snapshots = []
     snapshot_thread = None
     report_directory = tempfile.TemporaryDirectory(prefix='cn-web-report-')
@@ -1480,10 +1545,11 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 state['orphaned'] = True
                 break
             if not connection.poll(.05):
-                if pending_snapshots and (snapshot_thread is None or not snapshot_thread.is_alive()):
+                if pending_snapshots and not state['report_deleting'] and (snapshot_thread is None or not snapshot_thread.is_alive()):
                     if (state['job_type'] == 'monitor' or state['thread'] is None or
                             not state['thread'].is_alive()):
                         payload = pending_snapshots.pop(0)
+                        state['snapshot_active'] = True
                         snapshot_thread = Thread(target=report_snapshot, args=(payload,))
                         snapshot_thread.start()
                 continue
@@ -1501,16 +1567,52 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 continue
             kind, payload, job = message['kind'], message['payload'], message['job_id']
             busy = state['thread'] is not None and state['thread'].is_alive()
+            with operation_lock:
+                deleting_report = state['report_deleting']
             if kind == 'shutdown':
                 demob_vault.invalidate()
                 state['closing'] = True
                 snapshot_stop.set()
+                report_delete_stop.set()
                 state['interrupted'] = state['interrupted'] or bool(payload.get('interrupted'))
                 # Quit finishes an existing lookup, but releases blocked credentials.
                 if (state['interrupted'] or not state['ready'] or state['job_type'] in ('monitor', 'config_search', 'demob')
                         or state['waiting_snapshot']):
                     operation_stop.set()
                 interaction.close()
+            elif kind == 'delete_report':
+                from cn_tool.utils.file_io import saves_in_progress
+                request_id = payload['request_id']
+                if request_id == deleting_report:
+                    # The running request owns its one reply: a competing one would end the controller's wait early.
+                    continue
+                if request_id in report_delete_ids:
+                    report_delete_result(payload, 'failed', 'This report deletion request was already handled.')
+                elif len(report_delete_ids) >= 1024:
+                    report_delete_result(payload, 'failed', 'Report deletion limit reached. Restart the application.')
+                else:
+                    # An ID that got any answer is spent: replaying a refused one later must not delete a fresh workbook.
+                    report_delete_ids.add(request_id)
+                    if (not state['ready'] or state['initializing'] or busy or state['job'] is not None or
+                            state['saving'] or saves_in_progress() or pending_snapshots or deleting_report or
+                            state['snapshot_active']):
+                        report_delete_result(payload, 'busy', 'The report is busy. Try again when the current operation finishes.')
+                    else:
+                        if snapshot_thread is not None:
+                            snapshot_thread.join()
+                        if report_delete_thread is not None:
+                            report_delete_thread.join()
+                        with operation_lock:
+                            state['report_deleting'] = request_id
+                        report_delete_thread = Thread(target=delete_report, args=(payload,))
+                        report_delete_thread.start()
+            elif deleting_report and kind in {'lookup', 'demob_lookup', 'demob_confirm'}:
+                lookup_type = payload['lookup_type'] if kind == 'lookup' else 'demob'
+                emit('error', dict(lookup_type=lookup_type,
+                                  message='Report deletion is in progress. Try again when it finishes.'), job)
+            elif deleting_report and kind == 'snapshot_report':
+                emit('report_snapshot', dict(request_id=payload['request_id'],
+                                             error='Report deletion is in progress. Try again when it finishes.'))
             elif kind == 'cancel':
                 with operation_lock:
                     if job == state['job']:
@@ -1644,6 +1746,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
     finally:
         demob_vault.invalidate()
         snapshot_stop.set()
+        report_delete_stop.set()
         for payload in pending_snapshots:
             emit('report_snapshot', {'request_id': payload['request_id'],
                                      'error': 'Report download cancelled because the session is closing.'})
@@ -1663,6 +1766,8 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 config_search_connection.close()
             except OSError:
                 pass
+        if report_delete_thread is not None:
+            report_delete_thread.join()
         if snapshot_thread is not None:
             snapshot_thread.join()
         if delete_thread is not None:

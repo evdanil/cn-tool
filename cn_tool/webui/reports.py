@@ -57,6 +57,11 @@ def finish_ip_lookup_report(ctx, module, lookup):
     return ReportStatus('idle', filename, 'No report data was written.')
 
 
+def delete_report(ctx, cancel=None):
+    """Delete only the configured workbook without menu output or writer reset."""
+    return file_io.delete_report_file(ctx, cancel)
+
+
 def snapshot_report(ctx, destination, cancel=None):
     """Copy to a caller-created private file, never a browser-selected path."""
     file_io.snapshot_report(ctx, destination, cancel)

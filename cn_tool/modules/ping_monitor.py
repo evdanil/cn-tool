@@ -1190,17 +1190,19 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         """
         The ``unseen`` section of ``--available``: the hosts of the request ``key`` that never replied in any round
         kept for it (``ping_coverage``), with the ``Unseen`` and ``Not tested`` rows as ``fmt`` spells them, read in one
-        snapshot. A request the history no longer holds says nothing; one it holds with no rounds lists every host as
-        ``Not tested``, as the web table does. A subnet in which no host ever replied is named on stderr: this machine
-        may not reach it. A request with no such host says so on stderr (an empty section does not print), never on stdout.
+        snapshot. A request it holds with no rounds lists every host as ``Not tested``, as the web table does. A subnet
+        in which no host ever replied is named on stderr: this machine may not reach it. A request with no such host
+        says so on stderr (an empty section does not print), never on stdout.
 
-        @raise StoreError: the history cannot be read, or a stored round does not fit the request.
+        @raise StoreError: the history cannot be read, a stored round does not fit the request, or the request is no
+            longer in it (another cn deleted it since the caller found it: the section cannot be listed, and an empty
+            one would not say so).
         """
         with store.snapshot():
             info = store.request(key)
-            coverage = read_coverage(store, info) if info is not None else None
-        if coverage is None:
-            return []
+            if info is None:
+                raise StoreError(f"{ph.short_id(key)} is no longer in the ping history; its never-seen IPs cannot be listed")
+            coverage = read_coverage(store, info)
         for network in coverage.silent_subnets:
             _say(f"cn: monitor: no IP in {network} ever replied; this machine may not be able to reach it")
         rows = unseen_rows(coverage, fmt, _when)
@@ -1304,7 +1306,7 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
                 row["Seen"] = f"{summary.seen_rounds} of {summary.rounds} rounds"
                 row["Online"] = ph.online_text(
                     summary.periods, ongoing=summary.ongoing, running=online_now, with_dates=with_dates,
-                    limit=TABLE_PERIODS if fmt == "table" else None,
+                    limit=TABLE_PERIODS if fmt == "table" else None, dash="-" if fmt == "csv" else "–",
                 )
             rows.append(row)
         return rows

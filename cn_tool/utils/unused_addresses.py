@@ -52,15 +52,21 @@ def unused_addresses(network: str, tables: Mapping[str, Sequence[Mapping[str, An
                      warnings: Sequence[str], *, views_readable: bool = True) -> UnusedList:
     """
     The unused host addresses of ``network`` (one network in one view), or a refusal. The checks run in this order:
-    text that is no network, IPv6, unreadable view list, any warning, no ``general`` row, size, then the records. A
-    section missing from ``tables`` has no rows, but a row that has no readable address refuses the list.
+    text that is no network, IPv6, unreadable view list, any warning, no ``general`` row, size, then the records. Text
+    with no mask is no network (``ipaddress`` would read an address as a /32), and IPv6 text is IPv6 whatever its
+    host bits. A section missing from ``tables`` has no rows, but a row that has no readable address, or is no
+    mapping, refuses the list.
     """
+    text = str(network).strip()
     try:
-        net = ipaddress.ip_network(str(network).strip(), strict=True)
+        net = ipaddress.ip_network(text, strict=True)
     except ValueError:
-        return UnusedList(refusal=NOT_A_NETWORK)  # not a network at all: a mistyped mask, host bits set
+        # Not a network: a mistyped mask, host bits set. IPv6 text that fails only on host bits is still IPv6.
+        return UnusedList(refusal=IPV6_NOT_LISTED if _is_ipv6(text) else NOT_A_NETWORK)
     if net.version != 4:
         return UnusedList(refusal=IPV6_NOT_LISTED)
+    if "/" not in text:  # ipaddress reads a bare address as a /32, and a /32 would list that address as free
+        return UnusedList(refusal=NOT_A_NETWORK)
     if not views_readable:
         return UnusedList(refusal=VIEWS_UNREADABLE)
     if len(warnings):  # before the general row: a failed network lookup also leaves it empty, and is not a mistyped mask
@@ -89,6 +95,14 @@ def with_unconfirmed(warnings: Sequence[str], tables: Mapping[str, Sequence[Mapp
     return list(warnings)
 
 
+def _is_ipv6(text: str) -> bool:
+    """Whether ``text`` is IPv6 network text once its host bits are set aside."""
+    try:
+        return ipaddress.ip_network(text, strict=False).version == 6
+    except ValueError:
+        return False
+
+
 def _address(value: Any) -> Optional[int]:
     """The IPv4 address in ``value`` as an integer, or None when there is no readable one."""
     try:
@@ -98,15 +112,20 @@ def _address(value: Any) -> Optional[int]:
 
 
 def _used_intervals(tables: Mapping[str, Sequence[Mapping[str, Any]]]) -> Optional[List[Interval]]:
-    """Every address the four record lists take, as sorted, merged intervals; None when any row is unreadable."""
+    """
+    Every address the four record lists take, as sorted, merged intervals; None when any row is unreadable (an
+    address that does not parse, or a row that is no mapping).
+    """
     intervals: List[Interval] = []
     for name in _ADDRESS_SECTIONS:
         for row in tables.get(name) or ():
-            value = _address(row.get("IP address"))
+            value = _address(row.get("IP address")) if isinstance(row, Mapping) else None
             if value is None:
                 return None
             intervals.append((value, value))
     for row in tables.get(_RANGE_SECTION) or ():
+        if not isinstance(row, Mapping):
+            return None
         first, last = _address(row.get("start address")), _address(row.get("end address"))
         if first is None or last is None or first > last:
             return None

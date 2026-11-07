@@ -417,18 +417,20 @@ def _clock(when: float, with_date: bool) -> str:
 
 
 def online_text(
-    periods: Sequence[Period], *, ongoing: bool, running: bool, with_dates: bool = False, limit: Optional[int] = None
+    periods: Sequence[Period], *, ongoing: bool, running: bool, with_dates: bool = False, limit: Optional[int] = None,
+    dash: str = "–",
 ) -> str:
     """
     The ``Online`` column: ``09:00–09:41, 09:55–now`` in UTC, with ``MM-DD`` when the window spans days. The last
     period ends ``now`` when the host was seen in the last round of a run still going. With ``limit``, only the
-    latest periods are shown, then ``(+N earlier)``.
+    latest periods are shown, then ``(+N earlier)``. ``dash`` joins the two ends: a CSV takes a plain hyphen, which
+    Excel's default import shows as it is (it reads UTF-8 without a byte-order mark as ANSI).
     """
     shown = list(periods) if limit is None else list(periods)[-limit:]
     texts = []
     for number, (start, end) in enumerate(shown, 1):
         until = "now" if ongoing and running and number == len(shown) else _clock(end, with_dates)
-        texts.append(f"{_clock(start, with_dates)}–{until}")
+        texts.append(f"{_clock(start, with_dates)}{dash}{until}")
     hidden = len(periods) - len(shown)
     return ", ".join(texts) + (f" (+{hidden} earlier)" if hidden else "")
 

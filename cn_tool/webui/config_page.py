@@ -6,6 +6,7 @@ from dataclasses import replace
 from cn_tool.utils import oscompat
 
 from .subnets import CSS, report_display
+from .report_actions import render_report_delete
 
 
 def render_config_search(controller):
@@ -128,7 +129,7 @@ def render_config_search(controller):
         ui.label('Latest search').classes('text-weight-bold')
         outcome = ui.label('No search yet.').props('role=status aria-live=polite tabindex=-1 data-config-outcome')
         diagnostics = ui.column().props('role=status aria-live=polite data-config-diagnostics').classes('w-full cn-config')
-        report = ui.html('').props('role=status aria-live=polite').classes('cn-muted')
+        report = ui.html('').props('role=status aria-live=polite tabindex=-1 data-report-status').classes('cn-muted')
         def download_report():
             try:
                 latest['download'] = controller.request_report_snapshot()
@@ -139,7 +140,9 @@ def render_config_search(controller):
         with ui.row().classes('cn-config-actions items-center'):
             download = ui.button('Download accumulated report', on_click=download_report).props('outline dense')
             download.disable()
-            ui.label('May include earlier searches and whole configurations, including sensitive information.').classes('cn-muted')
+            report_delete = render_report_delete(controller, dense=True)
+        # Its own line: a status text that appears in the button row must not move it.
+        ui.label('May include earlier searches and whole configurations, including sensitive information.').classes('cn-muted')
     with ui.element('section').props('aria-label="Configuration results" tabindex=-1 data-config-results').classes('cn-panel cn-config cn-config-panel') as results_area:
         with ui.row().classes('w-full items-center justify-between cn-config-actions'):
             ui.label('Configuration matches').classes('text-h6')
@@ -295,6 +298,8 @@ def render_config_search(controller):
             page_state = controller.page_snapshot('config_search', result_revision=latest['result_revision'],
                                                   attempt_revision=latest['attempt_revision'])
             state = page_state.state
+            await report_delete.update(state)
+            deleting = state.report_delete_pending
             if page_state.result_changed:
                 latest['result_revision'] = page_state.result_revision
                 latest['result'] = page_state.result
@@ -319,7 +324,7 @@ def render_config_search(controller):
             if report_warning.text != (state.report_warning or ''):
                 report_warning.set_text(state.report_warning or '')
             report_warning.set_visibility(bool(state.report_warning))
-            run.set_enabled(not oscompat.is_macos() and phase == 'ready' and not state.active_job_id)
+            run.set_enabled(not deleting and not oscompat.is_macos() and phase == 'ready' and not state.active_job_id)
             stop.set_visibility(active and phase in {'running', 'stopping', 'saving'})
             stop.set_enabled(active and phase == 'running')
             quit_button.set_enabled(phase not in {'closing', 'closed'})
@@ -339,7 +344,7 @@ def render_config_search(controller):
             report_text = latest['download_error'] or display['text']
             if report.content != report_text:
                 report.set_content(report_text)
-            download.set_enabled(display['available'] and latest['download'] is None)
+            download.set_enabled(not deleting and display['available'] and latest['download'] is None)
             if latest['download']:
                 completion = controller.report_completion(latest['download']) or {}
                 if completion.get('status') == 'ready':
@@ -390,6 +395,9 @@ def render_config_search(controller):
     def release_query():
         if latest['query']:
             controller.release_config_search_page(latest['query'])
+        if latest['download']:
+            controller.release_report_request(latest['download'])
+            latest['download'] = None
     client.on_delete(release_query)
     ui.timer(0, poll, once=True)
     ui.timer(.5, poll)

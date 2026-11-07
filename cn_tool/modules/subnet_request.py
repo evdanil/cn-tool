@@ -135,6 +135,11 @@ def _view_of(network: Network) -> str:
     return getattr(network, "network_view", "")
 
 
+def _shows_view(requested: str, networks: Iterable[Network]) -> bool:
+    """Whether the rows of a run lead with ``network view``: a view was requested, or a network belongs to one."""
+    return bool(requested) or any(_view_of(network) for network in networks)
+
+
 def _in_view(network: Network) -> str:
     """" in network view lab" for a network of a view, else "": the words a menu line adds after the network."""
     view = _view_of(network)
@@ -489,7 +494,7 @@ class SubnetRequestModule(BaseModule):
         The view list is asked only when there is a group to list (``scope.listed()`` reads the grid the lookup
         already read), so a run that was refused early reads nothing more.
         """
-        show_view = bool(scope.requested) or any(_view_of(network) for network in lookup.grouped)
+        show_view = _shows_view(scope.requested, lookup.grouped)
         found = self.available_addresses(
             lookup, views_readable=scope.listed() if lookup.grouped else True, show_view=show_view,
         )
@@ -652,20 +657,16 @@ class SubnetRequestModule(BaseModule):
             query_targets, containers = lookup.query_targets, lookup.containers
             resolution_errors = lookup.resolution_errors
             invalid, failed = bool(malformed), bool(resolution_errors)
-            available = bool(getattr(args, "available", False))
-            if not query_targets:
-                sections = self.lookup_sections(ctx, lookup, misses=misses, fallback_view=scope.requested)
-                if available:
-                    sections, refused = self._with_available(ctx, lookup, scope, sections)
-                    failed = failed or refused
-                return CliResult(cli_exit_code(found=bool(containers), invalid=invalid, failed=failed), sections)
             subnet_data_cache, subnet_warning_cache = lookup.subnet_data, lookup.warnings
             grouped_by_network, save_view = lookup.grouped, lookup.save_view
+            # with no query target there is no network to group: nothing to collect, and no hook runs
             all_data_to_save = self._collect_save_data(ctx, grouped_by_network, subnet_data_cache, save_view=save_view)
             sections = self.lookup_sections(ctx, lookup, misses=misses, fallback_view=scope.requested)
-            if available:
+            if getattr(args, "available", False):
                 sections, refused = self._with_available(ctx, lookup, scope, sections)
                 failed = failed or refused
+            if not query_targets:
+                return CliResult(cli_exit_code(found=bool(containers), invalid=invalid, failed=failed), sections)
             if ctx.cfg["report_auto_save"] and all_data_to_save:
                 self._save_subnet_data(ctx, query_targets, all_data_to_save, duid=duid)
             self._publish_stats(ctx, len(inputs), query_targets, list(grouped_by_network), subnet_data_cache)
@@ -1403,7 +1404,7 @@ class SubnetRequestModule(BaseModule):
         ``duid`` (the run has an IPv6 object) gives every ``fixed addresses`` and ``IP addresses`` row a ``DUID``
         column, empty for an IPv4 address; without it an IPv4 run has no such column.
         """
-        show_view = bool(fallback_view) or any(_view_of(network) for network in networks)
+        show_view = _shows_view(fallback_view, networks)
         details: Dict[str, List[Dict[str, Any]]] = {name: [] for name in CLI_DETAIL_SECTIONS}
         for network in networks:
             net_str = str(network)

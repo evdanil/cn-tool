@@ -9,8 +9,10 @@ import math
 from cn_tool.utils.unused_addresses import CONTAINER, INCOMPLETE, UnusedList, unused_addresses, with_unconfirmed
 
 UNUSED_TITLE = 'Unused addresses'
-UNUSED_SECTION = 'unused addresses'  # the section of `cn subnet --available` (cn_tool.modules.subnet_request.UNUSED_SECTION)
-NO_LIST_NOTICE = 'no unused addresses listed: '  # what a refusal row of `cn subnet --available` says (subnet_request.NO_LIST_NOTICE)
+# The section of `cn subnet --available` (cn_tool.modules.subnet_request.UNUSED_SECTION).
+UNUSED_SECTION = 'unused addresses'
+# What a refusal row of `cn subnet --available` says (subnet_request.NO_LIST_NOTICE).
+NO_LIST_NOTICE = 'no unused addresses listed: '
 UNUSED_FILENAME = 'cn-unused-addresses.csv'
 UNUSED_MEANING = 'Unused means no record of any type in Infoblox. It does not prove that nothing answers there.'
 
@@ -23,11 +25,11 @@ def available_result(result, *, cache=None):
     marked ``unconfirmed``, because a list request missed its network, is refused as incomplete); every child
     container is a refusal of its own, and so is every group of a result whose view list was not proved readable
     (``views_readable``) or of a stopped lookup (``stopped``: ``INCOMPLETE``); an input whose lookup failed
-    (``resolution_errors``) is named last, with its message. Returns ``rows`` (the download: ``network view`` when any group has one, ``network``,
-    ``IP address``, as ``cn subnet --available`` prints them), ``refusals`` (``network``, ``network_view``,
-    ``reason``) and ``by_group`` (a group's id to its table ``rows``, ``network view`` when the
-    group has one and then ``IP address``, or to its ``refusal``). ``cache``, one dict for one result, keeps the answer so that a poll does
-    not compute it again.
+    (``resolution_errors``) is named last, with its message. Returns ``rows`` (the download: ``network view`` when
+    any group has one, ``network``, ``IP address``, as ``cn subnet --available`` prints them), ``refusals``
+    (``network``, ``network_view``, ``reason``) and ``by_group`` (a group's id to its table ``rows``, ``network view``
+    when the group has one and then ``IP address``, or to its ``refusal``). ``cache``, one dict for one result, keeps
+    the answer so that a poll does not compute it again.
     """
     if cache is not None and cache.get('result') is result:
         return cache['value']
@@ -74,9 +76,9 @@ def shows_view(result):
 def available_download(result, found):
     """
     The bytes of ``cn-unused-addresses.csv`` for ``found`` (``available_result(result)``): the ``unused addresses``
-    rows, then a ``warnings`` row (``network view`` when the result shows it, ``network``, ``warning``) for every input
-    that could not be listed, as ``cn subnet --available --format csv`` writes them, so that a short file cannot pass for
-    a complete one. No rows and no refusals give no bytes.
+    rows, then a ``warnings`` row (``network view`` when the result shows it, ``network``, ``warning``) for every
+    input that could not be listed, as ``cn subnet --available --format csv`` writes them, so that a short file cannot
+    pass for a complete one. No rows and no refusals give no bytes.
     """
     from cn_tool.utils.render import csv_bytes
     show_view = shows_view(result)
@@ -260,6 +262,15 @@ def outcome_display(snapshot):
 def report_display(snapshot):
     """Render report state and its independent worker-owned availability."""
     state = snapshot.latest_report_state or {}
+    current = snapshot.report_state or {}
+    if current.get('state') == 'deleted' and not current.get('available'):
+        text = current.get('message') or 'No accumulated report exists.'
+        failed = state.get('state') == 'failed'
+        if failed:
+            text += ' Report save failed.'
+            if state.get('message'):
+                text += ' ' + state['message']
+        return dict(text=escape(text), available=False, failed=failed)
     status = state.get('state')
     label = {'off': 'Reporting off', 'idle': 'No report saved', 'failed': 'Report save failed',
              'saved': 'Report saved', 'saving': 'Saving report', 'pending': 'Report pending'}.get(status, '')
@@ -268,6 +279,10 @@ def report_display(snapshot):
     available = (snapshot.report_state or state).get('available') is True
     if available and not state.get('saved_for_attempt'):
         text += ('. ' if text else '') + 'The accumulated report contains earlier data.'
+    if not text and not available and snapshot.phase == 'ready':
+        # A tool that has not run has no status of its own. Only a ready session knows that no report exists:
+        # before the worker reports, and once Quit or a failure forces availability off, one may.
+        text = 'No accumulated report yet.'
     return dict(text=escape(text), available=available, failed=status == 'failed')
 
 
@@ -329,6 +344,7 @@ LOOKUP_CSS = '''
 
 def render_subnets(controller, lookup_type='subnet'):
     from nicegui import ui
+    from .report_actions import render_report_delete
     from cn_tool.core.interaction import CredentialReply
 
     ui.add_css(CSS)
@@ -381,9 +397,16 @@ def render_subnets(controller, lookup_type='subnet'):
                         port_error.set_text(str(exc))
                         return
                     port_error.set_text('')
-                    controller.submit(targets.value.splitlines(), lookup_type=lookup_type, tcp_ports=parsed)
+                    start = lambda: controller.submit(targets.value.splitlines(), lookup_type=lookup_type, tcp_ports=parsed)
                 else:
-                    controller.submit(targets.value.splitlines(), lookup_type=lookup_type)
+                    start = lambda: controller.submit(targets.value.splitlines(), lookup_type=lookup_type)
+                try:
+                    start()
+                except RuntimeError as refusal:
+                    # A click on a button that the next poll was about to disable (another tab's work, a deletion):
+                    # say why nothing started rather than let the error end the handler and look like a dead button.
+                    port_error.set_text(str(refusal) or 'The lookup could not start. Try again.')
+                    return
                 await refresh_now()
             run = ui.button('Run Ping' if lookup_type == 'ping' else 'Look up', on_click=submit)
             stop = ui.button('Stop', on_click=controller.cancel_active).props('outline')
@@ -452,9 +475,11 @@ def render_subnets(controller, lookup_type='subnet'):
         with ui.column().classes('w-full') as outcome_area:
             draw_outcome()
         announcement = ui.html('').props('role=status aria-live=polite').classes('cn-sr-only')
-        report = ui.html('').props('role=status aria-live=polite').classes('cn-muted' + empty_class)
+        report = ui.html('').props('role=status aria-live=polite tabindex=-1 data-report-status').classes('cn-muted' + empty_class)
         download_help = 'Download copies the existing accumulated report after pending saves finish. A failed lookup save may leave only earlier data.'
-        download = ui.button('Download accumulated report', on_click=lambda: request_download()).props('outline')
+        with ui.row().classes('items-center'):
+            download = ui.button('Download accumulated report', on_click=lambda: request_download()).props('outline')
+            report_delete = render_report_delete(controller)
         download.tooltip(download_help)
         download._props['aria-description'] = download_help
     pending_results = ui.label('').classes('cn-muted' + empty_class)
@@ -472,6 +497,12 @@ def render_subnets(controller, lookup_type='subnet'):
                 report.set_content(latest['download_error'])
                 return
             report.set_content('Preparing a consistent report download…')
+
+    def release_download():
+        if latest['download'] is not None:
+            controller.release_report_request(latest['download'])
+            latest['download'] = None
+    ui.context.client.on_delete(release_download)
 
     def render_filter(rows, table_id):
         keys = list(dict.fromkeys(key for row in rows for key in row if key not in {'id', '__row'}))
@@ -904,6 +935,8 @@ u.value = ''; if (p) p.value = ''; emit(reply);
     async def poll_once():
         page = controller.page_snapshot(lookup_type, result_revision=latest.get('result_revision'),
                                         attempt_revision=latest.get('attempt_revision'))
+        await report_delete.update(page.state)
+        deleting = page.state.report_delete_pending
         if page.result_changed:
             latest['received_result'] = page.result
             latest['result_revision'] = page.result_revision
@@ -920,7 +953,7 @@ u.value = ''; if (p) p.value = ''; emit(reply);
                              f"{snapshot.scope or 'Configured scope pending'} | Account: {snapshot.username or 'pending'}")
         report_warning.set_text(snapshot.report_warning)
         busy = snapshot.phase in {'running', 'stopping', 'saving', 'closing'}
-        run.set_enabled(snapshot.phase == 'ready' and not snapshot.active_job_id and bool((targets.value or '').strip()))
+        run.set_enabled(not deleting and snapshot.phase == 'ready' and not snapshot.active_job_id and bool((targets.value or '').strip()))
         stop.set_visibility(snapshot.phase in {'running', 'stopping', 'saving'})
         stop.set_enabled(snapshot.phase == 'running')
         quit_button.set_enabled(snapshot.phase not in {'closing', 'closed'})
@@ -956,7 +989,7 @@ u.value = ''; if (p) p.value = ''; emit(reply);
         if display['failed']:
             report.classes(add='text-negative')
         report.set_content(display['text'])
-        download.set_enabled(display['available'] and latest['download'] is None)
+        download.set_enabled(not deleting and display['available'] and latest['download'] is None)
         if latest['download'] is not None:
             report.set_content('Preparing a consistent report download…')
         elif latest['download_error']:

@@ -146,6 +146,7 @@ network preview and the other tools remain available. Windows-native verificatio
 for the 0.9.0 additions remains deferred.
 Release 0.10.0 adds a **Show Available** checkbox to Subnets (addresses with no
 Infoblox record) and to Monitor's History tab (IPs that never replied).
+Release 0.11.0 adds **Delete report** beside the download button on every tool.
 See the [WebUI guide](https://github.com/evdanil/cn-tool/blob/main/docs/webui.md) for details.
 Closing a tab keeps the application running; **Quit application** ends it and runs
 configured exit actions, including email when enabled.

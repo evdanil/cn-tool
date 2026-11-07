@@ -3,17 +3,16 @@ import argparse
 import asyncio
 import socket
 import sys
+import threading
 import webbrowser
 
 from cn_tool.utils import oscompat
 
 _GRACEFUL_SHUTDOWN_TIMEOUT = 5
+_ERROR_BOX_TIMEOUT = 60
 
 
-def _show_error(message):
-    if sys.stderr is not None and sys.stderr.isatty():
-        print(message, file=sys.stderr)
-        return
+def _show_error_box(message):
     try:
         from tkinter import Tk, messagebox
         root = Tk()
@@ -21,8 +20,32 @@ def _show_error(message):
         messagebox.showerror('cn Subnets', message)
         root.destroy()
     except Exception:
-        if sys.stderr is not None:
+        # No display: the message already went to stderr, when there is one.
+        pass
+
+
+def _show_error(message):
+    # Stderr first: a scripted start has nobody to click a box.
+    printed = False
+    if sys.stderr is not None:
+        try:
             print(message, file=sys.stderr)
+            printed = True
+            if sys.stderr.isatty():
+                return
+        except (OSError, ValueError):
+            pass
+    if oscompat.is_macos():
+        # Tk aborts the process off the main thread there, so a box cannot be bounded: the message on stderr is
+        # enough, and with nowhere to print it the box runs on the main thread, as it always did.
+        if not printed:
+            _show_error_box(message)
+        return
+    # A desktop launcher still gets the box. A native message box may not run Tcl timers, so the box lives on a
+    # daemon thread and the wait is bounded.
+    box = threading.Thread(target=_show_error_box, args=(message,), daemon=True)
+    box.start()
+    box.join(_ERROR_BOX_TIMEOUT)
 
 
 def _start_config_search_guardian():

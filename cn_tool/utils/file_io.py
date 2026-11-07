@@ -383,9 +383,13 @@ def worker() -> None:
                     _pending_saves = max(0, _pending_saves - 1)
                     pending_now = _pending_saves
             finally:
-                save_queue.task_done()
-                # Always release cross-process lock
-                _release_report_lock(lock_fd, lock_fp)
+                # Release the cross-process lock BEFORE the save counts as finished: wait_for_all_saves() returns on
+                # task_done(), and a snapshot or deletion that follows it must not still find this writer's lock file.
+                # _release_report_lock swallows its own errors; the try/finally keeps task_done() certain anyway.
+                try:
+                    _release_report_lock(lock_fd, lock_fp)
+                finally:
+                    save_queue.task_done()
             if pending_now == 0 and not file_is_corrupt and ctx and getattr(ctx, "event_bus", None):
                 report_path = ctx.cfg.get("report_file")
                 if report_path:
@@ -491,40 +495,72 @@ def check_file_timeliness(logger: logging.Logger, file_path: Path) -> bool:
     return True
 
 
-def clear_report(ctx: ScriptContext) -> None:
-    """
-    Deletes the specified report file or the default report file (report.xlsx).
-    """
-    colors = get_global_color_scheme(ctx.cfg)
-    filename: Path = ctx.cfg["report_file"]
-    if filename.exists():
+def _wait_for_report_saves(cancel: Optional[threading.Event], operation: str) -> None:
+    """Drain accepted saves while allowing a waiting web operation to stop."""
+    if cancel is None:
+        wait_for_all_saves()
+    else:
+        with save_queue.all_tasks_done:
+            while save_queue.unfinished_tasks and not cancel.is_set():
+                save_queue.all_tasks_done.wait(.1)
+        if cancel.is_set():
+            raise InterruptedError(f'{operation} cancelled')
+
+
+def delete_report_file(ctx: ScriptContext, cancel: Optional[threading.Event] = None) -> bool:
+    """Delete the configured workbook quietly; the caller excludes new producers."""
+    _wait_for_report_saves(cancel, 'Deletion')
+    filename = Path(ctx.cfg['report_file']).expanduser()
+    if not filename.parent.is_dir():
+        # Nothing can exist there, and the lock file cannot be created there either: that is not "busy".
+        return False
+    lock_kwargs = dict(timeout=10.0, logger=ctx.logger)
+    if cancel is not None:
+        lock_kwargs['cancel'] = cancel
+    fd, lock_path = _acquire_report_lock(filename, **lock_kwargs)
+    if fd is None or lock_path is None:
+        if cancel is not None and cancel.is_set():
+            raise InterruptedError('Deletion cancelled')
+        raise TimeoutError('Report is busy')
+    try:
+        while not save_lock.acquire(timeout=.1):
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError('Deletion cancelled')
         try:
-            # Acquire cross-process lock to safely delete
-            fd, lp = _acquire_report_lock(filename, timeout=10.0, logger=ctx.logger)
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError('Deletion cancelled')
             try:
                 filename.unlink()
-            finally:
-                _release_report_lock(fd, lp)
+            except FileNotFoundError:
+                return False
+            return True
+        finally:
+            save_lock.release()
+    finally:
+        _release_report_lock(fd, lock_path)
+
+
+def clear_report(ctx: ScriptContext) -> None:
+    """Delete the configured report and retain the menu's messages and reset."""
+    colors = get_global_color_scheme(ctx.cfg)
+    filename: Path = ctx.cfg["report_file"]
+    try:
+        deleted = delete_report_file(ctx)
+        if deleted:
             ctx.console.print(f"[{colors['info']}]Report {filename} deleted[/]")
             ctx.logger.info(f"Clear report - Deleted {filename}")
-            # Reset the background writer state so future saves resume normally
             stop_worker()
             start_worker()
-            if getattr(ctx, "event_bus", None):
-                ctx.event_bus.publish(
-                    "status:update",
-                    {"component": "report", "state": "deleted", "path": str(filename)},
-                )
-        except OSError as e:
-            ctx.console.print(f"[{colors['error']}]Error deleting report {filename}: {e}[/]")
-            ctx.logger.error(f"Error deleting report {filename}: {e}")
-    else:
-        ctx.console.print(f"[{colors['info']}]Report {filename} does not exist.[/]")
+        else:
+            ctx.console.print(f"[{colors['info']}]Report {filename} does not exist.[/]")
         if getattr(ctx, "event_bus", None):
             ctx.event_bus.publish(
                 "status:update",
                 {"component": "report", "state": "deleted", "path": str(filename)},
             )
+    except OSError as e:
+        ctx.console.print(f"[{colors['error']}]Error deleting report {filename}: {e}[/]")
+        ctx.logger.error(f"Error deleting report {filename}: {e}")
 
 
 def append_df_to_excel(
@@ -740,14 +776,7 @@ def snapshot_report(ctx: ScriptContext, destination: Path, cancel: Optional[thre
     """Wait for this writer, then copy under the workbook's cross-process lock."""
     import shutil
 
-    if cancel is None:
-        wait_for_all_saves()
-    else:
-        with save_queue.all_tasks_done:
-            while save_queue.unfinished_tasks and not cancel.is_set():
-                save_queue.all_tasks_done.wait(.1)
-        if cancel.is_set():
-            raise InterruptedError('Snapshot cancelled')
+    _wait_for_report_saves(cancel, 'Snapshot')
     source = Path(ctx.cfg['report_file']).expanduser()
     destination = Path(destination)
     if source.resolve() == destination.resolve():

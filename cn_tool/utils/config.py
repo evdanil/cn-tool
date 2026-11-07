@@ -35,7 +35,7 @@ AUTH_ENV_DEFAULTS: Dict[str, str] = {
 DEFAULT_PING_HISTORY_DAYS = 180
 
 BASE_CONFIG_SCHEMA = {
-    "api_endpoint":         {"section": "api", "ini_key": "endpoint", "type": "str", "fallback": "API_URL"},
+    "api_endpoint":          {"section": "api", "ini_key": "endpoint", "type": "str", "fallback": "API_URL"},
     "api_verify_ssl":        {"section": "api", "ini_key": "verify_ssl", "type": "bool", "fallback": True},
     "api_timeout":           {"section": "api", "ini_key": "timeout", "type": "int", "fallback": 10},
     "api_max_workers":       {"section": "api", "ini_key": "max_workers", "type": "int", "fallback": 8},

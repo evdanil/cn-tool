@@ -20,6 +20,7 @@ and setup](infoblox.md#access-and-setup) requirements before using them.
 | 0.9.2 | The same tools, with compact results and improved navigation |
 | 0.9.3 | Column sorting and field filters, with Ping and Monitor outcome summaries |
 | 0.10.0 | Monitor host page-size selection, Show Available lists on Subnets and Monitor, and a Windows Pydantic compatibility pin |
+| 0.11.0 | Report deletion on every tool |
 
 The browser tools beyond Subnets are available in 0.9.0 and are not part of 0.8.4.
 The menu and CLI have their own established workflows.
@@ -271,6 +272,29 @@ reports and accumulated workbooks can contain full device configurations and ear
 results, so handle them as sensitive.
 
 ## Reports, Stop and Quit
+
+**Delete report** (from 0.11.0) appears beside the
+download button on every tool. Its confirmation names the report file (the file name only)
+and says that it removes the whole accumulated report shared by all the tools,
+including the sheets of the other tools. Results on screen, Monitor history and the
+copies already prepared or downloaded stay. So do the **Download available IPs**
+lists, which come from Infoblox results and the Ping history, never from the
+workbook. The next saved results create a new report.
+
+Deletion is offered only while nothing is running, no report write is pending and no
+report download is being prepared. The application checks again when you confirm and
+refuses if work has started in another tab meanwhile. While it runs, every open tab
+shows its progress, operation starts and report downloads are disabled in all of
+them, and **Quit** stays available. Each tab then announces **Accumulated report
+deleted.** or **No accumulated report exists.**, and no tool shows an older
+**Report saved** label again until a later operation saves; that save enables
+download and delete again.
+
+The workbook is removed only after the application has taken the report's locks. If
+another program holds it (Excel keeps a workbook open on Windows) or another process
+holds its lock, the report stays, the message tells you to close it and try again, and
+you can retry at once. If the session ends before the application confirms the
+deletion, the page says so.
 
 Automatic reporting follows `[report] auto_save`. Completed reportable lookups append
 once to the configured accumulating workbook. Navigation does not save again, and

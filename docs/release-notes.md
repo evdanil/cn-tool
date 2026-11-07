@@ -16,6 +16,35 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
+## 0.11.0
+
+Every web tool offers **Delete report** beside the download button. After a
+confirmation that names the report file, it deletes the whole accumulated report that
+all the tools share, including the sheets of the other tools; results on screen,
+Monitor history and copies already prepared or downloaded stay, and the next saved
+results start a fresh report. Deletion is offered only while nothing else is running
+or saving, and it never removes the workbook when it cannot take the report's locks:
+a workbook that is open in Excel or another program stays, and the message says to
+close it and try again. **Show Available** downloads do not read the workbook and are
+not affected. See the [WebUI guide](webui.md#reports-stop-and-quit).
+
+The menu's **Delete report** follows the same rule: when another process holds the
+report's lock for more than ten seconds, it now keeps the file and prints the error,
+where it used to delete the file anyway. It also waits for saves that are still
+queued before it takes the lock, which it did not do before.
+
+`cn monitor --format csv` now writes the `Online` column with a plain hyphen
+(`09:00-09:41`), so Excel shows it as written; the table, Markdown, JSON and the
+workbook keep the en dash. A script that matches the en dash in CSV output needs updating.
+
+When `cn-web` cannot start, its message reaches stderr once, and it no longer hangs
+when stderr is redirected. The error box at a desktop closes itself after 60 seconds;
+on macOS no box appears when stderr exists. Closing a page while a download is being
+prepared no longer leaves the prepared file behind until Quit. Monitor's rows-per-page
+menus open and close without animation, so they no longer take focus back when
+reopened quickly. `cn monitor --show ID --available` exits 3 and says so when the run
+is deleted while it is being read.
+
 ## 0.10.0
 
 Monitor's latest-round and saved-round host tables use a bottom pagination bar

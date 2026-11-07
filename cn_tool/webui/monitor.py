@@ -7,6 +7,7 @@ import re
 
 from .ping import parse_ports
 from .subnets import CSS, report_display
+from .report_actions import render_report_delete
 
 
 HISTORY_EXPIRED = 'History changed or expired. Return to requests to browse available records.'
@@ -103,8 +104,10 @@ def render_host_footer(*, scope, size, offset, count, total, previous_enabled,
     with ui.element('nav').props('aria-label=' + json.dumps(name)).classes('cn-monitor-footer'):
         with ui.row().classes('items-center gap-2 no-wrap'):
             ui.label('Rows per page:')
+            # No transition: Quasar holds every focus() for the 300 ms of a menu's transition, so a menu opened again
+            # inside that wait queued one that took the focus back from wherever the reader had moved on to.
             select = ui.select([5, 10, 15, 20, 25, 50], value=size, on_change=on_size).props(
-                'dense borderless aria-label="Rows per page"').classes('w-16')
+                'dense borderless aria-label="Rows per page" transition-duration=0').classes('w-16')
             select._props[marker] = 'page-size'
             if live:
                 select.props('popup-content-class=cn-monitor-live-popup')
@@ -119,6 +122,37 @@ def render_host_footer(*, scope, size, offset, count, total, previous_enabled,
                 button.set_enabled(enabled)
                 buttons.append(button)
     return buttons
+
+
+def paged_handlers(latest, size, stacks, *, busy, request, following, first, names=('previous-hosts', 'next-hosts')):
+    """The Previous, Next and rows-per-page handlers of a table that is read a page at a time (the live round, a saved
+    round, Show Available). ``stacks`` are the lists in ``latest`` that gain an entry for each page opened and lose one
+    on Previous, ``size`` is the key of the rows per page. ``busy()`` is true while an answer is awaited,
+    ``following()`` gives what Next adds to each stack (None on the last page), ``first()`` puts the state back on
+    page one, and ``request(name)`` asks for the page that the state now describes."""
+    async def previous():
+        if busy() or len(latest[stacks[0]]) < 2:
+            return
+        for key in stacks:
+            latest[key].pop()
+        await request(names[0])
+
+    async def next_page():
+        step = None if busy() else following()
+        if step is None:
+            return
+        for key, value in zip(stacks, step):
+            latest[key].append(value)
+        await request(names[1])
+
+    async def change_size(event):
+        if event.value == latest[size]:
+            return
+        latest[size] = event.value
+        first()
+        await request('page-size')
+
+    return previous, next_page, change_size
 
 
 def render_monitor(controller):
@@ -259,13 +293,15 @@ def render_monitor(controller):
         outcome_status = ui.label('').props('role=status').classes('text-negative')
         warning_status = ui.label('').props('role=status aria-live=polite').classes('text-negative')
         history_status = ui.label('').props('role=status').classes('text-negative')
-        report = ui.html('').props('role=status').classes('cn-muted')
+        report = ui.html('').props('role=status aria-live=polite tabindex=-1 data-report-status').classes('cn-muted')
         def download_report():
             try:
                 latest['download'] = controller.request_report_snapshot()
             except RuntimeError:
                 report.set_content('Report download is unavailable.')
-        download = ui.button('Download accumulated report', on_click=download_report).props('outline')
+        with ui.row().classes('items-center'):
+            download = ui.button('Download accumulated report', on_click=download_report).props('outline')
+            report_delete = render_report_delete(controller)
         pending_live = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
         live_area = ui.column().classes('w-full')
         @ui.refreshable
@@ -347,32 +383,17 @@ def render_monitor(controller):
                             for key in ('Host', 'Result', 'Address', 'TCP'):
                                 with ui.element('td'):
                                     ui.label(values[key]).classes('cn-monitor-target' if key == 'Host' else '').props('title=' + json.dumps(values[key]))
-            async def prev():
-                if latest['live_query'] or latest.get('live_user_request') or len(latest['live_offsets']) < 2:
-                    return
-                latest['live_offsets'].pop()
+            async def request_live(name):
                 latest['live_offset'] = latest['live_offsets'][-1]
-                latest['live_user_request'] = 'previous'
+                latest['live_user_request'] = name
                 latest['live_key'] = None
                 await poll()
 
-            async def next_page():
-                if latest['live_query'] or latest.get('live_user_request') or page.get('next_offset') is None:
-                    return
-                latest['live_offset'] = page['next_offset']
-                latest['live_offsets'].append(page['next_offset'])
-                latest['live_user_request'] = 'next'
-                latest['live_key'] = None
-                await poll()
-
-            async def change_size(event):
-                if event.value == latest['live_size']:
-                    return
-                latest['live_size'] = event.value
-                latest['live_offset'], latest['live_offsets'] = 0, [0]
-                latest['live_user_request'] = 'page-size'
-                latest['live_key'] = None
-                await poll()
+            prev, next_page, change_size = paged_handlers(
+                latest, 'live_size', ('live_offsets',), names=('previous', 'next'), request=request_live,
+                busy=lambda: latest['live_query'] or latest.get('live_user_request'),
+                following=lambda: None if page.get('next_offset') is None else (page['next_offset'],),
+                first=lambda: latest.update(live_offsets=[0]))
 
             latest['live_buttons'] = render_host_footer(scope='live', size=latest['live_size'], offset=page['offset'],
                 count=len(rows), total=page.get('total'), previous_enabled=len(latest['live_offsets']) > 1,
@@ -579,28 +600,11 @@ def render_monitor(controller):
                                 state_cell(history_value('observation', row.get('observation')), row.get('observation'))
                                 cell(row.get('address') or '—', target=True)
                                 cell(row.get('result') or '—')
-                async def previous_hosts():
-                    if latest['round_query'] or len(latest['host_cursors']) < 2:
-                        return
-                    latest['host_cursors'].pop()
-                    latest['host_offsets'].pop()
-                    await request_round_hosts('previous-hosts')
-
-                async def next_hosts():
-                    if latest['round_query']:
-                        return
-                    cursor = (latest['round_hosts'] or {}).get('next_cursor')
-                    if cursor:
-                        latest['host_cursors'].append(cursor)
-                        latest['host_offsets'].append(latest['host_offsets'][-1] + len(rows))
-                        await request_round_hosts('next-hosts')
-
-                async def change_host_size(event):
-                    if event.value == latest['host_size']:
-                        return
-                    latest['host_size'] = event.value
-                    latest['host_cursors'], latest['host_offsets'] = [None], [0]
-                    await request_round_hosts('page-size')
+                previous_hosts, next_hosts, change_host_size = paged_handlers(
+                    latest, 'host_size', ('host_cursors', 'host_offsets'), request=request_round_hosts,
+                    busy=lambda: latest['round_query'],
+                    following=lambda: next_cursor_step(latest['host_offsets'], latest['round_hosts'], len(rows)),
+                    first=lambda: latest.update(host_cursors=[None], host_offsets=[0]))
 
                 render_host_footer(scope='detail', size=latest['host_size'], offset=latest['host_offsets'][-1],
                     count=len(rows), total=hosts_page.get('total'), previous_enabled=len(latest['host_cursors']) > 1,
@@ -615,9 +619,16 @@ def render_monitor(controller):
                 controller.release_monitor_history_page(latest['coverage_query'])
             latest['coverage_query'] = None
 
+        def release_coverage_download():
+            """Give up the Unseen export in flight: the controller drops its late answer and removes its file."""
+            if latest['coverage_download']:
+                controller.release_report_request(latest['coverage_download'])
+            latest['coverage_download'] = None
+
         def reset_coverage():
             """Box off, nothing read, nothing left to show: what a new target line, or leaving the line, leaves behind."""
             cancel_coverage_query()
+            release_coverage_download()
             latest.update(coverage_defaults())
 
         def first_coverage_page():
@@ -689,27 +700,11 @@ def render_monitor(controller):
             first_coverage_page()
             await request_coverage('sort-' + column)
 
-        async def previous_coverage():
-            if latest['coverage_query'] or len(latest['coverage_cursors']) < 2:
-                return
-            latest['coverage_cursors'].pop()
-            latest['coverage_offsets'].pop()
-            await request_coverage('previous-hosts')
-
-        async def next_coverage():
-            page = latest['coverage_page'] or {}
-            if latest['coverage_query'] or not page.get('next_cursor'):
-                return
-            latest['coverage_cursors'].append(page['next_cursor'])
-            latest['coverage_offsets'].append(latest['coverage_offsets'][-1] + len(page['items']))
-            await request_coverage('next-hosts')
-
-        async def change_coverage_size(event):
-            if event.value == latest['coverage_size']:
-                return
-            latest['coverage_size'] = event.value
-            first_coverage_page()
-            await request_coverage('page-size')
+        previous_coverage, next_coverage, change_coverage_size = paged_handlers(
+            latest, 'coverage_size', ('coverage_cursors', 'coverage_offsets'), request=request_coverage,
+            busy=lambda: latest['coverage_query'],
+            following=lambda: next_cursor_step(latest['coverage_offsets'], latest['coverage_page']),
+            first=first_coverage_page)
 
         def draw_coverage_table(page):
             rows = page['items']
@@ -1088,6 +1083,8 @@ return area?.contains(document.activeElement) ||
             if page.attempt_changed:
                 latest['outcome'], latest['attempt_result'], latest['attempt_revision'] = page.outcome, page.attempt_result, page.attempt_revision
             state = page.state
+            await report_delete.update(state)
+            deleting = state.report_delete_pending
             active = state.active_lookup_type == 'monitor' and bool(state.active_job_id)
             update = state.monitor_update
             data = ((update or {}) if active else (latest.get('attempt_result') or latest['result'] or update or {}))
@@ -1100,7 +1097,7 @@ return area?.contains(document.activeElement) ||
             if state.error:
                 message = state.error.get('message', str(state.error)) if isinstance(state.error, dict) else str(state.error)
             set_changed(status, message)
-            run.set_enabled(phase == 'ready' and not state.active_job_id and all(control.enabled for control, _ in fields.values()))
+            run.set_enabled(not deleting and phase == 'ready' and not state.active_job_id and all(control.enabled for control, _ in fields.values()))
             stop.set_visibility(active and phase in {'running', 'stopping', 'saving'})
             stop.set_enabled(active and phase == 'running')
             quit_button.set_enabled(phase not in {'closing', 'closed'})
@@ -1117,7 +1114,7 @@ return area?.contains(document.activeElement) ||
             display = report_display(report_state)
             if report.content != display['text']:
                 report.set_content(display['text'])
-            download.set_enabled(display['available'] and latest['download'] is None)
+            download.set_enabled(not deleting and display['available'] and latest['download'] is None)
             if latest['download']:
                 completion = controller.report_completion(latest['download']) or {}
                 if completion.get('status') == 'ready':
@@ -1396,6 +1393,10 @@ return true;
             controller.release_monitor_history_page(latest['history_query'])
             latest['history_query'] = None
         cancel_coverage_query()
+        release_coverage_download()
+        if latest['download']:
+            controller.release_report_request(latest['download'])
+            latest['download'] = None
     client.on_delete(release_queries)
     targets.on_value_change(lambda _: poll())
     ui.timer(0, poll, once=True)
@@ -1406,6 +1407,15 @@ def live_fields(row):
     tcp = ', '.join(f"{entry['port']}: {entry['result']}" for entry in row.get('tcp', [])) or 'Not checked'
     return [('Host', str(row.get('host') or 'Unknown')), ('Address', str(row.get('address') or 'Unknown')),
             ('Result', str(row.get('result') or 'Unknown')), ('TCP', tcp)]
+
+
+def next_cursor_step(offsets, page, count=None):
+    """What Next adds to the stacks of a table paged by cursors: the page's next cursor and the number of the first
+    row after it (``count`` rows were shown; the page's items by default). None when the page has no next one."""
+    cursor = (page or {}).get('next_cursor')
+    if not cursor:
+        return None
+    return cursor, offsets[-1] + (len(page['items']) if count is None else count)
 
 
 COVERAGE_TONES = {'Seen': 'ok', 'Unseen': 'warning', 'Not tested': 'problem'}
