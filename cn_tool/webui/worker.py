@@ -51,6 +51,50 @@ def snapshot_report(ctx, destination, cancel=None):
     return path
 
 
+COVERAGE_GONE = 'This target line is no longer in the Ping history.'
+
+
+class CoverageExportRefused(Exception):
+    """An Unseen download that cannot be made, for a reason the page can state: ``str(error)`` is that reason."""
+
+
+def coverage_export(history_ctx, directory, parent, stop=None):
+    """
+    Write the ``Unseen`` rows of request ``parent`` (the rows ``cn monitor --available`` prints for ``unseen``, minus
+    the ``Not tested`` ones: ``unseen_rows``, whole history, whatever page or filter the table shows) as CSV under
+    ``directory``. Each export gets a folder of its own, so that a second one of the same line never takes the first
+    one's file from under its download. Returns the path and the name to offer, ``cn-unseen-<short id>.csv``.
+
+    @raise CoverageExportRefused: the history file or the request is gone, or the line has no ``Unseen`` host (no
+        file is written then, not even an empty one).
+    @raise StoreError: the history cannot be read, or a stored round does not fit its request.
+    @raise CoverageStopped: ``stop()`` was true.
+    """
+    from cn_tool.modules.ping_monitor import _when
+    from cn_tool.utils import ping_history
+    from cn_tool.utils.ping_coverage import UNSEEN, read_coverage, unseen_rows
+    from cn_tool.utils.ping_store import PingStore
+    from cn_tool.utils.render import csv_bytes
+    store = PingStore.open(ping_history.history_file(history_ctx), write=False)
+    if store is None:
+        raise CoverageExportRefused(COVERAGE_GONE)
+    with store:
+        with store.snapshot():
+            info = store.request_by_id(parent)
+            if info is None:
+                raise CoverageExportRefused(COVERAGE_GONE)
+            coverage = read_coverage(store, info, stop=stop)
+    rows = [row for row in unseen_rows(coverage, 'csv', _when) if row['Status'] == UNSEEN]
+    if not rows:
+        raise CoverageExportRefused('No never-seen IPs to download.')
+    folder = Path(directory) / uuid4().hex
+    folder.mkdir()
+    name = f'cn-unseen-{ping_history.short_id(info.key)}.csv'
+    path = folder / name
+    path.write_bytes(csv_bytes('unseen', rows))
+    return path, name
+
+
 def _refusal_key(runtime, account):
     """Keep session-local refusal fingerprints without retaining old passwords."""
     import hashlib
@@ -438,14 +482,19 @@ def prepare_result(module, ctx, lookup, malformed, misses, scope):
         tables = {name: rows for name, rows in sections.items() if name not in {'subnets', 'child containers', 'warnings'}}
         groups.append(dict(id=identity, network=str(network), network_view=_view_of(network),
                            original_inputs=originals, tables=tables,
-                           warnings=lookup.warnings.get(_cache_key(network), [])))
+                           warnings=lookup.warnings.get(_cache_key(network), []),
+                           unconfirmed=lookup.is_unconfirmed(network)))
     for row, group in zip(summary, groups):
         row['id'] = group['id']
     for index, row in enumerate(summary):
         row['__row'] = row.get('id', f'miss-{index}')
+    # Whether the run knew which network views it searched: the Subnets page lists unused addresses only when it
+    # did. ``listed`` reads the view list the lookup already holds, so this sends no request; a stopped lookup
+    # lists nothing, so it never asks (an early Stop may hold no view list, and asking would send one).
     return dict(summary=summary, detail_groups=groups, containers=lookup.containers,
                 input_errors=dict(malformed, **lookup.resolution_errors), invalid_inputs=dict(malformed),
-                resolution_errors=dict(lookup.resolution_errors), misses=misses, stopped=lookup.stopped)
+                resolution_errors=dict(lookup.resolution_errors), misses=misses, stopped=lookup.stopped,
+                views_readable=not lookup.inputs or (not lookup.stopped and scope.listed()))
 
 
 def classify_lookup_outcome(result: dict) -> dict:
@@ -1349,19 +1398,51 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             emit('report_snapshot', {'request_id': payload['request_id'], 'error': 'Could not prepare report download.'})
 
     history_queue = Queue(maxsize=8)
+    # The whole-history fold of Show Available can take long: it reads on a thread of its own, so that the other
+    # history queries stay quick. The same thread writes the Unseen download.
+    coverage_queue = Queue(maxsize=2)
     history_stopped = Event()
     history_thread = None
+    coverage_thread = None
     delete_thread = None
     delete_ids = set()
-    def read_history(history_ctx, session_id):
-        from cn_tool.utils.ping_history import read_monitor_history
-        while True:
-            payload = history_queue.get()
-            if payload is None or history_stopped.is_set():
+    def history_context():
+        from types import SimpleNamespace
+        return SimpleNamespace(cfg={'ping_history_file': state['runtime'].ctx.cfg.get('ping_history_file')})
+    def export_coverage(history_ctx, payload):
+        from cn_tool.utils.ping_coverage import CoverageStopped
+        try:
+            path, filename = coverage_export(history_ctx, report_directory.name, payload['parent'], history_stopped.is_set)
+            event = {'request_id': payload['request_id'], 'path': str(path), 'filename': filename}
+        except CoverageStopped:
+            return
+        except CoverageExportRefused as refusal:
+            event = {'request_id': payload['request_id'], 'error': str(refusal)}
+        except Exception as error:
+            logger = getattr(state['runtime'].ctx, 'logger', None)
+            if logger is not None:
+                logger.warning('Unseen download failed: %s', error)
+            event = {'request_id': payload['request_id'], 'error': monitor_history_error(True)}
+        with write_lock:
+            if history_stopped.is_set():
                 return
             try:
+                connection.send_bytes(encode(envelope(state['session'], None, 'report_snapshot', event)))
+            except (OSError, EOFError):
+                state['orphaned'] = True
+                operation_stop.set()
+    def read_history(history_ctx, session_id, source, extra=None):
+        from cn_tool.utils.ping_history import read_monitor_history
+        while True:
+            payload = source.get()
+            if payload is None or history_stopped.is_set():
+                return
+            if 'query_id' not in payload:  # a download, not a page
+                export_coverage(history_ctx, payload)
+                continue
+            try:
                 query = {key: payload[key] for key in ('kind', 'parent', 'cursor', 'limit', 'sort', 'descending', 'group', 'filter_field', 'filter_text') if key in payload}
-                page = read_monitor_history(history_ctx, query)
+                page = read_monitor_history(history_ctx, query, **(extra or {}))
                 if history_stopped.is_set():
                     return
                 cache = state['monitor_cache']
@@ -1478,17 +1559,28 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                         emit('monitor_delete_result', dict(query_id=request['query_id'], status=status, warning=warning))
                     delete_thread = Thread(target=delete_history)
                     delete_thread.start()
-            elif kind == 'monitor_history' and state['ready']:
-                if history_thread is None:
-                    from types import SimpleNamespace
-                    history_ctx = SimpleNamespace(cfg={'ping_history_file': state['runtime'].ctx.cfg.get('ping_history_file')})
-                    history_thread = Thread(target=read_history, args=(history_ctx, state['session']), daemon=True)
+            elif kind in {'monitor_history', 'monitor_coverage_export'} and state['ready']:
+                covering = kind == 'monitor_coverage_export' or payload['kind'] == 'coverage'
+                if covering and coverage_thread is None:
+                    # One fold is kept between this thread's pages (read_monitor_history ``cache``); the stop signal
+                    # ends a fold that Quit does not wait for.
+                    coverage_thread = Thread(target=read_history, args=(
+                        history_context(), state['session'], coverage_queue,
+                        dict(cache={}, stop=history_stopped.is_set)), daemon=True)
+                    coverage_thread.start()
+                elif not covering and history_thread is None:
+                    history_thread = Thread(target=read_history, daemon=True,
+                                            args=(history_context(), state['session'], history_queue))
                     history_thread.start()
                 try:
-                    history_queue.put_nowait(payload)
+                    (coverage_queue if covering else history_queue).put_nowait(payload)
                 except Full:
-                    emit('monitor_history_result', dict(query_id=payload['query_id'], items=[], next_cursor=None,
-                                                        error='History reader is busy. Try again.'))
+                    busy = 'History reader is busy. Try again.'
+                    if kind == 'monitor_coverage_export':
+                        emit('report_snapshot', {'request_id': payload['request_id'], 'error': busy})
+                    else:
+                        emit('monitor_history_result', dict(query_id=payload['query_id'], items=[], next_cursor=None,
+                                                            error=busy))
             elif kind == 'config_search_page':
                 cache = next((item for item in state['config_cache'].values()
                               if item is not None and item[0] == payload['job_id']), None)
@@ -1575,13 +1667,14 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             snapshot_thread.join()
         if delete_thread is not None:
             delete_thread.join()
-        if history_thread is not None:
-            while True:
-                try:
-                    history_queue.get_nowait()
-                except Empty:
-                    break
-            history_queue.put_nowait(None)
+        for reader, waiting in ((history_thread, history_queue), (coverage_thread, coverage_queue)):
+            if reader is not None:
+                while True:
+                    try:
+                        waiting.get_nowait()
+                    except Empty:
+                        break
+                waiting.put_nowait(None)
         interaction.close_store()
         runtime = state['runtime']
         if runtime is not None:

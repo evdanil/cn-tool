@@ -45,7 +45,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-webui = ["nicegui>=3.18,<3.19", "keyring>=25.7,<26"]
+webui = [
+    "nicegui>=3.18,<3.19",
+    "keyring>=25.7,<26",
+    "pydantic==2.14.2; sys_platform == 'win32'",
+]
 
 [project.urls]
 Homepage = "https://github.com/evdanil/cn-tool"

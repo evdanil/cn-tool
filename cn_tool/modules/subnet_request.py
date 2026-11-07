@@ -41,6 +41,7 @@ from cn_tool.utils.network_views import (
     view_scope,
 )
 from cn_tool.utils.process_data import CONTAINER_UTILIZATION_SCALE, process_data, utilization_percent
+from cn_tool.utils.unused_addresses import CONTAINER, unused_addresses, with_unconfirmed
 from cn_tool.utils.user_input import press_any_key, read_user_input
 from cn_tool.utils.validation import ipv6_form_problem
 
@@ -58,6 +59,10 @@ DETAIL_TABLE_ORDER = (
 DETAIL_TABLE_SUFFIX = {"general": "Information", "IP addresses": "in use"}
 #: The section (and menu table) listing the containers inside a container prefix; they are listed, never expanded.
 CHILD_CONTAINERS = "child containers"
+#: The section ``cn subnet --available`` adds before ``warnings``: the addresses with no record of any type.
+UNUSED_SECTION = "unused addresses"
+#: What a refusal says, in ``warnings`` and on the console, ahead of its reason (``cn_tool.utils.unused_addresses``).
+NO_LIST_NOTICE = "no unused addresses listed: "
 #: What ``cn subnet`` always returns besides ``subnets``, the child containers and ``warnings``, so the JSON keys do not depend on the data.
 CLI_DETAIL_SECTIONS = (*DETAIL_TABLE_ORDER, "Extensible Attributes", "Active Directory")
 TRUNCATION_NOTICE = f"showing the first {WAPI_MAX_ROWS:,} only (paging limit); query a smaller subnet"
@@ -115,6 +120,10 @@ WAPI_URIS: Dict[int, Dict[str, str]] = {
 }
 #: The purposes (keys of ``WAPI_URIS``) whose request the grid answers for one network view only.
 RESTRICTED_TO_ONE_VIEW = frozenset({"contains", "DNS records", "range bundle", "fixed addresses", "IP addresses"})
+#: The four lookups whose rows are the records of a network (``cn subnet --available`` subtracts them). One that
+#: answers "does not match any network" is a miss and no warning, since the network may sit in another view; for a
+#: network the bundle did find, it is a list the lookup could not confirm (``SubnetFetchOutcome.unconfirmed``).
+LIST_LOOKUPS = ("DNS records", "range bundle", "fixed addresses", "IP addresses")
 #: The sections the range answer feeds, which are also its warning labels; IPv6 has no failover section.
 RANGE_SECTIONS: Dict[int, Tuple[str, ...]] = {4: ("DHCP range", "DHCP failover"), 6: ("DHCP range",)}
 #: The column of a fixed address's DHCPv6 identity (JSON ``duid``), shown whenever the run has an IPv6 object.
@@ -291,10 +300,15 @@ class SubnetFetchOutcome:
     What the lookups of one CIDR returned. ``data`` is the part of the answers that named no
     network view (today's data); ``by_view`` has one entry for each view the answers named. The
     warnings belong to the CIDR, so every view shares them.
+
+    ``unconfirmed`` names the views in which one of the four list lookups (``LIST_LOOKUPS``) answered as a miss,
+    "" for a request that named no view. A miss is no warning (the CIDR may live in another view), so without
+    this a network split or deleted between the parallel requests would look like an empty one.
     """
     data: Dict[str, Any]
     warnings: List[str]
     by_view: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    unconfirmed: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -315,6 +329,40 @@ class SubnetLookup:
     save_view: bool
     duid: bool
     stopped: bool
+    #: ``_cache_key`` values: a named view marks that view's group of a CIDR, "" (the plain CIDR) every group of it.
+    #: A group in it had a list lookup that missed, or rows that name no view dropped beside rows that do: not
+    #: proved complete (``is_unconfirmed``). Only ``--available`` and the Subnets page's Unused list read it.
+    unconfirmed: Set[str] = field(default_factory=set)
+
+    def is_unconfirmed(self, network: Network) -> bool:
+        """Whether the group of ``network`` (one CIDR in one view) is in ``unconfirmed``, by its view or by its CIDR."""
+        return _cache_key(network) in self.unconfirmed or str(network) in self.unconfirmed
+
+
+def _unconfirmed_keys(network: Network, outcome: SubnetFetchOutcome) -> Set[str]:
+    """
+    The ``SubnetLookup.unconfirmed`` entries of one CIDR (``network``, a plain network) from its lookup's outcome:
+    each view whose list lookup missed, and the CIDR itself when rows that name no view came back beside rows that
+    do, because settling the targets keeps the labelled rows of each view and drops those. When no answer names a view
+    the one group is keyed by the plain CIDR, so a miss in any view marks it too.
+    """
+    views = set(outcome.unconfirmed)
+    if outcome.by_view and any(outcome.data.values()):
+        views.add("")
+    if outcome.unconfirmed and not outcome.by_view:
+        views.add("")
+    return {_cache_key(_make_network(network, view)) for view in views}
+
+
+@dataclass(frozen=True)
+class AvailableResult:
+    """
+    What ``SubnetRequestModule.available_addresses`` found: the ``rows`` of the subnets that could be listed
+    (``network view`` when the run shows it, ``network``, ``IP address``) and the ``refusals`` of the inputs that
+    could not (``network view`` when shown, ``network``, ``reason``), each with the reason there is no list.
+    """
+    rows: List[Dict[str, Any]]
+    refusals: List[Dict[str, str]]
 
 
 class SubnetRequestModule(BaseModule):
@@ -345,6 +393,7 @@ class SubnetRequestModule(BaseModule):
         """Collect data; the terminal observer preserves messages at resolution."""
         targets, errors, containers = [], {}, []
         data, warnings, views = {}, {}, {}
+        unconfirmed: Set[str] = set()
         stopped = False
         try:
             if control:
@@ -365,7 +414,7 @@ class SubnetRequestModule(BaseModule):
             networks = self._unique_networks(targets)
             if networks:
                 if control is None:
-                    data, warnings, views = self._fetch_subnets(ctx, networks, scope.requested, all_views)
+                    data, warnings, views = self._fetch_subnets(ctx, networks, scope.requested, all_views, unconfirmed)
                 else:
                     control.stage("fetching subnet information")
                     with ControlledExecutor(control, get_infoblox_max_workers(ctx)) as executor:
@@ -380,19 +429,86 @@ class SubnetRequestModule(BaseModule):
                                 views[str(network)] = tuple(sorted(outcome.by_view))
                             if outcome.warnings:
                                 warnings[str(network)] = outcome.warnings
+                            unconfirmed |= _unconfirmed_keys(network, outcome)
             if control:
                 control.stage("preparing results")
         except OperationCancelled:
             stopped = True
         targets, data, warnings, containers, save_view = self._settle_views(ctx, scope, targets, data, warnings, views, containers)
         return SubnetLookup(list(inputs), targets, errors, containers, data, warnings,
-                            self._group_by_network(targets), save_view, self._has_ipv6_object(inputs), stopped)
+                            self._group_by_network(targets), save_view, self._has_ipv6_object(inputs), stopped,
+                            unconfirmed)
 
     def lookup_sections(self, ctx: ScriptContext, lookup: SubnetLookup, *, misses: Sequence[str] = (),
                         fallback_view: str = "") -> Dict[str, List[Dict[str, Any]]]:
         return self._build_cli_sections(ctx, list(lookup.grouped), lookup.grouped, lookup.subnet_data,
                                         lookup.warnings, misses, lookup.containers,
                                         fallback_view=fallback_view, duid=lookup.duid)
+
+    def available_addresses(self, lookup: SubnetLookup, *, views_readable: bool, show_view: bool) -> AvailableResult:
+        """
+        The addresses of every subnet in ``lookup`` that have no record of any type, from the sections the lookup
+        already holds (it sends no request), or the reason a subnet cannot be listed.
+
+        Each group (one network in one network view, ``lookup.grouped``) is judged on its own by
+        ``unused_addresses`` with its sections, its warnings and ``views_readable`` (``ViewScope.listed()`` of
+        the run). A group the lookup could not prove complete (``lookup.is_unconfirmed``: a list lookup missed, or
+        rows that name no view were dropped) is handed one more warning, so it is refused as incomplete. Each child container of ``lookup.containers`` is a refusal of its own (``CONTAINER``): it is
+        listed, never expanded, so nothing stands for its addresses. ``show_view`` puts ``network view`` first in
+        the rows and the refusals, as the other sections of the run do (``_build_cli_sections``).
+        """
+        rows: List[Dict[str, Any]] = []
+        refusals: List[Dict[str, str]] = []
+        for network in lookup.grouped:
+            key = _cache_key(network)
+            lead = {NETWORK_VIEW: _view_of(network), "network": str(network)} if show_view else {"network": str(network)}
+            tables = lookup.subnet_data.get(key, {})
+            found = unused_addresses(
+                str(network), tables, with_unconfirmed(lookup.warnings.get(key, []), tables, lookup.is_unconfirmed(network)),
+                views_readable=views_readable,
+            )
+            if found.refusal:
+                refusals.append({**lead, "reason": found.refusal})
+            else:
+                rows.extend({**lead, "IP address": address} for address in found.addresses)
+        for container in lookup.containers:
+            lead = {NETWORK_VIEW: str(container.get(NETWORK_VIEW) or "")} if show_view else {}
+            refusals.append({**lead, "network": str(container["child container"]), "reason": CONTAINER})
+        return AvailableResult(rows, refusals)
+
+    def _with_available(
+        self, ctx: ScriptContext, lookup: SubnetLookup, scope: ViewScope, sections: Dict[str, List[Dict[str, Any]]],
+    ) -> tuple[Dict[str, List[Dict[str, Any]]], bool]:
+        """
+        ``sections`` of ``cn subnet --available``: ``unused addresses`` goes before ``warnings``, and every refusal
+        is a ``warnings`` row (``no unused addresses listed: <reason>``) and a line on the console, so a script that
+        reads the exit status cannot mistake "could not tell" for "nothing free". When a subnet was found, nothing was
+        refused and no address is unused, the console says ``cn subnet: no unused addresses`` (stdout is unchanged).
+        Returns the new sections and whether anything was refused.
+
+        The view list is asked only when there is a group to list (``scope.listed()`` reads the grid the lookup
+        already read), so a run that was refused early reads nothing more.
+        """
+        show_view = bool(scope.requested) or any(_view_of(network) for network in lookup.grouped)
+        found = self.available_addresses(
+            lookup, views_readable=scope.listed() if lookup.grouped else True, show_view=show_view,
+        )
+        warnings = list(sections.get("warnings", []))
+        if lookup.grouped and not found.refusals and not found.rows:
+            # an empty section vanishes in table, md and csv: say that nothing is unused, not that the option was ignored
+            ctx.console.print("cn subnet: no unused addresses", markup=False)
+        for refusal in found.refusals:
+            view = refusal.get(NETWORK_VIEW)
+            where = f" in network view {view}" if view else ""
+            ctx.console.print(f"{refusal['network']}{where} - {NO_LIST_NOTICE}{refusal['reason']}", markup=False)
+            warnings.append({
+                **{name: value for name, value in refusal.items() if name != "reason"},
+                "warning": NO_LIST_NOTICE + refusal["reason"],
+            })
+        ordered = {name: rows for name, rows in sections.items() if name != "warnings"}
+        ordered[UNUSED_SECTION] = found.rows
+        ordered["warnings"] = warnings
+        return ordered, bool(found.refusals)
 
     def run(self, ctx: ScriptContext) -> None:
         """
@@ -490,6 +606,14 @@ class SubnetRequestModule(BaseModule):
         ``network_view``); ``--view`` / ``[api] network_view`` limit the search to one view. A view that
         is not on the grid ends the run with 2, a view list that cannot be read with 3, both after the
         login and before any lookup, with an empty result.
+
+        With ``--available`` the result also has ``unused addresses`` (before ``warnings``): the addresses of
+        each IPv4 subnet with no record of any type, worked out from the lists this lookup already holds
+        (``available_addresses``; no extra request). A subnet that cannot be listed with certainty (a prefix
+        that is no network, a lookup that warned, a view list that could not be read, a child container, IPv6, a
+        network over 65,536 addresses) is a ``warnings`` row and a line on the console, shows no rows and
+        makes the exit status 3, also for a prefix that exits 1 and a container-only prefix that exits 0 without
+        the option. Without it the result is what it always was.
         """
         self.execute_hook('pre_run', ctx, None)
         try:
@@ -528,13 +652,20 @@ class SubnetRequestModule(BaseModule):
             query_targets, containers = lookup.query_targets, lookup.containers
             resolution_errors = lookup.resolution_errors
             invalid, failed = bool(malformed), bool(resolution_errors)
+            available = bool(getattr(args, "available", False))
             if not query_targets:
                 sections = self.lookup_sections(ctx, lookup, misses=misses, fallback_view=scope.requested)
+                if available:
+                    sections, refused = self._with_available(ctx, lookup, scope, sections)
+                    failed = failed or refused
                 return CliResult(cli_exit_code(found=bool(containers), invalid=invalid, failed=failed), sections)
             subnet_data_cache, subnet_warning_cache = lookup.subnet_data, lookup.warnings
             grouped_by_network, save_view = lookup.grouped, lookup.save_view
             all_data_to_save = self._collect_save_data(ctx, grouped_by_network, subnet_data_cache, save_view=save_view)
             sections = self.lookup_sections(ctx, lookup, misses=misses, fallback_view=scope.requested)
+            if available:
+                sections, refused = self._with_available(ctx, lookup, scope, sections)
+                failed = failed or refused
             if ctx.cfg["report_auto_save"] and all_data_to_save:
                 self._save_subnet_data(ctx, query_targets, all_data_to_save, duid=duid)
             self._publish_stats(ctx, len(inputs), query_targets, list(grouped_by_network), subnet_data_cache)
@@ -664,7 +795,8 @@ class SubnetRequestModule(BaseModule):
             ctx.console.print(f"[{colors['description']}]{prefix}: {note}[/]")
 
     def _fetch_subnets(
-        self, ctx: ScriptContext, networks: List[Network], network_view: str = "", all_views: Sequence[str] = ()
+        self, ctx: ScriptContext, networks: List[Network], network_view: str = "", all_views: Sequence[str] = (),
+        unconfirmed: Optional[Set[str]] = None,
     ) -> tuple[Dict[str, Dict], Dict[str, List[str]], Dict[str, Tuple[str, ...]]]:
         """
         Fetch every CIDR in parallel (``network_view`` limits the lookups to one view, "" searches every
@@ -672,7 +804,9 @@ class SubnetRequestModule(BaseModule):
         ``_fetch_all_data_for_subnet``): (data, warnings, views). Data and warnings are keyed by the CIDR's text, only when
         non-empty. The part of a CIDR's answers that names no view is its data under the plain CIDR;
         the part of each view it names is under ``_cache_key(_make_network(cidr, view))``. ``views`` lists,
-        for each CIDR whose answers named any, those views (sorted).
+        for each CIDR whose answers named any, those views (sorted). ``unconfirmed``, when given, is the set that
+        takes the ``SubnetLookup.unconfirmed`` entries of every CIDR (an out-parameter, so the three values returned
+        keep their shape).
         """
         colors = get_global_color_scheme(ctx.cfg)
         subnet_data_cache: Dict[str, Dict] = {}
@@ -707,6 +841,8 @@ class SubnetRequestModule(BaseModule):
                         views_by_network[net_str] = tuple(sorted(outcome.by_view))
                     if outcome.warnings:
                         subnet_warning_cache[net_str] = outcome.warnings
+                    if unconfirmed is not None:
+                        unconfirmed |= _unconfirmed_keys(network, outcome)
         return subnet_data_cache, subnet_warning_cache, views_by_network
 
     def _collect_save_data(
@@ -1010,7 +1146,8 @@ class SubnetRequestModule(BaseModule):
         if outcome.data or not outcome.by_view:
             processed_data = self.execute_hook('process_data', ctx, outcome.data)
         by_view = {view: self.execute_hook('process_data', ctx, data) for view, data in outcome.by_view.items()}
-        return SubnetFetchOutcome(data=processed_data, warnings=outcome.warnings, by_view=by_view)
+        return SubnetFetchOutcome(data=processed_data, warnings=outcome.warnings, by_view=by_view,
+                                  unconfirmed=outcome.unconfirmed)
 
     def _fetch_all_data_for_subnet(
         self,
@@ -1076,24 +1213,25 @@ class SubnetRequestModule(BaseModule):
                 "request_fn": paged_request,
             },
         }
-        planned = [  # (lookup, uri): one for the bundle, one for each view for the three the grid answers per view
-            (label, uri)
+        planned = [  # (lookup, view, uri): one for the bundle, one for each view for the four the grid answers per view
+            (label, view, uri)
             for label in request_specs
-            for _, uri in scoped_uris(_wapi_uri(label, network), _views_for(label, network_view, all_views))
+            for view, uri in scoped_uris(_wapi_uri(label, network), _views_for(label, network_view, all_views))
         ]
         partitions: Dict[str, Dict[str, Any]] = {}  # network view -> its parsed sections; "" = no view named
         warnings: List[str] = []
+        unconfirmed: Set[str] = set()  # the views whose list lookup missed ("" = the request named no view)
         pool = (
             nullcontext(executor) if executor is not None
             else ThreadPoolExecutor(max_workers=bound_infoblox_workers(ctx, len(planned)))
         )
         with pool as running:
-            future_to_label = {
-                running.submit(request_specs[label]["request_fn"], ctx, uri, ensure_auth=False): label
-                for label, uri in planned
+            future_to_request = {
+                running.submit(request_specs[label]["request_fn"], ctx, uri, ensure_auth=False): (label, view)
+                for label, view, uri in planned
             }
-            for future in as_completed(future_to_label):
-                label = future_to_label[future]
+            for future in as_completed(future_to_request):
+                label, view_asked = future_to_request[future]
                 spec = request_specs[label]
                 try:
                     result = future.result()
@@ -1121,6 +1259,8 @@ class SubnetRequestModule(BaseModule):
                             notice = _truncation_notice(payloads)
                     elif result.failed:
                         notice = describe_infoblox_failure(result)
+                    elif label in LIST_LOOKUPS:  # the grid's miss: no warning, but not proof that the list is empty
+                        unconfirmed.add(view_asked)
                     if notice:
                         for warning_label in spec["warning_labels"]:
                             warnings.append(f"{warning_label}: {notice}")
@@ -1140,6 +1280,7 @@ class SubnetRequestModule(BaseModule):
             data=unlabelled,
             warnings=list(dict.fromkeys(warnings)),  # the same line from the requests of two views is said once
             by_view={view: partitions[view] for view in sorted(partitions)},
+            unconfirmed=tuple(sorted(unconfirmed)),
         )
 
     def _display_results(self, ctx: ScriptContext, query_targets: List[QueryTarget], subnet_data_cache: Dict[str, Dict], grouped_by_network: Dict[Network, List[str]], subnet_warning_cache: Optional[Dict[str, List[str]]] = None) -> None:

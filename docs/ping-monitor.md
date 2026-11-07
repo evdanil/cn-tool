@@ -44,6 +44,7 @@ cn monitor 10.1.2.0/28 --every 30s                # until q or Ctrl+C
 cn monitor --file sites.txt --tcp 22              # one round, recorded, with the earlier rounds
 cn monitor --list                                 # the recorded requests, running ones included
 cn monitor --show a3f9 --since 24h --format md    # a summary from the history; nothing is pinged
+cn monitor --show a3f9 --available                # also the IPs that never replied (see below)
 cn monitor --follow a3f9                          # the live view of a run another process records
 cn monitor --rerun a3f9 --for 8h                  # a3f9's targets and ports again, its interval, 8 hours
 cn monitor --runs a3f9                            # list the full run IDs for a request
@@ -148,10 +149,66 @@ hosts were seen, when first and last, in how many rounds, and when they stayed o
   `Ping every` (Enter: 1m). With `[report] auto_save` the "Ping Monitor" sheet gets every host seen,
   with every online period.
 - **The history** is an SQLite file, `[ping] history_file` (default `~/.cn-ping-history.db`), kept
-  for `[ping] history_days` (default 30) days. It is one file per machine: SQLite's WAL journal does
+  for `[ping] history_days` days (default 180 from 0.10.0, 30 before; an Unseen list rests on
+  it, see below). It is one file per machine: SQLite's WAL journal does
   not work over a network file system, so a home directory on NFS or SMB works for one machine at a
   time. `--list`, `--show`, `--follow`, `--rerun` (before its run) and the menu's list never create or
   change it. Only a run (and its prune), `--delete`, `--clear` and the menu's `d` and `c` write, and
   the last four never create the file. A killed run keeps every round it finished and shows as
   `lost`. A history that cannot be written is reported once (`cn: monitor: history: ...`) and the run
   goes on without it, with exit status 3; so does a Python built without `sqlite3`.
+
+## Never-seen IPs (Show Available)
+
+From 0.10.0, `cn monitor TARGETS --available` and `cn monitor --show ID --available` list the IPs of a target
+line that never replied in **any** round the history holds. The browser's **Show Available** checkbox on the History tab
+of Monitor shows the same list (see the [WebUI guide](webui.md#monitor)). A scheduled job that pings a few subnets every
+hour has, after three or four months, the evidence to find the IPs nothing ever answered from, and their Infoblox records
+can then be checked and the unused ones cleaned up.
+
+```bash
+cn monitor --show a3f9 --available                  # the IPs that never replied, with the evidence
+cn monitor --show a3f9 --available --format csv     # the same as rows for a spreadsheet
+cn monitor --file sites.txt --every 1h --for 1d --available   # run, then list them
+```
+
+**A list is a lead, not proof.** Unseen means no reply to **this machine** during the rounds kept. A host that is
+firewalled, asleep or unplugged looks the same, so check with the owner or the Infoblox record before you delete anything.
+
+**One target line, one history.** A target line is a request: its targets (normalised and sorted, so `10.1.2.5/24` is
+`10.1.2.0/24`), its TCP ports and the hosts they expand to. History is not shared between lines. If you add a subnet to
+a `--file`, edit a target or change `--tcp`, the new line starts with an empty history for every subnet in it, and an
+IP that replied under the old line is Unseen in the new one until it replies there. The `Since` column shows how far back
+the evidence goes.
+
+| Status | Meaning | The IP's observations |
+| ------ | ------- | --------------------- |
+| `Seen` | replied in at least one round kept | any `!`, `R` or `T` |
+| `Unseen` | never replied, in at least one round where the probe ran | only `.` and `U`, perhaps with some `E` or `?` |
+| `Not tested` | no round could test it | only `E` and `?` |
+
+A failed probe (`E`) and a name that did not resolve (`?`) are not evidence of silence, so they are not counted as
+rounds for that IP: `Seen` reads `0 of 2,880 rounds` (the rounds that tested it) and `Failed rounds` counts the others.
+
+`--available` adds the section `unseen` with the `Unseen` and `Not tested` rows, in host order; the other sections keep
+their meaning. Its columns are `Host`, `Status`, `Seen`, `Failed rounds`, `Since` (the oldest round kept for the line,
+UTC) and `Note`; in JSON `seen_rounds` and `rounds` are numbers instead of `Seen`'s text. With targets the list is read
+after the run, so the run's own rounds count. An empty section does not print in the table, markdown or CSV formats, so
+when the history holds the request and no IP is Unseen or Not tested, stderr says `cn: monitor: no never-seen IPs: every
+host of this target line replied at least once`; stdout and the exit status stay as they are.
+
+**Silent subnets.** If no IP of a subnet in the line ever replied, this machine may simply be unable to reach it. Its IPs
+stay Unseen, each of those rows carries the `Note` `no IP in this subnet ever replied`, and stderr says `cn: monitor: no
+IP in 10.1.2.0/24 ever replied; this machine may not be able to reach it`. Treat them as untested, not unused.
+
+**Combinations and exit status.** `--available` goes with targets or `--show`. `--available` with `--since` exits 2, because
+never seen means the whole history, and so does `--available` with `--list`, `--runs`, `--follow`, `--delete`,
+`--delete-run`, `--clear` or `--rerun`. It changes no other exit status, no prompt and no report. Exit status 3 means the history could not be read
+for the list (the summary is still printed).
+
+**Retention.** The list rests on the rounds kept. Every run deletes the rounds older than `[ping] history_days`, which is
+180 from 0.10.0 unless you set it (30 before; a configuration that sets a value keeps it), and deleted rounds do not come back. Set it
+to cover the period you want to judge: with 30 days, an IP that last replied five weeks ago looks never seen. The
+configuration a run loads applies to the whole history file, so two schedules with different `history_days` prune to the
+shorter one. A longer history takes more disk: a /16 pinged hourly for 180 days, with 500 hosts replying in each round,
+measured 406 MB and 3.3 s to read for the list.

@@ -16,7 +16,31 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
-## 0.9.3 (this source)
+## 0.10.0
+
+Monitor's latest-round and saved-round host tables use a bottom pagination bar
+with a rows-per-page selector and arrow navigation. The Windows WebUI extra pins
+Pydantic to 2.14.2, whose matching pydantic-core 2.50.2 worked on a workstation
+where application control blocked the newer 2.50.4 binary. Local policy still
+determines which binaries may run.
+
+**Show Available** lists IPs that nothing seems to use, in the browser (a checkbox on
+Subnets and on Monitor's History tab) and on the command line (`--available` on
+`cn subnet` and `cn monitor`). On Subnets it lists the IPv4 addresses with no record of
+any type in Infoblox, from the lookup already made; a subnet that cannot be listed with
+certainty is named with its reason and, on the command line, ends the run with status 3.
+On Monitor it lists the IPs of a target line that never replied in any round kept. Each
+web table has a **Download available IPs** button that saves a CSV. Neither list proves
+an address is free: check it before you reuse the address or delete its record. See
+[Unused addresses](infoblox.md#unused-addresses-show-available) and
+[Never-seen IPs](ping-monitor.md#never-seen-ips-show-available).
+
+The default of `[ping] history_days` is now **180** days instead of 30, so a long watch
+keeps the evidence an Unseen list needs. A configuration that sets a value keeps it. The
+history file can grow to as much as six times its old size, and rounds already deleted
+do not come back; see [Configuration](configuration.md).
+
+## 0.9.3
 
 Result tables support column sorting and case-insensitive field filtering across
 all pages. Ping and Monitor offer compact outcome summaries. Filtering a Site

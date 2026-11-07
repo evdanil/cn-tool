@@ -31,8 +31,11 @@ AUTH_ENV_DEFAULTS: Dict[str, str] = {
     "auth_infoblox_password_var": "INFOBLOX_PW",
 }
 
+# Days of ping history kept when [ping] history_days is not set: a monitor that runs for months keeps its evidence.
+DEFAULT_PING_HISTORY_DAYS = 180
+
 BASE_CONFIG_SCHEMA = {
-    "api_endpoint":          {"section": "api", "ini_key": "endpoint", "type": "str", "fallback": "API_URL"},
+    "api_endpoint":         {"section": "api", "ini_key": "endpoint", "type": "str", "fallback": "API_URL"},
     "api_verify_ssl":        {"section": "api", "ini_key": "verify_ssl", "type": "bool", "fallback": True},
     "api_timeout":           {"section": "api", "ini_key": "timeout", "type": "int", "fallback": 10},
     "api_max_workers":       {"section": "api", "ini_key": "max_workers", "type": "int", "fallback": 8},
@@ -74,7 +77,7 @@ BASE_CONFIG_SCHEMA = {
     "cache_sqlite_cache_size": {"section": "cache", "ini_key": "sqlite_cache_size", "type": "str", "fallback": "16M"},
     "cache_sqlite_mmap_size":  {"section": "cache", "ini_key": "sqlite_mmap_size", "type": "str", "fallback": "32M"},
     "ping_history_file":     {"section": "ping", "ini_key": "history_file", "type": "path", "fallback": "~/.cn-ping-history.db"},
-    "ping_history_days":     {"section": "ping", "ini_key": "history_days", "type": "int", "fallback": 30},
+    "ping_history_days":     {"section": "ping", "ini_key": "history_days", "type": "int", "fallback": DEFAULT_PING_HISTORY_DAYS},
     "theme_name":            {"section": "theme", "ini_key": "theme", "type": "str", "fallback": "default"},
     # Config Analyzer (external TUI) settings
     "config_repo_history_dir":     {"section": "config_repo", "ini_key": "history_dir", "type": "str", "fallback": "history"},

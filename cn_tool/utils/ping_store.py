@@ -1188,6 +1188,12 @@ class PingStore:
             found = _request_infos(connection, "WHERE key = ?", (key,))
         return found[0] if found else None
 
+    def request_by_id(self, request_id: int) -> Optional[RequestInfo]:
+        """The request whose row id is ``request_id`` (what a web page names it by), or ``None``."""
+        with self._transaction(write=False) as connection:
+            found = _request_infos(connection, "WHERE id = ?", (request_id,))
+        return found[0] if found else None
+
     def other_ports(self, targets: Sequence[str], key: str) -> List[Tuple[int, ...]]:
         """The TCP ports of every other request (key differs) with exactly these ``targets``, oldest request first."""
         wanted = list(targets)
@@ -1269,6 +1275,20 @@ class PingStore:
             StoredRound(round_id, run_id, started, interval, observations, answered, tuple(rows.get(round_id, ())))
             for round_id, run_id, started, interval, observations, answered in found
         ]
+
+    def round_observations(self, request_id: int, *, through: Optional[int] = None) -> Iterator[Tuple[float, str]]:
+        """
+        The start and the observation characters of every stored round of the request, with no rows and in no
+        particular order (an order would make SQLite sort the whole history: the caller folds, and a fold does not
+        mind), streamed from the cursor, never held whole. Up to the same ``through`` mark (``last_round_id``) as
+        ``rounds``. Read inside a ``snapshot`` it is one history from the first round to the last.
+        """
+        match, params = _rounds_of(request_id, through=through)
+        with self._transaction(write=False) as connection:
+            for started, observations in connection.execute(
+                f"SELECT round.started, round.observations {_ROUNDS} WHERE {match}", params
+            ):
+                yield float(started), observations
 
     def last_round_id(self) -> int:
         """

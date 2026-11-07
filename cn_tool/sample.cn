@@ -59,8 +59,10 @@ version = 6
 # The Ping Monitor's history (menu m, cn monitor): one SQLite file per machine. A file on a network
 # file system (NFS, SMB) works for one machine at a time.
 # history_file = ~/.cn-ping-history.db
-# Days a recorded round is kept; a run removes the older rounds when it starts.
-# history_days = 30
+# Days a recorded round is kept; a run removes the older rounds when it starts. A list of hosts that never
+# replied (cn monitor --available, Show Available in the browser) rests on the rounds kept, so set this to
+# cover the period you want to judge.
+# history_days = 180
 
 [theme]
 # theme = default

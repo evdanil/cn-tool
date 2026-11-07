@@ -36,9 +36,11 @@ from cn_tool.modules import bulk_ping
 from cn_tool.utils import auth, oscompat, ping_grid, ping_live
 from cn_tool.utils import ping_history as ph
 from cn_tool.utils.cli_input import read_objects
+from cn_tool.utils.config import DEFAULT_PING_HISTORY_DAYS
 from cn_tool.utils.config_history import format_time, since_time
 from cn_tool.utils.display import console, get_global_color_scheme, print_table_data, table_columns
 from cn_tool.utils.file_io import queue_save
+from cn_tool.utils.ping_coverage import read_coverage, unseen_rows
 from cn_tool.utils.ping_store import (
     AlreadyRunning, Deletion, PingStore, RequestInfo, ResultRow, RunInfo, StoreError, StoredRound, id_problem,
 )
@@ -78,13 +80,19 @@ def usage_problem(args: argparse.Namespace) -> Optional[str]:
     ``--follow``, ``--rerun``, ``--delete``, ``--clear``) exclude each other, ``--every``/``--for``/``--tcp`` go with
     targets only (``--rerun`` takes ``--every`` and ``--for`` too: they change the plan it reuses), ``--since`` not
     with ``--list``, ``--delete`` or ``--clear``, ``--yes`` goes with ``--delete`` or ``--clear``, an ID has 4 or more
-    hex digits, and the interval and the duration are at least ``MIN_INTERVAL``. ``main`` refuses with it before
-    anything starts (and before stdin is read).
+    hex digits, and the interval and the duration are at least ``MIN_INTERVAL``. ``--available`` goes with targets or
+    ``--show`` only (``--rerun`` runs rounds, and is refused too), and never with ``--since``: never seen means the
+    whole history. ``main`` refuses with it before anything starts (and before stdin is read).
     """
     modes = [name for name in _MODES if getattr(args, name, None) not in (None, False)]  # even ''
     since = getattr(args, "since", None)
     if len(modes) > 1:
         return " and ".join("--" + mode.replace("_", "-") for mode in modes) + " cannot be combined"
+    available = getattr(args, "available", False)
+    if available and modes and modes[0] != "show":
+        return f"--available goes with targets or --show, not with --{modes[0].replace('_', '-')}"
+    if available and since is not None:
+        return "--available does not go with --since: never seen means the whole history"
     if getattr(args, "yes", False) and not {"delete", "clear", "delete_run"} & set(modes):
         return "--yes goes with --delete, --delete-run or --clear"
     if modes:
@@ -378,9 +386,13 @@ def _admission_text(request: Request, run: RunInfo, now: float, rerun_info: Opti
     return f"a run of {request.short_id} is going on ({_started_on(run, now)})"
 
 
-def _no_run() -> Dict[str, List[Row]]:
-    """The sections of a run that started nothing: what a refusal prints."""
-    return {"seen": [], "latest": [], "summary": [], "not_found": []}
+def _no_run(available: bool = False) -> Dict[str, List[Row]]:
+    """The sections of a run that started nothing: what a refusal prints. With ``--available`` the empty ``unseen``
+    section comes last, so a script finds the key whatever happened."""
+    sections: Dict[str, List[Row]] = {"seen": [], "latest": [], "summary": [], "not_found": []}
+    if available:
+        sections["unseen"] = []
+    return sections
 
 
 # --- running a recorded request again -------------------------------------------------------------------------
@@ -643,7 +655,7 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         return self._cli_run(ctx, args)
 
     def _cli_run(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
-        empty = _no_run()
+        empty = _no_run(getattr(args, "available", False))
         try:
             objects = read_objects(args.objects, args.file)
         except (OSError, UnicodeDecodeError) as exc:  # a file that is missing, a directory or not UTF-8
@@ -672,8 +684,10 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         request, the plan (a round every ``every`` seconds, none after ``length`` seconds from now), the run, its
         sections, the report and the exit status. ``before`` is told the request just before the run starts and may
         refuse it: an exit status and the line to say (nothing is started, the refused targets stay in ``not_found``).
+        With ``--available`` the ``unseen`` section is read after the run, so that its own rounds are in it (``_unseen``).
         """
-        empty = _no_run()
+        available = getattr(args, "available", False)
+        empty = _no_run(available)
         icmp = shutil.which("ping") is not None
         missing = bulk_ping._PING_MISSING.replace("cn: ping:", "cn: monitor:")
         if not icmp:
@@ -718,9 +732,14 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         not_found.extend({"object": name, "reason": bulk_ping._NO_SUCH_HOST} for name in sorted(missed))
 
         data = {**self._sections(outcome, args.format), "not_found": not_found}
+        history_failed = outcome.store_error is not None  # said above; the exit is 3 and ``unseen`` stays empty
+        if available:
+            data["unseen"] = []
+            if not history_failed:
+                data["unseen"], history_failed = self._read_unseen(ctx, request.key, args.format)
         self._save_report_rows(ctx, self._seen_rows(outcome, "report"))
         found = bool(outcome.rounds) and (outcome.tcp_open if request.ports else bool(data["seen"]))
-        failed = outcome.probe_failed or outcome.store_error is not None
+        failed = outcome.probe_failed or history_failed
         return CliResult(cli_exit_code(found, invalid, failed), data)
 
     def _cli_rerun(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
@@ -900,7 +919,10 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
             return info, problem, store.runs(info.id) if info is not None else []
 
     def _cli_show(self, ctx: ScriptContext, args: argparse.Namespace) -> CliResult:
+        available = getattr(args, "available", False)
         empty: Dict[str, List[Row]] = {"seen": [], "latest": [], "summary": []}
+        if available:
+            empty["unseen"] = []
         prefix = args.follow or args.show
         if args.follow and not ping_live.LiveScreen(get_global_color_scheme(ctx.cfg)).enabled:
             _say("cn: monitor: --follow needs a terminal on stderr; --show prints the summary")
@@ -927,10 +949,20 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
             except StoreError as exc:
                 _say(_HISTORY.format(exc))
                 return CliResult(3, empty)
+            history_failed = False
+            unseen: List[Row] = []
+            if available:  # still in the open store; the summary is printed when the coverage cannot be read
+                try:
+                    unseen = self._unseen(store, info.key, args.format)
+                except StoreError as exc:
+                    _say(_HISTORY.format(exc))
+                    history_failed = True
         data = self._sections(outcome, args.format)
+        if available:
+            data["unseen"] = unseen
         self._save_report_rows(ctx, self._seen_rows(outcome, "report"))
         found = outcome.tcp_open if outcome.request.ports else bool(data["seen"])
-        return CliResult(0 if found else 1, data)
+        return CliResult(3 if history_failed else 0 if found else 1, data)
 
     def _cli_runs(self, ctx: ScriptContext, prefix: str) -> CliResult:
         empty: Dict[str, List[Row]] = {"runs": []}
@@ -1153,6 +1185,44 @@ class PingMonitorModule(bulk_ping.BulkPingModule):
         outcome.live_runs = self._live_runs(current)
         outcome.running = bool(outcome.live_runs)
         return outcome
+
+    def _unseen(self, store: PingStore, key: str, fmt: str) -> List[Row]:
+        """
+        The ``unseen`` section of ``--available``: the hosts of the request ``key`` that never replied in any round
+        kept for it (``ping_coverage``), with the ``Unseen`` and ``Not tested`` rows as ``fmt`` spells them, read in one
+        snapshot. A request the history no longer holds says nothing; one it holds with no rounds lists every host as
+        ``Not tested``, as the web table does. A subnet in which no host ever replied is named on stderr: this machine
+        may not reach it. A request with no such host says so on stderr (an empty section does not print), never on stdout.
+
+        @raise StoreError: the history cannot be read, or a stored round does not fit the request.
+        """
+        with store.snapshot():
+            info = store.request(key)
+            coverage = read_coverage(store, info) if info is not None else None
+        if coverage is None:
+            return []
+        for network in coverage.silent_subnets:
+            _say(f"cn: monitor: no IP in {network} ever replied; this machine may not be able to reach it")
+        rows = unseen_rows(coverage, fmt, _when)
+        if not rows:  # an empty section vanishes in table, md and csv: say that nothing is there, not that the option was ignored
+            _say("cn: monitor: no never-seen IPs: every host of this target line replied at least once")
+        return rows
+
+    def _read_unseen(self, ctx: ScriptContext, key: str, fmt: str) -> Tuple[List[Row], bool]:
+        """``_unseen`` for a run's tail, from a store opened for reading after the run: the rows, and whether the history
+        could not be read (said on stderr, as every history failure is). No history file is nothing recorded."""
+        store, error = self._open_store(ctx, write=False)
+        if error:
+            _say(_HISTORY.format(error))
+            return [], True
+        if store is None:
+            return [], False
+        with store:
+            try:
+                return self._unseen(store, key, fmt), False
+            except StoreError as exc:
+                _say(_HISTORY.format(exc))
+                return [], True
 
     def _take_stored(self, outcome: RunOutcome, store: PingStore, request_id: int, since: Optional[float],
                      note: Optional[Callable[[ph.Change], None]] = None, through: Optional[int] = None,
@@ -1425,7 +1495,7 @@ class _Run:
             self.outcome.store_error = error
             return
         days = self.ctx.cfg.get("ping_history_days")
-        days = max(int(30 if days is None else days), 1)
+        days = max(int(DEFAULT_PING_HISTORY_DAYS if days is None else days), 1)
         self._store_call(lambda store: store.prune(self.started, days))
         request = self.request
         # The earlier rounds first, under the request's id when the history holds it (a new request has none): the

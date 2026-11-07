@@ -25,6 +25,20 @@ without WSL. The commands on this page are for PowerShell.
   `py -m cn_tool` with the same commands and options (`py -m cn_tool ip 10.1.2.3`). A pipx install
   keeps cn-tool in its own environment, so `py -m cn_tool` finds nothing there.
 
+## WebUI dependency compatibility (0.10.0)
+
+The Windows `webui` extra pins Pydantic to 2.14.2, which selects
+`pydantic-core==2.50.2`. This pair worked on a Python 3.12 x64 workstation where
+application control blocked `_pydantic_core.cp312-win_amd64.pyd` from core 2.50.4.
+The pin does not change Windows policy or guarantee approval on another machine.
+It does not affect base installs or the Linux/macOS web UI dependencies.
+
+If Windows reports that an Application Control policy blocked a `.pyd` file,
+ask your administrator to inspect the corresponding CodeIntegrity event and
+approve the required binaries. PowerShell's `RemoteSigned` setting governs
+scripts and does not resolve a native-extension policy block. Downgrading cn-tool
+alone does not restore the earlier transitive dependency versions.
+
 ## Passwords in PowerShell
 
 PowerShell's PSReadLine saves your command lines in plain text in

@@ -392,6 +392,17 @@ class ViewScope:
             return ()
         return tuple(sorted(grid.names)) if len(grid.names) > 1 else ()
 
+    def listed(self) -> bool:
+        """
+        Whether the run knows which network views it searched: a view was requested (its existence was
+        checked by ``problem()``), or the grid's views were listed. False when the list could not be read, so
+        records in other views may be missing from the answers (``cn subnet --available`` refuses on it).
+
+        It reads the grid kept for the run (``grid()``): after ``all_views()`` or ``problem()`` it sends no
+        request, and a failed list is never retried.
+        """
+        return bool(self.requested) or not self.grid().error
+
     # -- the view column -----------------------------------------------------------------------------
 
     def column(self, labels: Iterable[Any], *, dns: bool = False) -> bool:

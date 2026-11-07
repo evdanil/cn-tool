@@ -16,10 +16,15 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import AbstractSet, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING, AbstractSet, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union,
+)
 
 from cn_tool.utils import oscompat
 from cn_tool.utils.config_history import Since, parse_since
+
+if TYPE_CHECKING:  # only for the annotations
+    from pathlib import Path
 
 Row = Dict[str, str]
 Period = Tuple[float, float]
@@ -611,16 +616,81 @@ def _sorted_history_decode(cursor, parent, options, kind="hosts"):
         raise ValueError('invalid cursor') from error
 
 
-def read_monitor_history(ctx: object, query: Mapping[str, object]) -> Dict[str, object]:
+def history_file(ctx: object) -> "Path":
+    """The history database ``[ping] history_file`` names (``~/.cn-ping-history.db`` when empty), for a context whose
+    ``cfg`` holds ``ping_history_file``."""
+    from pathlib import Path
+
+    configured = ctx.cfg.get("ping_history_file")
+    return Path(configured if configured and str(configured) != "." else "~/.cn-ping-history.db").expanduser()
+
+
+def _coverage_page(
+    store: object, parent: int, after: object, query: Mapping[str, object], limit: int, cache: dict,
+    stop: Optional[Callable[[], bool]],
+) -> Optional[Dict[str, object]]:
+    """
+    One page of the ``coverage`` kind (the whole-history fold of request ``parent``, ``ping_coverage``), with the
+    ``next_cursor`` as ``[offset, fold]`` for the caller to sign, or None when ``stop`` ended the fold.
+
+    ``cache`` holds the one fold the pages are cut from: ``key`` (the request id, the newest round of the history and
+    the request's rounds) and ``coverage``. A query with no cursor reads the key in one snapshot and folds again only
+    when it changed. A cursor names the fold it was cut from by the hash of that key, so a page of it comes from the
+    cached fold or is ``expired``, never from another fold; so is a page of a request that is gone.
+
+    @raise HistoryExpired: the request is gone, or the cursor's fold is not the cached one.
+    @raise StoreError: the history cannot be read, or a stored round does not fit its request.
+    """
+    from cn_tool.utils.ping_coverage import CoverageStopped, coverage_page, read_coverage
+    from cn_tool.utils.ping_store import HistoryExpired
+
+    def fold_of(key: tuple) -> str:
+        return hashlib.sha256(json.dumps(list(key), separators=(",", ":")).encode("ascii")).hexdigest()
+
+    if after is None:
+        offset = 0
+        try:
+            with store.snapshot():
+                info = store.request_by_id(parent)
+                if info is None:
+                    raise HistoryExpired()
+                key = (info.id, store.last_round_id(), info.rounds)
+                if cache.get("key") != key:
+                    coverage = read_coverage(store, info, stop=stop)
+                    cache.clear()
+                    cache.update(key=key, coverage=coverage)
+        except CoverageStopped:
+            return None
+    else:
+        offset, fold = after
+        if ("key" not in cache or fold_of(cache["key"]) != fold or cache["key"][0] != parent
+                or store.request_brief(parent) is None):
+            raise HistoryExpired()
+    page = coverage_page(
+        cache["coverage"], sort=query["sort"], descending=query["descending"], group=query["group"],
+        filter_field=query["filter_field"], filter_text=query["filter_text"], limit=limit, offset=offset,
+    )
+    following = page.pop("next_offset")
+    return dict(page, next_cursor=None if following is None else [following, fold_of(cache["key"])])
+
+
+def read_monitor_history(
+    ctx: object, query: Mapping[str, object], *, cache: Optional[dict] = None, stop: Optional[Callable[[], bool]] = None,
+) -> Dict[str, object]:
     """Read one live, bounded history page from the configured database.
 
     ``query`` contains exactly ``kind``, ``parent``, ``cursor`` and ``limit``.
     Invalid input and pruned anchors return respectively ``invalid`` and
     ``expired``; a store failure returns its actionable message. No cursor
     implies a snapshot across calls. The connection belongs to this call.
+
+    The ``coverage`` kind (the whole history of a request, folded: ``ping_coverage``) always carries the five ordering
+    options and a request id as its parent; its page adds ``counts``, ``total`` and ``summary``. ``cache`` is the one
+    dict that keeps its fold between calls (``_coverage_page``), and ``stop`` is asked for each round the fold reads: a
+    stopped fold returns the error ``stopped`` and caches nothing.
     """
     import math
-    from pathlib import Path
+    from cn_tool.utils.ping_coverage import PAGE_FILTERS, PAGE_GROUPS, PAGE_SORTS
     from cn_tool.utils.ping_store import HistoryExpired, HistoryTooLarge, PingStore, StoreError
 
     def result(items: object = None, next_cursor: object = None, error: object = None) -> Dict[str, object]:
@@ -635,27 +705,28 @@ def read_monitor_history(ctx: object, query: Mapping[str, object]) -> Dict[str, 
     if ordered and query['kind'] != 'hosts':
         options.insert(0, query['kind'])
     kind, parent, cursor, limit = (query["kind"], query["parent"], query["cursor"], query["limit"])
-    if (not isinstance(kind, str) or kind not in ("requests", "runs", "rounds", "hosts", "template") or
+    if (not isinstance(kind, str) or kind not in ("requests", "runs", "rounds", "hosts", "template", "coverage") or
             not _history_int(limit) or limit > 100 or
             (kind == "requests" and parent is not None) or
-            (kind in ("runs", "hosts") and not _history_int(parent)) or
+            (kind in ("runs", "hosts", "coverage") and not _history_int(parent)) or
             (kind in ("rounds", "template") and not _history_run_id(parent)) or
-            (kind == "template" and (cursor is not None or limit != 1))):
+            (kind == "template" and (cursor is not None or limit != 1)) or
+            (kind == "coverage" and not ordered)):
         return result(error="invalid")
-    allowed_fields = {'hosts': ('host', 'status', 'address', 'result'),
+    allowed_fields = {'hosts': ('host', 'status', 'address', 'result'), 'coverage': PAGE_SORTS,
                       'requests': ('targets', 'ports', 'hosts'), 'runs': ('started', 'status', 'rounds', 'interval')}
+    filter_fields = dict(allowed_fields, coverage=PAGE_FILTERS)
+    groups = {'hosts': ('all', 'answered', 'no_response', 'problem', 'other'), 'coverage': PAGE_GROUPS}.get(kind, ('all',))
     if ordered and (kind not in allowed_fields or query['sort'] not in ('', *allowed_fields[kind]) or
-                    type(query['descending']) is not bool or query['group'] not in
-                    (('all', 'answered', 'no_response', 'problem', 'other') if kind == 'hosts' else ('all',)) or
-                    query['filter_field'] not in allowed_fields[kind] or
+                    type(query['descending']) is not bool or query['group'] not in groups or
+                    query['filter_field'] not in filter_fields[kind] or
                     not isinstance(query['filter_text'], str) or len(query['filter_text']) > 256):
         return result(error='invalid')
     try:
         after = None if cursor is None else (_sorted_history_decode(cursor, parent, options, kind) if ordered else _history_decode_cursor(cursor, kind, parent))
     except ValueError:
         return result(error="invalid")
-    configured = ctx.cfg.get("ping_history_file")
-    path = Path(configured if configured and str(configured) != "." else "~/.cn-ping-history.db").expanduser()
+    path = history_file(ctx)
     try:
         store = PingStore.open(path, write=False)
         if store is None:
@@ -666,6 +737,10 @@ def read_monitor_history(ctx: object, query: Mapping[str, object]) -> Dict[str, 
                     page = store.sorted_round_hosts(parent, sort=query['sort'], descending=query['descending'],
                         group=query['group'], filter_field=query['filter_field'], filter_text=query['filter_text'],
                         limit=limit, after=after)
+                elif kind == 'coverage':
+                    page = _coverage_page(store, parent, after, query, limit, {} if cache is None else cache, stop)
+                    if page is None:
+                        return result(error='stopped')
                 else:
                     import socket
                     import time

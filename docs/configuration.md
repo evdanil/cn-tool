@@ -64,9 +64,14 @@ config_file = ~/.ssh/config
 [ping]
 # The Ping Monitor's history (cn monitor, menu m): one SQLite file per machine
 # history_file = ~/.cn-ping-history.db
-# Days a recorded round is kept; a run removes older rounds when it starts
-# history_days = 30
+# Days a recorded round is kept; a run removes older rounds when it starts. A list of IPs that never
+# replied (cn monitor --available) rests on the rounds kept, so cover the period you want to judge
+# history_days = 180
 ```
+
+From 0.10.0 the Ping Monitor history keeps 180 days of rounds unless `history_days` says otherwise (it kept
+30, and a configuration that sets a value keeps it). A run deletes older rounds, and they do not come back, so a long watch
+for [never-seen IPs](ping-monitor.md#never-seen-ips-show-available) needs a `history_days` that covers it.
 
 Site codes and device naming differ between organisations, so by default cn-tool accepts
 any short token as a site code, matches it as a whole word anywhere in a subnet comment,

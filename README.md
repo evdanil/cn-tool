@@ -38,6 +38,10 @@ for the account and network requirements.
   including network views, PTR checks, DHCP data and extensible attributes.
 - **Check and monitor reachability:** bulk ICMP and optional TCP probes, repeated
   monitoring, persistent history and summaries of when hosts were seen online.
+- **Find IPs that nothing uses (0.10.0):** list the addresses of an IPv4 subnet that have no record
+  in Infoblox (`cn subnet --available`), and the IPs of a monitored target that never
+  replied (`cn monitor --available`), or tick **Show Available** in the browser. Both are
+  leads to check, not proof that an address is free.
 - **Investigate configurations:** search local repositories, identify snapshot changes
   with `cn diff`, and browse configurations and comparisons in a terminal interface.
 - **Collect and enrich results:** query Cisco IOS/IOS-XE and NX-OS inventory, add
@@ -109,6 +113,8 @@ cn ip 10.20.0.5 --format json
 cn subnet 10.20.0.0/24 --view prod --format md
 cn ping router.example.net --tcp 22,443
 cn monitor 10.20.0.0/28 --every 1m --for 2h
+cn subnet 10.1.2.0/24 --available --format csv
+cn monitor --show a3f9 --available
 cn diff router01 --since 24h
 ```
 
@@ -138,6 +144,8 @@ Release 0.9.3 adds column sorting, field filters and compact Ping and Monitor
 outcome summaries across result pages. The two configuration scans run on Linux and Windows; on macOS, Site Demobilization
 network preview and the other tools remain available. Windows-native verification
 for the 0.9.0 additions remains deferred.
+Release 0.10.0 adds a **Show Available** checkbox to Subnets (addresses with no
+Infoblox record) and to Monitor's History tab (IPs that never replied).
 See the [WebUI guide](https://github.com/evdanil/cn-tool/blob/main/docs/webui.md) for details.
 Closing a tab keeps the application running; **Quit application** ends it and runs
 configured exit actions, including email when enabled.
@@ -168,7 +176,9 @@ explains version scope.
 
 Infoblox queries read grid data. Network checks make probes; reports, cache and ping
 history write local files. Reports can contain sensitive network information and
-accumulate earlier results; review them before downloading or emailing them.
+accumulate earlier results; review them before downloading or emailing them. The unused
+and never-seen lists show Infoblox records and replies only: check an address before you
+reuse it or delete its record.
 Store credentials through the documented sources and keep TLS verification enabled
 with an appropriate CA bundle. See each guide for platform limits and error behavior.
 

@@ -9,6 +9,13 @@ from .ping import parse_ports
 from .subnets import CSS, report_display
 
 
+HISTORY_EXPIRED = 'History changed or expired. Return to requests to browse available records.'
+# Show Available's own words: the block has no requests list to return to, but a Refresh history that reads it again.
+COVERAGE_EXPIRED = 'The history changed while you were reading it. Use Refresh history to read it again.'
+COVERAGE_TITLE = 'Available IPs (whole history)'
+COVERAGE_MEANING = 'Unseen means it never replied to this machine in the rounds kept. Not tested means no round could test it.'
+
+
 def history_error_message(error):
     if error == 'too_large':
         return 'This history is too large to sort or filter safely. Reset this view or return to another record.'
@@ -83,6 +90,37 @@ class HistoryView:
         self.kind, self.parent, self.cursors, self.ancestors, self.view_only = 'requests', None, [None], [], False
 
 
+def render_host_footer(*, scope, size, offset, count, total, previous_enabled,
+                       next_enabled, on_previous, on_next, on_size):
+    """Present bounded host pages; callers retain query and navigation state."""
+    from nicegui import ui
+
+    live = scope == 'live'
+    marker = 'data-monitor-' + scope
+    name = {'live': 'Latest round pages', 'coverage': 'Available IPs pages'}.get(scope, 'Round host pages')
+    number = (lambda value: f'{value:,}') if scope == 'coverage' else str  # the other footers print as they always did
+    buttons = []
+    with ui.element('nav').props('aria-label=' + json.dumps(name)).classes('cn-monitor-footer'):
+        with ui.row().classes('items-center gap-2 no-wrap'):
+            ui.label('Rows per page:')
+            select = ui.select([5, 10, 15, 20, 25, 50], value=size, on_change=on_size).props(
+                'dense borderless aria-label="Rows per page"').classes('w-16')
+            select._props[marker] = 'page-size'
+            if live:
+                select.props('popup-content-class=cn-monitor-live-popup')
+        first, last = (offset + 1, offset + count) if count else (0, 0)
+        ui.label(f'{number(first)}–{number(last)}' + (f' of {number(total)}' if total is not None else '')).classes('cn-monitor-range')
+        with ui.row().classes('items-center gap-1 no-wrap'):
+            for label, icon, callback, enabled, value in [
+                    ('Previous hosts', 'chevron_left', on_previous, previous_enabled, 'previous' if live else 'previous-hosts'),
+                    ('Next hosts', 'chevron_right', on_next, next_enabled, 'next' if live else 'next-hosts')]:
+                button = ui.button(icon=icon, on_click=callback).props('flat round dense aria-label=' + json.dumps(label))
+                button._props[marker] = value
+                button.set_enabled(enabled)
+                buttons.append(button)
+    return buttons
+
+
 def render_monitor(controller):
     from nicegui import ui
 
@@ -119,20 +157,28 @@ def render_monitor(controller):
 .cn-monitor-detail { min-width:0; width:100%; }
 .cn-monitor-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:8px; width:100%; }
 .cn-monitor-context { min-width:0; overflow-wrap:anywhere; }
+.cn-monitor-footer { display:flex; flex-wrap:wrap; justify-content:flex-end; align-items:center; gap:16px; width:100%; min-width:0; padding:8px 12px; border-top:1px solid #E2E8ED; font-size:12px; }
+.cn-monitor-range { white-space:nowrap; font-variant-numeric:tabular-nums; }
 .cn-monitor-pages { margin-left:auto; display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.cn-monitor-coverage-table { min-width:1000px; }
+.cn-monitor-coverage-table td:nth-child(3), .cn-monitor-coverage-table td:nth-child(4) { white-space:nowrap; }
+.cn-monitor-notice { width:100%; min-width:0; overflow-wrap:anywhere; padding:8px 10px; border-left:3px solid #775110; background:#FFF3D8; color:#5E400C; }
 @media(max-width:900px) { .cn-monitor-inspector { grid-template-columns:1fr; } .cn-monitor-selected-title { display:none; } .cn-monitor-rounds-desktop { display:none; } .cn-monitor-round-select { display:block; width:100%; } }
 @media(max-width:600px) { .cn-monitor-actions { flex-wrap:wrap; } .cn-monitor-hosts th:first-child { width:185px; } .cn-monitor-hosts th:nth-child(2) { width:140px; } .cn-monitor-table th, .cn-monitor-table td { padding:7px; } .cn-monitor-pages { margin-left:0; } }
 ''')
     ui.colors(primary='#145C87')
     latest = {'result': None, 'result_revision': None, 'attempt_revision': None,
               'outcome': None, 'live_query': None, 'live_key': None, 'live_page': None,
-              'live_offset': 0, 'live_sort': '', 'live_descending': False, 'live_group': 'all', 'live_filter_field': 'host', 'live_filter_text': '', 'history_query': None, 'history_page': None,
+              'live_offset': 0, 'live_offsets': [0], 'live_size': 25, 'live_sort': '', 'live_descending': False, 'live_group': 'all', 'live_filter_field': 'host', 'live_filter_text': '', 'history_query': None, 'history_page': None,
               'history_dirty': True, 'download': None, 'template_query': None, 'delete_query': None,
               'round_query': None, 'round_hosts': None, 'selected_round': None,
-              'host_cursors': [None], 'host_sort': '', 'host_descending': False, 'host_group': 'all',
+              'host_cursors': [None], 'host_offsets': [0], 'host_size': 25, 'host_sort': '', 'host_descending': False, 'host_group': 'all',
               'host_filter_field': 'host', 'host_filter_text': '',
               'history_views': {'requests': dict(sort='', descending=False, field='targets', text=''),
-                                'runs': dict(sort='', descending=False, field='started', text='')}, 'round_pick': 'first', 'request_context': None, 'run_context': None}
+                                'runs': dict(sort='', descending=False, field='started', text='')}, 'round_pick': 'first', 'request_context': None, 'run_context': None,
+              # Show Available: the saved target the box belongs to (None: the page is not on one), the rows per page the
+              # tab chose (it outlives a reset), and everything else the table reads or shows, off until ticked.
+              'coverage_parent': None, 'coverage_size': 25, 'coverage_drawn': False, **coverage_defaults()}
     history = HistoryView()
     lock = asyncio.Lock()
 
@@ -224,6 +270,7 @@ def render_monitor(controller):
         live_area = ui.column().classes('w-full')
         @ui.refreshable
         def draw_live():
+            latest['live_buttons'] = []
             page = latest['live_page']
             if not page:
                 return
@@ -240,7 +287,7 @@ def render_monitor(controller):
             if counts is not None:
                 async def choose_group(group):
                     latest['live_group'] = group
-                    latest['live_offset'] = 0
+                    latest['live_offset'], latest['live_offsets'] = 0, [0]
                     latest['live_user_request'] = 'group-' + group
                     latest['live_key'] = None
                     await poll()
@@ -257,7 +304,7 @@ def render_monitor(controller):
                     pattern = ui.input('Contains', value=latest['live_filter_text']).props('outlined dense maxlength=256').classes('grow')
                     async def apply_filter():
                         latest['live_filter_field'], latest['live_filter_text'] = field.value, (pattern.value or '')[:256]
-                        latest['live_offset'] = 0
+                        latest['live_offset'], latest['live_offsets'] = 0, [0]
                         latest['live_user_request'] = 'filter'
                         latest['live_key'] = None
                         await poll()
@@ -266,7 +313,7 @@ def render_monitor(controller):
                     button._props['data-monitor-live'] = 'filter'
                     async def clear_filter():
                         latest['live_filter_text'] = ''
-                        latest['live_offset'] = 0
+                        latest['live_offset'], latest['live_offsets'] = 0, [0]
                         latest['live_user_request'] = 'clear-filter'
                         latest['live_key'] = None
                         await poll()
@@ -275,7 +322,6 @@ def render_monitor(controller):
                 ui.label('Counts describe the complete round; the table reflects the selected group and filter.').classes('cn-muted')
                 if not rows:
                     ui.label('No hosts match the selected group and filter.').classes('cn-muted')
-            ui.label(f"Showing hosts {page['offset'] + 1}–{page['offset'] + len(rows)}" if rows else 'No host results in this round.')
             with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 aria-label="Latest round results"'), ui.element('table').classes('cn-monitor-table cn-monitor-hosts').props('aria-label="Latest round host results"'):
                 with ui.element('thead'), ui.element('tr'):
                     async def change_sort(column):
@@ -283,7 +329,7 @@ def render_monitor(controller):
                             latest['live_descending'] = not latest['live_descending']
                         else:
                             latest['live_sort'], latest['live_descending'] = column, False
-                        latest['live_offset'] = 0
+                        latest['live_offset'], latest['live_offsets'] = 0, [0]
                         latest['live_user_request'] = 'sort-' + column
                         latest['live_key'] = None
                         await poll()
@@ -301,41 +347,37 @@ def render_monitor(controller):
                             for key in ('Host', 'Result', 'Address', 'TCP'):
                                 with ui.element('td'):
                                     ui.label(values[key]).classes('cn-monitor-target' if key == 'Host' else '').props('title=' + json.dumps(values[key]))
-            with ui.element('nav').props('aria-label="Latest round pages"').classes('row cn-monitor-actions'):
-                async def prev():
-                    latest['live_offset'] = max(0, latest['live_offset'] - 50)
-                    latest['live_user_request'] = 'previous'
-                    latest['live_key'] = None
-                    await poll()
-                async def next_page():
-                    latest['live_offset'] = page['next_offset']
-                    latest['live_user_request'] = 'next'
-                    latest['live_key'] = None
-                    await poll()
-                previous = ui.button('Previous hosts', on_click=prev).props('outline')
-                previous._props['data-monitor-live'] = 'previous'
-                previous.set_enabled(page['offset'] > 0)
-                following = ui.button('Next hosts', on_click=next_page).props('outline')
-                following._props['data-monitor-live'] = 'next'
-                following.set_enabled(page.get('next_offset') is not None)
-                if 'total' in page:
-                    pages = max(1, (page['total'] + 49) // 50)
-                    ui.label(f"Page {page['offset'] // 50 + 1} of {pages}")
-                    jump = ui.input('Page', value=str(page['offset'] // 50 + 1)).props('outlined dense inputmode=numeric').classes('w-24')
-                    jump._props['aria-label'] = 'Latest round page'
-                    error = ui.label('').props('role=alert').classes('text-negative')
-                    async def go():
-                        value = (jump.value or '').strip()
-                        if not re.fullmatch(r'[0-9]{1,10}', value) or not 1 <= int(value) <= pages:
-                            error.set_text(f'Enter a page between 1 and {pages}.')
-                            return
-                        latest['live_offset'] = (int(value) - 1) * 50
-                        latest['live_user_request'] = 'jump'
-                        latest['live_key'] = None
-                        await poll()
-                    jump.on('keydown.enter', go)
-                    button = ui.button('Go to page', on_click=go).props('outline dense')
-                    button._props['data-monitor-live'] = 'jump'
+            async def prev():
+                if latest['live_query'] or latest.get('live_user_request') or len(latest['live_offsets']) < 2:
+                    return
+                latest['live_offsets'].pop()
+                latest['live_offset'] = latest['live_offsets'][-1]
+                latest['live_user_request'] = 'previous'
+                latest['live_key'] = None
+                await poll()
+
+            async def next_page():
+                if latest['live_query'] or latest.get('live_user_request') or page.get('next_offset') is None:
+                    return
+                latest['live_offset'] = page['next_offset']
+                latest['live_offsets'].append(page['next_offset'])
+                latest['live_user_request'] = 'next'
+                latest['live_key'] = None
+                await poll()
+
+            async def change_size(event):
+                if event.value == latest['live_size']:
+                    return
+                latest['live_size'] = event.value
+                latest['live_offset'], latest['live_offsets'] = 0, [0]
+                latest['live_user_request'] = 'page-size'
+                latest['live_key'] = None
+                await poll()
+
+            latest['live_buttons'] = render_host_footer(scope='live', size=latest['live_size'], offset=page['offset'],
+                count=len(rows), total=page.get('total'), previous_enabled=len(latest['live_offsets']) > 1,
+                next_enabled=page.get('next_offset') is not None, on_previous=prev,
+                on_next=next_page, on_size=change_size)
         with live_area:
             draw_live()
     with history_panel, ui.column().classes('cn-panel cn-monitor-history gap-3'):
@@ -406,7 +448,7 @@ def render_monitor(controller):
             latest['detail_focus'] = focus
             try:
                 latest['round_query'] = controller.request_monitor_history(
-                    'hosts', latest['selected_round']['id'], latest['host_cursors'][-1], 50,
+                    'hosts', latest['selected_round']['id'], latest['host_cursors'][-1], latest['host_size'],
                     latest['host_sort'], latest['host_descending'], latest['host_group'],
                     latest['host_filter_field'], latest['host_filter_text'])
             except (AttributeError, RuntimeError, ValueError):
@@ -421,7 +463,7 @@ def render_monitor(controller):
 
         async def select_round(item, focus='round', *, refresh='all'):
             latest['selected_round'] = item
-            latest['host_cursors'] = [None]
+            latest['host_cursors'], latest['host_offsets'] = [None], [0]
             await request_round_hosts(focus, refresh=refresh)
 
         async def step_round(direction):
@@ -461,10 +503,11 @@ def render_monitor(controller):
             with ui.element('td'):
                 ui.label(str(text)).classes('cn-monitor-target' if target else '').props('title=' + json.dumps(str(text)))
 
-        def state_cell(text, observation=None):
-            tone = ('ok' if observation in {'!', 'T', 'R'} or text == 'finished' else
-                    'problem' if observation in {'E', '?', 'U'} or text == 'failed' else
-                    'warning' if text in {'running', 'lost'} else '')
+        def state_cell(text, observation=None, *, tone=None):
+            if tone is None:
+                tone = ('ok' if observation in {'!', 'T', 'R'} or text == 'finished' else
+                        'problem' if observation in {'E', '?', 'U'} or text == 'failed' else
+                        'warning' if text in {'running', 'lost'} else '')
             with ui.element('td'):
                 label = {'DNS name did not resolve': 'DNS failed', 'Answered on TCP': 'TCP reply'}.get(text, text)
                 ui.label(label).classes('cn-monitor-state ' + tone).props('title=' + json.dumps(text))
@@ -485,7 +528,7 @@ def render_monitor(controller):
                 counts = hosts_page.get('counts')
                 if counts is not None:
                     async def choose_host_group(group):
-                        latest['host_group'], latest['host_cursors'] = group, [None]
+                        latest['host_group'], latest['host_cursors'], latest['host_offsets'] = group, [None], [0]
                         await request_round_hosts('group-' + group)
                     with ui.element('nav').props('aria-label="Filter saved round hosts"').classes('cn-monitor-toolbar'):
                         for group, label in (('all', 'All'), ('answered', 'Answered'), ('no_response', 'No response'),
@@ -500,37 +543,19 @@ def render_monitor(controller):
                         pattern = ui.input('Round host filter', value=latest['host_filter_text']).props('outlined dense maxlength=256').classes('grow')
                         async def apply_host_filter():
                             latest['host_filter_field'], latest['host_filter_text'] = field.value, (pattern.value or '')[:256]
-                            latest['host_cursors'] = [None]
+                            latest['host_cursors'], latest['host_offsets'] = [None], [0]
                             await request_round_hosts('filter-hosts')
                         pattern.on('keydown.enter', apply_host_filter)
                         button = ui.button('Filter round hosts', on_click=apply_host_filter).props('outline dense')
                         button._props['data-monitor-detail'] = 'filter-hosts'
                         async def clear_host_filter():
-                            latest['host_filter_text'], latest['host_cursors'] = '', [None]
+                            latest['host_filter_text'], latest['host_cursors'], latest['host_offsets'] = '', [None], [0]
                             await request_round_hosts('clear-filter')
                         clear = ui.button('Clear round host filter', on_click=clear_host_filter).props('outline dense')
                         clear._props['data-monitor-detail'] = 'clear-filter'
                     ui.label(f"{hosts_page['total']} matching hosts; counts describe the complete round.").classes('cn-muted')
                     if not rows:
                         ui.label('No hosts match the selected group and filter.').classes('cn-muted')
-                with ui.element('nav').props('aria-label="Round host pages"').classes('cn-monitor-toolbar'):
-                    async def previous_hosts():
-                        if len(latest['host_cursors']) > 1:
-                            latest['host_cursors'].pop()
-                            await request_round_hosts('previous-hosts')
-                    async def next_hosts():
-                        cursor = (latest['round_hosts'] or {}).get('next_cursor')
-                        if cursor:
-                            latest['host_cursors'].append(cursor)
-                            await request_round_hosts('next-hosts')
-                    for label, callback, enabled, marker in [
-                            ('Previous hosts', previous_hosts, len(latest['host_cursors']) > 1, 'previous-hosts'),
-                            ('Next hosts', next_hosts, bool(hosts_page.get('next_cursor')), 'next-hosts')]:
-                        button = ui.button(label, on_click=callback).props('outline dense no-caps')
-                        button._props['data-monitor-detail'] = marker
-                        button.set_enabled(enabled)
-                    if rows:
-                        ui.label(f"{len(rows)} hosts on this page; {latest['selected_round'].get('answered', 0)} answered in round").classes('cn-muted')
                 with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 aria-label="Round results"'), ui.element('table').classes('cn-monitor-table cn-monitor-hosts').props('aria-label="Round host results"'):
                     with ui.element('thead'), ui.element('tr'):
                         async def sort_hosts(column):
@@ -538,7 +563,7 @@ def render_monitor(controller):
                                 latest['host_descending'] = not latest['host_descending']
                             else:
                                 latest['host_sort'], latest['host_descending'] = column, False
-                            latest['host_cursors'] = [None]
+                            latest['host_cursors'], latest['host_offsets'] = [None], [0]
                             await request_round_hosts('sort-' + column)
                         for label, column in (('Target', 'host'), ('Status', 'status'), ('Address', 'address'), ('Probe result', 'result')):
                             with ui.element('th').props('scope=col') as header:
@@ -554,8 +579,230 @@ def render_monitor(controller):
                                 state_cell(history_value('observation', row.get('observation')), row.get('observation'))
                                 cell(row.get('address') or '—', target=True)
                                 cell(row.get('result') or '—')
+                async def previous_hosts():
+                    if latest['round_query'] or len(latest['host_cursors']) < 2:
+                        return
+                    latest['host_cursors'].pop()
+                    latest['host_offsets'].pop()
+                    await request_round_hosts('previous-hosts')
+
+                async def next_hosts():
+                    if latest['round_query']:
+                        return
+                    cursor = (latest['round_hosts'] or {}).get('next_cursor')
+                    if cursor:
+                        latest['host_cursors'].append(cursor)
+                        latest['host_offsets'].append(latest['host_offsets'][-1] + len(rows))
+                        await request_round_hosts('next-hosts')
+
+                async def change_host_size(event):
+                    if event.value == latest['host_size']:
+                        return
+                    latest['host_size'] = event.value
+                    latest['host_cursors'], latest['host_offsets'] = [None], [0]
+                    await request_round_hosts('page-size')
+
+                render_host_footer(scope='detail', size=latest['host_size'], offset=latest['host_offsets'][-1],
+                    count=len(rows), total=hosts_page.get('total'), previous_enabled=len(latest['host_cursors']) > 1,
+                    next_enabled=bool(hosts_page.get('next_cursor')), on_previous=previous_hosts,
+                    on_next=next_hosts, on_size=change_host_size)
                 if not rows:
                     ui.label('No host results on this page.').classes('cn-muted')
+
+        # --- Show Available: every IP of the saved target on screen, with whether it ever replied ---------------------
+        def cancel_coverage_query():
+            if latest['coverage_query']:
+                controller.release_monitor_history_page(latest['coverage_query'])
+            latest['coverage_query'] = None
+
+        def reset_coverage():
+            """Box off, nothing read, nothing left to show: what a new target line, or leaving the line, leaves behind."""
+            cancel_coverage_query()
+            latest.update(coverage_defaults())
+
+        def first_coverage_page():
+            latest['coverage_cursors'], latest['coverage_offsets'] = [None], [0]
+
+        async def request_coverage(focus=None):
+            cancel_coverage_query()
+            latest['coverage_page'] = None
+            latest['coverage_focus'] = focus
+            try:
+                latest['coverage_query'] = controller.request_monitor_history(
+                    'coverage', latest['coverage_parent'], latest['coverage_cursors'][-1], latest['coverage_size'],
+                    latest['coverage_sort'], latest['coverage_descending'], latest['coverage_group'],
+                    latest['coverage_filter_field'], latest['coverage_filter_text'])
+            except (AttributeError, RuntimeError, ValueError):
+                latest['coverage_page'] = {'error': 'History is unavailable. Try refreshing.'}
+            await draw_coverage.refresh()
+
+        async def toggle_coverage(event):
+            if bool(event.value) == latest['coverage_on']:
+                return
+            if event.value:
+                latest['coverage_on'] = True
+                await request_coverage('toggle')
+            else:
+                reset_coverage()
+                await draw_coverage.refresh()
+            focus_coverage('toggle')
+
+        def sync_coverage_download():
+            """The download button, what its file holds and its error follow the state, without redrawing the table."""
+            button, label = latest.get('coverage_download_button'), latest.get('coverage_download_label')
+            if button is None:
+                return
+            page = latest['coverage_page'] or {}
+            unseen = 0 if page.get('error') else (page.get('counts') or {}).get('unseen', 0)
+            button.set_enabled(unseen > 0 and latest['coverage_download'] is None)
+            note = coverage_download_note(page)
+            latest['coverage_download_note'].set_text(note)
+            latest['coverage_download_note'].set_visibility(bool(note))
+            set_changed(label, latest['coverage_download_error'])
+
+        def download_coverage():
+            if latest['coverage_download'] or latest['coverage_parent'] is None:
+                return
+            latest['coverage_download_error'] = ''
+            try:
+                latest['coverage_download'] = controller.request_coverage_export(latest['coverage_parent'])
+            except (AttributeError, RuntimeError, ValueError):
+                latest['coverage_download_error'] = 'Download is unavailable. Refresh history and try again.'
+            sync_coverage_download()
+
+        async def choose_coverage_group(group):
+            latest['coverage_group'] = group
+            first_coverage_page()
+            await request_coverage('group-' + group)
+
+        async def apply_coverage_filter(field, pattern, *, clear=False):
+            latest['coverage_filter_field'] = field.value
+            latest['coverage_filter_text'] = '' if clear else (pattern.value or '')[:256]
+            first_coverage_page()
+            await request_coverage('clear-filter' if clear else 'filter')
+
+        async def sort_coverage(column):
+            if latest['coverage_sort'] == column:
+                latest['coverage_descending'] = not latest['coverage_descending']
+            else:
+                latest['coverage_sort'], latest['coverage_descending'] = column, False
+            first_coverage_page()
+            await request_coverage('sort-' + column)
+
+        async def previous_coverage():
+            if latest['coverage_query'] or len(latest['coverage_cursors']) < 2:
+                return
+            latest['coverage_cursors'].pop()
+            latest['coverage_offsets'].pop()
+            await request_coverage('previous-hosts')
+
+        async def next_coverage():
+            page = latest['coverage_page'] or {}
+            if latest['coverage_query'] or not page.get('next_cursor'):
+                return
+            latest['coverage_cursors'].append(page['next_cursor'])
+            latest['coverage_offsets'].append(latest['coverage_offsets'][-1] + len(page['items']))
+            await request_coverage('next-hosts')
+
+        async def change_coverage_size(event):
+            if event.value == latest['coverage_size']:
+                return
+            latest['coverage_size'] = event.value
+            first_coverage_page()
+            await request_coverage('page-size')
+
+        def draw_coverage_table(page):
+            rows = page['items']
+            counts = page['counts']
+            notices = coverage_notices(page['summary'])
+            if notices:  # one live region with a line for each subnet: a screen reader hears one update, not sixty-four
+                with ui.element('div').props('role=status').classes('cn-monitor-notice'):
+                    for line in notices:
+                        ui.label(line)
+            with ui.element('nav').props('aria-label="Available IPs by status"').classes('cn-monitor-toolbar'):
+                for group, label in (('all', 'All'), ('seen', 'Seen'), ('unseen', 'Unseen'), ('not_tested', 'Not tested')):
+                    count = sum(counts.values()) if group == 'all' else counts[group]
+                    button = ui.button(f'{label} ({count:,})', on_click=lambda _, value=group: choose_coverage_group(value)).props('outline dense')
+                    button._props['aria-pressed'] = str(group == latest['coverage_group']).lower()
+                    button._props['data-monitor-coverage'] = 'group-' + group
+            with ui.element('div').classes('cn-monitor-toolbar'):
+                field = ui.select({'host': 'Target', 'status': 'Status', 'note': 'Note'}, value=latest['coverage_filter_field'],
+                                  label='Available IPs filter field').props('outlined dense').classes('w-52')
+                pattern = ui.input('Available IPs filter', value=latest['coverage_filter_text']).props('outlined dense maxlength=256').classes('grow')
+                pattern.on('keydown.enter', lambda: apply_coverage_filter(field, pattern))
+                button = ui.button('Filter available IPs', on_click=lambda: apply_coverage_filter(field, pattern)).props('outline dense')
+                button._props['data-monitor-coverage'] = 'filter'
+                button = ui.button('Clear available IPs filter', on_click=lambda: apply_coverage_filter(field, pattern, clear=True)).props('outline dense')
+                button._props['data-monitor-coverage'] = 'clear-filter'
+            total = page['total']
+            ui.label(f"{total:,} matching {'host' if total == 1 else 'hosts'}; counts describe the whole history.").classes('cn-muted')
+            if not rows:
+                ui.label('No hosts match the selected group and filter.').classes('cn-muted')
+            with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 role=region aria-label="Available IPs results"'), ui.element('table').classes('cn-monitor-table cn-monitor-coverage-table').props('aria-label="Available IPs table"'):
+                with ui.element('thead'), ui.element('tr'):
+                    for label, column in (('Target', 'host'), ('Status', 'status'), ('First seen', 'first_seen'),
+                                          ('Last seen', 'last_seen'), ('Rounds answered', 'answered'), ('Failed rounds', None), ('Note', None)):
+                        with ui.element('th').props('scope=col') as header:
+                            if column is None:
+                                ui.label(label)
+                                continue
+                            if latest['coverage_sort'] == column:
+                                header._props['aria-sort'] = 'descending' if latest['coverage_descending'] else 'ascending'
+                            button = ui.button(label, on_click=lambda _, value=column: sort_coverage(value)).props('flat dense')
+                            button._props['aria-label'] = f'Sort available IPs by {label}' + ((', descending' if latest['coverage_descending'] else ', ascending') if latest['coverage_sort'] == column else '')
+                            button._props['data-monitor-coverage'] = 'sort-' + column
+                with ui.element('tbody'):
+                    for row in rows:
+                        with ui.element('tr'):
+                            cell(row['host'], target=True)
+                            state_cell(row['status'], tone=COVERAGE_TONES.get(row['status'], ''))
+                            cell(coverage_time(row['first_seen']))
+                            cell(coverage_time(row['last_seen']))
+                            cell(coverage_answered(row))
+                            cell(f"{row['failed']:,}")
+                            cell(row['note'] or '—', target=True)
+            render_host_footer(scope='coverage', size=latest['coverage_size'], offset=latest['coverage_offsets'][-1],
+                count=len(rows), total=total, previous_enabled=len(latest['coverage_cursors']) > 1,
+                next_enabled=bool(page.get('next_cursor')), on_previous=previous_coverage,
+                on_next=next_coverage, on_size=change_coverage_size)
+
+        @ui.refreshable
+        def draw_coverage():
+            latest['coverage_download_button'] = latest['coverage_download_label'] = latest['coverage_download_note'] = None
+            # The block is drawn on the runs of a saved target only: not on the list of targets, and not on the rounds of
+            # a run, where the box is remembered (``request_history``) but nothing is read or shown.
+            latest['coverage_drawn'] = latest['coverage_parent'] is not None and history.kind == 'runs'
+            if not latest['coverage_drawn']:
+                return
+            page = latest['coverage_page']
+            with ui.column().classes('w-full gap-2').props('role=region aria-label="Available IPs"'):
+                # The box is alone in the first row, ticked or not, so ticking it never moves it from under the pointer.
+                with ui.row().classes('cn-monitor-toolbar'):
+                    box = ui.checkbox('Show Available', value=latest['coverage_on'], on_change=toggle_coverage)
+                    box._props['data-monitor-coverage'] = 'toggle'
+                if not latest['coverage_on']:
+                    return
+                ui.label(COVERAGE_TITLE).props('role=heading aria-level=3').classes('text-subtitle1 text-weight-bold')
+                ui.label(COVERAGE_MEANING).classes('cn-muted')
+                with ui.row().classes('cn-monitor-toolbar'):
+                    help_text = ('Downloads every IP of this target line that never replied (Unseen) as CSV, with its note. '
+                                 'It is separate from the accumulated report and does not change it.')
+                    button = ui.button('Download available IPs', on_click=download_coverage).props('outline dense no-caps')
+                    button._props['data-monitor-coverage'] = 'download'
+                    button._props['aria-description'] = help_text
+                    button.tooltip(help_text)
+                    note = ui.label('').classes('cn-muted')
+                    label = ui.label('').props('role=alert').classes('text-negative')
+                    latest['coverage_download_button'], latest['coverage_download_label'] = button, label
+                    latest['coverage_download_note'] = note
+                    sync_coverage_download()
+                if page is None:
+                    ui.label('Reading the whole history…').props('role=status').classes('cn-muted')
+                elif page.get('error'):
+                    ui.label(COVERAGE_EXPIRED if page['error'] == 'expired' else history_error_message(page['error'])).props('role=alert').classes('text-negative')
+                else:
+                    ui.label(coverage_summary_line(page['summary'])).props('role=status').classes('text-weight-bold')
+                    draw_coverage_table(page)
 
         history_area = ui.column().classes('w-full')
         @ui.refreshable
@@ -575,7 +822,7 @@ def render_monitor(controller):
                 await request_history('next')
             async def refresh():
                 history.refresh()
-                await request_history('refresh')
+                await request_history('refresh', fresh_coverage=True)
             with ui.element('nav').props('aria-label="History location"').classes('cn-monitor-toolbar'):
                 if history.kind == 'requests':
                     ui.label('Saved targets').classes('text-h6')
@@ -616,7 +863,7 @@ def render_monitor(controller):
                 ui.label('Loading history…').props('role=status').classes('cn-muted')
                 return
             if page.get('error'):
-                ui.label('History changed or expired. Return to requests to browse available records.' if page['error'] == 'expired' else history_error_message(page['error'])).props('role=alert').classes('text-negative')
+                ui.label(HISTORY_EXPIRED if page['error'] == 'expired' else history_error_message(page['error'])).props('role=alert').classes('text-negative')
                 if page['error'] == 'too_large' and history.kind in ('requests', 'runs'):
                     async def reset_history_view():
                         default_field = 'targets' if history.kind == 'requests' else 'started'
@@ -749,7 +996,19 @@ def render_monitor(controller):
                                         remove.tooltip('A running monitor cannot be deleted.')
         with history_area:
             draw_history_controls()
+            draw_coverage()
             draw_history()
+
+    def focus_coverage(marker, *, only_if_lost=False):
+        """Put focus back on the control that was used, or its opposite, or the box. With ``only_if_lost`` only when a
+        redraw left it on the page, so that a slow answer never takes it from where the reader went."""
+        opposite = {'next-hosts': 'previous-hosts', 'previous-hosts': 'next-hosts'}.get(marker)
+        client.run_javascript(f'''(() => {{
+if ({json.dumps(only_if_lost)} && document.activeElement !== document.body) return;
+const find = name => name && document.querySelector(`[data-monitor-coverage="${{name}}"]:not([disabled])`);
+const control = find({json.dumps(marker)}) || find({json.dumps(opposite)}) || find('toggle');
+(control?.querySelector('input:not(.hidden)') || control)?.focus({{preventScroll:true}});  // not a checkbox's hidden input
+}})()''')
 
     def focus_history(target):
         selector = json.dumps(f'[data-monitor-history="{target}"]:not([disabled])')
@@ -764,15 +1023,35 @@ if (!requested && fallback) {{
 }}
 }})()''')
 
-    async def request_history(focus=None, *, round_pick='first'):
+    async def request_history(focus=None, *, round_pick='first', fresh_coverage=False):
         latest['round_pick'] = round_pick
         cancel_round_query()
         latest['selected_round'] = None
-        latest['host_cursors'] = [None]
+        latest['host_cursors'], latest['host_offsets'] = [None], [0]
         if latest['history_query']:
             controller.release_monitor_history_page(latest['history_query'])
         latest['history_query'] = None
         latest['history_page'] = None
+        # The box belongs to the saved target the runs table lists, and to the rounds of its runs. Another target, or the
+        # list of targets, starts with it off and its query released, so that an answer for the old target can never draw
+        # under the new one. The rounds of a run of the same target keep the box ticked but draw nothing and leave no query
+        # open; the runs, back again, read the table again.
+        target = (history.parent if history.kind == 'runs' else
+                  history.ancestors[-1][1] if history.kind == 'rounds' and history.ancestors else None)
+        if target != latest['coverage_parent']:
+            reset_coverage()
+            latest['coverage_parent'] = target
+            await draw_coverage.refresh()
+        elif history.kind == 'rounds':
+            cancel_coverage_query()
+            latest['coverage_page'] = None
+            if latest['coverage_drawn']:
+                await draw_coverage.refresh()
+        elif latest['coverage_on'] and (fresh_coverage or (latest['coverage_page'] is None and not latest['coverage_query'])):
+            first_coverage_page()
+            await request_coverage()
+        elif history.kind == 'runs' and not latest['coverage_drawn']:
+            await draw_coverage.refresh()  # back from the rounds with the box off: the block comes back
         try:
             if history.kind in ('requests', 'runs'):
                 current = latest['history_views'][history.kind]
@@ -791,7 +1070,11 @@ if (!requested && fallback) {{
         if not client.has_socket_connection:
             return False
         try:
-            return bool(await client.run_javascript(f"document.getElementById({json.dumps(live_area.html_id)})?.contains(document.activeElement)", timeout=1))
+            return bool(await client.run_javascript(f"""(() => {{
+const area = document.getElementById({json.dumps(live_area.html_id)});
+return area?.contains(document.activeElement) ||
+  [...document.querySelectorAll('.cn-monitor-live-popup')].some(popup => popup.getClientRects().length > 0 && getComputedStyle(popup).visibility !== 'hidden');
+}})()""", timeout=1))
         except TimeoutError:
             return False
 
@@ -852,17 +1135,18 @@ if (!requested && fallback) {{
             if latest.get('live_identity') != identity:
                 previous_identity = latest.get('live_identity')
                 latest.pop('pending_live', None)
-                if previous_identity and previous_identity[:2] == identity[:2] and revision is not None:
+                if (previous_identity and previous_identity[:2] == identity[:2] and revision is not None
+                        and not latest.get('live_user_request')):
                     set_changed(pending_live, f'Complete round revision {revision} is available; updating the displayed page.')
-                latest['live_user_request'] = None
                 if not previous_identity or previous_identity[:2] != identity[:2]:
-                    latest.update(live_offset=0, live_sort='', live_descending=False, live_group='all',
+                    latest['live_user_request'] = None
+                    latest.update(live_offset=0, live_offsets=[0], live_sort='', live_descending=False, live_group='all',
                                   live_filter_field='host', live_filter_text='')
                     if previous_identity:
                         latest['live_page'] = None
                         await draw_live.refresh()
                 latest['live_identity'] = identity
-            key = (job, run_id, revision, latest['live_offset'], latest['live_sort'], latest['live_descending'], latest['live_group'], latest['live_filter_field'], latest['live_filter_text']) if job and run_id is not None and revision is not None else None
+            key = (job, run_id, revision, latest['live_offset'], latest['live_size'], latest['live_sort'], latest['live_descending'], latest['live_group'], latest['live_filter_field'], latest['live_filter_text']) if job and run_id is not None and revision is not None else None
             if key != latest['live_key']:
                 latest.pop('pending_live', None)
                 if key is None:
@@ -873,10 +1157,15 @@ if (!requested && fallback) {{
                 latest['live_query'] = None
                 latest['live_key'] = key
                 if key:
+                    if latest.get('live_user_request'):
+                        for button in latest.get('live_buttons', []):
+                            button.props('aria-disabled=true').classes(add='disabled')
+                        set_changed(pending_live, 'Loading host results…')
                     try:
-                        latest['live_query'] = controller.request_monitor_live_page(*key[:4], 50, *key[4:])
+                        latest['live_query'] = controller.request_monitor_live_page(*key)
                     except (AttributeError, RuntimeError, ValueError):
                         latest['live_page'] = {'status': 'unavailable'}
+                        set_changed(pending_live, '')
                         await draw_live.refresh()
             if latest['live_query']:
                 result = controller.monitor_live_page(latest['live_query'])
@@ -887,31 +1176,45 @@ if (!requested && fallback) {{
                         latest['live_key'] = None
                     elif result.get('status') == 'ready' and not result.get('rows') and latest['live_offset']:
                         total = result.get('total')
-                        last_offset = max(0, ((total - 1) // 50) * 50) if type(total) is int and total >= 0 else None
+                        size = latest['live_size']
+                        last_offset = max(0, ((total - 1) // size) * size) if type(total) is int and total >= 0 else None
                         latest['live_offset'] = (last_offset if last_offset is not None and last_offset < latest['live_offset']
-                                                 else max(0, latest['live_offset'] - 50))
+                                                 else (latest['live_offsets'][-2] if len(latest['live_offsets']) > 1 else 0))
+                        latest['live_offsets'] = [offset for offset in latest['live_offsets'] if offset < latest['live_offset']] + [latest['live_offset']]
                         latest['live_key'] = None
                     else:
                         latest['pending_live'] = result
             if latest.get('pending_live') is not None:
+                pending_result = latest['pending_live']
+                pending_key = latest['live_key']
                 focus_target = latest.get('live_user_request')
                 had_live_focus = await live_has_focus()
-                if focus_target or not had_live_focus:
-                    if focus_target and had_live_focus:
-                        try:
-                            current_focus = await client.run_javascript("document.activeElement?.closest('[data-monitor-live]')?.dataset.monitorLive || null", timeout=1)
-                            focus_target = current_focus or focus_target
-                        except TimeoutError:
-                            pass
-                    latest['live_page'] = latest.pop('pending_live')
-                    latest['live_user_request'] = None
-                    set_changed(pending_live, '')
-                    await draw_live.refresh()
-                    if focus_target and had_live_focus:
-                        selector = json.dumps(f'[data-monitor-live="{focus_target}"]:not([disabled])')
-                        client.run_javascript(f"if (document.activeElement === document.body) (document.querySelector({selector}) || document.querySelector('[data-monitor-live]:not([disabled])'))?.focus()")
-                else:
-                    set_changed(pending_live, f"Complete round revision {latest['pending_live'].get('revision', revision)} is available. Move focus away from these controls to show it.")
+                if (focus_target and had_live_focus and latest['live_key'] == pending_key
+                        and latest.get('pending_live') is pending_result):
+                    try:
+                        current_focus = await client.run_javascript("document.activeElement?.closest('[data-monitor-live]')?.dataset.monitorLive || null", timeout=1)
+                        focus_target = current_focus or focus_target
+                    except TimeoutError:
+                        pass
+                # UI callbacks can change the query while either browser focus check awaits.
+                if latest['live_key'] == pending_key and latest.get('pending_live') is pending_result:
+                    if focus_target or not had_live_focus:
+                        latest['live_page'] = latest.pop('pending_live')
+                        latest['live_user_request'] = None
+                        set_changed(pending_live, '')
+                        await draw_live.refresh()
+                        if focus_target and had_live_focus:
+                            selector = json.dumps(f'[data-monitor-live="{focus_target}"]:not([disabled])')
+                            client.run_javascript(f"""(() => {{
+if (document.activeElement !== document.body) return;
+const opposite = {{next:'previous', previous:'next'}}[{json.dumps(focus_target)}];
+const control = document.querySelector({selector}) ||
+  (opposite && document.querySelector(`[data-monitor-live="${{opposite}}"]:not([disabled])`)) ||
+  document.querySelector('[data-monitor-live]:not([disabled])');
+(control?.querySelector('input') || control)?.focus({{preventScroll:true}});
+}})()""")
+                    else:
+                        set_changed(pending_live, f"Complete round revision {latest['pending_live'].get('revision', revision)} is available. Move focus away from these controls to show it.")
             if latest['template_query']:
                 template_page = controller.monitor_history_page(latest['template_query'])
                 if template_page is not None:
@@ -1015,6 +1318,34 @@ if (document.activeElement === document.body && document.querySelector('.cn-moni
 }}
 }})()''')
 
+            query = latest['coverage_query']
+            if query:
+                result = controller.monitor_history_page(query)
+                if result is not None:
+                    controller.release_monitor_history_page(query)
+                    latest['coverage_query'] = None
+                    marker, latest['coverage_focus'] = latest['coverage_focus'], None
+                    if result.get('error') == 'expired':
+                        first_coverage_page()  # the next read starts from the first page
+                    latest['coverage_page'] = result
+                    await draw_coverage.refresh()
+                    if marker:
+                        focus_coverage(marker, only_if_lost=True)
+
+            exported = latest['coverage_download']
+            if exported:
+                completion = controller.report_completion(exported) or {}
+                if completion.get('status') == 'ready':
+                    latest['coverage_download'] = None
+                    with client:
+                        ui.download('/download/' + exported)
+                    sync_coverage_download()
+                elif completion.get('status') == 'failed':
+                    latest['coverage_download'] = None
+                    latest['coverage_download_error'] = completion.get('error') or 'The download failed.'
+                    controller.acknowledge_report_completion(exported)
+                    sync_coverage_download()
+
     for control, suffix, default in [(targets, 'targets', ''), (ports, 'ports', ''),
                                      (interval, 'interval', '60'), (duration, 'duration', '')]:
         control.disable()
@@ -1064,6 +1395,7 @@ return true;
         if latest['history_query']:
             controller.release_monitor_history_page(latest['history_query'])
             latest['history_query'] = None
+        cancel_coverage_query()
     client.on_delete(release_queries)
     targets.on_value_change(lambda _: poll())
     ui.timer(0, poll, once=True)
@@ -1074,6 +1406,57 @@ def live_fields(row):
     tcp = ', '.join(f"{entry['port']}: {entry['result']}" for entry in row.get('tcp', [])) or 'Not checked'
     return [('Host', str(row.get('host') or 'Unknown')), ('Address', str(row.get('address') or 'Unknown')),
             ('Result', str(row.get('result') or 'Unknown')), ('TCP', tcp)]
+
+
+COVERAGE_TONES = {'Seen': 'ok', 'Unseen': 'warning', 'Not tested': 'problem'}
+
+
+def coverage_defaults():
+    """Show Available's state with the box off and nothing read: also what a reset puts back (the target line and the
+    rows per page are kept apart, in ``latest``)."""
+    return dict(coverage_on=False, coverage_query=None, coverage_page=None, coverage_cursors=[None], coverage_offsets=[0],
+                coverage_sort='', coverage_descending=False, coverage_group='all', coverage_filter_field='host',
+                coverage_filter_text='', coverage_download=None, coverage_download_error='', coverage_focus=None)
+
+
+def coverage_download_note(page):
+    """What the Download available IPs file holds, beside its button: every Unseen IP of the line, whatever group, sort or
+    filter the table shows (``page['counts']`` describe the whole history). Nothing before the history is read."""
+    if not page or page.get('error') or 'counts' not in page:
+        return ''
+    unseen = page['counts']['unseen']
+    if not unseen:
+        return 'No Unseen IP to download.'
+    return f"{unseen:,} Unseen {'IP' if unseen == 1 else 'IPs'}, whatever filter is showing."
+
+
+def coverage_time(value):
+    """A first or last seen time as the history tables show a time, and ``—`` for an IP that never replied."""
+    return '—' if value is None else history_value('started', value)
+
+
+def coverage_answered(item):
+    return f"{item['answered']:,} of {item['tested']:,}"
+
+
+def coverage_summary_line(summary):
+    """What the table rests on: the rounds kept for the target line and the day of the oldest."""
+    rounds = summary['rounds']
+    if not rounds:
+        return 'No rounds are kept for this target line.'
+    return f"{rounds:,} {'round' if rounds == 1 else 'rounds'} since {coverage_time(summary['since']).split(' ', 1)[0]}"
+
+
+def coverage_notices(summary):
+    """One line for each subnet where no IP ever replied, and a last one when the page could not name them all."""
+    from cn_tool.utils.ping_coverage import PAGE_SILENT_SUBNETS
+
+    names = summary['silent_subnets']
+    lines = [f'No IP in {name} has ever replied. This machine may not be able to reach it, '
+             'so these IPs are untested rather than unused.' for name in names]
+    if len(names) >= PAGE_SILENT_SUBNETS:
+        lines.append('and possibly more.')
+    return lines
 
 
 def history_run_summary(item):

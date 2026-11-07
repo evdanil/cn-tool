@@ -70,6 +70,65 @@ subnet too, and it has no `DHCP failover` rows. An input shorter than /30 (IPv6:
 its child containers (`container`, `child container`, `comment`, `utilization %`); they are not
 expanded, so query one to see its subnets.
 
+## Unused addresses (Show Available)
+
+From 0.10.0, `cn subnet --available` lists the addresses of each IPv4 subnet that have **no record of any
+type** in Infoblox, and the **Show Available** checkbox on the browser's Subnets page shows the same list as **Unused
+addresses**. Both work from the lookup that is already made and send no extra request.
+
+```bash
+cn subnet 10.1.2.0/24 --available
+cn subnet 10.1.2.0/24 --available --format json | jq -r '.unused_addresses[].ip_address'
+```
+
+An address is unused when it is a host address of the subnet (never the network or broadcast address) and is in none of
+four lists: `fixed addresses` (reservations included), `DNS records`, `DHCP range` (every address from its start to its
+end, so a reserved range is never listed) and `IP addresses` (every other used address). cn-tool does not use the grid's
+own `UNUSED` status, because it also marks reserved-range addresses. Each network in each network view has its own
+list: `10.1.2.0/24` in `default` and in `lab` are judged apart.
+
+**Unused means no record in Infoblox.** It does not mean that nothing answers on the address: a device can use an address
+that nobody recorded, so ping it or monitor it before you assign it.
+
+`--available` adds the section `unused addresses` before `warnings`, with the columns `network view` (in the runs that
+show it, see [Network views](#network-views)), `network` and `IP address`; without the option the section, JSON key
+included, does not exist. `--format csv` carries it as the rows whose `section` is `unused addresses`, and a report is
+unchanged. An empty section does not print in the table, markdown or CSV formats, so that "nothing is unused" would look
+like "the option was ignored": when a subnet was found, nothing was refused and no address is unused, stderr says
+`cn subnet: no unused addresses`. Stdout and the exit status stay as they are. In the browser the table has a `network view` column where the other tables show it, then `IP address`,
+the text filter and paging apply, and **Download available IPs** saves a CSV of every subnet in the result, with
+the same columns as the command line section, followed by a `warnings` section with a row (`network view`, `network`,
+`warning`) for every input that could not be listed, as `--format csv` writes them. A refused subnet is named beside the
+button with its reason, and so it is in the file: a short file cannot pass for a complete one. The panel counts networks
+(`Unused addresses: 344 in 2 networks`) and says what the list means.
+
+**When there is no list.** An empty answer looks exactly like an empty subnet, so a list is given only with positive
+proof: the lookup confirmed that exact network in that view, and neither it nor the lookups of its four lists failed or
+reached the 10,000-row limit. Each of the four lists answered for that view: a list request that answers "does not
+match any network" (a network split or deleted while it was being read) is not an empty list, and neither are rows that
+name no view beside rows that do. Each was asked of that view (the grid's views could be listed, or a view was selected
+with `--view` or `[api] network_view`), and the subnet is IPv4 with at most 65,536 addresses (a /16). Otherwise the subnet
+is **refused**: it is named with one of these reasons, and shows no rows. A failed lookup is checked first, so a network
+lookup that failed reads `its records could not all be read`, never `not a network in Infoblox`.
+
+| Reason shown | When |
+| ------------ | ---- |
+| `not a network in Infoblox` | the prefix is not itself a network that Infoblox holds in that view, often a mistyped mask (a `10.1.2.0/25` inside a managed /24) |
+| `its records could not all be read` | a lookup of the subnet failed (the one that confirms the network included), was cut at the 10,000-row limit, or answered that the network does not exist after the network lookup had found it, or (in the browser) the lookup was stopped |
+| `the network views could not be listed, so records in other views may be missing` | the grid's view list could not be read, and no view was selected (`--view` or `[api] network_view`) |
+| `a container, not a network` | a child container: it is listed in `child containers`, never expanded |
+| `IPv6 subnets are not listed` | the subnet is IPv6 |
+| `too large to list` | the network has more than 65,536 addresses |
+
+A list is only as complete as what your Infoblox account can read, so use an account that can read every record type in
+the network.
+
+On the command line a refusal is a `warnings` row (`no unused addresses listed: <reason>`), a line on stderr that names the
+input, and exit status 3, so that a script cannot take "could not tell" for "nothing is free". That includes a prefix that
+exits 1, and a container-only prefix that exits 0, without the option. The other subnets of the run are still listed. A
+failed lookup gives no list for its input, and a stopped lookup in the browser gives none at all, because a half-read
+subnet cannot be shown to hold no records.
+
 ## Network views
 
 A network view is an Infoblox partition of the IP space: the same network, address or name can

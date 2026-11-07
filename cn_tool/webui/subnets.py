@@ -6,6 +6,90 @@ from html import escape
 import ipaddress
 import math
 
+from cn_tool.utils.unused_addresses import CONTAINER, INCOMPLETE, UnusedList, unused_addresses, with_unconfirmed
+
+UNUSED_TITLE = 'Unused addresses'
+UNUSED_SECTION = 'unused addresses'  # the section of `cn subnet --available` (cn_tool.modules.subnet_request.UNUSED_SECTION)
+NO_LIST_NOTICE = 'no unused addresses listed: '  # what a refusal row of `cn subnet --available` says (subnet_request.NO_LIST_NOTICE)
+UNUSED_FILENAME = 'cn-unused-addresses.csv'
+UNUSED_MEANING = 'Unused means no record of any type in Infoblox. It does not prove that nothing answers there.'
+
+
+def available_result(result, *, cache=None):
+    """
+    The unused addresses of a Subnets result, from the sections it already holds (no request, no worker).
+
+    Each group (one network in one network view) is judged on its own by ``unused_addresses`` (a group the lookup
+    marked ``unconfirmed``, because a list request missed its network, is refused as incomplete); every child
+    container is a refusal of its own, and so is every group of a result whose view list was not proved readable
+    (``views_readable``) or of a stopped lookup (``stopped``: ``INCOMPLETE``); an input whose lookup failed
+    (``resolution_errors``) is named last, with its message. Returns ``rows`` (the download: ``network view`` when any group has one, ``network``,
+    ``IP address``, as ``cn subnet --available`` prints them), ``refusals`` (``network``, ``network_view``,
+    ``reason``) and ``by_group`` (a group's id to its table ``rows``, ``network view`` when the
+    group has one and then ``IP address``, or to its ``refusal``). ``cache``, one dict for one result, keeps the answer so that a poll does
+    not compute it again.
+    """
+    if cache is not None and cache.get('result') is result:
+        return cache['value']
+    groups = result.get('detail_groups') or []
+    views_readable = bool(result.get('views_readable', False))  # not proved is not readable
+    stopped = bool(result.get('stopped'))
+    show_view = shows_view(result)
+    rows, refusals, by_group = [], [], {}
+    for group in groups:
+        network, network_view = str(group['network']), str(group.get('network_view') or '')
+        # A stopped lookup cannot show that it left no half-read group, so none of its groups is listed.
+        tables = group.get('tables') or {}
+        found = UnusedList(refusal=INCOMPLETE) if stopped else unused_addresses(
+            network, tables, with_unconfirmed(group.get('warnings') or [], tables, bool(group.get('unconfirmed'))),
+            views_readable=views_readable)
+        if found.refusal:
+            refusals.append(dict(network=network, network_view=network_view, reason=found.refusal))
+            by_group[group['id']] = dict(rows=[], refusal=found.refusal)
+            continue
+        lead = {'network view': network_view, 'network': network} if show_view else {'network': network}
+        rows.extend(dict(lead, **{'IP address': address}) for address in found.addresses)
+        shown = {'network view': network_view} if network_view else {}
+        by_group[group['id']] = dict(rows=[dict(shown, **{'IP address': address}) for address in found.addresses],
+                                     refusal='')
+    for container in result.get('containers') or []:
+        refusals.append(dict(network=str(container.get('child container') or container.get('container') or ''),
+                             network_view=str(container.get('network view') or ''), reason=CONTAINER))
+    # An input whose lookup failed (a name that did not resolve, a request that failed) has no group and no table, so
+    # nothing stands for its addresses: it is named, like a container. A miss and an invalid input are not.
+    for failed, message in (result.get('resolution_errors') or {}).items():
+        refusals.append(dict(network=str(failed), network_view='', reason=str(message)))
+    found = dict(rows=rows, refusals=refusals, by_group=by_group)
+    if cache is not None:
+        cache.clear()
+        cache.update(result=result, value=found)
+    return found
+
+
+def shows_view(result):
+    """Whether the rows of the download carry ``network view``: when any group of the result belongs to a view."""
+    return any(group.get('network_view') for group in result.get('detail_groups') or [])
+
+
+def available_download(result, found):
+    """
+    The bytes of ``cn-unused-addresses.csv`` for ``found`` (``available_result(result)``): the ``unused addresses``
+    rows, then a ``warnings`` row (``network view`` when the result shows it, ``network``, ``warning``) for every input
+    that could not be listed, as ``cn subnet --available --format csv`` writes them, so that a short file cannot pass for
+    a complete one. No rows and no refusals give no bytes.
+    """
+    from cn_tool.utils.render import csv_bytes
+    show_view = shows_view(result)
+    refused = [{**({'network view': refusal['network_view']} if show_view else {}), 'network': refusal['network'],
+                'warning': NO_LIST_NOTICE + refusal['reason']} for refusal in found['refusals']]
+    return csv_bytes({UNUSED_SECTION: found['rows'], 'warnings': refused})
+
+
+def refusal_line(refusal):
+    """``<network or child container>[ in network view V]: <reason>``, as the page names a subnet it cannot list."""
+    where = f" in network view {refusal['network_view']}" if refusal['network_view'] else ''
+    return f"{refusal['network']}{where}: {refusal['reason']}"
+
 
 def order_rows(rows, key, descending=False):
     """Order a copy of a complete result; missing values stay last in both directions."""
@@ -95,6 +179,8 @@ class Presentation:
     filters: dict = field(default_factory=dict)
     table_pagination: dict = field(default_factory=dict)
     pagination: dict = field(default_factory=lambda: {"rowsPerPage": 25, "page": 1})
+    show_available: bool = False  # the tab's choice: it survives a new lookup, a page load starts with it off
+    available_cache: dict = field(default_factory=dict)  # ``available_result`` of the result on screen only
 
     def attach(self, result, operation_id=None):
         identity = tuple(group['id'] for group in result.get('detail_groups', []))
@@ -106,6 +192,7 @@ class Presentation:
             self.sorts.clear()
             self.filters.clear()
             self.table_pagination.clear()
+            self.available_cache.clear()
             self.pagination = {"rowsPerPage": 25, "page": 1}
             self.summary_scroll = (0, 0, 0)
             self.selection = identity[0] if len(identity) == 1 else None
@@ -588,6 +675,36 @@ restore();
         else:
             ui.run_javascript(f'document.getElementById({button_id})?.focus({{preventScroll:true}}); window.scrollTo(0, {vertical});')
 
+    async def toggle_available(event):
+        client = ui.context.client
+        async with poll_lock:
+            view.show_available = bool(event.value)
+            await draw_results.refresh()
+            await restore_result_focus(client, results.html_id, 'data-show-available', 'true')
+
+    def send_available(result, found):
+        """Offer the rows and refusals that were drawn, not whatever result has arrived since."""
+        ui.download.content(available_download(result, found), UNUSED_FILENAME, 'text/csv')
+
+    def render_available_panel(result, found):
+        """The line above the summary or details: how many, what it means, what could not be listed and why, and the download."""
+        listed = sum(1 for entry in found['by_group'].values() if not entry['refusal'])
+        count = len(found['rows'])
+        with ui.element('section').classes('w-full cn-available').props('aria-label="Unused addresses"'):
+            text = (f"Unused addresses: {count:,} in {listed} network{'s' if listed != 1 else ''}" if listed
+                    else 'Unused addresses: no network could be listed')
+            ui.label(text).props('role=status').classes('text-weight-bold')
+            ui.label(UNUSED_MEANING).classes('cn-muted')
+            help_text = ('Downloads the unused addresses of this result as CSV. It is separate from the '
+                         'accumulated report and does not change it.')
+            download_available = ui.button('Download available IPs', on_click=lambda: send_available(result, found)).props('outline')
+            download_available.tooltip(help_text)
+            download_available._props['aria-description'] = help_text
+            if not count:
+                download_available.disable()
+            for refusal in found['refusals']:
+                ui.label(refusal_line(refusal)).props('role=status').classes('text-negative')
+
     @ui.refreshable
     def draw_results():
         snapshot = latest.get('displayed_snapshot')
@@ -619,6 +736,13 @@ restore();
                 show_all._props['data-detail-id'] = 'all'
             new_lookup_button = ui.button('New lookup', on_click=new_lookup).props('outline')
             latest['new_lookup_button'] = new_lookup_button.html_id
+            listable = bool(groups or result.get('containers'))  # a result of misses and errors has nothing to list
+            if listable:
+                show_available = ui.checkbox('Show Available', value=view.show_available, on_change=toggle_available)
+                show_available._props['data-show-available'] = 'true'
+        available = available_result(result, cache=view.available_cache) if listable and view.show_available else None
+        if available is not None:
+            render_available_panel(result, available)
         if not groups:
             ui.label('No matching networks.').classes('text-weight-bold')
         if result.get('containers'):
@@ -644,11 +768,15 @@ restore();
                     for warning in group.get('warnings', []):
                         ui.label(str(warning)).classes('text-negative')
                     sections = list(group.get('tables', {}).items())
-                    section_ids = [f'section-{detail_heading.id}-{index}' for index in range(len(sections))]
+                    unused = available['by_group'].get(group['id']) if available is not None else None
+                    section_ids = [f'section-{detail_heading.id}-{index}' for index in range(len(sections) + (unused is not None))]
                     with ui.element('nav').classes('w-full') as section_index:
                         section_index._props['aria-label'] = f'Detail sections for {identity}'
                         for (name, rows), section_id in zip(sections, section_ids):
                             ui.link(f'{name} ({len(rows)})', f'#{section_id}').classes('q-mr-md')
+                        if unused is not None:
+                            count = 'not listed' if unused['refusal'] else len(unused['rows'])
+                            ui.link(f'{UNUSED_TITLE} ({count})', f'#{section_ids[-1]}').classes('q-mr-md')
                     for (name, rows), section_id in zip(sections, section_ids):
                         with ui.element('section').props(f'id={section_id}').classes('w-full'):
                             if rows:
@@ -658,6 +786,16 @@ restore();
                             else:
                                 with ui.expansion(f'{name} (0)').classes('w-full'):
                                     table(rows, table_id=(group['id'], name))
+                    if unused is not None:
+                        with ui.element('section').props(f'id={section_ids[-1]}').classes('w-full'):
+                            with ui.element('h3'):
+                                ui.label(UNUSED_TITLE if unused['refusal'] else f"{UNUSED_TITLE} ({len(unused['rows'])})")
+                            if unused['refusal']:
+                                ui.label(f"Not listed: {unused['refusal']}.")
+                            elif unused['rows']:
+                                table(unused['rows'], table_id=(group['id'], UNUSED_TITLE))
+                            else:
+                                ui.label('No unused addresses.')
         if result.get('containers'):
             containers = result['containers']
             with ui.element('section').props('id=child-containers').classes('w-full'):

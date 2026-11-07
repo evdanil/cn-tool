@@ -11,7 +11,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, TextIO
+from typing import Any, Dict, List, Mapping, Optional, Sequence, TextIO, Union
 
 from rich.console import Console
 
@@ -79,6 +79,19 @@ def _render_csv(data: Data) -> str:
         for row in rows:
             writer.writerow([title, *(row.get(column) for column in columns)])
     return buffer.getvalue()
+
+
+def csv_bytes(section: Union[str, Mapping[str, Sequence[Mapping[str, Any]]]],
+              rows: Optional[Sequence[Mapping[str, Any]]] = None) -> bytes:
+    """
+    The bytes of ``--format csv``, ``utf-8`` (a file the web page offers for download): one section as
+    ``csv_bytes("unseen", rows)``, or several as ``csv_bytes({"unused addresses": rows, "warnings": rows})``, in that
+    order under one header (the union of their columns, as ``render`` writes them). Like ``render``, it has nothing
+    to say about a section without rows: no rows at all, no bytes.
+    """
+    sections = section if isinstance(section, Mapping) else {section: rows or ()}
+    data = {title: list(found) for title, found in sections.items() if found}
+    return _render_csv(data).encode("utf-8") if data else b""
 
 
 def render(ctx: ScriptContext, data: Data, fmt: str, *, color: bool = False, width: Optional[int] = None) -> str:

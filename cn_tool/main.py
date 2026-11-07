@@ -275,7 +275,8 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "utilisation, options, members and failover, DNS records and fixed addresses. Lists are paged up "
             "to 10,000 rows per subnet. For IPv6 subnets Infoblox reports no DHCP utilisation and no failover, "
             "so those cells are empty. Every used address is also listed with all its record types (HOST, A, "
-            "PTR, FA, RESERVATION, LEASE, ...)."
+            "PTR, FA, RESERVATION, LEASE, ...). --available adds the IPv4 addresses that have no record of "
+            "any type in Infoblox; that is not a proof that nothing answers there."
         ),
         "objects": (
             "10.1.2.0/24, 10.1.2.0/255.255.255.0, 2001:db8:20::/64, or an address (its subnet); a container "
@@ -287,8 +288,24 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "cn subnet 2001:db8:20::/64 --format md",
             "cn subnet --file change-4711.txt --report",
             "cn subnet 10.1.2.0/24 --format json | jq -r '.dns_records[].a_record'",
+            "cn subnet 10.1.2.0/24 --available --format csv",
         ),
         "views": True,
+        "options": (
+            {
+                "flags": ("--available",), "action": "store_true",
+                "help": (
+                    "also list the addresses with no record of any type in Infoblox (section 'unused addresses'; "
+                    "IPv4 subnets of up to 65,536 addresses). A subnet that cannot be listed with certainty is "
+                    "named in 'warnings' and ends the run with 3"
+                ),
+            },
+        ),
+        "exit": (
+            "exit: 0 data for at least one subnet, 1 none, 2 invalid input, 3 Infoblox, credential or report "
+            "failure, or with --available a subnet that could not be listed (stdout still holds what was found), "
+            "130 interrupted."
+        ),
         "found": "data for at least one subnet",
     },
     "fqdn": {
@@ -428,6 +445,8 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "it records one round and adds the earlier rounds of the same targets to the summary. --list, "
             "--show and --follow read the history and ping nothing. --delete and --clear remove recorded "
             "requests from it, after asking. --runs ID lists individual runs and --delete-run RUN_ID deletes one. "
+            "--available (with targets or --show) also lists the hosts that never replied in any round kept for "
+            "them; a silent host may be asleep or firewalled, so check before any cleanup. "
             "--rerun ID runs a recorded request again."
         ),
         "menu_line": 'Same as menu item m, "Ping Monitor".',
@@ -487,6 +506,13 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
                 "flags": ("-y", "--yes"), "action": "store_true",
                 "help": "with --delete, --delete-run or --clear: do not ask (needed without a terminal)",
             },
+            {
+                "flags": ("--available",), "action": "store_true",
+                "help": (
+                    "with targets or --show: also list the hosts that never replied in any round recorded for these "
+                    "targets, and those no round could test (section 'unseen'); not with --since"
+                ),
+            },
         ),
         "examples": (
             "cn monitor 10.1.2.0/24 --for 2h --every 1m",
@@ -497,6 +523,7 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "cn monitor --runs a3f9",
             "cn monitor --delete-run RUN_ID",
             "cn monitor --rerun a3f9 --for 8h",
+            "cn monitor --show a3f9 --available --format csv",
         ),
         "exit": (
             "exit: 0 a host was seen in the window (with --tcp: a port was open), 1 none was, 2 invalid input or "
@@ -504,6 +531,7 @@ _COMMAND_DETAILS: dict[str, dict[str, Any]] = {
             "be read or written (the summary is still printed) or the report failed, 130 a second Ctrl+C. "
             "--delete and --clear: 0 deleted, 1 nothing deleted (not confirmed, or nothing recorded), 2 a run of it "
             "is going on, or no terminal to ask on and no --yes. --delete-run exits the same way. "
+            "--available: 2 with --since or with a mode other than --show, 3 when its list could not be read. "
             "--rerun exits as a run, and 2 while a run of the "
             "request is going on."
         ),

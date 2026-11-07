@@ -18,7 +18,8 @@ and setup](infoblox.md#access-and-setup) requirements before using them.
 | 0.9.0 | Subnets, IP, Ping, Monitor, Configuration Search and Site Demobilization |
 | 0.9.1 | The same tools, with live Monitor progress and history management |
 | 0.9.2 | The same tools, with compact results and improved navigation |
-| 0.9.3 (this source) | Column sorting and field filters, with Ping and Monitor outcome summaries |
+| 0.9.3 | Column sorting and field filters, with Ping and Monitor outcome summaries |
+| 0.10.0 | Monitor host page-size selection, Show Available lists on Subnets and Monitor, and a Windows Pydantic compatibility pin |
 
 The browser tools beyond Subnets are available in 0.9.0 and are not part of 0.8.4.
 The menu and CLI have their own established workflows.
@@ -107,6 +108,20 @@ the configured network-view scope and existing IPv4/IPv6 validation and enrichme
 Subnets summaries keep network, status, view and **Details** together in a paged table;
 returning from details restores the summary position. **View results** jumps past setup.
 
+From 0.10.0, a **Show Available** checkbox beside **New lookup** lists the addresses that have no record of
+any type in Infoblox. It is unticked on every page load and works on the result on screen, so ticking it sends no
+request. Each subnet's details gain **Unused addresses (N)**: a table of `network view` (where the other tables show
+one, and first, as they do) and `IP address` (there is no status column, because every row would say the same) with the
+usual text filter and paging. A line above the results gives the total (`Unused addresses: 344 in 2 networks`), says that
+Unused means no record of any type in Infoblox and does not prove that nothing answers there, and names every input that
+could not be listed, with its reason: not a network in Infoblox, records that could not all be read (a stopped lookup
+included), network views that could not be listed, a container, an IPv6 subnet, or a network over 65,536 addresses.
+**Download available IPs** saves a CSV of every listed subnet, with the columns of `cn subnet --available`, and a
+`warnings` section with a row for each input that could not be listed, as `cn subnet --available --format csv` writes
+them, so a short file cannot pass for a complete one; it is separate from **Download accumulated report** and does not
+change it, and it is disabled while there are no rows. Unused means no record in Infoblox, not that nothing answers on
+the address: see [Unused addresses](infoblox.md#unused-addresses-show-available).
+
 IP accepts individual IPv4/IPv6 addresses, one per line. Results show address, network
 status, network view and available data and plugin columns in a compact paged table.
 Narrow screens scroll within the table to reach remaining fields. Invalid inputs, misses, request failures, PTR warnings
@@ -143,6 +158,11 @@ The latest complete round uses bounded pages. This run's and earlier round count
 shown separately; an incomplete first round is not an outage. History is a changing view
 of recorded requests, runs, rounds and hosts, and refreshing it starts at page one.
 
+From 0.10.0, latest-round and saved-round host tables have a bottom
+pagination bar. Choose **Rows per page** and use the arrows to browse the matching
+hosts. Changing the page size returns to the first page and preserves the chosen
+sort and filters. Pages start at 25 rows; bounded choices keep large rounds responsive.
+
 Use the **Live monitor** tab for setup and current results, or **History** to browse saved
 targets and runs in compact tables. **View rounds** opens a round selector alongside the
 selected round's target/status table. **Earlier round** and **Later round** move through
@@ -151,7 +171,8 @@ separate controls. On narrow screens, choose a round from **Round (UTC)**; targe
 statuses stay in adjacent columns. Rounds are ordered oldest first, and all timestamps
 are UTC. **Back to runs** returns to the same run-list page.
 
-It uses `[ping] history_file` and `[ping] history_days`; viewing history never prunes it.
+It uses `[ping] history_file` and `[ping] history_days` (180 days by default from 0.10.0); viewing history
+never prunes it.
 Starting with 0.9.1, the live view shows progress during a round. Under a request's runs, **Use settings** loads the saved targets and TCP ports into the
 form on the Live monitor tab without starting a monitor. Review the interval and duration before starting: a
 finite duration is estimated from the saved schedule, and some older schedules need a
@@ -164,6 +185,22 @@ Closing a tab or navigating away leaves this session's monitor running. **Stop m
 ends its own run; Quit stops it and waits for cleanup. History and workbook failures are
 reported separately. Completed rounds from a stopped monitor can be included in the workbook.
 See [monitor history](ping-monitor.md#ping-monitor-cn-monitor) for storage and retention details.
+
+From 0.10.0, a saved target on the **History** tab has a **Show Available** checkbox, unticked whenever you
+open a target. Nothing extra is read until you tick it. The page then reads the target line's whole history in the
+background and stays usable, under the heading **Available IPs (whole history)**, which says what Unseen and Not tested
+mean. It shows the rounds the list rests on (`2,880 rounds since 2026-07-09`), one notice listing each subnet in which no
+IP ever replied (this machine may not reach it) and a table of every IP with its status (**Seen**, **Unseen** or **Not
+tested**), first and last seen, rounds answered (`0 of 2,880`), failed rounds and a note. The **All**, **Seen**,
+**Unseen** and **Not tested** buttons (with counts for the whole history) and the field filter narrow the rows, the
+headings sort, and the bottom footer chooses rows per page as in the other host tables. **Download available IPs** saves a
+CSV of every Unseen row of the target line with its note, whatever page, sort or filter is showing, and says how many
+rows that is (`344 Unseen IPs, whatever filter is showing.`); it is separate from **Download accumulated report**, and
+disabled until the table has loaded and while no IP is Unseen. **Refresh history** reads the list again. The box stays
+ticked when you go into a run's rounds (**View rounds**) and back to the same target's runs, and the table is read again
+then; another target, or the list of targets, starts with it unticked. The Live monitor tab does not change. Unseen means no reply to this machine in
+the rounds kept, so a firewalled or sleeping host looks the same, and `history_days` must cover the period being
+judged: see [Never-seen IPs](ping-monitor.md#never-seen-ips-show-available).
 
 ## Configuration tools in 0.9.0
 
@@ -241,7 +278,7 @@ stopped one-shot or unreportable lookups add no report. Save failures leave resu
 available. Version 0.9.0 shows the effective report directory and warns if an
 inaccessible configured directory causes startup to fall back to another directory.
 
-**Download report** waits for pending writes and downloads a consistent copy of the
+**Download accumulated report** waits for pending writes and downloads a consistent copy of the
 existing workbook. It does not enable reporting or save a selected view. After a failed
 or disabled save, the downloaded file may contain only earlier results. The accumulated
 workbook may hold earlier sensitive information as well as the current result.

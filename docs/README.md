@@ -4,9 +4,11 @@
 
 These guides describe the current source tree. Check `cn --version` before following
 instructions for an installed package. The menu and CLI features described here are
-available in 0.8.4. The WebUI guide covers changes through this source's 0.9.3,
+available in 0.8.4. The WebUI guide covers changes through this source's 0.10.0,
 including the browser tools added in 0.9.0 beyond Subnets that are not part of
 0.8.4. Check the installed version before using newer result layouts and navigation.
+The `--available` option of `cn subnet` and `cn monitor`, and the Show Available checkbox
+of the browser's Subnets and Monitor pages, are new in 0.10.0.
 
 For a released version, choose its tag in GitHub's branch/tag selector. Releases before
 this guide split keep the reference in their README: use the

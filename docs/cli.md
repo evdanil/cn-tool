@@ -19,12 +19,12 @@ ln -s /path/to/main.py ~/bin/cn
 
 | Command  | Objects | Returns |
 | -------- | ------- | ------- |
-| `subnet` | `10.1.2.0/24`, `10.1.2.0/255.255.255.0`, `2001:db8:20::/64` or an IP address (its subnet); a container prefix expands to its subnets and lists its child containers, not expanded | subnet summary with DHCP utilization %, DHCP ranges, DNS records, fixed addresses, every used IP address with its record types (`HOST`, `A`, `PTR`, `FA`, `RESERVATION`, `LEASE`, ...), extensible attributes (an IPv6 subnet has no DHCP utilization or failover); a `child containers` table for a container prefix; one summary row and one set of details per network view that holds the subnet |
+| `subnet` | `10.1.2.0/24`, `10.1.2.0/255.255.255.0`, `2001:db8:20::/64` or an IP address (its subnet); a container prefix expands to its subnets and lists its child containers, not expanded | subnet summary with DHCP utilization %, DHCP ranges, DNS records, fixed addresses, every used IP address with its record types (`HOST`, `A`, `PTR`, `FA`, `RESERVATION`, `LEASE`, ...), extensible attributes (an IPv6 subnet has no DHCP utilization or failover); a `child containers` table for a container prefix; one summary row and one set of details per network view that holds the subnet; with `--available` (0.10.0), also the `unused addresses` section: the IPv4 addresses with no record of any type in Infoblox, see [Unused addresses](infoblox.md#unused-addresses-show-available) |
 | `ip`     | IPv4 and IPv6 addresses | network view (on a grid with several), subnet, DNS name, status, MAC (IPv4), DUID (IPv6) and PTR name, one row per network view that holds the address; an unused IPv4 address is reported as `UNUSED`; an address that no Infoblox network contains is in `not_found` as `No Infoblox network contains this address` |
 | `fqdn`   | names or name prefixes (at least three characters) | A, AAAA, host and CNAME records whose name contains the text, with type, DNS view (on a grid with several), zone, TTL and a PTR check |
 | `site`   | site codes; with `-k/--keyword`, keywords | the subnets of each site code, or matching each keyword, with DHCP utilization % and, on a grid with several network views, the network view |
 | `ping`   | IPv4 and IPv6 addresses, host names, `10.1.2.0/24` and `2001:db8::/120` networks | ICMP result per host and, with `--tcp 22,443`, the state of each port |
-| `monitor` | as `ping`; none with `--list`, `--show ID`, `--follow ID`, `--rerun ID`, `--runs ID`, `--delete-run RUN_ID`, `--delete ID` or `--clear` | pings round after round (`--every`, `--for`) and records each round in the ping history; then the hosts seen in the window (first and last seen, rounds seen, online periods), every host's result in the last round and a summary. `--list`: the recorded requests; `--show`, `--follow`: a recorded request's summary, from the history; `--rerun`: a new run of a recorded request, output as a run; `--runs`: individual run IDs; `--delete-run`: delete one run; `--delete`, `--clear`: delete requests, after asking |
+| `monitor` | as `ping`; none with `--list`, `--show ID`, `--follow ID`, `--rerun ID`, `--runs ID`, `--delete-run RUN_ID`, `--delete ID` or `--clear` | pings round after round (`--every`, `--for`) and records each round in the ping history; then the hosts seen in the window (first and last seen, rounds seen, online periods), every host's result in the last round and a summary. `--list`: the recorded requests; `--show`, `--follow`: a recorded request's summary, from the history; `--rerun`: a new run of a recorded request, output as a run; `--runs`: individual run IDs; `--delete-run`: delete one run; `--delete`, `--clear`: delete requests, after asking; with `--available` (0.10.0; a run or `--show`), also the `unseen` section: the IPs that never replied in any round kept, see [Never-seen IPs](ping-monitor.md#never-seen-ips-show-available) |
 | `diff`   | device names, as in `<name>.cfg` in the configuration repositories | configuration lines added or removed since the last change or `--since`, with the snapshot, author and time |
 | `doctor` | none | one row per configuration, credential and Infoblox check |
 | `init`   | none | nothing on stdout: it writes a commented starting configuration to `~/.cn` and never overwrites a file (exit 0 written, 2 the file exists, 3 it could not be written) |
@@ -34,11 +34,12 @@ fetched separately); at the cap a warning says so. `fqdn` pages each record type
 CNAME) and its PTR search up to 10,000 rows.
 
 `ip`, `subnet`, `fqdn`, `site` and `doctor` add `--view NAME` and `--all-views` (see
-[Network views](infoblox.md#network-views)). `ping` adds `--tcp PORTS`; `monitor` adds `--tcp PORTS`,
+[Network views](infoblox.md#network-views)). `subnet` adds `--available`. `ping` adds `--tcp PORTS`; `monitor` adds `--tcp PORTS`,
 `--every INTERVAL`, `--for DURATION`, `--since WHEN`, `--list`, `--show ID`, `--follow ID`,
-`--rerun ID`, `--runs ID`, `--delete-run RUN_ID`, `--delete ID`, `--clear` and `-y/--yes`; and `diff` adds `--since WHEN` and
+`--rerun ID`, `--runs ID`, `--delete-run RUN_ID`, `--delete ID`, `--clear`, `-y/--yes` and `--available`; and `diff` adds `--since WHEN` and
 `--line TEXT`. `doctor` and `init` take neither objects nor `--file`, and `monitor` takes no objects
-with `--list`, `--show`, `--follow`, `--rerun`, `--runs`, `--delete-run`, `--delete` or `--clear`. `diff`, `doctor` and `init`
+with `--list`, `--show`, `--follow`, `--rerun`, `--runs`, `--delete-run`, `--delete` or `--clear`. `--available` goes with
+targets, or with `--show` for `monitor`. `diff`, `doctor` and `init`
 write no report: they have no `--report`, and `-r FILE` is refused with exit 2. An option name is
 never abbreviated (`--rep` is an error, not `--report`).
 
@@ -99,7 +100,7 @@ Setup status block in the menu shows the same rows without the live checks.
 | 0 | at least one object returned data | misses are listed in `not_found` |
 | 1 | no object returned data | an IP outside every managed network |
 | 2 | usage or configuration error | unknown command, no or invalid objects, MAC address, an IPv4-mapped or zoned IPv6 address, Infoblox not configured, a network view that is not on the grid, an empty `--view`, unreadable `--file`, no command and no terminal for the menu, an `[auth]` value that is not a variable name |
-| 3 | incomplete or not saved | no credentials (TACACS, or Infoblox's own account) without a terminal, a GPG file for another user, authentication failure, timeout or server error, rejected or too-large query, the network views could not be listed while one was selected, report not written |
+| 3 | incomplete or not saved | no credentials (TACACS, or Infoblox's own account) without a terminal, a GPG file for another user, authentication failure, timeout or server error, rejected or too-large query, the network views could not be listed while one was selected, report not written, a subnet that `--available` could not list |
 | 130 | interrupted | Ctrl-C |
 
 Status 1 means "no record", not "the IP is free": an unused IPv4 address returns `UNUSED` with
@@ -107,7 +108,9 @@ status 0. An address that no Infoblox network contains is a miss, not a failure:
 HTTP 400 ("A network was not found for this address."), which cn lists in `not_found` as `No
 Infoblox network contains this address`. It does not fail the run (status 1 when nothing else was
 found, and no error in the log). Any other 400 is still a rejected query, status 3.
-With status 3, stdout still holds what was found.
+With status 3, stdout still holds what was found. With `--available`, a subnet that cannot be listed with certainty makes
+the status 3 even for a prefix that exits 1 without the option or a container-only prefix that exits 0, so that a script
+cannot take "could not tell" for "nothing is free" (reasons: [Unused addresses](infoblox.md#unused-addresses-show-available)).
 
 `ping`, `diff` and `doctor` use the same statuses with their own meaning of "data":
 
@@ -125,8 +128,8 @@ keeps):
 | ------ | -------------------------- | -------- | -------------------- | ------------------------ |
 | 0 | a host was seen in the window; with `--tcp`, a port was `open` in some round | a request is recorded | a host was seen in the window; with TCP ports, a port was `open` | the request (`--clear`: every request) was deleted; or (`--clear`) the leftovers of an interrupted delete were freed |
 | 1 | no host was seen, or no round finished | nothing is recorded | no host was seen in the window | nothing was deleted: the answer was not `y`, or (`--clear`) nothing is recorded, leftover rounds included |
-| 2 | as `cn ping`, and `--every` under `10s`, `--for` shorter than `--every`, a bad interval, or two modes together; with `--rerun`: no request has that ID, a run of it is going on, targets or `--tcp` given, a `--for` shorter than the interval it keeps or an `--every` longer than the length it keeps | `--since`, targets or another mode given | no request has that ID, or the prefix starts several; `--follow` without a terminal on stderr | no request has that ID (nothing recorded included), the prefix starts several IDs or has fewer than 4 hex digits; a run of the request (`--clear`: any run) is going on; no terminal to ask on and no `--yes`; targets, `--tcp`, `--every`, `--for`, `--since` or another mode given; `--yes` without `--delete` or `--clear` |
-| 3 | a probe could not run in a round of this run; the history could not be read or written (the summary is still printed); report not written; with `--rerun`: the history cannot be read (nothing started) | the history cannot be read | the history cannot be read; report not written | the history cannot be opened, read or written; nothing was deleted |
+| 2 | as `cn ping`, and `--every` under `10s`, `--for` shorter than `--every`, a bad interval, or two modes together; with `--rerun`: no request has that ID, a run of it is going on, targets or `--tcp` given, a `--for` shorter than the interval it keeps or an `--every` longer than the length it keeps; `--available` with `--since` or `--rerun` | `--since`, `--available`, targets or another mode given | no request has that ID, or the prefix starts several; `--follow` without a terminal on stderr; `--available` with `--since` or `--follow` | no request has that ID (nothing recorded included), the prefix starts several IDs or has fewer than 4 hex digits; a run of the request (`--clear`: any run) is going on; no terminal to ask on and no `--yes`; targets, `--tcp`, `--every`, `--for`, `--since`, `--available` or another mode given; `--yes` without `--delete` or `--clear` |
+| 3 | a probe could not run in a round of this run; the history could not be read or written, for the `--available` list too (the summary is still printed); report not written; with `--rerun`: the history cannot be read (nothing started) | the history cannot be read | the history cannot be read, the `--available` list included; report not written | the history cannot be opened, read or written; nothing was deleted |
 | 130 | a second Ctrl+C (the first ends the run with its summary) | Ctrl-C | Ctrl-C; with `--follow`, a second Ctrl+C | Ctrl-C (at the question: nothing was deleted) |
 
 `--report` appends the result to the xlsx report (`[report] filename`, or `-r FILE`, which implies
@@ -156,12 +159,12 @@ be read.
 
 | Command  | Sections |
 | -------- | -------- |
-| `subnet` | `subnets`, `child_containers`, the detail sections (`general`, `dhcp_range`, ...), `warnings`; the rows carry `network_view` |
+| `subnet` | `subnets`, `child_containers`, the detail sections (`general`, `dhcp_range`, ...), with `--available` `unused_addresses`, `warnings`; the rows carry `network_view` |
 | `ip`     | `ip_information`, `not_found`, `warnings` |
 | `fqdn`   | `fqdn`, `not_found`, `warnings` |
 | `site`   | `location`, `not_found`, `warnings` |
 | `ping`   | `ping` (`host`, `address`, `result`, `tcp_<port>`...), `not_found` |
-| `monitor` | a run or `--rerun`: `seen`, `latest`, `summary`, `not_found`; `--list`: `requests`; `--show` and `--follow`: `seen`, `latest`, `summary`; `--delete` and `--clear`: `deleted` (one row per request deleted) |
+| `monitor` | a run or `--rerun`: `seen`, `latest`, `summary`, `not_found`; `--list`: `requests`; `--show` and `--follow`: `seen`, `latest`, `summary`; with `--available`, a run or `--show` also has `unseen`; `--delete` and `--clear`: `deleted` (one row per request deleted) |
 | `diff`   | `compared`, `changes`, `not_found`, `warnings` |
 | `doctor` | `checks` |
 
@@ -172,9 +175,12 @@ be read.
 | `seen` | one row per host seen in the window: `host`, `address`, `latest` (the ping result in the last finished round, never a port's answer: `cn ping`'s values plus `REJECTED` and `UNREACHABLE`), `tcp_<port>` (ports in ascending order), `first_seen`, `last_seen`, `seen_rounds`, `rounds` (integers), `online` (a list of `{"from", "to"}` times, `to` `null` while a period is open in a running request) |
 | `latest` | every host of the last finished round: `host`, `address`, `result`, `tcp_<port>`; read from the history, a host that was not seen has an empty `address` |
 | `summary` | `id`, `started`, `ended`, `rounds`, `earlier_rounds`, `interval` (seconds, `null` for one round), `hosts`, `seen`, `answering` |
+| `unseen` | with `--available`: one row per host that never replied in any round kept (`status` `Unseen`) or that no round could test (`Not tested`), in host order: `host`, `status`, `seen_rounds`, `rounds` (the rounds that tested the host, failed probes and unresolved names left out; integers), `failed_rounds`, `since` (the oldest round kept, UTC), `note` (`no IP in this subnet ever replied` when no IP of its subnet ever did) |
 | `requests` | `id`, `targets`, `tcp` (`-` for none), `runs`, `rounds`, `last_round`, `state` (`running`, `finished`, `stopped`, `failed` or `lost`), `detail` (the rest of the state, e.g. `round 14 of up to 120, next at 09:15:00`) |
 
 Times are UTC, to the second (`2026-10-09T09:14:00+00:00`).
+
+`subnet --available` adds `unused_addresses`: one row for each address with no record of any type, with `network` and `ip_address` (and `network_view` first in the runs that show the view column). In `--format csv` they are the rows whose `section` is `unused addresses`. When a subnet was found, nothing was refused and no address is unused, stderr says `cn subnet: no unused addresses`, and `cn monitor --available` says `cn: monitor: no never-seen IPs: every host of this target line replied at least once` when no host is Unseen or Not tested; stdout and the exit status do not change.
 
 New columns: `fqdn` has `type`, `canonical`, `dns_view`, `zone`, `ttl` and `ptr`; `ip_information`
 has `network_view`, `ptr_name` and, in runs that look up an IPv6 object, `duid`; the

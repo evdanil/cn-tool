@@ -472,6 +472,19 @@ class SessionController:
             self._send('snapshot_report', None, {'request_id': request_id})
             return request_id
 
+    def request_coverage_export(self, parent):
+        """Ask the worker for the CSV of every ``Unseen`` host of request ``parent`` (a history ``requests`` row id).
+        The reply is a ``report_snapshot``, so it completes, downloads and is released as the workbook is."""
+        with self._lock:
+            if self._state.phase not in {'ready', 'running', 'stopping', 'saving'}:
+                raise RuntimeError('Session unavailable')
+            request_id = uuid4().hex
+            payload = dict(request_id=request_id, parent=parent)
+            validate(envelope(self.session_id, None, 'monitor_coverage_export', payload))
+            self._send('monitor_coverage_export', None, payload)
+            self._report_requests.add(request_id)
+            return request_id
+
     def report_completion(self, request_id):
         """Path-free completion retained independently for every requesting tab."""
         with self._lock:
@@ -596,6 +609,8 @@ class SessionController:
                 if (request is None or len(payload['items']) > request[1] or
                         (request[0] == 'template' and (payload['next_cursor'] is not None or
                          len(payload['items']) != (0 if payload['error'] else 1))) or
+                        # A coverage page that is not an error carries its summary, and no other page does.
+                        ('summary' in payload) != (request[0] == 'coverage' and payload['error'] is None) or
                         not all(valid_monitor_history_item(request[0], item) for item in payload['items'])):
                     return
                 self._history_requests.pop(payload['query_id'], None)

@@ -51,15 +51,18 @@ def create_app(controller, access):
         except KeyError:
             return JSONResponse({'error': 'Download unavailable.'}, status_code=404)
         snapshot = controller.report_completion(request_id) or {}
-        filename = snapshot.get('filename', 'report.xlsx') if snapshot.get('request_id') == request_id else 'report.xlsx'
+        # The Unseen download is a CSV file; every other snapshot is the report workbook, as it always was.
+        csv = str(path).lower().endswith('.csv')
+        fallback = 'report.csv' if csv else 'report.xlsx'
+        filename = snapshot.get('filename', fallback) if snapshot.get('request_id') == request_id else fallback
         class SnapshotResponse(FileResponse):
             async def __call__(self, scope, receive, send):
                 try:
                     await super().__call__(scope, receive, send)
                 finally:
                     controller.release_snapshot(request_id)
-        return SnapshotResponse(path, filename=filename, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                                headers={'Cache-Control': 'no-store'})
+        media_type = 'text/csv' if csv else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        return SnapshotResponse(path, filename=filename, media_type=media_type, headers={'Cache-Control': 'no-store'})
 
     @ui.page('/config-search')
     def config_search_page():

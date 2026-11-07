@@ -19,7 +19,8 @@ FIELDS = {
     'monitor_delete': {'action', 'run_id', 'request_id', 'query_id'},
     'monitor_delete_result': {'query_id', 'status', 'warning'},
     'monitor_history': {'kind', 'parent', 'cursor', 'limit', 'query_id', 'sort', 'descending', 'group', 'filter_field', 'filter_text'},
-    'monitor_history_result': {'items', 'next_cursor', 'error', 'query_id', 'counts', 'total'},
+    'monitor_history_result': {'items', 'next_cursor', 'error', 'query_id', 'counts', 'total', 'summary'},
+    'monitor_coverage_export': {'request_id', 'parent'},
     'monitor_live_page': {'job_id', 'run_id', 'revision', 'offset', 'limit', 'query_id', 'sort', 'descending', 'group', 'filter_field', 'filter_text'},
     'monitor_live_page_result': {'job_id', 'run_id', 'revision', 'offset', 'rows', 'next_offset', 'status', 'current_revision', 'query_id', 'total', 'counts'},
     'monitor_update': {'lookup_type', 'run_id', 'revision', 'stage', 'completed', 'total', 'current_rounds', 'earlier_rounds', 'skipped_slots', 'history_error'},
@@ -32,7 +33,7 @@ for _kind in ('demob_page', 'demob_page_result', 'config_search_page', 'config_s
     FIELDS[_kind] |= _PAGE_OPTIONS
 FIELDS['demob_page_result'] |= {'columns', 'overall_total'}
 FIELDS['config_search_page_result'] |= {'overall_total'}
-COMMANDS = frozenset(('initialize', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_history', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
+COMMANDS = frozenset(('initialize', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_history', 'monitor_coverage_export', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
 
 
 def envelope(session_id, job_id, kind, payload):
@@ -73,6 +74,19 @@ def valid_monitor_request_summary(item):
                 for value in (item['target_count'], item['port_count'], item['host_count'])) and
             (item['target_count'] is None or item['target_count'] >= len(item['targets_preview'])) and
             (item['port_count'] is None or item['port_count'] >= len(item['ports_preview'])))
+
+
+def _valid_coverage_summary(summary):
+    """``rounds`` read, ``since`` (the oldest round's start, or None) and the silent subnets, at most 64."""
+    from cn_tool.utils.ping_coverage import PAGE_SILENT_SUBNETS
+    if not isinstance(summary, dict) or set(summary) != {'rounds', 'since', 'silent_subnets'}:
+        return False
+    rounds, since, names = summary['rounds'], summary['since'], summary['silent_subnets']
+    return (type(rounds) is int and 0 <= rounds <= 2**63 - 1 and
+            (since is None or type(since) is int and -(2**63) <= since <= 2**63 - 1 or
+             type(since) is float and math.isfinite(since)) and
+            isinstance(names, list) and len(names) <= PAGE_SILENT_SUBNETS and
+            all(isinstance(name, str) and len(name) <= 256 for name in names))
 
 
 def valid_monitor_history_item(kind, item):
@@ -124,6 +138,14 @@ def valid_monitor_history_item(kind, item):
                 text(item['host']) and item['observation'] in ('!', 'R', 'T', 'U', '.', 'E', '?', ' ') and
                 (item['address'] is None or text(item['address'])) and
                 (item['result'] is None or text(item['result'])))
+    if kind == 'coverage':
+        return (set(item) == {'index', 'host', 'status', 'first_seen', 'last_seen', 'answered', 'tested', 'failed',
+                              'note'} and
+                integer(item['index']) and text(item['host']) and
+                item['status'] in ('Seen', 'Unseen', 'Not tested') and
+                optional_number(item['first_seen']) and optional_number(item['last_seen']) and
+                integer(item['answered']) and integer(item['tested']) and integer(item['failed']) and
+                text(item['note']))
     return False
 
 def validate(message):
@@ -154,6 +176,14 @@ def validate(message):
         elif (payload['status'] not in ('deleted', 'missing', 'running', 'failed') or
               not isinstance(payload['warning'], str) or len(payload['warning']) > 512):
             raise ValueError('Invalid deletion result')
+        return message
+    if kind == 'monitor_coverage_export':
+        from cn_tool.utils.ping_history import _history_int
+        request_id = payload.get('request_id')
+        if (message['job_id'] is not None or set(payload) != FIELDS[kind] or not isinstance(request_id, str) or
+                not 1 <= len(request_id) <= 128 or not request_id.isascii() or not request_id.isprintable() or
+                not _history_int(payload['parent'])):
+            raise ValueError('Invalid coverage export')
         return message
     if kind.startswith('demob_'):
         optional = (_PAGE_OPTIONS if kind == 'demob_page' else
@@ -249,8 +279,9 @@ def validate(message):
         return message
     if kind in {'monitor_history', 'monitor_history_result'}:
         optional = {'sort', 'descending', 'group', 'filter_field', 'filter_text'} if kind == 'monitor_history' else {'counts', 'total'}
-        base = FIELDS[kind] - optional
-        allowed = (base, base | optional) if kind == 'monitor_history' else (base, base | {'total'}, base | optional)
+        base = FIELDS[kind] - optional - ({'summary'} if kind == 'monitor_history_result' else set())
+        allowed = ((base, base | optional) if kind == 'monitor_history' else
+                   (base, base | {'total'}, base | optional, base | optional | {'summary'}))
         if message['job_id'] is not None or set(payload) not in allowed:
             raise ValueError('Invalid history envelope')
         query_id = payload['query_id']
@@ -260,22 +291,27 @@ def validate(message):
         if cursor is not None and (not isinstance(cursor, str) or len(cursor) > 1024 or not re.fullmatch(r'[A-Za-z0-9_-]+', cursor)):
             raise ValueError('Invalid history cursor')
         if kind == 'monitor_history':
+            from cn_tool.utils.ping_coverage import PAGE_FILTERS, PAGE_GROUPS, PAGE_SORTS
             from cn_tool.utils.ping_history import _history_decode_cursor, _history_int, _history_run_id, _sorted_history_decode
             page_kind, parent, limit = payload['kind'], payload['parent'], payload['limit']
-            if (page_kind not in ('requests', 'runs', 'rounds', 'hosts', 'template') or not _history_int(limit) or limit > 100 or
+            if (page_kind not in ('requests', 'runs', 'rounds', 'hosts', 'template', 'coverage') or
+                    not _history_int(limit) or limit > 100 or
                     (page_kind == 'requests' and parent is not None) or
-                    (page_kind in ('runs', 'hosts') and not _history_int(parent)) or
+                    (page_kind in ('runs', 'hosts', 'coverage') and not _history_int(parent)) or
                     (page_kind in ('rounds', 'template') and not _history_run_id(parent)) or
-                    (page_kind == 'template' and (cursor is not None or limit != 1))):
+                    (page_kind == 'template' and (cursor is not None or limit != 1)) or
+                    (page_kind == 'coverage' and 'sort' not in payload)):  # a fold is always paged in an order
                 raise ValueError('Invalid history query')
             if 'sort' in payload:
-                fields = {'hosts': ('host', 'status', 'address', 'result'),
+                fields = {'hosts': ('host', 'status', 'address', 'result'), 'coverage': PAGE_SORTS,
                           'requests': ('targets', 'ports', 'hosts'),
                           'runs': ('started', 'status', 'rounds', 'interval')}.get(page_kind, ())
-                groups = ('all', 'answered', 'no_response', 'problem', 'other') if page_kind == 'hosts' else ('all',)
+                filters = PAGE_FILTERS if page_kind == 'coverage' else fields
+                groups = {'hosts': ('all', 'answered', 'no_response', 'problem', 'other'),
+                          'coverage': PAGE_GROUPS}.get(page_kind, ('all',))
                 if (not fields or payload['sort'] not in ('', *fields) or
                         type(payload['descending']) is not bool or payload['group'] not in groups or
-                        payload['filter_field'] not in fields or
+                        payload['filter_field'] not in filters or
                         not isinstance(payload['filter_text'], str) or len(payload['filter_text']) > 256):
                     raise ValueError('Invalid history ordering')
                 options = [payload[k] for k in ('sort', 'descending', 'group', 'filter_field', 'filter_text')]
@@ -290,17 +326,23 @@ def validate(message):
             items, error = payload['items'], payload['error']
             if 'total' in payload and (type(payload['total']) is not int or payload['total'] < 0):
                 raise ValueError('Invalid history total')
+            # A summary belongs to a coverage page alone: its counts are the statuses, not the hosts' groups.
+            from cn_tool.utils.ping_coverage import PAGE_COUNTS
+            coverage = 'summary' in payload
             if 'counts' in payload and (
-                    not isinstance(payload['counts'], dict) or set(payload['counts']) != {'answered', 'no_response', 'problem', 'other'} or
+                    not isinstance(payload['counts'], dict) or
+                    set(payload['counts']) != (set(PAGE_COUNTS) if coverage else {'answered', 'no_response', 'problem', 'other'}) or
                     any(type(n) is not int or n < 0 for n in payload['counts'].values()) or
                     payload['total'] > sum(payload['counts'].values())):
                 raise ValueError('Invalid history counts')
+            if coverage and not _valid_coverage_summary(payload['summary']):
+                raise ValueError('Invalid history summary')
             if (not isinstance(items, list) or len(items) > 100 or
                     (error is not None and not isinstance(error, str))):
                 raise ValueError('Invalid history result')
             for item in items:
                 if not any(valid_monitor_history_item(item_kind, item)
-                           for item_kind in ('requests', 'runs', 'rounds', 'hosts', 'template')):
+                           for item_kind in (('coverage',) if coverage else ('requests', 'runs', 'rounds', 'hosts', 'template'))):
                     raise ValueError('Invalid history item')
         return message
     if kind in {'monitor_live_page', 'monitor_live_page_result'}:
