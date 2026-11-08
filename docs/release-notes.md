@@ -16,6 +16,14 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
+## 0.11.1
+
+On Windows, Ctrl+C in the console window that runs `cn-web` ends the web interface
+quietly again, with exit code 130. Since 0.9.0 it also printed a `KeyboardInterrupt`
+traceback from the background process behind Configuration Search. A Ctrl+C while
+credentials are read from or saved to the system's credential store no longer prints
+a traceback either.
+
 ## 0.11.0
 
 Every web tool offers **Delete report** beside the download button. After a

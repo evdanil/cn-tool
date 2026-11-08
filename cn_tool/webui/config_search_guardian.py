@@ -24,6 +24,10 @@ import sys
 import threading
 
 from cn_tool.utils import oscompat
+from .interrupts import ignore_console_interrupts
+
+# The spawn bootstrap imports this module before it runs the target.
+ignore_console_interrupts()
 
 _MAX_MESSAGE = 8 * 1024 * 1024
 _TIMEOUT = 2.0
@@ -122,6 +126,7 @@ def _receive(connection):
 
 
 def _child(target, request, connection, expected_parent):
+    ignore_console_interrupts()
     if oscompat.is_linux():
         _linux_parent_death(expected_parent)
     try:
@@ -145,6 +150,7 @@ def _terminate(process):
 
 
 def _serve(target, launcher, worker, parent_pid):
+    ignore_console_interrupts()
     child = None
     child_pipe = None
     generation = 0

@@ -10,6 +10,11 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
 
+from .interrupts import ignore_console_interrupts
+
+# The spawn bootstrap imports this module before it runs the helper.
+ignore_console_interrupts()
+
 
 @dataclass(frozen=True)
 class CredentialScope:
@@ -123,6 +128,7 @@ def _execute(backend, action, service, username, password):
 
 
 def _helper_main(conn):
+    ignore_console_interrupts()
     try:
         request = json.loads(conn.recv_bytes(65536).decode('utf-8'))
         result = _execute(_native_backend(), request['action'], request['service'], request['username'], request['password'])

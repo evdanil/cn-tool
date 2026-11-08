@@ -321,6 +321,7 @@ Quit stops Monitor and waits for cleanup and any report save already in progress
 active work drains. Quit also stops active configuration searches, including Site
 Demobilization.
 Closing a tab does not run exit actions. An unexpected worker failure is displayed
-without rerunning work or replaying email. In 0.8.4, Ctrl+C also stops a local WebUI
-session cleanly on Windows; interruption skips normal exit actions inappropriate for
-a canceled session.
+without rerunning work or replaying email. Ctrl+C also stops a local WebUI session
+cleanly on Windows (from 0.8.4; 0.9.0 to 0.11.0 also printed a traceback from a
+background process as they ended, which 0.11.1 removes); interruption skips normal
+exit actions inappropriate for a canceled session.

@@ -1,27 +1,15 @@
 """Persistent cn runtime; its sole reader stays responsive during blocking work."""
 from dataclasses import asdict
 from pathlib import Path
-import multiprocessing
 from queue import Empty, Full, Queue
-import signal
 from threading import Condition, Event, Lock, Thread
 from uuid import uuid4
 
 from cn_tool.core.interaction import AuthenticationFailed, AuthenticationRequired, CredentialReply
 from cn_tool.core.operation import OperationCancelled, OperationControl
 from cn_tool.core.runtime import RuntimeSession, SetupRequired, abort_initialization
+from .interrupts import ignore_console_interrupts as _ignore_parent_interrupts
 from .protocol import COMMANDS, decode, encode, envelope, valid_monitor_history_item
-
-
-def _ignore_parent_interrupts():
-    """Let the launcher coordinate child shutdown after a console Ctrl+C."""
-    if multiprocessing.current_process().name == 'MainProcess':
-        return
-    try:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-    except (AttributeError, ValueError):
-        pass
-
 
 _ignore_parent_interrupts()
 
