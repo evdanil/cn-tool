@@ -33,14 +33,14 @@ class CacheManager:
 
         # diskcache loads here, when a cache is really built, so importing this module (which every
         # start does) stays cheap. A CacheManager exists only when the cache is enabled.
-        from diskcache import FanoutCache, JSONDisk
+        from diskcache_community import FanoutCache, SafeJSONDisk
 
         # Main cache object
         self.dc = FanoutCache(
             directory=str(directory),
             shards=4,
             timeout=1,
-            disk=JSONDisk,
+            disk=SafeJSONDisk.with_options(on_error="miss"),
             compress_level=6,
             sqlite_cache_size=cache_size,
             sqlite_mmap_size=mmap_size,
@@ -58,8 +58,8 @@ class CacheManager:
         # the SQLite tuning from the parent FanoutCache. Apply manually.
         for idx in (self.dev_idx, self.ip_idx, self.kw_idx, self.rev_idx):
             try:
-                idx._cache._sql(f'PRAGMA cache_size={cache_size}').fetchall()
-                idx._cache._sql(f'PRAGMA mmap_size={mmap_size}').fetchall()
+                idx.cache._sql(f'PRAGMA cache_size={cache_size}').fetchall()
+                idx.cache._sql(f'PRAGMA mmap_size={mmap_size}').fetchall()
             except Exception:
                 pass
 

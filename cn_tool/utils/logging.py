@@ -70,7 +70,7 @@ def configure_logging(logfile_location: str, log_level_str: str, extra_loggers: 
     # in extra_loggers) would propagate to the handler-less root logger, where
     # Python's lastResort handler prints WARNING+ to stderr and corrupts a Rich
     # Live display.
-    for managed_name in ("netmiko", "paramiko", "cn_tool.utils", *extra_loggers):
+    for managed_name in ("netmiko", "paramiko", "cn_tool.utils", "diskcache_community", *extra_loggers):
         managed = logging.getLogger(managed_name)
         if managed_name in ("netmiko", "paramiko"):
             # packet-level DEBUG from these floods the shared log during

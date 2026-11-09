@@ -31,7 +31,7 @@ from .search_helpers import extract_keywords, extract_literal_ips
 from .validation import ip_regexp
 
 if TYPE_CHECKING:
-    from diskcache import Index  # annotations only: diskcache loads when a cache is built
+    from diskcache_community import Index  # annotations only: diskcache loads when a cache is built
 
 HEX8_RE = re.compile(r"^[0-9A-F]{8}\b")
 LONG_HEX_RE = re.compile(r"^[0-9A-Fa-f]{24,}$")
@@ -1067,7 +1067,7 @@ def _release_post_indexing_memory(cache: CacheManager, logger: logging.Logger) -
         for shard in cache.dc._shards:
             shard._sql('PRAGMA shrink_memory').fetchall()
         for idx_obj in cache.dc._indexes.values():
-            idx_obj._cache._sql('PRAGMA shrink_memory').fetchall()
+            idx_obj.cache._sql('PRAGMA shrink_memory').fetchall()
         logger.debug("Post-indexing: SQLite shrink_memory completed.")
     except Exception as exc:
         logger.warning("Post-indexing: SQLite shrink_memory failed (diskcache internals may have changed): %s", exc)

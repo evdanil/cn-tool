@@ -18,7 +18,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Any
 
 if TYPE_CHECKING:
-    from diskcache import Index  # annotations only: diskcache loads when a cache is built
+    from diskcache_community import Index  # annotations only: diskcache loads when a cache is built
 
 
 class SortedKeyIndex:
