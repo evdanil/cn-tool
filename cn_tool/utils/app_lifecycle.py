@@ -56,7 +56,7 @@ def shutdown_resources(ctx: ScriptContext, exit_code: int = 0, message: str = ''
         # Close Index connections (FanoutCache.close() misses these)
         for idx in (cache.dev_idx, cache.ip_idx, cache.kw_idx, cache.rev_idx):
             try:
-                idx._cache.close()
+                idx.cache.close()
             except Exception:
                 pass
         cache.dc.close()
