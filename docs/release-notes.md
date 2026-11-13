@@ -16,6 +16,18 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
+## 0.12.1
+
+On Windows, `py -m cn_tool.webui` and `py -m cn_tool` start cn through the signed Python
+interpreter instead of the unsigned `cn-web.exe` and `cn.exe` launchers that application
+control may block; see [Starting on a managed Windows PC](windows.md#starting-on-a-managed-windows-pc).
+`py -m cn_tool.webui --create-shortcut` writes a **cn-tool Web** shortcut to the Start menu and
+the Desktop that opens the interface without a console window (`--console` keeps one), and
+programs cn runs, such as `ping.exe`, no longer open console windows of their own. Starting the
+web interface again while it runs reopens the browser on the running session instead of
+starting a second one. A start without a console now works, and a failed one shows its error in
+a **cn-tool Web** message box. No configuration change or migration is needed.
+
 ## 0.12.0
 
 **Settings** creates and edits the configuration file (`-c FILE`, else `~/.cn`) in the

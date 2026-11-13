@@ -49,7 +49,8 @@ def decrypt_gpg_file(logger: logging.Logger, file_path: Path) -> Optional[str]:
     try:
         result = subprocess.run(
             ["gpg", "--batch", "-d", file_path],
-            capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=True, timeout=90
+            capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", check=True, timeout=90,
+            **oscompat.child_process_kwargs(),
         )
         output = result.stdout
         output.encode("utf-8")  # raises for what surrogateescape kept of bytes that are not UTF-8

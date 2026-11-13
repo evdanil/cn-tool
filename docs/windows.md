@@ -21,9 +21,58 @@ without WSL. The commands on this page are for PowerShell.
   says `py -m pip`. Python 3.12 to 3.14 is recommended: Python 3.15 was too new for PyYAML's Windows
   wheel when 0.7.0 was released, so pip would need a compiler there. On Windows on Arm, install the
   x64 Python; cn runs under emulation.
-- **When `cn.exe` is blocked** by AppLocker or antivirus: `py -m pip install --user cn-tool`, then
+- **When `cn.exe` is blocked** by AppLocker or antivirus (for the web interface and a shortcut, see
+  [Starting on a managed Windows PC](#starting-on-a-managed-windows-pc)): `py -m pip install --user cn-tool`, then
   `py -m cn_tool` with the same commands and options (`py -m cn_tool ip 10.1.2.3`). A pipx install
   keeps cn-tool in its own environment, so `py -m cn_tool` finds nothing there.
+
+## Starting on a managed Windows PC
+
+When pip installs cn-tool it writes `cn.exe`, `cn-tool.exe` and `cn-web.exe` on your PC. They are small
+launchers that cannot be signed, so application control (AppLocker, WDAC, Smart App Control) or antivirus
+may block them. Start cn through Python itself instead, which python.org signs (the shortcut needs cn-tool
+0.12.1 or later):
+
+1. Install Python 3.12, 3.13 or 3.14 from python.org.
+2. Make an environment in your local profile and install cn-tool into it:
+
+   ```powershell
+   py -m venv "$env:LOCALAPPDATA\cn-tool"
+   & "$env:LOCALAPPDATA\cn-tool\Scripts\python.exe" -m pip install "cn-tool[webui]"
+   ```
+
+   You do not need `Activate.ps1`, which policy often blocks: the full path to `python.exe` works without
+   it.
+3. Write the shortcut:
+
+   ```powershell
+   & "$env:LOCALAPPDATA\cn-tool\Scripts\python.exe" -m cn_tool.webui --create-shortcut
+   ```
+
+   It writes **cn-tool Web** to the Start menu and the Desktop. Add `-c "C:\path\team.cn"` for a shortcut
+   that opens that configuration, and `--console` for one that keeps a console window.
+4. Double-click **cn-tool Web**. The interface opens in your browser with no console window; stop it with
+   **Quit application**. Clicking the shortcut again while it runs reopens the same session, so a closed
+   tab is never lost.
+5. For the menu and the command line, use the same `python.exe` with `-m cn_tool`, for example
+   `& "$env:LOCALAPPDATA\cn-tool\Scripts\python.exe" -m cn_tool ip 10.1.2.3`.
+
+Good to know:
+
+- **What the policies check.** AppLocker and WDAC check the program a shortcut starts (here the signed
+  `pythonw.exe`), not the shortcut itself; WDAC also checks every library (`.pyd`) Python loads. The
+  default AppLocker rules allow programs under Program Files and Windows only, so a Python or environment in
+  your profile may need a publisher rule for "Python Software Foundation" from your administrator. When a
+  library is blocked, cn-tool says "A part of the web interface could not be loaded" and names it.
+- **Nothing happens on a double-click?** Run the command of step 3 without `--create-shortcut` in
+  PowerShell to see the error.
+- **After upgrading or reinstalling Python**, or moving the environment, run step 3 again: the shortcut
+  points at that `python.exe`.
+- **A Desktop in OneDrive** syncs the shortcut to your other PCs, where it may not work; delete it there.
+- **Write the shortcut as the user who will use it**, not from a separate administrator account, which
+  would put it in that account's profile.
+- **pipx** works the same way through Python: `py -m pipx install "cn-tool[webui]"` (`pipx.exe` is a
+  launcher too).
 
 ## WebUI dependency compatibility (0.10.0)
 

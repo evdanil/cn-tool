@@ -689,7 +689,7 @@ class BulkPingModule(BaseModule):
                             on_attempt(host)
                         proc = Popen(
                             _ping_command(address), stdout=PIPE, stderr=STDOUT, text=True,
-                            encoding="utf-8", errors="replace",
+                            encoding="utf-8", errors="replace", **oscompat.child_process_kwargs(),
                         )
                     except FileNotFoundError as exc:
                         logger.error("'ping' command not found.")

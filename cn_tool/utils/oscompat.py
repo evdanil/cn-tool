@@ -117,11 +117,40 @@ def _windows_pid_exists(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+# winbase.h. subprocess.CREATE_NO_WINDOW exists only on Windows, so the literal is kept here.
+CREATE_NO_WINDOW = 0x08000000
+
+
+def no_console_window_flags() -> int:
+    """The ``creationflags`` a console child (``ping.exe``, ``gpg.exe``) needs so that it opens no window.
+
+    A Windows process without a console (``pythonw``, the windowless web UI shortcut) that starts a console
+    program gives that child a new, visible console window of its own. ``CREATE_NO_WINDOW`` runs it without one.
+    Only then: a process with a console (``GetConsoleWindow`` is not null) returns 0, so its children share that
+    console, and Ctrl+C reaches them, as before. POSIX returns 0 without loading kernel32.
+    """
+    if not is_windows():
+        return 0
+    return 0 if _kernel32().GetConsoleWindow() else CREATE_NO_WINDOW
+
+
+def child_process_kwargs() -> dict:
+    """``{"creationflags": CREATE_NO_WINDOW}`` when ``no_console_window_flags`` asks for it, else ``{}``.
+
+    Spread into every ``subprocess`` call (``Popen(cmd, ..., **oscompat.child_process_kwargs())``). An empty dict
+    keeps a POSIX call, and a Windows start with a console, at exactly today's arguments: ``creationflags`` is a
+    Windows-only argument.
+    """
+    flags = no_console_window_flags()
+    return {"creationflags": flags} if flags else {}
+
+
 def _kernel32():
-    """``kernel32`` with the prototypes ``pid_exists`` needs declared. Tests replace this with a fake.
+    """``kernel32`` with the prototypes ``pid_exists`` and ``no_console_window_flags`` need declared. Tests replace this with a fake.
 
     The default ``restype`` of ctypes is a C int, which cuts a 64-bit handle to 32 bits, so ``OpenProcess`` is
-    declared to return a pointer-sized ``HANDLE`` and every function lists its argument types. ``use_last_error``
+    declared to return a pointer-sized ``HANDLE``, ``GetConsoleWindow`` a pointer-sized ``HWND``, and every function
+    lists its argument types. ``use_last_error``
     makes ctypes keep the error of each call, which ``_last_error`` reads. ``ctypes`` is imported here, not at
     module level: no run that never asks about a Windows process pays for it.
     """
@@ -133,6 +162,8 @@ def _kernel32():
     kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, wintypes.LPDWORD)
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.GetConsoleWindow.restype = wintypes.HWND
+    kernel32.GetConsoleWindow.argtypes = ()
     return kernel32
 
 

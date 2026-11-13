@@ -7,6 +7,7 @@ import socket
 from typing import Dict, Any
 
 from cn_tool.core.base import ScriptContext
+from cn_tool.utils import oscompat
 
 
 def _validate_ip(ip_str: str) -> bool:
@@ -55,7 +56,8 @@ def _run_mtr_and_get_last_hop(ctx: ScriptContext, target_ip: str) -> Dict[str, A
             capture_output=True,
             text=True,
             timeout=45,  # Generous timeout for the whole MTR process
-            check=False
+            check=False,
+            **oscompat.child_process_kwargs(),
         )
         mtr_output = process.stdout
     except FileNotFoundError:

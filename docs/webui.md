@@ -22,6 +22,7 @@ and setup](infoblox.md#access-and-setup) requirements before using them.
 | 0.10.0 | Monitor host page-size selection, Show Available lists on Subnets and Monitor, and a Windows Pydantic compatibility pin |
 | 0.11.0 | Report deletion on every tool |
 | 0.12.0 | Settings (edit the configuration and use it without a relaunch), and All rows, CSV download and copy for the Ping and Monitor tables |
+| 0.12.1 | The same tools; on Windows, a start through signed Python and a shortcut without a console window, and one session per user |
 
 The browser tools beyond Subnets are available in 0.9.0 and are not part of 0.8.4.
 The menu and CLI have their own established workflows.
@@ -54,12 +55,18 @@ not on PATH, use `python -m cn_tool.webui` with the same options in the Python
 environment where cn-tool is installed. A system Python does not automatically see
 a pipx environment's packages.
 
-An administrator can create a desktop shortcut to the installed `cn-web` executable.
-On Windows it is typically `<venv>\Scripts\cn-web.exe`; for pipx, use `pipx environment`
-to locate its executable directory. Quote paths containing spaces and optionally append
-`-c "C:\path\chosen.cn"`. Shortcut creation is manual.
+From 0.12.1, on Windows, `py -m cn_tool.webui --create-shortcut` writes a **cn-tool Web** shortcut to
+the Start menu and the Desktop; `-c FILE` makes it open that configuration. The shortcut
+starts the interface through the signed Python interpreter (`pythonw.exe`) without a
+console window, so stop it with **Quit application**; `--console` writes one that keeps a
+console window, where Ctrl+C also stops it. Run the command again after upgrading or moving
+Python. On a managed PC, where application control blocks the unsigned `cn-web.exe` that pip
+writes, see [Starting on a managed Windows PC](windows.md#starting-on-a-managed-windows-pc).
 
-Keep the launcher running. A one-use launch link attaches the browser. Tabs share one
+Keep the launcher running. A one-use launch link attaches the browser. From 0.12.1 there is one
+session per user: starting `cn-web` (or its shortcut) again while it runs reopens the
+browser on that session with a new link, and a different `-c FILE` is refused until the
+running session is quit. Tabs share one
 runtime, account and active operation. Closing or refreshing a tab leaves the application
 running; use **Quit application** to finish the session. **Settings** edits the
 configuration file and can apply it without a relaunch; see [Settings](#settings).

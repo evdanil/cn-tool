@@ -147,6 +147,10 @@ for the 0.9.0 additions remains deferred.
 Release 0.10.0 adds a **Show Available** checkbox to Subnets (addresses with no
 Infoblox record) and to Monitor's History tab (IPs that never replied).
 Release 0.11.0 adds **Delete report** beside the download button on every tool.
+Release 0.12.0 adds **Settings** and, for the Ping and Monitor tables, All rows, a CSV
+download and a copy. Release 0.12.1 starts cn on Windows through the signed Python interpreter
+(`py -m cn_tool.webui`, and `--create-shortcut` for a shortcut without a console window) and
+keeps one browser session per user.
 See the [WebUI guide](https://github.com/evdanil/cn-tool/blob/main/docs/webui.md) for details.
 Closing a tab keeps the application running; **Quit application** ends it and runs
 configured exit actions, including email when enabled.
