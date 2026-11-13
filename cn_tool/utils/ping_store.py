@@ -76,6 +76,10 @@ _ROUNDS = "FROM round JOIN run ON run.id = round.run_id"
 _UNOWNED = "NOT EXISTS (SELECT 1 FROM run WHERE run.id = round.run_id)"  # a round that delete() left without its run
 
 
+
+# The rows of one sorted host page (a saved round, Show Available): the web "All" page size.
+SORTED_PAGE_MAX = 1024
+
 class StoreError(Exception):
     """One line for ``cn: monitor: history: <message>``."""
 
@@ -934,7 +938,7 @@ class PingStore:
         if (not _history_integer(round_id) or sort not in ('', *fields) or type(descending) is not bool or
                 group not in ('all', 'answered', 'no_response', 'problem', 'other') or
                 filter_field not in fields or not isinstance(filter_text, str) or len(filter_text) > 256 or
-                type(limit) is not int or not 1 <= limit <= 100 or
+                type(limit) is not int or not 1 <= limit <= SORTED_PAGE_MAX or
                 (after is not None and (not isinstance(after, (list, tuple)) or len(after) != 2 or
                  not _history_integer(after[0], 0) or not isinstance(after[1], str) or
                  not re.fullmatch(r'[0-9a-f]{64}', after[1])))):

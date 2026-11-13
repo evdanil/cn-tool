@@ -74,6 +74,7 @@ def render_config_search(controller):
         ui.link('Monitor', '/monitor')
         ui.link('Configuration Search', '/config-search').props('aria-current=page')
         ui.link('Site Demobilization', '/demobilization')
+        ui.link('Settings', '/settings')
     if oscompat.is_macos():
         ui.label('Configuration search is currently unavailable on macOS. Other tools remain available.').props('role=status').classes('text-warning')
     status = ui.label('Attaching…').props('role=status aria-live=polite').classes('text-weight-bold')

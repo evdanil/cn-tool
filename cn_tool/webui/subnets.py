@@ -176,6 +176,9 @@ class Presentation:
     summary_scroll: tuple = (0, 0, 0)
     return_selection: object = None
     ping_page: int = 0
+    ping_size: object = 50  # the tab's rows per page (table_export.PAGE_SIZES): it survives a new result
+    ping_export_status: str = ''
+    ping_copying: bool = False
     ping_group: str = 'All'
     sorts: dict = field(default_factory=dict)
     filters: dict = field(default_factory=dict)
@@ -190,6 +193,7 @@ class Presentation:
         changed = result_identity != self.result_identity if operation_id is not None else set(identity) != set(self.result_identity or ())
         if changed or self.result_identity is None:
             self.ping_page = 0
+            self.ping_export_status = ''
             self.ping_group = 'All'
             self.sorts.clear()
             self.filters.clear()
@@ -350,6 +354,9 @@ def render_subnets(controller, lookup_type='subnet'):
     ui.add_css(CSS)
     if lookup_type != 'ping':
         ui.add_css(LOOKUP_CSS)
+    else:
+        from .table_actions import SCROLL_SCRIPT
+        ui.add_head_html(SCROLL_SCRIPT)
     empty_class = ' cn-ping-empty' if lookup_type == 'ping' else ' cn-lookup-empty'
     ui.colors(primary='#145C87')
     view = Presentation()
@@ -366,6 +373,7 @@ def render_subnets(controller, lookup_type='subnet'):
         ui.link('Monitor', '/monitor')
         ui.link('Configuration Search', '/config-search')
         ui.link('Site Demobilization', '/demobilization')
+        ui.link('Settings', '/settings')
     scope_label = ui.label('Attaching to the application…').classes('cn-muted')
     with ui.row().classes('items-center') as credentials_row:
         forget = ui.button('Forget saved credentials', on_click=controller.forget_credentials).props('outline')
@@ -565,13 +573,14 @@ def render_subnets(controller, lookup_type='subnet'):
                 ui.label('No rows match this filter.').props('role=status')
                 return
         if lookup_type == 'ping':
-            leading = [key for key in ['Host', 'Result', *(key for key in keys if key.startswith('TCP ')), 'Address'] if key in keys]
-            keys = leading + [key for key in keys if key not in leading]
+            from .ping import ping_columns
+            keys = ping_columns(keys)  # one order for the table and its export
         elif lookup_type == 'ip' or summary:
             identity_key = 'IP' if lookup_type == 'ip' else 'Resolved Subnet'
             leading = [key for key in (identity_key, 'Status', 'Network view') if key in keys]
             keys = leading + [key for key in keys if key not in leading]
-        columns = [dict(name=key, label={'Host': 'Target', 'Result': 'ICMP result'}.get(key, key) if lookup_type == 'ping' else key,
+        from .ping import PING_LABELS
+        columns = [dict(name=key, label=PING_LABELS.get(key, key) if lookup_type == 'ping' else key,
                         field=key, align='left', sortable=False) for key in keys]
         if lookup_type == 'ping':
             for column in columns:
@@ -631,6 +640,10 @@ def render_subnets(controller, lookup_type='subnet'):
         widget.props(f'role=region tabindex=0 aria-label="{table_name} result table"')
         if lookup_type == 'ping':
             widget.props('hide-bottom dense').classes('cn-ping-table').style(f'--cn-ping-extra-columns:{max(0, len(columns) - 2)}')
+            from .table_actions import keep_scroll
+            # A redraw of the same page (a running Ping adds rows) keeps the reader's place; another page starts at the top.
+            keep_scroll(widget, 'ping', [view.ping_page, view.ping_size, view.ping_group, view.filters.get('ping'),
+                                         view.sorts.get('ping'), repr(view.result_identity)])
         else:
             widget.props('dense').classes('cn-lookup-table')
             if summary or lookup_type == 'ip':
@@ -984,6 +997,7 @@ u.value = ''; if (p) p.value = ''; emit(reply);
         elapsed.set_text(f'Elapsed: {int(snapshot.elapsed_seconds)}s' if busy else '')
         retry.set_visibility(snapshot.phase == 'setup_required')
         recovery_help.set_visibility(snapshot.phase == 'setup_required')
+        settings_link.set_visibility(snapshot.phase == 'setup_required')
         display = report_display(snapshot)
         report.classes(remove='text-negative')
         if display['failed']:
@@ -1082,8 +1096,9 @@ if (!active?.closest(interactive)) document.getElementById({heading_id})?.focus(
             return
         await refresh_now()
 
-    recovery_help = ui.label('Retry setup retries credentials. If you edit .cn, quit and relaunch to load the changes.').classes('cn-muted text-sm')
+    recovery_help = ui.label('Retry setup reads the configuration again and retries credentials. Change the configuration in Settings.').classes('cn-muted text-sm')
     retry = ui.button('Retry setup', on_click=controller.retry_initialize).props('outline')
+    settings_link = ui.link('Open Settings to change the configuration', '/settings').mark('settings-from-setup')
     targets.disable()
     targets.on_value_change(lambda _: poll())
     async def restore_draft():

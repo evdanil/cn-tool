@@ -18,6 +18,7 @@ class ReportDeleteAction:
         self.client = ui.context.client
         self.state = None
         self.request_id = None
+        self.generation = None  # the settings generation the open confirmation belongs to
         self.closed = False
         self.message = ''
         self.refused = False  # the message is a refusal of a click: it goes when the cause has passed
@@ -73,6 +74,7 @@ if (status) delete status.cnDeleteOwnedFocus;
         self.filename.set_text('Report file: ' + name.replace('\\', '/').rsplit('/', 1)[-1])
         self.message, self.refused = '', False
         self.status.set_text('')
+        self.generation = self.state.config_generation
         self.confirm.enable()
         self.dialog.open()
 
@@ -81,7 +83,7 @@ if (status) delete status.cnDeleteOwnedFocus;
             return
         self.confirm.disable()
         try:
-            self.request_id = self.controller.request_report_delete()
+            self.request_id = self.controller.request_report_delete(generation=self.generation)
         except (RuntimeError, OSError, EOFError) as refusal:
             # The tab's view can be seconds old, so the controller's own answer decides. Its texts are written for
             # the user and carry no path; anything else gets a generic line.
@@ -102,6 +104,10 @@ if (status) delete status.cnDeleteOwnedFocus;
             return
         self.state = state
         report = state.report_state or {}
+        if self.dialog.value and self.generation is not None and state.config_generation != self.generation:
+            # Reloaded settings may name another workbook than the one this confirmation names.
+            self.dialog.close()
+            self.message, self.refused = '', False
         if self.message:
             # Messages expire with their cause. A refusal says why a click did nothing, so it stays while that cause
             # lasts (the other work) and goes once deletion is offered again. Any other message (a failure, a dropped

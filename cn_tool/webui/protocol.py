@@ -6,7 +6,7 @@ import re
 FIELDS = {
     'delete_report': {'request_id'},
     'report_delete_result': {'request_id', 'status', 'message', 'report_state'},
-    'initialize': {'config_file'}, 'credentials_reply': {'request_id', 'reply', 'remember'}, 'forget_credentials': set(),
+    'initialize': {'config_file'}, 'reload_config': {'config_file'}, 'reload_result': {'status', 'message'}, 'credentials_reply': {'request_id', 'reply', 'remember'}, 'forget_credentials': set(),
     'lookup': {'inputs', 'lookup_type', 'tcp_ports', 'interval_seconds', 'duration_seconds'}, 'cancel': set(), 'snapshot_report': {'request_id'}, 'shutdown': {'interrupted'},
     'ready': {'scope', 'username', 'report_warning', 'report_state'}, 'setup_required': {'message', 'code'},
     'credentials_required': {'request_id', 'account', 'username', 'need_username', 'need_password', 'message', 'store_supported'},
@@ -31,11 +31,13 @@ FIELDS = {
     'error': {'message', 'lookup_type'}, 'report_snapshot': {'request_id', 'path', 'error', 'filename'}, 'closed': set(),
 }
 _PAGE_OPTIONS = {'sort_by', 'descending', 'filter_by', 'filter_text'}
+# The rows of one live Monitor page: the web "All" page size (table_export.MAX_PAGE_ROWS).
+LIVE_PAGE_MAX = 1024
 for _kind in ('demob_page', 'demob_page_result', 'config_search_page', 'config_search_page_result'):
     FIELDS[_kind] |= _PAGE_OPTIONS
 FIELDS['demob_page_result'] |= {'columns', 'overall_total'}
 FIELDS['config_search_page_result'] |= {'overall_total'}
-COMMANDS = frozenset(('delete_report', 'initialize', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_history', 'monitor_coverage_export', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
+COMMANDS = frozenset(('delete_report', 'initialize', 'reload_config', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_history', 'monitor_coverage_export', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
 
 
 def envelope(session_id, job_id, kind, payload):
@@ -182,6 +184,11 @@ def validate(message):
                 not _valid_report_state(payload['report_state'])):
             raise ValueError('Invalid report deletion result')
         return message
+    if kind == 'reload_result':
+        if (set(payload) != FIELDS[kind] or payload['status'] not in ('applied', 'refused', 'failed') or
+                not isinstance(payload['message'], str) or len(payload['message']) > 512):
+            raise ValueError('Invalid reload result')
+        return message
     if kind in {'monitor_delete', 'monitor_delete_result'}:
         if message['job_id'] is not None or set(payload) != FIELDS[kind]:
             raise ValueError('Invalid deletion envelope')
@@ -315,9 +322,12 @@ def validate(message):
         if kind == 'monitor_history':
             from cn_tool.utils.ping_coverage import PAGE_FILTERS, PAGE_GROUPS, PAGE_SORTS
             from cn_tool.utils.ping_history import _history_decode_cursor, _history_int, _history_run_id, _sorted_history_decode
+            from cn_tool.utils.ping_store import SORTED_PAGE_MAX
             page_kind, parent, limit = payload['kind'], payload['parent'], payload['limit']
+            # A sorted host page ("All" rows per page) takes up to SORTED_PAGE_MAX rows; every other page 100.
+            most = SORTED_PAGE_MAX if page_kind in ('hosts', 'coverage') and 'sort' in payload else 100
             if (page_kind not in ('requests', 'runs', 'rounds', 'hosts', 'template', 'coverage') or
-                    not _history_int(limit) or limit > 100 or
+                    not _history_int(limit) or limit > most or
                     (page_kind == 'requests' and parent is not None) or
                     (page_kind in ('runs', 'hosts', 'coverage') and not _history_int(parent)) or
                     (page_kind in ('rounds', 'template') and not _history_run_id(parent)) or
@@ -359,7 +369,9 @@ def validate(message):
                 raise ValueError('Invalid history counts')
             if coverage and not _valid_coverage_summary(payload['summary']):
                 raise ValueError('Invalid history summary')
-            if (not isinstance(items, list) or len(items) > 100 or
+            # The controller and the worker hold each page to the limit its request asked for.
+            from cn_tool.utils.ping_store import SORTED_PAGE_MAX
+            if (not isinstance(items, list) or len(items) > SORTED_PAGE_MAX or
                     (error is not None and not isinstance(error, str))):
                 raise ValueError('Invalid history result')
             for item in items:
@@ -382,7 +394,7 @@ def validate(message):
         if any(type(payload[k]) is not int or payload[k] < 0 for k in ('revision', 'offset')):
             raise ValueError('Invalid live page position')
         if kind == 'monitor_live_page':
-            if type(payload['limit']) is not int or not 1 <= payload['limit'] <= 100:
+            if type(payload['limit']) is not int or not 1 <= payload['limit'] <= LIVE_PAGE_MAX:
                 raise ValueError('Invalid live page limit')
             if 'sort' in payload and (payload['sort'] not in ('', 'host', 'address', 'result', 'tcp') or
                                       type(payload['descending']) is not bool or
@@ -403,7 +415,7 @@ def validate(message):
                     type(payload['current_revision']) is not int or payload['current_revision'] < 0 or
                     (payload['next_offset'] is not None and
                      (type(payload['next_offset']) is not int or payload['next_offset'] < 0)) or
-                    not isinstance(rows, list) or len(rows) > 100):
+                    not isinstance(rows, list) or len(rows) > LIVE_PAGE_MAX):
                 raise ValueError('Invalid live page result')
             for row in rows:
                 if (not isinstance(row, dict) or set(row) != {'host', 'address', 'result', 'tcp'} or

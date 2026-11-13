@@ -693,7 +693,7 @@ def read_monitor_history(
     """
     import math
     from cn_tool.utils.ping_coverage import PAGE_FILTERS, PAGE_GROUPS, PAGE_SORTS
-    from cn_tool.utils.ping_store import HistoryExpired, HistoryTooLarge, PingStore, StoreError
+    from cn_tool.utils.ping_store import SORTED_PAGE_MAX, HistoryExpired, HistoryTooLarge, PingStore, StoreError
 
     def result(items: object = None, next_cursor: object = None, error: object = None) -> Dict[str, object]:
         return {"items": [] if items is None else items, "next_cursor": next_cursor, "error": error}
@@ -707,8 +707,10 @@ def read_monitor_history(
     if ordered and query['kind'] != 'hosts':
         options.insert(0, query['kind'])
     kind, parent, cursor, limit = (query["kind"], query["parent"], query["cursor"], query["limit"])
+    # A sorted host page (a saved round, Show Available) takes up to SORTED_PAGE_MAX rows; every other page 100.
+    most = SORTED_PAGE_MAX if ordered and kind in ("hosts", "coverage") else 100
     if (not isinstance(kind, str) or kind not in ("requests", "runs", "rounds", "hosts", "template", "coverage") or
-            not _history_int(limit) or limit > 100 or
+            not _history_int(limit) or limit > most or
             (kind == "requests" and parent is not None) or
             (kind in ("runs", "hosts", "coverage") and not _history_int(parent)) or
             (kind in ("rounds", "template") and not _history_run_id(parent)) or

@@ -37,10 +37,26 @@ def collect_plugin_schemas(master_schema: Dict[str, Any]) -> Dict[str, Any]:
     I/O or thread/process creation, otherwise those CLIs' runtime builds incur
     those side effects on every invocation.
     """
-    plugins_path = os.path.join(os.path.dirname(__file__), "..", "plugins")
     schema = master_schema.copy()
+    for obj in _plugin_classes():
+        try:
+            plugin_schema = obj().config_schema or {}
+        except Exception as exc:
+            logger.warning(
+                "collect_plugin_schemas: could not read schema from %s: %s",
+                obj.__name__,
+                exc,
+            )
+            continue
+        schema = _merge_plugin_schema(schema, plugin_schema)
+    return schema
+
+
+def _plugin_classes():
+    """Every ``BasePlugin`` subclass of ``cn_tool/plugins``, in ``sorted(os.listdir(...))`` file order."""
+    plugins_path = os.path.join(os.path.dirname(__file__), "..", "plugins")
     if not os.path.isdir(plugins_path):
-        return schema
+        return
     for filename in sorted(os.listdir(plugins_path)):
         if not filename.endswith(".py") or filename.startswith("__"):
             continue
@@ -58,17 +74,20 @@ def collect_plugin_schemas(master_schema: Dict[str, Any]) -> Dict[str, Any]:
                     continue
             except TypeError:
                 continue
-            try:
-                plugin_schema = obj().config_schema or {}
-            except Exception as exc:
-                logger.warning(
-                    "collect_plugin_schemas: could not read schema from %s: %s",
-                    obj.__name__,
-                    exc,
-                )
-                continue
-            schema = _merge_plugin_schema(schema, plugin_schema)
-    return schema
+            yield obj
+
+
+def collect_plugin_settings() -> list:
+    """The settings the terminal Setup offers (each plugin's ``user_configurable_settings``), in plugin order."""
+    settings = []
+    for obj in _plugin_classes():
+        try:
+            offered = obj().user_configurable_settings or []
+        except Exception as exc:
+            logger.warning("collect_plugin_settings: could not read settings from %s: %s", obj.__name__, exc)
+            continue
+        settings.extend(dict(entry) for entry in offered if isinstance(entry, dict) and entry.get("key"))
+    return settings
 
 
 def load_modules_and_plugins(master_schema: Dict[str, Any]) -> tuple[Dict[str, BaseModule], list[BasePlugin], Dict[str, Any]]:

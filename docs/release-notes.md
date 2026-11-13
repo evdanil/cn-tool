@@ -16,6 +16,19 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
+## 0.12.0
+
+**Settings** creates and edits the configuration file (`-c FILE`, else `~/.cn`) in the
+browser. Saving rewrites only the changed lines and keeps comments, refuses a file that
+changed on disk since it was loaded, and never shows or saves a password.
+**Use the new settings now** applies them without a relaunch when no work is running, and
+**Retry setup** reads the configuration again. Ping and Monitor tables offer
+**All (up to 1,024)** rows per page, **Download table (CSV)** (UTF-8 with a byte-order
+mark, for Excel) and **Copy table** (tab-separated, for pasting into a sheet), over the
+whole table as filtered and sorted. On the Monitor's History tab, **Show Available**
+keeps the keyboard focus on its box while a page of its table is still being read.
+No configuration change or migration is needed.
+
 ## 0.11.1
 
 On Windows, Ctrl+C in the console window that runs `cn-web` ends the web interface

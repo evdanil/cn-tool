@@ -103,6 +103,7 @@ def render_demob(controller):
         ui.link('Monitor', '/monitor')
         ui.link('Configuration Search', '/config-search')
         ui.link('Site Demobilization', '/demobilization').props('aria-current=page')
+        ui.link('Settings', '/settings')
     with ui.element('details').classes('cn-demob-help cn-demob'):
         with ui.element('summary'):
             ui.label('How this check works').classes('inline')

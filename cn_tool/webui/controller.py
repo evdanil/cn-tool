@@ -18,6 +18,9 @@ def _remove_file(path):
         pass
 
 
+STALE_CONFIRMATION = 'The settings were reloaded since this was opened. Nothing was deleted.'
+
+
 class ReportDeletionInProgress(RuntimeError):
     """Work refused only because a report deletion is running; the text is written for the user."""
 
@@ -53,6 +56,12 @@ class SessionSnapshot:
     report_snapshot: object = None
     report_delete_pending: bool = False
     report_snapshot_pending: bool = False
+    # How the latest reload_configuration ended: token, status ('pending', 'applied', 'refused', 'failed'), message.
+    reload_result: object = None
+    # One more for each reload or Retry setup sent: either can bring other settings. The History tab of every page
+    # starts again (the history file may be another), and a deletion confirmed under an older generation is refused
+    # (the workbook or history file may be another). No deletion can be confirmed until the session is ready again.
+    config_generation: int = 0
     scope: str = ''
     username: str = ''
     report_warning: str = ''
@@ -82,6 +91,8 @@ class SessionController:
         self._reader = None
         self._started_at = None
         self._config_file = None
+        self._reload_token = 0
+        self._reload_mode = None
         self._disconnected = False
         self._reader_finished = False
         self._delete_pending = None
@@ -152,6 +163,49 @@ class SessionController:
                     self._state.phase = 'closed'
                 raise
 
+    @property
+    def config_file(self):
+        """The ``-c FILE`` this session was started with, or None: the Settings page edits it, else ``~/.cn``."""
+        return self._config_file
+
+    def reload_configuration(self):
+        """
+        Read the configuration files again (Settings' "Use the new settings now", and Retry setup).
+
+        In ``setup_required`` there is no runtime: this is ``retry_initialize``. In ``ready`` the worker closes the
+        runtime without exit actions and opens a new one from the session's own files; only while nothing runs.
+        """
+        with self._lock:
+            if self._state.phase == 'setup_required':
+                self.retry_initialize()
+                return self._reload_started('retry')
+            if self._state.phase != 'ready':
+                raise RuntimeError('The settings can be reloaded once the application has started.')
+            if (self._state.active_job_id is not None or self._state.report_delete_pending
+                    or self._workbook_snapshots):
+                raise RuntimeError('The settings can be reloaded when no work is running. '
+                                   'Try again when it finishes.')
+            self._send('reload_config', None, {'config_file': self._config_file})
+            self._state.phase = 'starting'
+            self._state.error = None
+            self._state.config_generation += 1
+            return self._reload_started('reload')
+
+    def _reload_started(self, mode):
+        """A token for the page that asked, and a pending result in the snapshot that every tab reads."""
+        self._reload_token += 1
+        self._reload_mode = mode
+        self._state.reload_result = dict(token=self._reload_token, status='pending', message='')
+        return self._reload_token
+
+    def _reload_ended(self, status, message=''):
+        if self._reload_mode is None:
+            return
+        self._reload_mode = None
+        self._state.reload_result = dict(token=self._reload_token, status=status, message=message)
+        if status == 'applied':  # a saved login is looked up again for the settings now in use
+            self._state.saved_login_restored = False
+
     def retry_initialize(self):
         """Explicit retry after canceled credentials; retain this runtime and account."""
         with self._lock:
@@ -160,6 +214,7 @@ class SessionController:
             self._send('initialize', None, {'config_file': self._config_file})
             self._state.phase = 'starting'
             self._state.error = None
+            self._state.config_generation += 1  # the files are read again: confirmations opened before are stale
 
     def _send(self, kind, job_id, payload):
         if self._connection is None:
@@ -402,8 +457,10 @@ class SessionController:
         with self._lock:
             return self._state.phase
 
-    def request_monitor_delete(self, action, run_id=None, request_id=None):
+    def request_monitor_delete(self, action, run_id=None, request_id=None, generation=None):
         with self._lock:
+            if generation is not None and generation != self._state.config_generation:
+                raise RuntimeError(STALE_CONFIRMATION)
             if self._state.phase not in {'ready', 'running', 'stopping', 'saving'}:
                 raise RuntimeError('Session unavailable')
             if self._delete_pending is not None:
@@ -500,9 +557,12 @@ class SessionController:
             self._config_requests.pop(query_id, None)
             self._config_pages.pop(query_id, None)
 
-    def request_report_delete(self) -> str:
-        """Reserve the shared workbook before sending a path-free deletion request."""
+    def request_report_delete(self, generation=None) -> str:
+        """Reserve the shared workbook before sending a path-free deletion request. ``generation`` is the
+        ``config_generation`` the confirmation was opened under: one from before a reload is refused."""
         with self._lock:
+            if generation is not None and generation != self._state.config_generation:
+                raise RuntimeError(STALE_CONFIRMATION)
             if self._state.report_delete_pending:
                 raise ReportDeletionInProgress()
             if (self._state.phase != 'ready' or self._state.active_job_id or self._state.report_snapshot_pending):
@@ -677,6 +737,14 @@ class SessionController:
                     return
             if self._state.phase in {'failed', 'closed'}:
                 return
+            if kind == 'reload_result':
+                if self._reload_mode == 'reload':
+                    self._reload_ended(payload['status'], payload['message'])
+                return
+            if kind == 'ready' and self._reload_mode == 'retry':
+                self._reload_ended('applied')
+            if kind == 'setup_required' or (kind == 'error' and job is None):
+                self._reload_ended('failed', payload['message'])
             if kind == 'ready':
                 self._state.scope, self._state.username = payload['scope'], payload['username']
                 self._state.report_warning = payload.get('report_warning', '')
@@ -744,6 +812,7 @@ class SessionController:
                 expected = self._monitor_requests.get(payload['query_id'])
                 current = self._state.monitor_update
                 if (not expected or any(payload[k] != expected[k] for k in ('job_id', 'run_id', 'revision', 'offset'))
+                        or len(payload['rows']) > expected['limit']
                         or not current or current['run_id'] != payload['run_id'] or current['revision'] != payload['revision']):
                     return
                 self._monitor_requests.pop(payload['query_id'], None)

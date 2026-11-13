@@ -277,6 +277,19 @@ class WorkerInteraction:
         self.restore_attempts = set()
         self.prompt_count = 0
 
+    def rebind(self, endpoint):
+        """
+        After a reload: saved logins are looked up again, for ``endpoint``, and Forget has no login selected until
+        one is used again.
+        """
+        with self.condition:
+            # No generation bump: a queued "remember me" save names the old endpoint's scope and still belongs there.
+            self.restore_attempts.clear()
+            self.store_support = {}
+            self.identity = None
+            self.restored = False
+            self.endpoint = endpoint
+
     def bind(self, endpoint, store):
         self.endpoint, self.store = endpoint, store
         self.store_queue = Queue()
@@ -1030,6 +1043,8 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
     report_delete_stop = Event()
     state = {'session': None, 'job': None, 'runtime': None, 'scope': None,
              'closing': False, 'initializing': False, 'initialization_failed': False, 'interrupted': False,
+             'started': False,  # once a runtime has started, a later start failure is Setup required, never fatal
+             'rebind': False,  # a reload asked for saved logins to follow the new settings; kept until a start succeeds
              'orphaned': False, 'thread': None, 'ready': False, 'saving': False,
              'report': None, 'job_type': None, 'monitor_cache': None,
              # Each slot is one independently bounded (10,000 rows / 8 MiB) completed search.
@@ -1107,24 +1122,55 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             finally:
                 state['report_deleting'] = None
 
-    def initialize(payload):
+    def emit_ready():
+        cfg = getattr(state['runtime'].ctx, 'cfg', {})
+        emit('ready', {'scope': '', 'username': '',
+                       'report_warning': cfg.get('report_directory_warning', ''),
+                       'report_state': state['report']})
+
+    def discard_runtime():
+        """Close the runtime without exit actions (they belong to Quit); the next start opens one from the files."""
+        from cn_tool.utils.cache import CacheManager
+        runtime, state['runtime'] = state['runtime'], None
+        if runtime is None:
+            return
+        try:
+            abort_initialization(runtime.ctx, exit_code=0)
+        except Exception:
+            pass  # the old runtime is gone either way; the new one starts from the files
+        runtime.closed = True
+        CacheManager._instance = None  # closed above: the new runtime opens its own, in its configured directory
+
+    def reload_config(payload):
+        """Close the runtime, then start one from the files again."""
+        discard_runtime()
+        state['rebind'] = True  # survives a failed reload: Retry setup's successful start rebinds then
+        initialize(payload, reloading=True)
+
+    def initialize(payload, reloading=False):
         try:
             if state['runtime'] is None:
                 state['runtime'] = RuntimeSession.open(
                     config_file=Path(payload['config_file']) if payload['config_file'] else None,
                     interaction=interaction)
             runtime = state['runtime']
+            endpoint = str(runtime.ctx.cfg.get('api_endpoint') or '')
             if interaction.store is None:
-                interaction.bind(str(runtime.ctx.cfg.get('api_endpoint') or ''),
-                                 (store_factory or NativeCredentialStore)(interaction.vault_stop))
-            state['ready'] = True
-            state['initializing'] = False
+                interaction.bind(endpoint, (store_factory or NativeCredentialStore)(interaction.vault_stop))
+            elif state['rebind']:
+                interaction.rebind(endpoint)
+            state['rebind'] = False
             cfg = getattr(runtime.ctx, 'cfg', {})
             state['report'] = report_state_for_context(runtime.ctx, {
                 'state': 'idle' if cfg.get('report_auto_save') else 'off'})
-            emit('ready', {'scope': '', 'username': '',
-                           'report_warning': cfg.get('report_directory_warning', ''),
-                           'report_state': state['report']})
+            refresh_history_context()
+            # Ready only now: a failure above leaves the worker not ready, so Retry setup is admitted.
+            state['ready'] = True
+            state['initializing'] = False
+            state['started'] = True
+            emit_ready()
+            if reloading:
+                emit('reload_result', {'status': 'applied', 'message': ''})
         except (SetupRequired, AuthenticationRequired) as exc:
             interaction.discard()
             state['initializing'] = False
@@ -1132,9 +1178,24 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             if interaction.restored:
                 message += ' To use a different login, forget saved credentials, then quit and relaunch.'
             emit('setup_required', {'message': message, 'code': exc.code})
-        except Exception:
+            if reloading:
+                emit('reload_result', {'status': 'failed', 'message': message[:512]})
+        except Exception as exc:
             interaction.discard()
             state['initializing'] = False
+            if reloading or state['started']:
+                # After a first start (a reload, or Retry after one) Setup required keeps Retry setup; only a session
+                # that never started ends here, as before.
+                reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else exc.__class__.__name__
+                message = (f'The settings could not be loaded ({reason}). Correct them in Settings, '
+                           'then select Retry setup.')
+                # A runtime that opened before the failure would be kept by Retry setup, which then never reads
+                # the corrected files: close it, and Retry opens one again.
+                discard_runtime()
+                state['rebind'] = True
+                emit('setup_required', {'message': message, 'code': 2})
+                emit('reload_result', {'status': 'failed', 'message': message[:512]})
+                return
             state['initialization_failed'] = True
             emit('error', {'message': 'Runtime initialization failed. Check the configured connection.'})
 
@@ -1454,12 +1515,22 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
     coverage_thread = None
     delete_thread = None
     delete_ids = set()
-    def history_context():
-        from types import SimpleNamespace
+    from types import SimpleNamespace
+    # One context for both readers, refreshed by every start and reload: a reloaded [ping] history_file is the one
+    # they read next (the coverage fold of the old file is dropped with it).
+    shared_history = SimpleNamespace(cfg={'ping_history_file': None}, logger=None)
+    coverage_extra = dict(cache={}, stop=history_stopped.is_set)
+    def refresh_history_context():
         ctx = state['runtime'].ctx
+        history_file = ctx.cfg.get('ping_history_file')
+        if history_file != shared_history.cfg['ping_history_file']:
+            # A new cache, not a cleared one: a fold of the old file still running fills the dict it was given.
+            coverage_extra['cache'] = {}
         # the logger is how ``read_monitor_history`` keeps the detail of a StoreError, which the browser is not told
-        return SimpleNamespace(cfg={'ping_history_file': ctx.cfg.get('ping_history_file')},
-                               logger=getattr(ctx, 'logger', None))
+        shared_history.cfg = {'ping_history_file': history_file}
+        shared_history.logger = getattr(ctx, 'logger', None)
+    def history_context():
+        return shared_history
     def export_coverage(history_ctx, payload):
         from cn_tool.utils.ping_coverage import CoverageStopped
         try:
@@ -1655,8 +1726,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                     # One fold is kept between this thread's pages (read_monitor_history ``cache``); the stop signal
                     # ends a fold that Quit does not wait for.
                     coverage_thread = Thread(target=read_history, args=(
-                        history_context(), state['session'], coverage_queue,
-                        dict(cache={}, stop=history_stopped.is_set)), daemon=True)
+                        history_context(), state['session'], coverage_queue, coverage_extra), daemon=True)
                     coverage_thread.start()
                 elif not covering and history_thread is None:
                     history_thread = Thread(target=read_history, daemon=True,
@@ -1693,6 +1763,27 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 else:
                     emit('report_snapshot', {'request_id': payload['request_id'],
                                              'error': 'Report downloads are busy. Try again.'})
+            elif kind == 'reload_config':
+                from cn_tool.utils.file_io import saves_in_progress
+                if busy and state['ready'] and not state['initializing'] and state['job'] is None:
+                    # The last operation has sent its answer and is only returning: wait for it, as 'initialize'
+                    # does, instead of refusing a reload sent the moment that answer arrived.
+                    state['thread'].join(5)
+                    busy = state['thread'].is_alive()
+                if (not state['ready'] or state['initializing'] or busy or state['job'] is not None or
+                        state['saving'] or saves_in_progress() or pending_snapshots or deleting_report or
+                        state['snapshot_active'] or (delete_thread is not None and delete_thread.is_alive())):
+                    if state['ready']:
+                        emit_ready()  # refused: the session stays as it was (an error without a job would end it)
+                    emit('reload_result', {'status': 'refused', 'message': 'The settings can be reloaded when no work '
+                                           'is running. Try again when it finishes.'})
+                else:
+                    demob_vault.invalidate()
+                    operation_stop.clear()
+                    state['ready'] = False
+                    state['initializing'] = True
+                    state['thread'] = Thread(target=reload_config, args=(payload,))
+                    state['thread'].start()
             elif kind == 'initialize' and not state['initializing'] and not state['ready']:
                 if busy:
                     state['thread'].join()

@@ -5,9 +5,32 @@ from datetime import datetime, timezone
 import json
 import re
 
+from . import table_actions, table_export
 from .ping import parse_ports
 from .subnets import CSS, report_display
 from .report_actions import render_report_delete
+
+
+# Export walks: a "History reader is busy" answer is asked again this many times, after a pause that grows each time.
+EXPORT_BUSY_RETRIES = 5
+EXPORT_BUSY_PAUSE = .2
+EXPORT_POLL = .05
+EXPORT_PAGE_SECONDS = 60
+EXPORT_PAUSED = 'Paging, sorting and filtering are paused until it is ready.'
+EXPORT_PREPARING = 'Preparing the table. ' + EXPORT_PAUSED
+EXPORT_CANCELLED = {'download': 'Cancelled. Nothing was downloaded.', 'copy': 'Cancelled. Nothing was copied.'}
+EXPORT_TABLE_CHANGED = 'Stopped because the table changed. Nothing was exported.'
+EXPORT_TIMEOUT = 'The table did not answer in time. Try again.'
+LIVE_CHANGED = 'The live round changed during the export. Download again.'
+LIVE_UNAVAILABLE = 'The latest round is unavailable. Try again.'
+ROUND_CHANGED = 'This round changed or was deleted during the export. Download again.'
+ROUND_TOO_LARGE = 'This round is too large to display safely. Select another round.'
+COVERAGE_CHANGED = 'The history changed during the export. Use Refresh history, then download again.'
+COVERAGE_EXPORT_SCOPE = ' This table as filtered; Download available IPs holds every Unseen IP, whatever the filter.'
+
+
+def export_too_many(limit):
+    return f'The table has more than {limit:,} rows, more than a spreadsheet holds. Filter it, then try again.'
 
 
 HISTORY_EXPIRED = 'History changed or expired. Return to requests to browse available records.'
@@ -92,8 +115,9 @@ class HistoryView:
 
 
 def render_host_footer(*, scope, size, offset, count, total, previous_enabled,
-                       next_enabled, on_previous, on_next, on_size):
-    """Present bounded host pages; callers retain query and navigation state."""
+                       next_enabled, on_previous, on_next, on_size, controls=None):
+    """Present bounded host pages; callers retain query and navigation state. The size select and the two buttons are
+    added to ``controls`` when it is given (the controls an export pauses)."""
     from nicegui import ui
 
     live = scope == 'live'
@@ -106,9 +130,11 @@ def render_host_footer(*, scope, size, offset, count, total, previous_enabled,
             ui.label('Rows per page:')
             # No transition: Quasar holds every focus() for the 300 ms of a menu's transition, so a menu opened again
             # inside that wait queued one that took the focus back from wherever the reader had moved on to.
-            select = ui.select([5, 10, 15, 20, 25, 50], value=size, on_change=on_size).props(
-                'dense borderless aria-label="Rows per page" transition-duration=0').classes('w-16')
+            select = ui.select(table_export.page_size_options(), value=size, on_change=on_size).props(
+                'dense borderless aria-label="Rows per page" transition-duration=0').classes('cn-monitor-page-size')
             select._props[marker] = 'page-size'
+            if controls is not None:
+                controls.append(select)
             if live:
                 select.props('popup-content-class=cn-monitor-live-popup')
         first, last = (offset + 1, offset + count) if count else (0, 0)
@@ -121,24 +147,28 @@ def render_host_footer(*, scope, size, offset, count, total, previous_enabled,
                 button._props[marker] = value
                 button.set_enabled(enabled)
                 buttons.append(button)
+    if controls is not None:
+        controls.extend(buttons)
     return buttons
 
 
-def paged_handlers(latest, size, stacks, *, busy, request, following, first, names=('previous-hosts', 'next-hosts')):
+def paged_handlers(latest, size, stacks, *, busy, request, following, first, names=('previous-hosts', 'next-hosts'),
+                   locked=lambda: False):
     """The Previous, Next and rows-per-page handlers of a table that is read a page at a time (the live round, a saved
     round, Show Available). ``stacks`` are the lists in ``latest`` that gain an entry for each page opened and lose one
     on Previous, ``size`` is the key of the rows per page. ``busy()`` is true while an answer is awaited,
     ``following()`` gives what Next adds to each stack (None on the last page), ``first()`` puts the state back on
-    page one, and ``request(name)`` asks for the page that the state now describes."""
+    page one, and ``request(name)`` asks for the page that the state now describes. While ``locked()`` (an export
+    walks the table) every handler ignores its control, and the size select goes back to the size shown."""
     async def previous():
-        if busy() or len(latest[stacks[0]]) < 2:
+        if locked() or busy() or len(latest[stacks[0]]) < 2:
             return
         for key in stacks:
             latest[key].pop()
         await request(names[0])
 
     async def next_page():
-        step = None if busy() else following()
+        step = None if locked() or busy() else following()
         if step is None:
             return
         for key, value in zip(stacks, step):
@@ -147,6 +177,9 @@ def paged_handlers(latest, size, stacks, *, busy, request, following, first, nam
 
     async def change_size(event):
         if event.value == latest[size]:
+            return
+        if locked():
+            event.sender.set_value(latest[size])
             return
         latest[size] = event.value
         first()
@@ -193,6 +226,8 @@ def render_monitor(controller):
 .cn-monitor-context { min-width:0; overflow-wrap:anywhere; }
 .cn-monitor-footer { display:flex; flex-wrap:wrap; justify-content:flex-end; align-items:center; gap:16px; width:100%; min-width:0; padding:8px 12px; border-top:1px solid #E2E8ED; font-size:12px; }
 .cn-monitor-range { white-space:nowrap; font-variant-numeric:tabular-nums; }
+.cn-monitor-page-size { min-width:4rem; }
+.cn-monitor-page-size .q-field__native > span { white-space:nowrap; }
 .cn-monitor-pages { margin-left:auto; display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
 .cn-monitor-coverage-table { min-width:1000px; }
 .cn-monitor-coverage-table td:nth-child(3), .cn-monitor-coverage-table td:nth-child(4) { white-space:nowrap; }
@@ -201,7 +236,7 @@ def render_monitor(controller):
 @media(max-width:600px) { .cn-monitor-actions { flex-wrap:wrap; } .cn-monitor-hosts th:first-child { width:185px; } .cn-monitor-hosts th:nth-child(2) { width:140px; } .cn-monitor-table th, .cn-monitor-table td { padding:7px; } .cn-monitor-pages { margin-left:0; } }
 ''')
     ui.colors(primary='#145C87')
-    latest = {'result': None, 'result_revision': None, 'attempt_revision': None,
+    latest = {'result': None, 'result_revision': None, 'attempt_revision': None, 'config_generation': None,
               'outcome': None, 'live_query': None, 'live_key': None, 'live_page': None,
               'live_offset': 0, 'live_offsets': [0], 'live_size': 25, 'live_sort': '', 'live_descending': False, 'live_group': 'all', 'live_filter_field': 'host', 'live_filter_text': '', 'history_query': None, 'history_page': None,
               'history_dirty': True, 'download': None, 'template_query': None, 'delete_query': None,
@@ -212,9 +247,259 @@ def render_monitor(controller):
                                 'runs': dict(sort='', descending=False, field='started', text='')}, 'round_pick': 'first', 'request_context': None, 'run_context': None,
               # Show Available: the saved target the box belongs to (None: the page is not on one), the rows per page the
               # tab chose (it outlives a reset), and everything else the table reads or shows, off until ticked.
-              'coverage_parent': None, 'coverage_size': 25, 'coverage_drawn': False, **coverage_defaults()}
+              'coverage_parent': None, 'coverage_size': 25, 'coverage_drawn': False, **coverage_defaults(),
+              # Table export, for each host table: its state outlives the redraws of the table, and the controls the
+              # last draw made (the export group, and the table's own controls that a walk pauses) are kept beside it.
+              'exports': {scope: dict(busy=False, mode=None, cancel=None, status='', copy=None)
+                          for scope in ('live', 'detail', 'coverage')},
+              'export_controls': {}, 'table_controls': {'live': [], 'detail': [], 'coverage': []}}
     history = HistoryView()
     lock = asyncio.Lock()
+    ui.add_head_html(table_actions.SCROLL_SCRIPT)
+
+    def walking(scope):
+        return latest['exports'][scope]['busy']
+
+    def show_export(scope, *, lock_table=True):
+        """The export group and, unless ``lock_table`` is false, the table's controls follow the export's state."""
+        state = latest['exports'][scope]
+        controls = latest['export_controls'].get(scope)
+        if controls and not controls['download'].is_deleted:
+            table_actions.set_busy(controls, state['busy'])
+            set_changed(controls['status'], state['status'])
+        if lock_table:
+            lock_controls(latest['table_controls'][scope], state['busy'])
+
+    def draw_export(scope, identity, total, extra=''):
+        """The Table export group of a table's top toolbar; a copy prepared for another table, filter, sort or round is
+        dropped."""
+        state = latest['exports'][scope]
+        if state['copy'] is not None and state['copy'][0] != identity:
+            state['copy'] = None
+        with ui.element('div').classes('cn-monitor-toolbar'):
+            latest['export_controls'][scope] = table_actions.render_export_group(
+                name=scope, description=table_actions.scope_description(total or 0, 'hosts') + extra,
+                on_download=lambda: export_table(scope, 'download'), on_copy=lambda: export_table(scope, 'copy'),
+                on_cancel=lambda: cancel_export(scope, 'user'))
+        show_export(scope, lock_table=False)
+
+    def cancel_export(scope, reason):
+        """Stop a walk of ``scope``: ``'user'`` (Cancel) or ``'changed'`` (the table went or became another)."""
+        state = latest['exports'][scope]
+        if state['busy'] and state['cancel'] is None:
+            state['cancel'] = reason
+
+    def focus_export(scope, mode):
+        """Put the focus back on the button that started an export when a redraw or the hidden Cancel dropped it."""
+        client.run_javascript(f'''setTimeout(() => {{
+const active = document.activeElement;
+if (!active || active === document.body || active.closest?.('[data-table-export]')?.dataset.tableExport === {json.dumps(f'{scope}-cancel')})
+  document.querySelector({json.dumps(f'[data-table-export="{scope}-{mode}"]')})?.focus({{preventScroll:true}});
+}}, 0)''')
+
+    async def export_source(scope, mode):
+        """What a walk of ``scope`` reads, as the table on screen shows it (None when it shows no table)."""
+        if scope == 'live':
+            pending = latest.get('pending_live')
+            if pending is not None and pending.get('status') == 'ready':
+                # A newer round waits while the focus is in the live table. The export reads the latest round, so it
+                # shows that round first: the file and the table on screen agree.
+                latest['live_page'] = latest.pop('pending_live')
+                latest['live_user_request'] = None
+                set_changed(pending_live, '')
+                await draw_live.refresh()
+                focus_export(scope, mode)
+            page = latest['live_page'] or {}
+            identity = latest.get('live_identity')
+            if page.get('status') != 'ready' or not identity:
+                return None
+            job, run_id = identity[:2]
+            revision = page.get('revision')
+            options = (latest['live_sort'], latest['live_descending'], latest['live_group'],
+                       latest['live_filter_field'], latest['live_filter_text'])
+
+            def read(result):
+                if result.get('status') == 'expired' or result.get('revision', revision) != revision:
+                    return 'error', LIVE_CHANGED
+                if result.get('status') != 'ready':
+                    return 'error', LIVE_UNAVAILABLE
+                return 'rows', (result.get('rows') or [], result.get('next_offset'), result.get('total'))
+            return dict(identity=('live', latest['config_generation'], job, run_id, revision) + options,
+                        start=0, columns=LIVE_COLUMNS,
+                        total=page.get('total'),
+                        cells=live_cells, name=f'monitor-live-r{revision}', read=read,
+                        request=lambda offset: controller.request_monitor_live_page(
+                            job, run_id, revision, offset, table_export.MAX_PAGE_ROWS, *options),
+                        answer=controller.monitor_live_page, release=controller.release_monitor_live_page,
+                        # The controller drops an answer whose revision is no longer current: never wait for it.
+                        stale=lambda: (controller.snapshot().monitor_update or {}).get('revision') not in (None, revision),
+                        stale_message=LIVE_CHANGED,
+                        refused=lambda: (LIVE_CHANGED if ((controller.snapshot().monitor_update or {}).get('revision')
+                                                          not in (None, revision)) else LIVE_UNAVAILABLE))
+        if scope == 'detail':
+            page, selected = latest['round_hosts'] or {}, latest['selected_round']
+            if not selected or page.get('error') or 'items' not in page:
+                return None
+            parent, kind, columns, cells = selected['id'], 'hosts', ROUND_HOST_COLUMNS, round_host_cells
+            options = tuple(latest['host_' + key] for key in ('sort', 'descending', 'group', 'filter_field', 'filter_text'))
+            messages, name, identity = ({'expired': ROUND_CHANGED, 'too_large': ROUND_TOO_LARGE},
+                                        f'monitor-round-{parent}', ('detail', parent))
+        else:
+            page, parent = latest['coverage_page'] or {}, latest['coverage_parent']
+            if parent is None or page.get('error') or 'items' not in page:
+                return None
+            kind, columns, cells = 'coverage', COVERAGE_COLUMNS, coverage_cells
+            options = tuple(latest['coverage_' + key] for key in ('sort', 'descending', 'group', 'filter_field', 'filter_text'))
+            messages, name = {'expired': COVERAGE_CHANGED}, f'monitor-available-{parent}'
+            identity = ('coverage', parent, (page.get('summary') or {}).get('rounds'),
+                        tuple(sorted((page.get('counts') or {}).items())))
+
+        def read(result):
+            error = result.get('error')
+            if error and str(error).startswith('History reader is busy'):
+                return 'busy', str(error)
+            if error:
+                return 'error', messages.get(error) or history_error_message(error)
+            if kind == 'coverage' and ((result.get('summary') or {}).get('rounds'),
+                                       tuple(sorted((result.get('counts') or {}).items()))) != identity[2:4]:
+                # A round recorded since the table was drawn refolds the history: the file would not be this table.
+                return 'error', COVERAGE_CHANGED
+            return 'rows', (result.get('items') or [], result.get('next_cursor') or None, result.get('total'))
+        # The settings generation is part of the identity: a copy prepared before a reload never matches after it.
+        return dict(identity=identity + options + (latest['config_generation'],), start=None, columns=columns,
+                    cells=cells, name=name, read=read,
+                    total=page.get('total'),
+                    request=lambda cursor: controller.request_monitor_history(
+                        kind, parent, cursor, table_export.MAX_PAGE_ROWS, *options),
+                    answer=controller.monitor_history_page, release=controller.release_monitor_history_page,
+                    refused=lambda: 'History is unavailable. Try refreshing.')
+
+    def settings_moved():
+        """The controller is past the settings generation this page last saw (a reload was sent since its last poll):
+        what the page shows may belong to another history file, so nothing is read for it."""
+        known = latest['config_generation']
+        return known is not None and controller.snapshot().config_generation != known
+
+    def stopped_message(state):
+        return '' if client.is_deleted else (EXPORT_CANCELLED[state['mode']] if state['cancel'] == 'user'
+                                              else EXPORT_TABLE_CHANGED)
+
+    async def page_answer(source, query, state):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + EXPORT_PAGE_SECONDS
+        while state['cancel'] is None and not client.is_deleted:
+            result = source['answer'](query)
+            if result is not None:
+                return result, None
+            if source.get('stale') and source['stale']():
+                return None, source['stale_message']
+            if loop.time() > deadline:
+                return None, EXPORT_TIMEOUT
+            await asyncio.sleep(EXPORT_POLL)
+        return None, stopped_message(state)
+
+    async def walk_table(scope, source):
+        """Every row of the table as filtered and sorted, a page of ``MAX_PAGE_ROWS`` at a time from the first,
+        following each answer's own next offset or cursor; ``(rows, None)`` or ``(None, why it stopped)``. Its
+        queries are its own, released as soon as answered, so the page's own query is never touched."""
+        state = latest['exports'][scope]
+        rows, position, pages, retries = [], source['start'], 0, 0
+        limit = table_export.MAX_EXPORT_ROWS
+        while True:
+            if state['cancel'] is not None or client.is_deleted:
+                return None, stopped_message(state)
+            if settings_moved():
+                return None, EXPORT_TABLE_CHANGED
+            try:
+                query = source['request'](position)
+            except (AttributeError, RuntimeError, ValueError):
+                return None, source['refused']()
+            try:
+                result, message = await page_answer(source, query, state)
+            finally:
+                source['release'](query)
+            if result is None:
+                return None, message
+            outcome, value = source['read'](result)
+            if outcome == 'busy':
+                retries += 1
+                if retries > EXPORT_BUSY_RETRIES:
+                    return None, value
+                await asyncio.sleep(EXPORT_BUSY_PAUSE * retries)
+                continue
+            if outcome == 'error':
+                return None, value
+            items, following, total = value
+            retries, pages = 0, pages + 1
+            rows.extend(items)
+            if len(rows) > limit or (type(total) is int and total > limit):
+                return None, export_too_many(limit)
+            if following is None:
+                return rows, None
+            if not items or (type(following) is int and following <= position):
+                return None, source['refused']()  # an answer that does not move on would never end
+            position = following
+            if pages % 4 == 0:
+                state['status'] = table_actions.progress_text(len(rows), total if type(total) is int else None) + ' ' + EXPORT_PAUSED
+                show_export(scope, lock_table=False)
+
+    async def export_table(scope, mode):
+        """Download table (CSV) or Copy table: walk the whole table, then offer the file or write the clipboard. A copy
+        the browser refused stays prepared, so the next Copy table of the same table writes it at once."""
+        state = latest['exports'][scope]
+        if state['busy']:
+            return
+        if settings_moved():
+            state['status'] = EXPORT_TABLE_CHANGED
+            show_export(scope)
+            return
+        state.update(busy=True, mode=mode, cancel=None)
+        try:
+            source = await export_source(scope, mode)
+            if source is None:
+                return
+            prepared = state['copy'] if mode == 'copy' and (state['copy'] or (None,))[0] == source['identity'] else None
+            known = source.get('total')
+            if mode == 'copy' and prepared is None and type(known) is int and table_actions.copy_refusal(known):
+                state['status'] = table_actions.copy_refusal(known)  # known from the table on screen: read nothing
+                return
+            if prepared is None:
+                state['copy'], state['status'] = None, EXPORT_PREPARING
+                show_export(scope)
+                rows, message = await walk_table(scope, source)
+                if rows is None:
+                    state['status'] = message
+                    return
+                if mode == 'copy' and table_actions.copy_refusal(len(rows)):
+                    state['status'] = table_actions.copy_refusal(len(rows))
+                    return
+                # Built on a thread: a table of hundreds of thousands of rows would hold every tab's poll for seconds.
+                # Cancel stays offered meanwhile, so it is checked again after each step, before anything is delivered.
+                labels, records = await asyncio.to_thread(export_records, source['columns'], source['cells'], rows)
+                if state['cancel'] is not None or client.is_deleted:
+                    state['status'] = stopped_message(state)
+                    return
+                if mode == 'download':
+                    data = await asyncio.to_thread(table_export.csv_bytes, labels, records)
+                    if state['cancel'] is not None or client.is_deleted:
+                        state['status'] = stopped_message(state)
+                        return
+                    with client:
+                        table_actions.offer_csv(data, table_export.export_filename(source['name'], datetime.now()))
+                    state['status'] = table_actions.done_text(len(records))
+                    return
+                text = await asyncio.to_thread(table_export.tsv_text, labels, records)
+                if state['cancel'] is not None or client.is_deleted:
+                    state['status'] = stopped_message(state)
+                    return
+                prepared = state['copy'] = (source['identity'], text, len(records))
+            copied, state['status'] = await table_actions.write_clipboard(client, prepared[1], prepared[2])
+            state['copy'] = None if copied else prepared
+        finally:
+            state.update(busy=False, cancel=None)
+            if not client.is_deleted:
+                show_export(scope)
+                focus_export(scope, mode)
 
     with ui.row().classes('w-full items-center justify-between cn-monitor-row'):
         ui.label('Ping Monitor').mark('title').classes('text-h4')
@@ -226,6 +511,7 @@ def render_monitor(controller):
         ui.link('Monitor', '/monitor').props('aria-current=page')
         ui.link('Configuration Search', '/config-search')
         ui.link('Site Demobilization', '/demobilization')
+        ui.link('Settings', '/settings')
     with ui.row().classes('cn-monitor-toolbar'):
         status = ui.label('Attaching…').props('role=status aria-live=polite').classes('text-weight-bold grow')
         def stop_owned():
@@ -307,6 +593,7 @@ def render_monitor(controller):
         @ui.refreshable
         def draw_live():
             latest['live_buttons'] = []
+            controls = latest['table_controls']['live'] = []
             page = latest['live_page']
             if not page:
                 return
@@ -322,6 +609,8 @@ def render_monitor(controller):
             counts = page.get('counts')
             if counts is not None:
                 async def choose_group(group):
+                    if walking('live'):
+                        return
                     latest['live_group'] = group
                     latest['live_offset'], latest['live_offsets'] = 0, [0]
                     latest['live_user_request'] = 'group-' + group
@@ -334,11 +623,14 @@ def render_monitor(controller):
                         button = ui.button(f'{label} ({count})', on_click=lambda _, value=group: choose_group(value)).props('outline dense')
                         button._props['aria-pressed'] = str(group == latest['live_group']).lower()
                         button._props['data-monitor-live'] = 'group-' + group
+                        controls.append(button)
                 with ui.element('div').classes('cn-monitor-toolbar'):
                     field = ui.select({'host': 'Target', 'result': 'Result', 'address': 'Address', 'tcp': 'TCP'},
                                       value=latest['live_filter_field'], label='Filter field').props('outlined dense').classes('w-40')
                     pattern = ui.input('Contains', value=latest['live_filter_text']).props('outlined dense maxlength=256').classes('grow')
                     async def apply_filter():
+                        if walking('live'):
+                            return
                         latest['live_filter_field'], latest['live_filter_text'] = field.value, (pattern.value or '')[:256]
                         latest['live_offset'], latest['live_offsets'] = 0, [0]
                         latest['live_user_request'] = 'filter'
@@ -348,6 +640,8 @@ def render_monitor(controller):
                     button = ui.button('Filter hosts', on_click=apply_filter).props('outline dense')
                     button._props['data-monitor-live'] = 'filter'
                     async def clear_filter():
+                        if walking('live'):
+                            return
                         latest['live_filter_text'] = ''
                         latest['live_offset'], latest['live_offsets'] = 0, [0]
                         latest['live_user_request'] = 'clear-filter'
@@ -355,12 +649,20 @@ def render_monitor(controller):
                         await poll()
                     clear = ui.button('Clear host filter', on_click=clear_filter).props('outline dense')
                     clear._props['data-monitor-live'] = 'clear-filter'
+                    controls.extend((field, pattern, button, clear))
                 ui.label('Counts describe the complete round; the table reflects the selected group and filter.').classes('cn-muted')
                 if not rows:
                     ui.label('No hosts match the selected group and filter.').classes('cn-muted')
-            with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 aria-label="Latest round results"'), ui.element('table').classes('cn-monitor-table cn-monitor-hosts').props('aria-label="Latest round host results"'):
+            identity = latest.get('live_identity') or (None, None, None)
+            options = (latest['live_sort'], latest['live_descending'], latest['live_group'],
+                       latest['live_filter_field'], latest['live_filter_text'])
+            draw_export('live', ('live', *identity[:2], page.get('revision')) + options,
+                        page.get('total') if page.get('total') is not None else len(rows))
+            with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 aria-label="Latest round results"') as scroll, ui.element('table').classes('cn-monitor-table cn-monitor-hosts').props('aria-label="Latest round host results"'):
                 with ui.element('thead'), ui.element('tr'):
                     async def change_sort(column):
+                        if walking('live'):
+                            return
                         if latest['live_sort'] == column:
                             latest['live_descending'] = not latest['live_descending']
                         else:
@@ -369,20 +671,17 @@ def render_monitor(controller):
                         latest['live_user_request'] = 'sort-' + column
                         latest['live_key'] = None
                         await poll()
-                    for label, column in (('Target', 'host'), ('Result', 'result'), ('Address', 'address'), ('TCP', 'tcp')):
+                    for label, column in LIVE_COLUMNS:
                         with ui.element('th').props('scope=col') as header:
                             if latest['live_sort'] == column:
                                 header._props['aria-sort'] = 'descending' if latest['live_descending'] else 'ascending'
                             button = ui.button(label, on_click=lambda _, value=column: change_sort(value)).props('flat dense')
                             button._props['aria-label'] = f'Sort by {label}' + ((', descending' if latest['live_descending'] else ', ascending') if latest['live_sort'] == column else '')
                             button._props['data-monitor-live'] = 'sort-' + column
-                with ui.element('tbody'):
-                    for row in rows:
-                        with ui.element('tr'):
-                            values = dict(live_fields(row))
-                            for key in ('Host', 'Result', 'Address', 'TCP'):
-                                with ui.element('td'):
-                                    ui.label(values[key]).classes('cn-monitor-target' if key == 'Host' else '').props('title=' + json.dumps(values[key]))
+                            controls.append(button)
+                ui.html(body_html(live_cells(row) for row in rows), sanitize=False, tag='tbody')
+            # A new revision of the same page keeps the reader's place in the box; another page starts at the top.
+            table_actions.keep_scroll(scroll, 'live', (page['offset'], latest['live_size']) + options)
             async def request_live(name):
                 latest['live_offset'] = latest['live_offsets'][-1]
                 latest['live_user_request'] = name
@@ -393,12 +692,13 @@ def render_monitor(controller):
                 latest, 'live_size', ('live_offsets',), names=('previous', 'next'), request=request_live,
                 busy=lambda: latest['live_query'] or latest.get('live_user_request'),
                 following=lambda: None if page.get('next_offset') is None else (page['next_offset'],),
-                first=lambda: latest.update(live_offsets=[0]))
+                first=lambda: latest.update(live_offsets=[0]), locked=lambda: walking('live'))
 
             latest['live_buttons'] = render_host_footer(scope='live', size=latest['live_size'], offset=page['offset'],
                 count=len(rows), total=page.get('total'), previous_enabled=len(latest['live_offsets']) > 1,
                 next_enabled=page.get('next_offset') is not None, on_previous=prev,
-                on_next=next_page, on_size=change_size)
+                on_next=next_page, on_size=change_size, controls=controls)
+            show_export('live')
         with live_area:
             draw_live()
     with history_panel, ui.column().classes('cn-panel cn-monitor-history gap-3'):
@@ -417,9 +717,15 @@ def render_monitor(controller):
                 delete_cancel = ui.button('Cancel', on_click=cancel_delete).props('outline autofocus')
                 async def confirm_delete():
                     selection = latest['delete_selection']
+                    if not selection or selection.get('generation') != latest['config_generation']:
+                        # Opened before the settings were reloaded: the history file may now be another one.
+                        delete_error.set_text('The settings were reloaded since this was opened. Nothing was deleted.')
+                        delete_confirm.disable()
+                        return
                     try:
                         latest['delete_query'] = controller.request_monitor_delete(
-                            selection['action'], selection.get('run_id'), selection.get('request_id'))
+                            selection['action'], selection.get('run_id'), selection.get('request_id'),
+                            generation=selection['generation'])
                     except (AttributeError, RuntimeError, ValueError):
                         delete_error.set_text('Could not start deletion. Try again when the session is ready.')
                         return
@@ -433,7 +739,7 @@ def render_monitor(controller):
         def open_delete(action, item=None):
             if latest['delete_query']:
                 return
-            latest['delete_selection'] = {'action': action}
+            latest['delete_selection'] = {'action': action, 'generation': latest['config_generation']}
             if action == 'run':
                 latest['delete_selection'].update(run_id=item['id'], request_id=item.get('request_id'))
                 delete_title.set_text('Delete this run?')
@@ -463,13 +769,15 @@ def render_monitor(controller):
                 controller.release_monitor_history_page(latest['round_query'])
             latest['round_query'] = None
             latest['round_hosts'] = None
+            cancel_export('detail', 'changed')  # the round's table goes: an export of it stops
 
         async def request_round_hosts(focus=None, *, refresh='hosts'):
             cancel_round_query()
             latest['detail_focus'] = focus
             try:
                 latest['round_query'] = controller.request_monitor_history(
-                    'hosts', latest['selected_round']['id'], latest['host_cursors'][-1], latest['host_size'],
+                    'hosts', latest['selected_round']['id'], latest['host_cursors'][-1],
+                    table_export.page_limit(latest['host_size']),
                     latest['host_sort'], latest['host_descending'], latest['host_group'],
                     latest['host_filter_field'], latest['host_filter_text'])
             except (AttributeError, RuntimeError, ValueError):
@@ -525,30 +833,28 @@ def render_monitor(controller):
                 ui.label(str(text)).classes('cn-monitor-target' if target else '').props('title=' + json.dumps(str(text)))
 
         def state_cell(text, observation=None, *, tone=None):
-            if tone is None:
-                tone = ('ok' if observation in {'!', 'T', 'R'} or text == 'finished' else
-                        'problem' if observation in {'E', '?', 'U'} or text == 'failed' else
-                        'warning' if text in {'running', 'lost'} else '')
+            label, classes, title = state_cell_parts(text, state_tone(text, observation) if tone is None else tone)
             with ui.element('td'):
-                label = {'DNS name did not resolve': 'DNS failed', 'Answered on TCP': 'TCP reply'}.get(text, text)
-                ui.label(label).classes('cn-monitor-state ' + tone).props('title=' + json.dumps(text))
+                ui.label(label).classes(classes).props('title=' + json.dumps(title))
 
         @ui.refreshable
         def draw_round_hosts():
+            controls = latest['table_controls']['detail'] = []
             hosts_page = latest['round_hosts']
             if hosts_page is None:
                 ui.label('Loading round results…').props('role=status').classes('cn-muted')
             elif hosts_page.get('error'):
                 message = ('This round changed or was deleted. Refresh history to select an available round.'
                            if hosts_page['error'] == 'expired' else
-                           'This round is too large to display safely. Select another round.'
-                           if hosts_page['error'] == 'too_large' else history_error_message(hosts_page['error']))
+                           ROUND_TOO_LARGE if hosts_page['error'] == 'too_large' else history_error_message(hosts_page['error']))
                 ui.label(message).props('role=alert').classes('text-negative')
             else:
                 rows = hosts_page.get('items', [])
                 counts = hosts_page.get('counts')
                 if counts is not None:
                     async def choose_host_group(group):
+                        if walking('detail'):
+                            return
                         latest['host_group'], latest['host_cursors'], latest['host_offsets'] = group, [None], [0]
                         await request_round_hosts('group-' + group)
                     with ui.element('nav').props('aria-label="Filter saved round hosts"').classes('cn-monitor-toolbar'):
@@ -558,11 +864,14 @@ def render_monitor(controller):
                             button = ui.button(f'{label} ({count})', on_click=lambda _, value=group: choose_host_group(value)).props('outline dense')
                             button._props['aria-pressed'] = str(group == latest['host_group']).lower()
                             button._props['data-monitor-detail'] = 'group-' + group
+                            controls.append(button)
                     with ui.element('div').classes('cn-monitor-toolbar'):
                         field = ui.select({'host': 'Target', 'status': 'Status', 'address': 'Address', 'result': 'Probe result'},
                                           value=latest['host_filter_field'], label='Round host filter field').props('outlined dense').classes('w-40')
                         pattern = ui.input('Round host filter', value=latest['host_filter_text']).props('outlined dense maxlength=256').classes('grow')
                         async def apply_host_filter():
+                            if walking('detail'):
+                                return
                             latest['host_filter_field'], latest['host_filter_text'] = field.value, (pattern.value or '')[:256]
                             latest['host_cursors'], latest['host_offsets'] = [None], [0]
                             await request_round_hosts('filter-hosts')
@@ -570,54 +879,61 @@ def render_monitor(controller):
                         button = ui.button('Filter round hosts', on_click=apply_host_filter).props('outline dense')
                         button._props['data-monitor-detail'] = 'filter-hosts'
                         async def clear_host_filter():
+                            if walking('detail'):
+                                return
                             latest['host_filter_text'], latest['host_cursors'], latest['host_offsets'] = '', [None], [0]
                             await request_round_hosts('clear-filter')
                         clear = ui.button('Clear round host filter', on_click=clear_host_filter).props('outline dense')
                         clear._props['data-monitor-detail'] = 'clear-filter'
+                        controls.extend((field, pattern, button, clear))
                     ui.label(f"{hosts_page['total']} matching hosts; counts describe the complete round.").classes('cn-muted')
                     if not rows:
                         ui.label('No hosts match the selected group and filter.').classes('cn-muted')
-                with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 aria-label="Round results"'), ui.element('table').classes('cn-monitor-table cn-monitor-hosts').props('aria-label="Round host results"'):
+                options = tuple(latest['host_' + key] for key in ('sort', 'descending', 'group', 'filter_field', 'filter_text'))
+                round_id = (latest['selected_round'] or {}).get('id')
+                draw_export('detail', ('detail', round_id) + options,
+                            hosts_page.get('total') if hosts_page.get('total') is not None else len(rows))
+                with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 aria-label="Round results"') as scroll, ui.element('table').classes('cn-monitor-table cn-monitor-hosts').props('aria-label="Round host results"'):
                     with ui.element('thead'), ui.element('tr'):
                         async def sort_hosts(column):
+                            if walking('detail'):
+                                return
                             if latest['host_sort'] == column:
                                 latest['host_descending'] = not latest['host_descending']
                             else:
                                 latest['host_sort'], latest['host_descending'] = column, False
                             latest['host_cursors'], latest['host_offsets'] = [None], [0]
                             await request_round_hosts('sort-' + column)
-                        for label, column in (('Target', 'host'), ('Status', 'status'), ('Address', 'address'), ('Probe result', 'result')):
+                        for label, column in ROUND_HOST_COLUMNS:
                             with ui.element('th').props('scope=col') as header:
                                 if latest['host_sort'] == column:
                                     header._props['aria-sort'] = 'descending' if latest['host_descending'] else 'ascending'
                                 button = ui.button(label, on_click=lambda _, value=column: sort_hosts(value)).props('flat dense')
                                 button._props['aria-label'] = f'Sort round hosts by {label}' + ((', descending' if latest['host_descending'] else ', ascending') if latest['host_sort'] == column else '')
                                 button._props['data-monitor-detail'] = 'sort-' + column
-                    with ui.element('tbody'):
-                        for row in rows:
-                            with ui.element('tr'):
-                                cell(row.get('host') or 'Unknown host', target=True)
-                                state_cell(history_value('observation', row.get('observation')), row.get('observation'))
-                                cell(row.get('address') or '—', target=True)
-                                cell(row.get('result') or '—')
+                                controls.append(button)
+                    ui.html(body_html(round_host_cells(row) for row in rows), sanitize=False, tag='tbody')
+                table_actions.keep_scroll(scroll, 'detail', (round_id, latest['host_offsets'][-1], latest['host_size']) + options)
                 previous_hosts, next_hosts, change_host_size = paged_handlers(
                     latest, 'host_size', ('host_cursors', 'host_offsets'), request=request_round_hosts,
                     busy=lambda: latest['round_query'],
                     following=lambda: next_cursor_step(latest['host_offsets'], latest['round_hosts'], len(rows)),
-                    first=lambda: latest.update(host_cursors=[None], host_offsets=[0]))
+                    first=lambda: latest.update(host_cursors=[None], host_offsets=[0]), locked=lambda: walking('detail'))
 
                 render_host_footer(scope='detail', size=latest['host_size'], offset=latest['host_offsets'][-1],
                     count=len(rows), total=hosts_page.get('total'), previous_enabled=len(latest['host_cursors']) > 1,
                     next_enabled=bool(hosts_page.get('next_cursor')), on_previous=previous_hosts,
-                    on_next=next_hosts, on_size=change_host_size)
+                    on_next=next_hosts, on_size=change_host_size, controls=controls)
                 if not rows:
                     ui.label('No host results on this page.').classes('cn-muted')
+                show_export('detail')
 
         # --- Show Available: every IP of the saved target on screen, with whether it ever replied ---------------------
         def cancel_coverage_query():
             if latest['coverage_query']:
                 controller.release_monitor_history_page(latest['coverage_query'])
             latest['coverage_query'] = None
+            cancel_export('coverage', 'changed')  # the table is read again or goes: an export of it stops
 
         def release_coverage_download():
             """Give up the Unseen export in flight: the controller drops its late answer and removes its file."""
@@ -634,18 +950,25 @@ def render_monitor(controller):
         def first_coverage_page():
             latest['coverage_cursors'], latest['coverage_offsets'] = [None], [0]
 
+        async def redraw_coverage():
+            """Draw what is under the box again, and the whole block only when it has to appear or go (back from the
+            rounds of a run): the box itself stays, with the focus and any key the reader pressed on it."""
+            drawn = latest['coverage_parent'] is not None and history.kind == 'runs'
+            await (draw_coverage_body if drawn and latest['coverage_drawn'] else draw_coverage).refresh()
+
         async def request_coverage(focus=None):
             cancel_coverage_query()
             latest['coverage_page'] = None
             latest['coverage_focus'] = focus
             try:
                 latest['coverage_query'] = controller.request_monitor_history(
-                    'coverage', latest['coverage_parent'], latest['coverage_cursors'][-1], latest['coverage_size'],
+                    'coverage', latest['coverage_parent'], latest['coverage_cursors'][-1],
+                    table_export.page_limit(latest['coverage_size']),
                     latest['coverage_sort'], latest['coverage_descending'], latest['coverage_group'],
                     latest['coverage_filter_field'], latest['coverage_filter_text'])
             except (AttributeError, RuntimeError, ValueError):
                 latest['coverage_page'] = {'error': 'History is unavailable. Try refreshing.'}
-            await draw_coverage.refresh()
+            await redraw_coverage()
 
         async def toggle_coverage(event):
             if bool(event.value) == latest['coverage_on']:
@@ -655,7 +978,7 @@ def render_monitor(controller):
                 await request_coverage('toggle')
             else:
                 reset_coverage()
-                await draw_coverage.refresh()
+                await redraw_coverage()
             focus_coverage('toggle')
 
         def sync_coverage_download():
@@ -675,6 +998,10 @@ def render_monitor(controller):
             if latest['coverage_download'] or latest['coverage_parent'] is None:
                 return
             latest['coverage_download_error'] = ''
+            if settings_moved():  # the request on screen may now name another history file's request
+                latest['coverage_download_error'] = 'The settings were reloaded. Refresh history, then download again.'
+                sync_coverage_download()
+                return
             try:
                 latest['coverage_download'] = controller.request_coverage_export(latest['coverage_parent'])
             except (AttributeError, RuntimeError, ValueError):
@@ -682,17 +1009,23 @@ def render_monitor(controller):
             sync_coverage_download()
 
         async def choose_coverage_group(group):
+            if walking('coverage'):
+                return
             latest['coverage_group'] = group
             first_coverage_page()
             await request_coverage('group-' + group)
 
         async def apply_coverage_filter(field, pattern, *, clear=False):
+            if walking('coverage'):
+                return
             latest['coverage_filter_field'] = field.value
             latest['coverage_filter_text'] = '' if clear else (pattern.value or '')[:256]
             first_coverage_page()
             await request_coverage('clear-filter' if clear else 'filter')
 
         async def sort_coverage(column):
+            if walking('coverage'):
+                return
             if latest['coverage_sort'] == column:
                 latest['coverage_descending'] = not latest['coverage_descending']
             else:
@@ -704,9 +1037,10 @@ def render_monitor(controller):
             latest, 'coverage_size', ('coverage_cursors', 'coverage_offsets'), request=request_coverage,
             busy=lambda: latest['coverage_query'],
             following=lambda: next_cursor_step(latest['coverage_offsets'], latest['coverage_page']),
-            first=first_coverage_page)
+            first=first_coverage_page, locked=lambda: walking('coverage'))
 
         def draw_coverage_table(page):
+            controls = latest['table_controls']['coverage'] = []
             rows = page['items']
             counts = page['counts']
             notices = coverage_notices(page['summary'])
@@ -720,6 +1054,7 @@ def render_monitor(controller):
                     button = ui.button(f'{label} ({count:,})', on_click=lambda _, value=group: choose_coverage_group(value)).props('outline dense')
                     button._props['aria-pressed'] = str(group == latest['coverage_group']).lower()
                     button._props['data-monitor-coverage'] = 'group-' + group
+                    controls.append(button)
             with ui.element('div').classes('cn-monitor-toolbar'):
                 field = ui.select({'host': 'Target', 'status': 'Status', 'note': 'Note'}, value=latest['coverage_filter_field'],
                                   label='Available IPs filter field').props('outlined dense').classes('w-52')
@@ -727,16 +1062,20 @@ def render_monitor(controller):
                 pattern.on('keydown.enter', lambda: apply_coverage_filter(field, pattern))
                 button = ui.button('Filter available IPs', on_click=lambda: apply_coverage_filter(field, pattern)).props('outline dense')
                 button._props['data-monitor-coverage'] = 'filter'
-                button = ui.button('Clear available IPs filter', on_click=lambda: apply_coverage_filter(field, pattern, clear=True)).props('outline dense')
-                button._props['data-monitor-coverage'] = 'clear-filter'
+                clear = ui.button('Clear available IPs filter', on_click=lambda: apply_coverage_filter(field, pattern, clear=True)).props('outline dense')
+                clear._props['data-monitor-coverage'] = 'clear-filter'
+                controls.extend((field, pattern, button, clear))
             total = page['total']
             ui.label(f"{total:,} matching {'host' if total == 1 else 'hosts'}; counts describe the whole history.").classes('cn-muted')
             if not rows:
                 ui.label('No hosts match the selected group and filter.').classes('cn-muted')
-            with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 role=region aria-label="Available IPs results"'), ui.element('table').classes('cn-monitor-table cn-monitor-coverage-table').props('aria-label="Available IPs table"'):
+            options = tuple(latest['coverage_' + key] for key in ('sort', 'descending', 'group', 'filter_field', 'filter_text'))
+            # This table as filtered, every page, against Download available IPs above: every Unseen IP, whatever the filter.
+            draw_export('coverage', ('coverage', latest['coverage_parent'], page['summary']['rounds'],
+                                     tuple(sorted(counts.items()))) + options, total, COVERAGE_EXPORT_SCOPE)
+            with ui.element('div').classes('cn-monitor-scroll').props('tabindex=0 role=region aria-label="Available IPs results"') as scroll, ui.element('table').classes('cn-monitor-table cn-monitor-coverage-table').props('aria-label="Available IPs table"'):
                 with ui.element('thead'), ui.element('tr'):
-                    for label, column in (('Target', 'host'), ('Status', 'status'), ('First seen', 'first_seen'),
-                                          ('Last seen', 'last_seen'), ('Rounds answered', 'answered'), ('Failed rounds', None), ('Note', None)):
+                    for label, column in COVERAGE_COLUMNS:
                         with ui.element('th').props('scope=col') as header:
                             if column is None:
                                 ui.label(label)
@@ -746,20 +1085,15 @@ def render_monitor(controller):
                             button = ui.button(label, on_click=lambda _, value=column: sort_coverage(value)).props('flat dense')
                             button._props['aria-label'] = f'Sort available IPs by {label}' + ((', descending' if latest['coverage_descending'] else ', ascending') if latest['coverage_sort'] == column else '')
                             button._props['data-monitor-coverage'] = 'sort-' + column
-                with ui.element('tbody'):
-                    for row in rows:
-                        with ui.element('tr'):
-                            cell(row['host'], target=True)
-                            state_cell(row['status'], tone=COVERAGE_TONES.get(row['status'], ''))
-                            cell(coverage_time(row['first_seen']))
-                            cell(coverage_time(row['last_seen']))
-                            cell(coverage_answered(row))
-                            cell(f"{row['failed']:,}")
-                            cell(row['note'] or '—', target=True)
+                            controls.append(button)
+                ui.html(body_html(coverage_cells(row) for row in rows), sanitize=False, tag='tbody')
+            table_actions.keep_scroll(scroll, 'coverage', (latest['coverage_parent'], latest['coverage_offsets'][-1],
+                                                           latest['coverage_size']) + options)
             render_host_footer(scope='coverage', size=latest['coverage_size'], offset=latest['coverage_offsets'][-1],
                 count=len(rows), total=total, previous_enabled=len(latest['coverage_cursors']) > 1,
                 next_enabled=bool(page.get('next_cursor')), on_previous=previous_coverage,
-                on_next=next_coverage, on_size=change_coverage_size)
+                on_next=next_coverage, on_size=change_coverage_size, controls=controls)
+            show_export('coverage')
 
         @ui.refreshable
         def draw_coverage():
@@ -769,14 +1103,23 @@ def render_monitor(controller):
             latest['coverage_drawn'] = latest['coverage_parent'] is not None and history.kind == 'runs'
             if not latest['coverage_drawn']:
                 return
-            page = latest['coverage_page']
             with ui.column().classes('w-full gap-2').props('role=region aria-label="Available IPs"'):
                 # The box is alone in the first row, ticked or not, so ticking it never moves it from under the pointer.
                 with ui.row().classes('cn-monitor-toolbar'):
                     box = ui.checkbox('Show Available', value=latest['coverage_on'], on_change=toggle_coverage)
                     box._props['data-monitor-coverage'] = 'toggle'
-                if not latest['coverage_on']:
-                    return
+                draw_coverage_body()
+
+        @ui.refreshable
+        def draw_coverage_body():
+            """Everything under the box. The box, its query and its answers redraw only this, never the box: a redraw
+            that replaced it would drop the focus of a reader who moved to it while a page was read (the answer then
+            sent the focus to the control that asked) and lose a Space pressed on it while the redraw was on its way."""
+            latest['coverage_download_button'] = latest['coverage_download_label'] = latest['coverage_download_note'] = None
+            page = latest['coverage_page']
+            if not latest['coverage_on']:
+                return
+            with ui.column().classes('w-full gap-2'):
                 ui.label(COVERAGE_TITLE).props('role=heading aria-level=3').classes('text-subtitle1 text-weight-bold')
                 ui.label(COVERAGE_MEANING).classes('cn-muted')
                 with ui.row().classes('cn-monitor-toolbar'):
@@ -1083,6 +1426,26 @@ return area?.contains(document.activeElement) ||
             if page.attempt_changed:
                 latest['outcome'], latest['attempt_result'], latest['attempt_revision'] = page.outcome, page.attempt_result, page.attempt_revision
             state = page.state
+            generation = state.config_generation
+            if latest['config_generation'] is None:
+                latest['config_generation'] = generation
+            elif generation != latest['config_generation']:
+                # Reloaded settings may name another [ping] history_file: a round or a fold chosen before may not exist
+                # there, or be another one under the same id. History starts again from the saved targets.
+                latest['config_generation'] = generation
+                if not latest['delete_query']:  # a confirmation opened for the history file before the reload
+                    latest['delete_selection'] = None
+                    delete_dialog.close()
+                cancel_export('detail', 'changed')
+                cancel_export('coverage', 'changed')
+                for prepared in latest['exports'].values():  # a refused copy kept for the next click: another table now
+                    prepared['copy'] = None
+                # The chosen round goes now; History is read again once the session accepts queries (the reload is
+                # still starting when the generation moves), by the history_dirty step below.
+                cancel_round_query()
+                latest['selected_round'] = None
+                history.reset()
+                latest['history_dirty'] = True
             await report_delete.update(state)
             deleting = state.report_delete_pending
             active = state.active_lookup_type == 'monitor' and bool(state.active_job_id)
@@ -1136,6 +1499,7 @@ return area?.contains(document.activeElement) ||
                         and not latest.get('live_user_request')):
                     set_changed(pending_live, f'Complete round revision {revision} is available; updating the displayed page.')
                 if not previous_identity or previous_identity[:2] != identity[:2]:
+                    cancel_export('live', 'changed')
                     latest['live_user_request'] = None
                     latest.update(live_offset=0, live_offsets=[0], live_sort='', live_descending=False, live_group='all',
                                   live_filter_field='host', live_filter_text='')
@@ -1143,7 +1507,7 @@ return area?.contains(document.activeElement) ||
                         latest['live_page'] = None
                         await draw_live.refresh()
                 latest['live_identity'] = identity
-            key = (job, run_id, revision, latest['live_offset'], latest['live_size'], latest['live_sort'], latest['live_descending'], latest['live_group'], latest['live_filter_field'], latest['live_filter_text']) if job and run_id is not None and revision is not None else None
+            key = (job, run_id, revision, latest['live_offset'], table_export.page_limit(latest['live_size']), latest['live_sort'], latest['live_descending'], latest['live_group'], latest['live_filter_field'], latest['live_filter_text']) if job and run_id is not None and revision is not None else None
             if key != latest['live_key']:
                 latest.pop('pending_live', None)
                 if key is None:
@@ -1173,7 +1537,7 @@ return area?.contains(document.activeElement) ||
                         latest['live_key'] = None
                     elif result.get('status') == 'ready' and not result.get('rows') and latest['live_offset']:
                         total = result.get('total')
-                        size = latest['live_size']
+                        size = table_export.page_limit(latest['live_size'])
                         last_offset = max(0, ((total - 1) // size) * size) if type(total) is int and total >= 0 else None
                         latest['live_offset'] = (last_offset if last_offset is not None and last_offset < latest['live_offset']
                                                  else (latest['live_offsets'][-2] if len(latest['live_offsets']) > 1 else 0))
@@ -1325,7 +1689,7 @@ if (document.activeElement === document.body && document.querySelector('.cn-moni
                     if result.get('error') == 'expired':
                         first_coverage_page()  # the next read starts from the first page
                     latest['coverage_page'] = result
-                    await draw_coverage.refresh()
+                    await redraw_coverage()
                     if marker:
                         focus_coverage(marker, only_if_lost=True)
 
@@ -1370,7 +1734,7 @@ return true;
                 if restored:
                     control.enable()
                     return
-            except TimeoutError:
+            except (TimeoutError, asyncio.TimeoutError):  # distinct classes on Python 3.10: a miss left a field disabled
                 pass
             if not client.is_deleted:
                 client.run_javascript(f'(() => {{{install}}})()')
@@ -1379,6 +1743,7 @@ return true;
                 ui.timer(1, restore, once=True)
         ui.timer(0, restore, once=True)
     def release_queries():
+        cancel_export('live', 'changed')
         cancel_round_query()
         if latest['delete_query']:
             controller.release_monitor_delete_result(latest['delete_query'])
@@ -1407,6 +1772,86 @@ def live_fields(row):
     tcp = ', '.join(f"{entry['port']}: {entry['result']}" for entry in row.get('tcp', [])) or 'Not checked'
     return [('Host', str(row.get('host') or 'Unknown')), ('Address', str(row.get('address') or 'Unknown')),
             ('Result', str(row.get('result') or 'Unknown')), ('TCP', tcp)]
+
+
+# The columns of the three host tables, label and sort key (None: not sortable), in the order they are drawn. The table's
+# header and its export both read them, and the ``*_cells`` functions give each row's cells in the same order as
+# ``(text, classes, title)``: what the cell shows, the classes of its label, and the full text a short label stands for.
+LIVE_COLUMNS = (('Target', 'host'), ('Result', 'result'), ('Address', 'address'), ('TCP', 'tcp'))
+ROUND_HOST_COLUMNS = (('Target', 'host'), ('Status', 'status'), ('Address', 'address'), ('Probe result', 'result'))
+COVERAGE_COLUMNS = (('Target', 'host'), ('Status', 'status'), ('First seen', 'first_seen'), ('Last seen', 'last_seen'),
+                    ('Rounds answered', 'answered'), ('Failed rounds', None), ('Note', None))
+STATE_LABELS = {'DNS name did not resolve': 'DNS failed', 'Answered on TCP': 'TCP reply'}
+
+
+def plain_cell(text, *, target=False):
+    text = str(text)
+    return text, 'cn-monitor-target' if target else '', text
+
+
+def state_tone(text, observation=None):
+    return ('ok' if observation in {'!', 'T', 'R'} or text == 'finished' else
+            'problem' if observation in {'E', '?', 'U'} or text == 'failed' else
+            'warning' if text in {'running', 'lost'} else '')
+
+
+def state_cell_parts(text, tone):
+    return STATE_LABELS.get(text, text), f'cn-monitor-state {tone}'.strip(), text
+
+
+def live_cells(row):
+    values = dict(live_fields(row))
+    return [plain_cell(values['Host'], target=True), plain_cell(values['Result']), plain_cell(values['Address']),
+            plain_cell(values['TCP'])]
+
+
+def round_host_cells(row):
+    status = history_value('observation', row.get('observation'))
+    return [plain_cell(row.get('host') or 'Unknown host', target=True),
+            state_cell_parts(status, state_tone(status, row.get('observation'))),
+            plain_cell(row.get('address') or '—', target=True), plain_cell(row.get('result') or '—')]
+
+
+def coverage_cells(row):
+    return [plain_cell(row['host'], target=True), state_cell_parts(row['status'], COVERAGE_TONES.get(row['status'], '')),
+            plain_cell(coverage_time(row['first_seen'])), plain_cell(coverage_time(row['last_seen'])),
+            plain_cell(coverage_answered(row)), plain_cell(f"{row['failed']:,}"),
+            plain_cell(row['note'] or '—', target=True)]
+
+
+def body_html(rows):
+    """The rows of a host table as the markup of its ``tbody``, every text escaped: one element for the browser to draw
+    instead of two for each cell, so that a page of 1,024 hosts appears at once."""
+    from html import escape
+
+    return ''.join('<tr>' + ''.join(f'<td><div class="{classes}" title="{escape(title)}">{escape(text)}</div></td>'
+                                    for text, classes, title in cells) + '</tr>' for cells in rows)
+
+
+def export_records(columns, cells, rows):
+    """The header and the rows of an export: the table's column labels and its cells' texts, as displayed."""
+    labels = [label for label, _ in columns]
+    return labels, [dict(zip(labels, (text for text, _, _ in cells(row)))) for row in rows]
+
+
+def lock_controls(controls, locked):
+    """While a table is exported, its paging, size, sort, filter and group controls are ``aria-disabled`` and their
+    handlers ignore clicks (never ``disabled``, which would drop the focus); a select or a field is also read-only."""
+    from nicegui import ui
+
+    for control in controls:
+        if control.is_deleted or (control._props.get('aria-disabled') == 'true') == locked:
+            continue
+        if locked:
+            control._props['aria-disabled'] = 'true'
+        else:
+            control._props.pop('aria-disabled', None)
+        if isinstance(control, (ui.select, ui.input)):
+            if locked:
+                control._props['readonly'] = True
+            else:
+                control._props.pop('readonly', None)
+        control.update()
 
 
 def next_cursor_step(offsets, page, count=None):

@@ -21,6 +21,7 @@ and setup](infoblox.md#access-and-setup) requirements before using them.
 | 0.9.3 | Column sorting and field filters, with Ping and Monitor outcome summaries |
 | 0.10.0 | Monitor host page-size selection, Show Available lists on Subnets and Monitor, and a Windows Pydantic compatibility pin |
 | 0.11.0 | Report deletion on every tool |
+| 0.12.0 | Settings (edit the configuration and use it without a relaunch), and All rows, CSV download and copy for the Ping and Monitor tables |
 
 The browser tools beyond Subnets are available in 0.9.0 and are not part of 0.8.4.
 The menu and CLI have their own established workflows.
@@ -60,8 +61,8 @@ to locate its executable directory. Quote paths containing spaces and optionally
 
 Keep the launcher running. A one-use launch link attaches the browser. Tabs share one
 runtime, account and active operation. Closing or refreshing a tab leaves the application
-running; use **Quit application** to finish the session. Configuration changes require
-Quit and relaunch. The interface does not edit configuration.
+running; use **Quit application** to finish the session. **Settings** edits the
+configuration file and can apply it without a relaunch; see [Settings](#settings).
 
 ## Released interface (0.8.4)
 
@@ -137,8 +138,9 @@ comma-separated TCP ports. Hostnames use system DNS with IPv4 preferred over IPv
 ICMP uses the system `ping`; if it is unavailable, a TCP selection still runs and marks
 ICMP as not run. The [ping limits](ping-monitor.md#bulk-ping-cn-ping) also apply here.
 
-Invalid targets and DNS failures are separate from completed rows. Results and diagnostic
-lists use pages of up to 50 items, with controls and page-number entry to reach every
+Invalid targets and DNS failures are separate from completed rows. Results show 50 rows a
+page by default; **Rows per page** offers 5 to 100 and, from 0.12.0, **All (up to 1,024)**. Diagnostic
+lists use pages of up to 50 items. Both have controls and page-number entry to reach every
 item. Stop waits for DNS and active probes to drain and distinguishes incomplete from
 unattempted hosts. Earlier useful results remain available when a new attempt yields none.
 
@@ -162,7 +164,32 @@ of recorded requests, runs, rounds and hosts, and refreshing it starts at page o
 From 0.10.0, latest-round and saved-round host tables have a bottom
 pagination bar. Choose **Rows per page** and use the arrows to browse the matching
 hosts. Changing the page size returns to the first page and preserves the chosen
-sort and filters. Pages start at 25 rows; bounded choices keep large rounds responsive.
+sort and filters. Pages start at 25 rows; the choices run from 5 to 100 and, from 0.12.0,
+**All (up to 1,024)**: every row of a table of 1,024 or fewer, pages of 1,024 beyond.
+
+### Download table (CSV) and Copy table
+
+From 0.12.0, the Ping results table and the Monitor latest-round, saved-round and Show Available host
+tables have **Download table (CSV)** and **Copy table** above them. Both take the whole
+table as it is filtered and sorted, every page, with the columns and headings on screen
+(Ping has one column per TCP port; Monitor one TCP column).
+
+- **Download table (CSV)** saves a comma-separated file that Excel opens with a
+  double-click (UTF-8 with a byte-order mark, so `—` and `09:00–09:41` read correctly).
+  Its name says which table and when, for example `cn-ping-20261112-090507.csv` or
+  `cn-monitor-round-42-…`.
+- **Copy table** puts the same rows on the clipboard as tab-separated text, so that they
+  paste into separate cells of an existing sheet. If the browser does not allow the copy
+  (for example because another window had the focus), return to the tab and select
+  **Copy table** again.
+- A cell that starts like a formula (`=`, `+`, `-`, `@`) and is not a number gets a
+  leading `'`, so a host name never runs as a formula.
+- For a Ping run that was stopped or is still running, the export includes the completed
+  results and says so.
+- On Monitor, a large table is read page by page: progress is shown, **Cancel** stops it,
+  and the table's paging, sorting and filters wait until it finishes. A new live round
+  arriving meanwhile stops it with a message; download again. **Download available IPs**
+  stays as it was: every Unseen IP, whatever the filter.
 
 Use the **Live monitor** tab for setup and current results, or **History** to browse saved
 targets and runs in compact tables. **View rounds** opens a round selector alongside the
@@ -270,6 +297,39 @@ reload in the same live session for up to five minutes. Decline, a replacement l
 Stop, Quit or expiration invalidates it; confirmation can be used once. Automatic
 reports and accumulated workbooks can contain full device configurations and earlier
 results, so handle them as sensitive.
+
+## Settings
+
+From 0.12.0, **Settings** (in every page's tool links, and under **Setup required** on Subnets and IP)
+creates and edits your configuration file without a text editor. It edits the file given with
+`cn-web -c FILE`, otherwise `~/.cn` (`%USERPROFILE%\.cn` on Windows), and lists every file cn
+reads, in order: a later file overrides an earlier one.
+
+- The common settings come first (the same ones as the terminal **Application Setup**, menu
+  `s`), followed by the settings this file already sets. **Show all settings** lists the rest,
+  and **Find a setting** searches all of them. Each setting shows its help, its value if this
+  file does not set it (inherited from an earlier file, or the default), and the template's
+  example.
+- **Remove** takes a setting out of the file, so the inherited value applies again. Emptying a
+  box sets the setting to empty in this file; **Set empty** does the same for a setting the
+  file does not have yet. An empty value overrides an earlier file; for example, an empty
+  `[ssh] config_file` turns the SSH config off.
+- **Create file** writes the commented `cn init` template when no earlier configuration file
+  exists. Otherwise it writes only the settings you set, so that the earlier files stay in
+  effect. **Save changes** rewrites only the lines that change, and keeps your comments and
+  every setting the page does not show.
+- Values are checked when you leave a box and when you save. Numbers must be whole, an
+  endpoint must be an `http://` or `https://` URL, and `[auth]` entries must be variable
+  names. Patterns must be valid regular expressions.
+- If the file changed on disk after the page loaded it, nothing is saved. Reload, with or
+  without your edits.
+- Passwords are never shown or saved here, including the SMTP password in `[email]`. Keep them
+  in the environment or a GPG file.
+- After saving, **Use the new settings now** reads the configuration again in the running
+  window, when no work is running (a login you typed in this window is asked for again; saved,
+  environment and GPG credentials are found again). **Quit now** and starting `cn-web` again
+  works too. `cn` commands use the new settings from their next run. In **Setup required**,
+  **Retry setup** also reads the configuration again.
 
 ## Reports, Stop and Quit
 

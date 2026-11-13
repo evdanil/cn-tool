@@ -40,6 +40,7 @@ def configure_logging(logfile_location: str, log_level_str: str, extra_loggers: 
     # If the logger already has handlers, don't add more. This prevents
     # duplicate log entries if this function is ever called more than once.
     if logger.hasHandlers():
+        _close_all(logger)
         logger.handlers.clear()
 
     # Create a file handler at the configured location, creating parent
@@ -79,6 +80,7 @@ def configure_logging(logfile_location: str, log_level_str: str, extra_loggers: 
         else:
             managed.setLevel(log_level_numeric)
         managed.propagate = False
+        _close_all(managed)
         managed.handlers.clear()
         managed.addHandler(file_handler)
 
@@ -86,3 +88,12 @@ def configure_logging(logfile_location: str, log_level_str: str, extra_loggers: 
     # logger.debug(f"Logger '{logger.name}' configured with level {log_level_str} ({log_level_numeric}) writing to {logfile_location}")
 
     return logger
+
+
+def _close_all(logger: logging.Logger) -> None:
+    """Close the handlers about to be replaced: a dropped file handler would keep its file open (locked on Windows)."""
+    for handler in list(logger.handlers):
+        try:
+            handler.close()
+        except Exception:  # pragma: no cover - a handler that cannot close is dropped all the same
+            pass

@@ -23,6 +23,7 @@ def create_app(controller, access):
     from .monitor import render_monitor
     from .config_page import render_config_search
     from .demob_page import render_demob
+    from .settings_page import render_settings
 
     parent = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     parent.add_middleware(AccessMiddleware, access=access)
@@ -83,6 +84,10 @@ def create_app(controller, access):
     @ui.page('/ip')
     def ip_page():
         render_ip(controller)
+
+    @ui.page('/settings')
+    def settings_page():
+        render_settings(controller)
 
     # Gzip buffers headers until the first body chunk; a cancelled file
     # transfer can then look like a missing response to NiceGUI's middleware.

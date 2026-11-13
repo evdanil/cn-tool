@@ -1,5 +1,6 @@
 """Ping presentation helpers for the shared local session."""
 import asyncio
+from datetime import datetime
 import json
 import re
 
@@ -78,6 +79,9 @@ PING_CSS = """
 .cn-ping-outcome, .cn-ping-outcome > .nicegui-column { gap:8px; }
 .cn-ping-outcome h2 { margin-top:0; }
 .cn-ping-results-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 20px; width:100%; }
+.cn-ping-page-size { min-width:0; max-width:100%; }
+.cn-ping-page-size .q-field { min-width:0; max-width:150px; }
+.cn-table-export { min-width:0; max-width:100%; }
 .cn-ping-result-filters, .cn-ping-groups { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
 .cn-ping-result-filters { width:100%; }
 .cn-ping-result-filters .cn-field-filter { width:auto; }
@@ -172,6 +176,25 @@ const wanted = {role} === 'jump' ? nav?.querySelector('input') : nav?.querySelec
         error = ui.label('').props('role=alert').classes('text-negative')
 
 
+PING_LABELS = {'Host': 'Target', 'Result': 'ICMP result'}
+
+
+def ping_columns(keys):
+    """The Ping table's columns in display order (Target, ICMP result, each TCP port, Address, then the rest)."""
+    keys = list(keys)
+    leading = [key for key in ['Host', 'Result', *(key for key in keys if key.startswith('TCP ')), 'Address'] if key in keys]
+    return leading + [key for key in keys if key not in leading]
+
+
+def ping_export(rows, all_rows):
+    """The labels and rows of the Ping table as displayed: every row of ``rows`` (filtered and sorted, every page)."""
+    keys = ping_columns(dict.fromkeys(key for row in all_rows for key in row if key not in {'id', '__row'}))
+    labels = [PING_LABELS.get(key, key) for key in keys]
+    shown = [{label: str(row.get(key)) if isinstance(row.get(key), (dict, list, tuple)) else row.get(key)
+              for key, label in zip(keys, labels)} for row in rows]
+    return labels, shown
+
+
 def render_ping_results(snapshot, table, view, refresh, interaction_lock, results_id, render_filter):
     from nicegui import ui
     if (snapshot.phase in {'running', 'stopping', 'saving'} or
@@ -218,14 +241,61 @@ def render_ping_results(snapshot, table, view, refresh, interaction_lock, result
     sort = view.sorts.get('ping')
     if sort:
         filtered = order_rows(filtered, *sort)
-    page_size = 50
+    from . import table_actions
+    from .table_export import csv_bytes, export_filename, page_limit, page_size_options, tsv_text
+    page_size = page_limit(view.ping_size)
     pages = (len(filtered) + page_size - 1) // page_size
     view.ping_page = min(view.ping_page, pages - 1)
     start = view.ping_page * page_size
     shown = filtered[start:start + page_size]
+    # A result arrives once, when a run ends; while a new run goes on, the table holds the previous, complete one.
+    note = 'Ping was stopped: only completed results are included.' if result.get('stopped') else ''
+
+    async def change_size(event):
+        if event.value == view.ping_size:
+            return
+        client = ui.context.client
+        async with interaction_lock:
+            view.ping_size = event.value
+            view.ping_page = 0
+            await refresh()
+            from .subnets import restore_result_focus
+            await restore_result_focus(client, results_id, 'data-ping-page-size', 'size')
+
+    def download():
+        labels, data = ping_export(filtered, rows)
+        table_actions.offer_csv(csv_bytes(labels, data), export_filename('ping', datetime.now()))
+        view.ping_export_status = table_actions.done_text(len(data), note=note)
+        controls['status'].set_text(view.ping_export_status)
+
+    async def copy():
+        if view.ping_copying:
+            return
+        if table_actions.copy_refusal(len(filtered)):
+            view.ping_export_status = table_actions.copy_refusal(len(filtered))
+            controls['status'].set_text(view.ping_export_status)
+            return
+        labels, data = ping_export(filtered, rows)
+        view.ping_copying = True
+        try:
+            copied, message = await table_actions.write_clipboard(ui.context.client, tsv_text(labels, data), len(data))
+        finally:
+            view.ping_copying = False
+        view.ping_export_status = f'{message} {note}'.strip() if copied else message
+        controls['status'].set_text(view.ping_export_status)
+
     with ui.element('div').classes('cn-ping-results-toolbar'):
         ui.label(f'Showing {start + 1}–{start + len(shown)} of {len(filtered)} results').props('role=status aria-live=polite')
+        with ui.row().classes('items-center gap-2 cn-ping-page-size'):
+            ui.label('Rows per page:')
+            size = ui.select(page_size_options(), value=view.ping_size, on_change=change_size).props(
+                'dense borderless aria-label="Rows per page" transition-duration=0').mark('ping-page-size')
+            size._props['data-ping-page-size'] = 'size'
         if pages > 1:
             render_pager('results', 'Results', view.ping_page, pages,
                          lambda value: setattr(view, 'ping_page', value), refresh, interaction_lock=interaction_lock, results=True)
+        controls = table_actions.render_export_group(
+            name='ping', on_download=download, on_copy=copy,
+            description=table_actions.scope_description(len(filtered), 'results'))
+        controls['status'].set_text(view.ping_export_status)
     table(shown, table_id='ping', all_rows=rows)

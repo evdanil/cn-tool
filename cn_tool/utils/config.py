@@ -220,6 +220,11 @@ def _apply_types(cfg: Dict[str, Any], schema: Dict[str, Any], logger: logging.Lo
 
 
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def is_env_name(name: str) -> bool:
+    """True when ``name`` can be an environment variable's name (the rule of the [auth] keys)."""
+    return bool(_ENV_NAME.fullmatch(name))
 _AUTH_USER_KEYS = ("auth_device_user_var", "auth_infoblox_user_var")
 _AUTH_PASSWORD_KEYS = ("auth_device_password_var", "auth_infoblox_password_var")
 
@@ -275,6 +280,11 @@ def _auth_key_label(cfg: Mapping[str, Any], key: str) -> str:
     """
     blank = f" (blank: {AUTH_ENV_DEFAULTS[key]})" if not _configured_env_name(cfg, key) else ""
     return f"[auth] {_auth_ini_key(key)}{blank}"
+
+
+def env_name_is_shown(name: str, key: str) -> bool:
+    """Whether a text may show the name configured for ``key`` (the display rule of ``shown_env_name``)."""
+    return _env_name_is_shown(name, key)
 
 
 def _env_name_is_shown(name: str, key: str) -> bool:
