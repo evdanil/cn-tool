@@ -1,6 +1,8 @@
 rich
 requests >= 2.32.3
-pandas >= 2.2.2, < 4
+# pandas 3 needs Python 3.11: the pinned release there, the 2.x line on Python 3.10.
+pandas == 3.1.0; python_version >= '3.11'
+pandas >= 2.2.2, < 3; python_version < '3.11'
 openpyxl
 diskcache
 netmiko < 5

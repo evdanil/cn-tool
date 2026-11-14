@@ -2410,7 +2410,7 @@ class _Menu:
 
 # --- the frame ---------------------------------------------------------------------------------------------
 
-_COUNT_WORDS = (("!", "replying"), ("R", "rejecting"), ("T", "TCP only"), ("U", "unreachable"), ("x", "gone"))
+_COUNT_WORDS = ping_grid.COUNT_WORDS
 
 
 def frame(request: Request, blocks: Sequence[ping_grid.Block], tracker: ph.Tracker, pending: Dict[int, str], *,

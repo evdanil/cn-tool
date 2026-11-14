@@ -49,7 +49,7 @@ may block them. Start cn through Python itself instead, which python.org signs (
    & "$env:LOCALAPPDATA\cn-tool\Scripts\python.exe" -m cn_tool.webui --create-shortcut
    ```
 
-   It writes **cn-tool Web** to the Start menu and the Desktop. Add `-c "C:\path\team.cn"` for a shortcut
+   It writes **cn-tool Web**, with the cn-tool icon, to the Start menu and the Desktop. Add `-c "C:\path\team.cn"` for a shortcut
    that opens that configuration, and `--console` for one that keeps a console window.
 4. Double-click **cn-tool Web**. The interface opens in your browser with no console window; stop it with
    **Quit application**. Clicking the shortcut again while it runs reopens the same session, so a closed

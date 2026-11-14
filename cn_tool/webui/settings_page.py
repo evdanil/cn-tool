@@ -1,5 +1,6 @@
 """Settings: edit the ``.cn`` file this session reads, line by line (``cn_tool/utils/config_editor.py``)."""
 import asyncio
+import json
 from pathlib import Path
 
 from .subnets import CSS
@@ -473,7 +474,7 @@ def render_settings(controller):
                 names = ', '.join(by_key[key].label for key in problems)
                 problem.set_text(f'Nothing was saved. Correct {len(problems)} setting'
                                  f'{"s" if len(problems) != 1 else ""}: {names}.')
-                rows[next(key for key in rows if key in problems)]['widget'].run_method('focus')
+                focus_widget(rows[next(key for key in rows if key in problems)]['widget'])
                 return False
             document = latest['document']
             if not changes and document.exists:
@@ -609,6 +610,18 @@ def _field_widget(ui, item, value, hint, read_only):
     if read_only:
         widget.disable()
     return widget.mark(f'setting-{item.section}-{item.ini_key}')
+
+
+def focus_widget(widget):
+    """Focus a field when this message arrives, never later.
+
+    ``run_method('focus')`` goes through Quasar's focus queue, which holds the request while a tooltip, menu or dialog
+    is opening or closing and runs it when that ends: the reader can have moved on by then.
+    """
+    widget.client.run_javascript(f'''(() => {{
+const root = document.getElementById({json.dumps(widget.html_id)});
+(root?.matches('input, textarea') ? root : root?.querySelector('input, textarea, [tabindex]:not([tabindex="-1"])'))?.focus({{preventScroll:true}});
+}})()''')
 
 
 def _attribute(element, name, value):

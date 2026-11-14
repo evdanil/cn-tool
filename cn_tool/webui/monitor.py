@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import json
 import re
 
-from . import table_actions, table_export
+from . import monitor_map, table_actions, table_export
 from .ping import parse_ports
 from .subnets import CSS, report_display
 from .report_actions import render_report_delete
@@ -239,6 +239,11 @@ def render_monitor(controller):
     latest = {'result': None, 'result_revision': None, 'attempt_revision': None, 'config_generation': None,
               'outcome': None, 'live_query': None, 'live_key': None, 'live_page': None,
               'live_offset': 0, 'live_offsets': [0], 'live_size': 25, 'live_sort': '', 'live_descending': False, 'live_group': 'all', 'live_filter_field': 'host', 'live_filter_text': '', 'history_query': None, 'history_page': None,
+              # The Map view. 'live_view' is the tab's choice (kept in its sessionStorage; Map until the tab says
+              # otherwise), 'map_cols' the characters that fit its box: nothing is asked for until the tab reports
+              # them. 'map_payload' is the worker's answer for 'map_revision' and 'map_drawn' what the tab has drawn.
+              'live_view': 'map', 'map_cols': 0, 'map_show': -1, 'map_query': None, 'map_key': None,
+              'map_payload': None, 'map_revision': None, 'map_drawn': None, 'map_host_query': None,
               'history_dirty': True, 'download': None, 'template_query': None, 'delete_query': None,
               'round_query': None, 'round_hosts': None, 'selected_round': None,
               'host_cursors': [None], 'host_offsets': [0], 'host_size': 25, 'host_sort': '', 'host_descending': False, 'host_group': 'all',
@@ -256,6 +261,8 @@ def render_monitor(controller):
     history = HistoryView()
     lock = asyncio.Lock()
     ui.add_head_html(table_actions.SCROLL_SCRIPT)
+    ui.add_css(monitor_map.CSS)
+    ui.add_head_html(monitor_map.SCRIPT)
 
     def walking(scope):
         return latest['exports'][scope]['busy']
@@ -587,9 +594,151 @@ if (!active || active === document.body || active.closest?.('[data-table-export]
                 report.set_content('Report download is unavailable.')
         with ui.row().classes('items-center'):
             download = ui.button('Download accumulated report', on_click=download_report).props('outline')
+            # Off until the first poll reports: it reshapes the page above this button, and a click straddling that is lost.
+            download.disable()
             report_delete = render_report_delete(controller)
-        pending_live = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
-        live_area = ui.column().classes('w-full')
+        def set_view_buttons():
+            for name, button in view_buttons.items():
+                pressed = str(name == latest['live_view']).lower()
+                if button._props.get('aria-pressed') != pressed:
+                    button._props['aria-pressed'] = pressed
+                    button.update()
+
+        def choose_view(view):
+            # The tab keeps the choice (sessionStorage) and answers with the view and the width of its map box.
+            latest['live_view'] = view
+            set_view_buttons()
+            client.run_javascript(f'window.cnMonitorMap && window.cnMonitorMap.setView({json.dumps(view)})')
+
+        with ui.element('nav').props('aria-label="Latest round view"').classes('cn-monitor-toolbar cn-live-switch'):
+            view_buttons = {name: ui.button(label, on_click=lambda _, value=name: choose_view(value)).props('outline dense')
+                            for name, label in (('map', 'Map'), ('table', 'Table'))}
+            for name, button in view_buttons.items():
+                button._props['data-monitor-view'] = name
+        set_view_buttons()
+        # One wrapper, two areas: the tab shows the area of its view (monitor_map.CSS) and both stay in the page.
+        live_view = ui.column().classes('w-full cn-live-view')
+        with live_view, ui.column().classes('w-full cn-live-map-area'):
+            map_status = ui.label('Waiting for the first complete round.').props('role=status aria-live=polite').classes('cn-muted')
+            map_summary = ui.label('').classes('cn-map-summary')
+            map_box = ui.element('div').classes('cn-monitor-scroll cn-map').props('tabindex=0 role=group aria-label="Host map"')
+            ui.html(monitor_map.legend_html(), sanitize=False).classes('cn-map-legend').props('role=note aria-label="Map legend"')
+            ui.label('The map shows every host of the complete round: one character per address, in address order. '
+                     'Point at, tap or move to a character for its details. Filters and sorting belong to the Table view.').classes('cn-muted')
+            map_live = ui.label('').props('role=status aria-live=polite').classes('cn-map-sr')
+
+        def show_map(force_full=False):
+            """Draw 'map_payload' at the tab's width: the whole map, or only the rows that differ from what it shows."""
+            payload = latest['map_payload']
+            if payload is None or not latest['map_cols']:
+                return
+            try:
+                drawn = monitor_map.render(payload, latest['map_cols'])
+            except ValueError:  # an answer the layout cannot draw: say so, and leave the rest of the page working
+                clear_map('The map of the latest round is unavailable.')
+                return
+            changes = None if force_full else monitor_map.diff(latest['map_drawn'], drawn)
+            latest['map_drawn'] = drawn
+            message = dict(rev=latest['map_revision'],
+                           label=f"Host map, {payload['hosts']:,} hosts; arrow keys move, Enter for details")
+            if changes is None:
+                message['full'] = monitor_map.full_html(drawn)
+            else:
+                message['rows'] = changes
+            set_changed(map_summary, payload['summary'])
+            set_changed(map_status, f"Showing complete round revision {latest['map_revision']}.")
+            client.run_javascript(f'window.cnMonitorMap && window.cnMonitorMap.draw({json.dumps(message)})')
+
+        def clear_map(message):
+            if latest['map_payload'] is not None or latest['map_drawn'] is not None:
+                client.run_javascript('window.cnMonitorMap && window.cnMonitorMap.draw({rev: null, full: ""})')
+            latest.update(map_payload=None, map_drawn=None, map_revision=None)
+            set_changed(map_summary, '')
+            set_changed(map_status, message)
+
+        def release_map_queries():
+            for name, release in (('map_query', 'release_monitor_live_map'), ('map_host_query', 'release_monitor_live_host')):
+                if latest[name]:
+                    getattr(controller, release, lambda query: None)(latest[name])
+                    latest[name] = None
+
+        def whole(value, low, high):
+            return value if type(value) is int and low <= value <= high else None
+
+        async def map_view_reported(event):
+            args = event.args if isinstance(event.args, dict) else {}
+            latest['live_view'] = 'table' if args.get('view') == 'table' else 'map'
+            set_view_buttons()
+            cols = whole(args.get('cols'), 1, 100000)
+            if latest['live_view'] == 'map' and cols:
+                resized, latest['map_cols'] = cols != latest['map_cols'], min(cols, monitor_map.MAX_COLS)
+                if args.get('fresh'):
+                    latest['map_drawn'] = None
+                if resized or args.get('fresh'):
+                    show_map()
+            await poll()
+
+        async def map_show_block(event):
+            args = event.args if isinstance(event.args, dict) else {}
+            block = whole(args.get('b'), 0, monitor_map.CAP_CELLS - 1)
+            if block is not None:
+                latest['map_show'] = block
+                await poll()
+
+        async def map_show_in_table(event):
+            args = event.args if isinstance(event.args, dict) else {}
+            target = args.get('target')
+            if not isinstance(target, str) or not target or walking('live'):
+                return
+            latest['live_filter_field'], latest['live_filter_text'] = 'host', target[:256]
+            latest['live_offset'], latest['live_offsets'] = 0, [0]
+            latest['live_user_request'] = 'filter'
+            latest['live_key'] = None
+            choose_view('table')
+            await poll()
+
+        async def map_host_details(event):
+            """The popup's second half: what the worker's copy of the round knows of one cell."""
+            args = event.args if isinstance(event.args, dict) else {}
+            block, cell = (whole(args.get(name), 0, monitor_map.CAP_CELLS - 1) for name in ('b', 'c'))
+            key, revision = latest['map_key'], latest['map_revision']
+            if block is None or cell is None or not key or revision is None or args.get('rev') != revision:
+                return
+            if latest['map_host_query']:
+                controller.release_monitor_live_host(latest['map_host_query'])
+                latest['map_host_query'] = None
+            try:
+                query = controller.request_monitor_live_host(key[0], key[1], revision, block, cell)
+            except (AttributeError, RuntimeError, ValueError):
+                return
+            latest['map_host_query'] = query
+            answer = None
+            for _ in range(200):  # the worker answers from memory: a few milliseconds
+                answer = controller.monitor_live_host(query)
+                if answer is not None or latest['map_host_query'] != query or client.is_deleted:
+                    break
+                await asyncio.sleep(.02)
+            if latest['map_host_query'] == query:
+                latest['map_host_query'] = None
+                controller.release_monitor_live_host(query)
+            if answer and answer.get('status') == 'ready' and answer.get('host') and not client.is_deleted:
+                message = dict(b=block, c=cell, rev=revision, lines=monitor_map.host_lines(answer['host']))
+                client.run_javascript(f'window.cnMonitorMap && window.cnMonitorMap.details({json.dumps(message)})')
+
+        ui.on('cn_monitor_map_view', map_view_reported)
+        ui.on('cn_monitor_map_show', map_show_block)
+        ui.on('cn_monitor_map_table', map_show_in_table)
+        ui.on('cn_monitor_map_host', map_host_details)
+
+        def start_map():
+            options = dict(box=map_box.html_id, wrap=live_view.html_id, live=map_live.html_id,
+                           words=monitor_map.STATE_WORDS, group=monitor_map.ping_grid.GROUP)
+            client.run_javascript(f'window.cnMonitorMap && window.cnMonitorMap.init({json.dumps(options)})')
+        client.on_connect(start_map)
+
+        with live_view, ui.column().classes('w-full cn-live-table-area'):
+            pending_live = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
+            live_area = ui.column().classes('w-full')
         @ui.refreshable
         def draw_live():
             latest['live_buttons'] = []
@@ -1506,6 +1655,10 @@ return area?.contains(document.activeElement) ||
                     if previous_identity:
                         latest['live_page'] = None
                         await draw_live.refresh()
+                    latest['map_show'] = -1
+                    release_map_queries()
+                    latest['map_key'] = None
+                    clear_map('Waiting for the first complete round.')
                 latest['live_identity'] = identity
             key = (job, run_id, revision, latest['live_offset'], table_export.page_limit(latest['live_size']), latest['live_sort'], latest['live_descending'], latest['live_group'], latest['live_filter_field'], latest['live_filter_text']) if job and run_id is not None and revision is not None else None
             if key != latest['live_key']:
@@ -1545,6 +1698,35 @@ return area?.contains(document.activeElement) ||
                         latest['live_key'] = None
                     else:
                         latest['pending_live'] = result
+            # The Map view asks only while the tab shows it and has said how wide its box is. A new round replaces the
+            # rows that changed: nothing of the page is rebuilt, so focus, scroll and an open popup stay.
+            map_key = ((job, run_id, revision, latest['map_show'])
+                       if latest['live_view'] == 'map' and latest['map_cols'] and job and run_id is not None and revision is not None
+                       else None)
+            if map_key != latest['map_key']:
+                if latest['map_query']:
+                    controller.release_monitor_live_map(latest['map_query'])
+                    latest['map_query'] = None
+                latest['map_key'] = map_key
+                if map_key:
+                    try:
+                        latest['map_query'] = controller.request_monitor_live_map(*map_key)
+                    except (AttributeError, RuntimeError, ValueError):
+                        clear_map('The map of the latest round is unavailable.')
+            if latest['map_query']:
+                drawn_map = controller.monitor_live_map(latest['map_query'])
+                if drawn_map is not None:
+                    controller.release_monitor_live_map(latest['map_query'])
+                    latest['map_query'] = None
+                    if drawn_map.get('status') == 'expired':
+                        latest['map_key'] = None
+                    elif drawn_map.get('status') == 'ready' and drawn_map.get('map'):
+                        latest['map_payload'], latest['map_revision'] = drawn_map['map'], drawn_map['revision']
+                        show_map()
+                    elif drawn_map.get('status') == 'not_ready':
+                        clear_map('Waiting for the first complete round. No result is inferred for an unfinished round.')
+                    else:
+                        clear_map('The map of the latest round is unavailable.')
             if latest.get('pending_live') is not None:
                 pending_result = latest['pending_live']
                 pending_key = latest['live_key']
@@ -1754,6 +1936,7 @@ return true;
         if latest['live_query']:
             controller.release_monitor_live_page(latest['live_query'])
             latest['live_query'] = None
+        release_map_queries()
         if latest['history_query']:
             controller.release_monitor_history_page(latest['history_query'])
             latest['history_query'] = None

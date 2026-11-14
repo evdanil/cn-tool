@@ -12,6 +12,7 @@ independent reader (Windows Script Host's shortcut object, from PowerShell).
 from __future__ import annotations
 
 import uuid
+from typing import Optional
 
 CLSID_SHELL_LINK = "{00021401-0000-0000-C000-000000000046}"
 IID_ISHELLLINKW = "{000214F9-0000-0000-C000-000000000046}"
@@ -33,6 +34,7 @@ _RELEASE = 2
 _SET_DESCRIPTION = 7
 _SET_WORKING_DIRECTORY = 9
 _SET_ARGUMENTS = 11
+_SET_ICON_LOCATION = 17
 _SET_PATH = 20
 # IPersistFile: IPersist::GetClassID 3, IsDirty 4, Load 5, Save 6, SaveCompleted 7, GetCurFile 8.
 _SAVE = 6
@@ -57,10 +59,13 @@ def known_folder(folder_id: str) -> str:
             _ole32().CoTaskMemFree(buffer.value)
 
 
-def write_link(path: str, target: str, arguments: str, workdir: str, description: str) -> None:
+def write_link(path: str, target: str, arguments: str, workdir: str, description: str,
+               icon: Optional[str] = None) -> None:
     """Write the shortcut ``path`` (a ``.lnk``) that starts ``target`` with ``arguments`` in ``workdir``.
 
-    No icon is set: Explorer shows the target's own. Every interface obtained is released and COM is
+    ``icon`` is the path of a ``.ico`` the shortcut shows (its first image); without one no icon is set and
+    Explorer shows the target's own. An icon is decoration: a failing ``SetIconLocation`` is ignored and the
+    shortcut is still written. Every interface obtained is released and COM is
     uninitialised again when this call initialised it (``S_OK`` or ``S_FALSE``; not ``RPC_E_CHANGED_MODE``), also
     after a failure. A failing HRESULT raises ``OSError`` naming the call and the HRESULT in hex.
     """
@@ -83,6 +88,8 @@ def write_link(path: str, target: str, arguments: str, workdir: str, description
                 (_SET_DESCRIPTION, "SetDescription", description),
             ):
                 _check(_method(link, index, ctypes.c_wchar_p)(link, value), "IShellLinkW::" + name)
+            if icon:
+                _method(link, _SET_ICON_LOCATION, ctypes.c_wchar_p, ctypes.c_int)(link, icon, 0)
             persist = ctypes.c_void_p()
             query = _method(link, _QUERY_INTERFACE, ctypes.c_void_p, ctypes.c_void_p)
             _check(query(link, _guid(IID_IPERSISTFILE), ctypes.pointer(persist)), "IShellLinkW::QueryInterface")

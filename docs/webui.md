@@ -24,9 +24,12 @@ and setup](infoblox.md#access-and-setup) requirements before using them.
 | 0.12.0 | Settings (edit the configuration and use it without a relaunch), and All rows, CSV download and copy for the Ping and Monitor tables |
 | 0.12.1 | The same tools; on Windows, a start through signed Python and a shortcut without a console window, and one session per user |
 | 0.12.2 | The same tools; **Ping these** and **Monitor these** on the IP and Subnets result tables |
+| 0.12.3 | The same tools; the Monitor **Map** view of the latest round, an icon for the Windows shortcut, and the version on every page |
 
 The browser tools beyond Subnets are available in 0.9.0 and are not part of 0.8.4.
 The menu and CLI have their own established workflows.
+
+From 0.12.3, every page ends with one small line: the cn-tool version in use and the copyright holder.
 
 ## Sorting and filtering results in 0.9.3
 
@@ -57,7 +60,8 @@ environment where cn-tool is installed. A system Python does not automatically s
 a pipx environment's packages.
 
 From 0.12.1, on Windows, `py -m cn_tool.webui --create-shortcut` writes a **cn-tool Web** shortcut to
-the Start menu and the Desktop; `-c FILE` makes it open that configuration. The shortcut
+the Start menu and the Desktop; `-c FILE` makes it open that configuration. From 0.12.3 the shortcut has
+the cn-tool icon (run the command again for a shortcut written by an earlier version). It
 starts the interface through the signed Python interpreter (`pythonw.exe`) without a
 console window, so stop it with **Quit application**; `--console` writes one that keeps a
 console window, where Ctrl+C also stops it. Run the command again after upgrading or moving
@@ -185,6 +189,56 @@ leave duration blank to continue until stopped. Both supplied values must be at 
 The latest complete round uses bounded pages. This run's and earlier round counts are
 shown separately; an incomplete first round is not an outage. History is a changing view
 of recorded requests, runs, rounds and hosts, and refreshing it starts at page one.
+
+#### Map and Table
+
+From 0.12.3, the latest complete round has two views, chosen with **Map** and **Table** above it. The page
+opens on the **Map**; a tab remembers the view it was given, across a refresh, and a new tab
+starts on the Map again.
+
+The Map is the live view of [`cn monitor`](ping-monitor.md#ping-monitor-cn-monitor) in the
+page: one character for each address, in address order, one block for each subnet line (rows
+of 64, 32 or 16 addresses, in groups of 8, each row labelled with its first address) and a
+`Hosts` block for single addresses and names. It shows every host of the round. Filters, sorting
+and paging belong to the Table, and what is chosen there does not hide anything on the Map.
+
+| Character | Meaning |
+| --------- | ------- |
+| `!` | replied; underlined, in the warning colour, when only some echo requests were answered |
+| `R` | rejected: the host itself sent an ICMP error, so it is up, behind its own firewall |
+| `T` | silent to ping, but a TCP port answered |
+| `x` | gone: not seen in this round, but seen earlier |
+| `U` | unreachable: never seen, and an ICMP error came from another address; it stays until the host is seen |
+| `E` | the probe failed |
+| `?` | the name did not resolve |
+| `.` | silent: no answer |
+| blank | not probed yet, or not a host of the run (a network or broadcast address) |
+
+A character in reverse video changed in the last round (the host came or went). The characters
+carry the meaning and the colours only add to it; the legend under the Map lists all of them.
+The counters line above it reads as on the command line, for example
+`12 replying · 1 unreachable · 2 gone · 15 seen of 254`.
+
+- **Details.** Point at a character for its address and state at once, then its latest result,
+  TCP ports, **Last seen**, **First seen**, the rounds it answered and since when it has been
+  seen or gone. Click or tap the character to keep the details open: they then have **Copy IP**,
+  **Show in table** (opens the Table filtered to that host) and **Close**. Escape, or a click or
+  tap elsewhere, closes them. The times in the details are in UTC.
+- **Keyboard.** The Map is one stop in the tab order. The arrow keys move a cursor from
+  character to character and show its details, Home and End go to the ends of a row, Page Up
+  and Page Down to the neighbouring block, Enter or Space keeps the details open and Escape
+  closes them. The details are announced to a screen reader as they are shown, and again after
+  a round only when something other than **Last seen** and **Answered** has changed; the Table
+  holds the same round as rows and columns.
+- **Rounds.** The Map shows complete rounds only, like the Table, so it changes once per
+  interval and never shows a round in progress. A new round redraws only the rows that changed:
+  the scroll position, the cursor and open details stay.
+- **Large runs.** Up to 65,536 addresses are drawn (one /16). Beyond that, each subnet line is
+  one counter line, as on the command line when the grid does not fit the terminal
+  (`10.0.0.0/16: 3 ! · 61,102 .`), with **Show this block** to draw that subnet alone. The `Hosts`
+  block is drawn up to 2,048 names, and a long name makes the Map wider.
+- The Map is text: it can be selected, copied, searched with the browser's find, and printed.
+  Round-trip times are not measured, so none is shown.
 
 From 0.10.0, latest-round and saved-round host tables have a bottom
 pagination bar. Choose **Rows per page** and use the arrows to browse the matching

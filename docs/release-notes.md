@@ -16,6 +16,31 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
+## 0.12.3
+
+In the web interface, Monitor's latest complete round opens as a **Map**: the grid of `cn monitor`,
+one character for each address (`!` replied, `R` rejected, `T` TCP only, `x` gone, `U` unreachable,
+`E` error, `?` unresolved name, `.` silent; reverse video for a change in the last round). Point at
+a character, tap it, or move to it with the arrow keys for the host's details; the times in them
+are in UTC. **Table** above the Map switches to the paged table, and the tab remembers the choice.
+The Map always shows the whole round: filters and sorting apply to the Table only. Up to 65,536
+addresses are drawn; a larger run shows one counter line for each subnet, with **Show this block**.
+See [Map and Table](webui.md#map-and-table).
+
+- On Windows, the **cn-tool Web** shortcut has an icon. Run
+  `py -m cn_tool.webui --create-shortcut` again to give it to a shortcut you already have.
+- Every page of the web interface ends with the cn-tool version in use and the copyright holder,
+  and `cn --version` prints the copyright holder on a second line. A script that reads the version
+  should read the first line.
+- pandas is pinned to 3.1.0 on Python 3.11 and later. On Python 3.10, which pandas 3 does not
+  support, cn-tool keeps the pandas 2.x line (2.2.2 or later).
+- **Download accumulated report** on the Subnets, IP, Ping and Monitor pages is off until the page
+  has its first status, so a click made while the page is still settling is no longer lost.
+  **New lookup** puts the cursor in **Targets** at once, and Settings puts it at once in the first
+  setting to correct after a save that was refused.
+
+No configuration change or migration is needed.
+
 ## 0.12.2
 
 In the web interface, the IP results table, the Subnets summary and the Subnets detail tables that

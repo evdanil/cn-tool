@@ -89,6 +89,25 @@ def package_version_string() -> str:
     return stamp.package_version
 
 
+COPYRIGHT_HOLDER = "Evgeny Danilchenko"  # as in LICENSE and the package metadata; the one place the name is kept
+
+
+def copyright_line(stream=None) -> str:
+    """``© Evgeny Danilchenko``, the line under ``cn --version`` and the end of the web UI footer.
+
+    With a ``stream`` whose encoding has no copyright sign the line starts with ``(c)``, so that printing it
+    cannot fail.
+    """
+    sign = "\u00a9"
+    encoding = getattr(stream, "encoding", None) if stream is not None else None
+    if encoding:
+        try:
+            sign.encode(encoding)
+        except (UnicodeError, LookupError):
+            sign = "(c)"
+    return f"{sign} {COPYRIGHT_HOLDER}"
+
+
 def version_line(tool_name: str, component_version: str) -> str:
     """Render a bundled tool's ``--version`` line in the hybrid format.
 

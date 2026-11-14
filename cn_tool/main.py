@@ -623,6 +623,8 @@ def _add_options(target: Any, specs: Any, **overrides: Any) -> None:
     """Add the options of ``specs`` to a parser or group; ``overrides`` replace spec keys such as ``default``."""
     for spec in specs:
         kwargs = {key: value for key, value in spec.items() if key not in ("flags", "root_only", "needs")}
+        if kwargs.get("action") == "version":  # the first line is what scripts read; the holder follows on its own
+            kwargs["version"] = f"{kwargs['version']}\n{cn_buildstamp.copyright_line(sys.stdout)}"
         target.add_argument(*spec["flags"], **{**kwargs, **overrides})
 
 

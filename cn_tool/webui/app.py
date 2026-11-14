@@ -24,6 +24,7 @@ def create_app(controller, access):
     from .config_page import render_config_search
     from .demob_page import render_demob
     from .settings_page import render_settings
+    from .footer import render_footer
 
     parent = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     parent.add_middleware(AccessMiddleware, access=access)
@@ -68,29 +69,39 @@ def create_app(controller, access):
     @ui.page('/config-search')
     def config_search_page():
         render_config_search(controller)
+        render_footer()
 
     @ui.page('/demobilization')
     def demobilization_page():
         render_demob(controller)
+        render_footer()
 
     @ui.page('/ping')
     def ping_page():
         render_ping(controller)
+        render_footer()
 
     @ui.page('/monitor')
     def monitor_page():
         render_monitor(controller)
+        render_footer()
 
     @ui.page('/ip')
     def ip_page():
         render_ip(controller)
+        render_footer()
 
     @ui.page('/settings')
     def settings_page():
         render_settings(controller)
+        render_footer()
+
+    def subnets_page():
+        render_subnets(controller)
+        render_footer()
 
     # Gzip buffers headers until the first body chunk; a cancelled file
     # transfer can then look like a missing response to NiceGUI's middleware.
-    ui.run_with(parent, root=lambda: render_subnets(controller), title='CN Tool',
+    ui.run_with(parent, root=subnets_page, title='CN Tool',
                 show_welcome_message=False, reconnect_timeout=15, gzip_middleware_factory=None)
     return parent

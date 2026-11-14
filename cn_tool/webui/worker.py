@@ -808,6 +808,9 @@ class MonitorLiveCache:
         self.lock = Lock()
         self.run_id = None
         self.rows = ()
+        self.blocks = None  # the run's grid blocks, built at its first round
+        self.map_snapshot = None  # the Map view's copy of the tracker at the latest complete round
+        self.rows_by_host = {}
         self.update = dict(lookup_type='monitor', run_id='', revision=0, stage='starting', completed=0, total=0,
                            current_rounds=0, earlier_rounds=0, skipped_slots=0, history_error='')
 
@@ -833,14 +836,53 @@ class MonitorLiveCache:
         rows = tuple((str(row.get('Host', '')), str(row.get('Address', '')), str(row.get('Result') or 'unknown'),
                       tuple((port, str(row.get(f'TCP {port}') or 'unknown')) for port in ports))
                      for row in outcome.last_rows)
+        # The Map view reads the tracker only here, on the thread that feeds it: later answers come from the copy.
+        snapshot = None
+        tracker = getattr(outcome, 'tracker', None)
+        if tracker is not None:
+            from . import monitor_map
+            if self.blocks is None:
+                self.blocks = tuple(outcome.request.blocks())
+            snapshot = monitor_map.snapshot(self.blocks, tracker)
         with self.lock:
             if run_id != self.run_id or revision <= self.update['revision']:
                 return
             self.rows = rows
+            self.map_snapshot = snapshot
+            self.rows_by_host = {row[0]: row for row in rows} if snapshot is not None else {}
             self.update.update(revision=revision, current_rounds=outcome.rounds, earlier_rounds=outcome.earlier,
                                skipped_slots=outcome.late, history_error=monitor_history_error(outcome.store_error))
             update = dict(self.update)
         self.emit(update)
+
+    def _map_answer(self, query, name, answer):
+        """A Map view answer under the live page's contract: ``answer(snapshot, rows by host)`` for the round asked
+        for, ``expired`` for an older one, ``unavailable`` for another job or run (or a cell that does not exist)."""
+        with self.lock:
+            revision = self.update['revision']
+            snapshot, rows = self.map_snapshot, self.rows_by_host
+            run_id = self.run_id
+        result = dict(query, current_revision=revision)
+        result[name] = None
+        if query['job_id'] != self.job_id or query['run_id'] != run_id:
+            result['status'] = 'unavailable'
+        elif query['revision'] != revision:
+            result['status'] = 'expired'
+        elif revision == 0:
+            result['status'] = 'not_ready'
+        else:
+            result[name] = answer(snapshot, rows) if snapshot is not None else None
+            result['status'] = 'ready' if result[name] is not None else 'unavailable'
+        return result
+
+    def map(self, query):
+        from . import monitor_map
+        return self._map_answer(query, 'map', lambda snapshot, _: monitor_map.map_payload(snapshot, query['show']))
+
+    def host(self, query):
+        from . import monitor_map
+        return self._map_answer(query, 'host', lambda snapshot, rows: monitor_map.host_payload(
+            snapshot, rows, query['block'], query['cell']))
 
     def page(self, query):
         with self.lock:
@@ -1753,6 +1795,15 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 else:
                     page = cache.page(payload)
                 emit('monitor_live_page_result', page)
+            elif kind in ('monitor_live_map', 'monitor_live_host'):
+                cache = state['monitor_cache']
+                name = kind.rsplit('_', 1)[1]
+                if cache is None:
+                    answer = dict(payload, status='unavailable', current_revision=0)
+                    answer[name] = None
+                else:
+                    answer = getattr(cache, name)(payload)
+                emit(kind + '_result', answer)
             elif kind == 'forget_credentials':
                 interaction.forget()
             elif kind == 'credentials_reply' and job is not None and job == state['job']:

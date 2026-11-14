@@ -25,6 +25,10 @@ FIELDS = {
     'monitor_coverage_export': {'request_id', 'parent'},
     'monitor_live_page': {'job_id', 'run_id', 'revision', 'offset', 'limit', 'query_id', 'sort', 'descending', 'group', 'filter_field', 'filter_text'},
     'monitor_live_page_result': {'job_id', 'run_id', 'revision', 'offset', 'rows', 'next_offset', 'status', 'current_revision', 'query_id', 'total', 'counts'},
+    'monitor_live_map': {'job_id', 'run_id', 'revision', 'show', 'query_id'},
+    'monitor_live_map_result': {'job_id', 'run_id', 'revision', 'show', 'query_id', 'status', 'current_revision', 'map'},
+    'monitor_live_host': {'job_id', 'run_id', 'revision', 'block', 'cell', 'query_id'},
+    'monitor_live_host_result': {'job_id', 'run_id', 'revision', 'block', 'cell', 'query_id', 'status', 'current_revision', 'host'},
     'monitor_update': {'lookup_type', 'run_id', 'revision', 'stage', 'completed', 'total', 'current_rounds', 'earlier_rounds', 'skipped_slots', 'history_error'},
     'progress': {'stage', 'lookup_type', 'completed', 'total'}, 'result': {'result', 'outcome', 'lookup_type'}, 'report_state': {'state', 'lookup_type'},
     'lookup_context': {'lookup_type', 'username', 'scope'},
@@ -33,11 +37,76 @@ FIELDS = {
 _PAGE_OPTIONS = {'sort_by', 'descending', 'filter_by', 'filter_text'}
 # The rows of one live Monitor page: the web "All" page size (table_export.MAX_PAGE_ROWS).
 LIVE_PAGE_MAX = 1024
+# The Map view (monitor_map.CAP_CELLS and CAP_NAMES): the cells one answer may draw, and the grid's characters.
+MAP_CELLS_MAX = 65536
+MAP_NAMES_MAX = 2048
+MAP_CHARS = frozenset('!RTxUE?. ')
 for _kind in ('demob_page', 'demob_page_result', 'config_search_page', 'config_search_page_result'):
     FIELDS[_kind] |= _PAGE_OPTIONS
 FIELDS['demob_page_result'] |= {'columns', 'overall_total'}
 FIELDS['config_search_page_result'] |= {'overall_total'}
-COMMANDS = frozenset(('delete_report', 'initialize', 'reload_config', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_history', 'monitor_coverage_export', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
+COMMANDS = frozenset(('delete_report', 'initialize', 'reload_config', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_live_map', 'monitor_live_host', 'monitor_history', 'monitor_coverage_export', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
+
+
+def _short_text(value, limit):
+    return isinstance(value, str) and len(value) <= limit
+
+
+def _valid_marks(block, count):
+    return (_short_text(block['chars'], count) and len(block['chars']) == count and set(block['chars']) <= MAP_CHARS and
+            all(isinstance(block[key], list) and len(block[key]) <= count and
+                all(type(at) is int and 0 <= at < count for at in block[key]) for key in ('changed', 'partial')))
+
+
+def _valid_live_map(answer):
+    """The Map view's answer: per block its characters and marks, or its counter line."""
+    if (not isinstance(answer, dict) or set(answer) != {'summary', 'hosts', 'blocks'} or
+            not _short_text(answer['summary'], 512) or type(answer['hosts']) is not int or answer['hosts'] < 0 or
+            not isinstance(answer['blocks'], list) or len(answer['blocks']) > MAP_CELLS_MAX):
+        return False
+    cells = 0
+    for block in answer['blocks']:
+        if not isinstance(block, dict) or not _short_text(block.get('title'), 128):
+            return False
+        kind = block.get('kind')
+        if kind == 'compact':
+            if (set(block) != {'kind', 'title', 'text', 'can_show'} or not _short_text(block['text'], 512) or
+                    type(block['can_show']) is not bool):
+                return False
+        elif kind == 'subnet':
+            if (set(block) != {'kind', 'title', 'network', 'chars', 'changed', 'partial'} or
+                    not _short_text(block['network'], 64) or not isinstance(block['chars'], str) or
+                    not _valid_marks(block, len(block['chars']))):
+                return False
+            cells += len(block['chars'])
+        elif kind == 'hosts':
+            if (set(block) != {'kind', 'title', 'names', 'chars', 'changed', 'partial'} or
+                    not isinstance(block['names'], list) or len(block['names']) > MAP_NAMES_MAX or
+                    not all(_short_text(name, 255) for name in block['names']) or
+                    not _valid_marks(block, len(block['names']))):
+                return False
+        else:
+            return False
+        if cells > MAP_CELLS_MAX:
+            return False
+    return True
+
+
+def _valid_live_host(answer):
+    """The Map view's answer for one cell."""
+    def moment(value):
+        return value is None or (type(value) in (int, float) and value == value and abs(value) != float('inf'))
+    return (isinstance(answer, dict) and
+            set(answer) == {'host', 'target', 'address', 'char', 'result', 'tcp', 'first_seen', 'last_seen', 'since',
+                            'seen_rounds', 'rounds', 'changed', 'partial'} and
+            all(type(answer[key]) is bool for key in ('host', 'changed', 'partial')) and
+            all(_short_text(answer[key], 255) for key in ('target', 'address', 'result')) and
+            isinstance(answer['char'], str) and len(answer['char']) == 1 and answer['char'] in MAP_CHARS and
+            all(moment(answer[key]) for key in ('first_seen', 'last_seen', 'since')) and
+            all(type(answer[key]) is int and answer[key] >= 0 for key in ('seen_rounds', 'rounds')) and
+            isinstance(answer['tcp'], list) and len(answer['tcp']) <= 5 and
+            all(isinstance(item, dict) and set(item) == {'port', 'result'} and type(item['port']) is int and
+                1 <= item['port'] <= 65535 and _short_text(item['result'], 64) for item in answer['tcp']))
 
 
 def envelope(session_id, job_id, kind, payload):
@@ -378,6 +447,30 @@ def validate(message):
                 if not any(valid_monitor_history_item(item_kind, item)
                            for item_kind in (('coverage',) if coverage else ('requests', 'runs', 'rounds', 'hosts', 'template'))):
                     raise ValueError('Invalid history item')
+        return message
+    if kind in {'monitor_live_map', 'monitor_live_map_result', 'monitor_live_host', 'monitor_live_host_result'}:
+        if message['job_id'] is not None or set(payload) != FIELDS[kind]:
+            raise ValueError('Invalid live map envelope')
+        if any(not isinstance(payload[k], str) or not payload[k] or len(payload[k]) > 128 or
+                   not payload[k].isascii() or not payload[k].isprintable()
+               for k in ('job_id', 'run_id', 'query_id')):
+            raise ValueError('Invalid live map identifier')
+        if type(payload['revision']) is not int or payload['revision'] < 0:
+            raise ValueError('Invalid live map revision')
+        if 'show' in payload and (type(payload['show']) is not int or not -1 <= payload['show'] < MAP_CELLS_MAX):
+            raise ValueError('Invalid live map block')
+        if 'block' in payload and any(type(payload[k]) is not int or not 0 <= payload[k] < MAP_CELLS_MAX
+                                      for k in ('block', 'cell')):
+            raise ValueError('Invalid live map cell')
+        if kind.endswith('_result'):
+            answer = payload['map' if kind == 'monitor_live_map_result' else 'host']
+            if (payload['status'] not in ('ready', 'not_ready', 'expired', 'unavailable') or
+                    type(payload['current_revision']) is not int or payload['current_revision'] < 0 or
+                    (answer is None) != (payload['status'] != 'ready')):
+                raise ValueError('Invalid live map result')
+            if answer is not None and not (_valid_live_map(answer) if kind == 'monitor_live_map_result'
+                                           else _valid_live_host(answer)):
+                raise ValueError('Invalid live map answer')
         return message
     if kind in {'monitor_live_page', 'monitor_live_page_result'}:
         optional = {'sort', 'descending', 'group', 'filter_field', 'filter_text'} if kind == 'monitor_live_page' else {'total', 'counts'}

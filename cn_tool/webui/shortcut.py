@@ -9,6 +9,9 @@ in a venv that is the venv's own redirector, so the shortcut stays in the venv (
 real Windows paths. ``create_shortcuts`` is what the launcher calls once its own checks (the options, the
 ``import nicegui``) have passed. It reaches the shell through ``winshell``'s module attributes and the disk
 through ``_exists``.
+
+Both shortcuts show the package's own icon, ``assets/cn-tool.ico`` beside this module (built by
+``scripts/build_webui_icon.py``). An installation without that file gets shortcuts with the interpreter's icon.
 """
 from __future__ import annotations
 
@@ -46,6 +49,7 @@ class Plan:
     workdir: str
     description: str
     link_name: str
+    icon: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -63,12 +67,14 @@ def plan_shortcut(
     home: str,
     cwd: str,
     exists: Callable[[str], bool],
+    icon_file: Optional[str] = None,
 ) -> Union[Plan, Refusal]:
     """The shortcut for the interpreter ``executable`` (``sys.executable``), or why there can be none.
 
     A relative ``config_file`` is resolved against ``cwd`` and a leading ``~`` against ``home``, as the start
     path reads ``-c``, so the shortcut opens the file the user just named. The configuration file is checked
-    first, then the interpreter (plan 1.1, refusals 4 and 5).
+    first, then the interpreter (plan 1.1, refusals 4 and 5). ``icon_file`` becomes the shortcut's icon when
+    it exists; a missing one is no refusal, the shortcut then shows the interpreter's icon.
     """
     arguments = ["-m", "cn_tool.webui"]
     if config_file:
@@ -87,6 +93,7 @@ def plan_shortcut(
     return Plan(
         target=target, arguments=subprocess.list2cmdline(arguments), workdir=str(PureWindowsPath(home)),
         description=DESCRIPTION, link_name=LINK_NAME,
+        icon=icon_file if icon_file and exists(icon_file) else None,
     )
 
 
@@ -103,7 +110,7 @@ def create_shortcuts(*, console: bool, config_file: Optional[str], out: TextIO, 
         return 2
     plan = plan_shortcut(
         sys.executable, console=console, config_file=config_file, home=str(Path.home()), cwd=os.getcwd(),
-        exists=_exists,
+        exists=_exists, icon_file=_icon_file(),
     )
     if isinstance(plan, Refusal):
         print(_PREFIX + plan.message, file=err)
@@ -112,7 +119,8 @@ def create_shortcuts(*, console: bool, config_file: Optional[str], out: TextIO, 
         try:
             path = str(PureWindowsPath(winshell.known_folder(folder_id)) / plan.link_name)
             existed = _exists(path)
-            winshell.write_link(path, plan.target, plan.arguments, plan.workdir, plan.description)
+            winshell.write_link(path, plan.target, plan.arguments, plan.workdir, plan.description,
+                                icon=plan.icon)
         except OSError as exc:
             print(f"{_PREFIX}The {label} shortcut could not be written: {exc}", file=err)
             return 3
@@ -126,6 +134,11 @@ def _absolute(config_file: str, *, home: str, cwd: str) -> str:
     if not path.drive and not path.root and path.parts[:1] == ("~",):
         path = PureWindowsPath(home, *path.parts[1:])
     return ntpath.normpath(str(PureWindowsPath(cwd) / path))
+
+
+def _icon_file() -> str:
+    """Where the installed package keeps the shortcut's icon. Tests replace this."""
+    return str(Path(__file__).resolve().parent / "assets" / "cn-tool.ico")
 
 
 def _exists(path: str) -> bool:

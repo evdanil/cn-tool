@@ -102,6 +102,8 @@ class SessionController:
         self._history_pages = {}
         self._monitor_requests = {}
         self._monitor_pages = {}
+        self._map_requests = {}  # the Map view's questions (the map and one cell), by query id
+        self._map_answers = {}
         self._config_requests = {}
         self._config_pages = {}
         self._demob_requests = {}
@@ -251,6 +253,8 @@ class SessionController:
                 self._state.monitor_update = None
                 self._monitor_requests.clear()
                 self._monitor_pages.clear()
+                self._map_requests.clear()
+                self._map_answers.clear()
             self._state.active_job_id = job
             self._state.active_lookup_type = lookup_type
             self._state.attempts_by_type[lookup_type] = dict(job_id=job, outcome=None, report_state=None)
@@ -529,6 +533,41 @@ class SessionController:
     def monitor_live_page(self, query_id):
         with self._lock:
             return deepcopy(self._monitor_pages.get(query_id))
+
+    def _request_map(self, kind, job_id, run_id, revision, **position):
+        with self._lock:
+            update = self._state.monitor_update
+            selected = self._state.attempts_by_type['monitor'] or {}
+            if (self._state.phase in {'closing', 'closed', 'failed'} or not update or
+                    selected.get('job_id') != job_id or update['run_id'] != run_id or update['revision'] != revision):
+                raise RuntimeError('Monitor snapshot is unavailable or expired')
+            if len(self._map_requests) + len(self._map_answers) >= 16:
+                raise RuntimeError('Too many outstanding map queries')
+            query_id = uuid4().hex
+            payload = dict(job_id=job_id, run_id=run_id, revision=revision, query_id=query_id, **position)
+            self._send(kind, None, payload)
+            self._map_requests[query_id] = (kind, payload)
+            return query_id
+
+    def _map_answer(self, query_id):
+        with self._lock:
+            return deepcopy(self._map_answers.get(query_id))
+
+    def _release_map(self, query_id):
+        with self._lock:
+            self._map_requests.pop(query_id, None)
+            self._map_answers.pop(query_id, None)
+
+    def request_monitor_live_map(self, job_id, run_id, revision, show=-1):
+        """Ask for the Map view of the current round; ``show`` is the one block drawn when the map is over its cap."""
+        return self._request_map('monitor_live_map', job_id, run_id, revision, show=show)
+
+    def request_monitor_live_host(self, job_id, run_id, revision, block, cell):
+        """Ask what the current round knows of the host at ``cell`` of ``block`` of the Map view."""
+        return self._request_map('monitor_live_host', job_id, run_id, revision, block=block, cell=cell)
+
+    monitor_live_map = monitor_live_host = _map_answer
+    release_monitor_live_map = release_monitor_live_host = _release_map
 
     def request_config_search_page(self, job_id, offset, limit=50, *, sort_by=None, descending=False, filter_by=None, filter_text=''):
         with self._lock:
@@ -817,6 +856,15 @@ class SessionController:
                     return
                 self._monitor_requests.pop(payload['query_id'], None)
                 self._monitor_pages[payload['query_id']] = deepcopy(payload)
+            elif kind in ('monitor_live_map_result', 'monitor_live_host_result'):
+                expected = self._map_requests.get(payload['query_id'])
+                current = self._state.monitor_update
+                if (not expected or expected[0] + '_result' != kind or
+                        any(payload[key] != value for key, value in expected[1].items()) or
+                        not current or current['run_id'] != payload['run_id'] or current['revision'] != payload['revision']):
+                    return
+                self._map_requests.pop(payload['query_id'], None)
+                self._map_answers[payload['query_id']] = deepcopy(payload)
             elif kind == 'demob_preview':
                 if self._state.active_lookup_type != 'demob' or self._state.phase == 'closing':
                     return
@@ -961,6 +1009,8 @@ class SessionController:
                 self._clear_report_availability()
                 self._monitor_requests.clear()
                 self._monitor_pages.clear()
+                self._map_requests.clear()
+                self._map_answers.clear()
                 self._config_requests.clear()
                 self._config_pages.clear()
                 self._state.results_by_type['config_search'] = None

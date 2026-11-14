@@ -8,6 +8,9 @@ cn-tool needs Python 3.10 or newer, on Linux, macOS or Windows 10 and 11 (x64). 
 3.12 to 3.14 is recommended (see [Windows](windows.md#windows)). The macOS `ping` and `ping6` were run on a real Apple-silicon Mac runner (macOS
 26); a silent IPv6 host, Intel Macs and older macOS versions have not been run.
 
+From 0.12.3 cn-tool installs pandas 3.1.0 on Python 3.11 and newer, and the pandas 2.x line on Python 3.10,
+which pandas 3 does not support.
+
 ## From PyPI
 
 [pipx](https://pipx.pypa.io/) gives cn-tool a virtual environment of its own and puts its commands
@@ -18,6 +21,9 @@ terminal install pipx itself.
 pipx install cn-tool
 cn --version
 ```
+
+`cn --version` prints the version on its first line (`cn-tool v0.12.3 hash ...`); from 0.12.3 a second line
+names the copyright holder.
 
 Or install it into a virtual environment you manage:
 

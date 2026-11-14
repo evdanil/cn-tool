@@ -27,6 +27,8 @@ STYLES: Dict[str, str] = {"!": "ok", "R": "info", "T": "info", "x": "warning", "
 LEGEND: Dict[str, str] = {"!": "replied", "R": "rejected (up, firewalled)", "T": "TCP only",
                           "U": "unreachable (reported since first probed)", "x": "gone", ".": "silent",
                           "E": "error", "?": "name did not resolve"}
+# The counters line's words, in its order (the CLI frame and the web map).
+COUNT_WORDS = (("!", "replying"), ("R", "rejecting"), ("T", "TCP only"), ("U", "unreachable"), ("x", "gone"))
 GROUP = 8
 ROW_SIZES = (64, 32, 16)
 
@@ -83,17 +85,10 @@ def grid_lines(
     host *i*'s character. A host in ``changed`` is drawn in reverse video, and one in ``partial``
     that replied in the warning colour.
     """
-    for size in ROW_SIZES:
-        if _fewest_lines(blocks, size) > height:  # a smaller row size only adds rows
-            return None
-        labels = [_row_labels(block, size) if block.network is not None else [] for block in blocks]
-        label_width = max((len(label) for rows in labels for label in rows), default=0)
-        if any(block.network is None for block in blocks):
-            label_width = max(label_width, len(_HOSTS))
-        if label_width + 1 + size + size // GROUP - 1 <= width:
-            break
-    else:
+    fitted = _fit(blocks, width, height)
+    if fitted is None:
         return None
+    size, labels, label_width = fitted
 
     look = _Look(chars, changed, partial)
     lines: List[Line] = []
@@ -110,6 +105,13 @@ def grid_lines(
         for row, label in enumerate(rows):
             lines.append(_row(label, block.cells[row * size:(row + 1) * size], look, label_width))
     return None if len(lines) > height else lines
+
+
+def row_layout(blocks: Sequence[Block], width: int) -> Optional[Tuple[int, int]]:
+    """``(cells in a row, the label column's width)`` as ``grid_lines`` draws ``blocks`` at ``width``, or ``None``
+    when not even the smallest row fits. A caller that maps a drawn position back to a host reads the two here."""
+    fitted = _fit(blocks, width, None)
+    return None if fitted is None else (fitted[0], fitted[2])
 
 
 def compact_lines(blocks: Sequence[Block], chars: Sequence[str]) -> List[Line]:
@@ -156,6 +158,22 @@ class _Look:
         if host in self.changed:
             style += " reverse"
         return (char, style)
+
+
+def _fit(blocks: Sequence[Block], width: int, height: Optional[int]
+         ) -> Optional[Tuple[int, List[List[str]], int]]:
+    """The row size, each block's row labels and the label column's width: the largest of ``ROW_SIZES`` that fits
+    ``width``; ``None`` when none does, or when the fewest lines a size needs outnumber ``height``."""
+    for size in ROW_SIZES:
+        if height is not None and _fewest_lines(blocks, size) > height:  # a smaller row size only adds rows
+            return None
+        labels = [_row_labels(block, size) if block.network is not None else [] for block in blocks]
+        label_width = max((len(label) for rows in labels for label in rows), default=0)
+        if any(block.network is None for block in blocks):
+            label_width = max(label_width, len(_HOSTS))
+        if label_width + 1 + size + size // GROUP - 1 <= width:
+            return size, labels, label_width
+    return None
 
 
 def _spellings(network: Union[IPv4Network, IPv6Network]) -> List[str]:

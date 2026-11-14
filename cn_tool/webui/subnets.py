@@ -490,6 +490,9 @@ def render_subnets(controller, lookup_type='subnet'):
             report_delete = render_report_delete(controller)
         download.tooltip(download_help)
         download._props['aria-description'] = download_help
+        # Off until the first poll reports. Nothing is known about a report before it, and that poll reshapes the
+        # page above this button: a click straddling the reshape lands elsewhere and is lost.
+        download.disable()
     pending_results = ui.label('').classes('cn-muted' + empty_class)
     results = ui.column().classes('w-full')
     results.props('tabindex=-1')
@@ -703,6 +706,18 @@ document.addEventListener('focusin', moved, true);
 restore();
 }})();''')
 
+    def focus_targets():
+        """Put focus in Targets when this message arrives, never later.
+
+        ``targets.run_method('focus')`` goes through Quasar's focus queue, which holds the request while a tooltip or
+        menu is opening (the tooltip's 300 ms transition) and runs it when that ends. By then the reader can have
+        gone back to the results, and the late focus takes it from the control the page restored.
+        """
+        ui.run_javascript(f'''(() => {{
+const root = document.getElementById({json.dumps(targets.html_id)});
+(root?.matches('textarea') ? root : root?.querySelector('textarea'))?.focus({{preventScroll:true}});
+}})()''')
+
     async def new_lookup():
         latest['lookup_scroll'] = await ui.context.client.run_javascript('window.scrollY')
         if view.selection is None and latest.get('summary_table'):
@@ -710,7 +725,7 @@ restore();
             view.summary_scroll = await ui.context.client.run_javascript(f'[window.scrollY, document.getElementById({table_id})?.scrollLeft || 0, document.getElementById({table_id})?.scrollTop || 0]')
         view.new_lookup()
         draw_results.refresh()
-        targets.run_method('focus')
+        focus_targets()
 
     async def return_results():
         view.return_to_results()
