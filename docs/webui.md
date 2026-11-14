@@ -23,6 +23,7 @@ and setup](infoblox.md#access-and-setup) requirements before using them.
 | 0.11.0 | Report deletion on every tool |
 | 0.12.0 | Settings (edit the configuration and use it without a relaunch), and All rows, CSV download and copy for the Ping and Monitor tables |
 | 0.12.1 | The same tools; on Windows, a start through signed Python and a shortcut without a console window, and one session per user |
+| 0.12.2 | The same tools; **Ping these** and **Monitor these** on the IP and Subnets result tables |
 
 The browser tools beyond Subnets are available in 0.9.0 and are not part of 0.8.4.
 The menu and CLI have their own established workflows.
@@ -137,6 +138,23 @@ Narrow screens scroll within the table to reach remaining fields. Invalid inputs
 and unchecked work are shown separately. The latest attempt remains visible if it
 produces no rows, alongside labelled previous useful results. Switching tools or
 refreshing does not run a lookup again.
+
+### Ping these and Monitor these
+
+From 0.12.2, the IP results table, the Subnets summary and every Subnets detail table that lists
+addresses (in use, fixed, DNS records, **Unused addresses**) have **Ping these (N)** and **Monitor these (N)** above
+them. N is the number of targets in the table as it is filtered, on every page: apply the field filter first to send
+fewer.
+The targets are the rows' addresses, each once, in the table's order; the Subnets summary sends its subnets, one
+per line, which Ping and Monitor test host by host as they do for a typed subnet. A row without an address or
+subnet is left out and the button says how many; when the filter leaves no row the buttons are not shown, and
+when no row holds an address they are disabled.
+
+Selecting a button opens Ping or Monitor in the same tab with the targets in **Targets**. Nothing is started:
+review the list, add TCP ports or an interval, and select **Run Ping** or **Run monitor**. The list is never
+shortened. You are asked to confirm first when the tab already holds different unsent text in that Targets box
+(it is replaced), when the targets cover more than 1,024 addresses (the most that TCP ports can be tested for),
+or when a subnet is larger than a /16, which Ping and Monitor refuse.
 
 ### Ping
 

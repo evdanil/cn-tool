@@ -150,7 +150,8 @@ Release 0.11.0 adds **Delete report** beside the download button on every tool.
 Release 0.12.0 adds **Settings** and, for the Ping and Monitor tables, All rows, a CSV
 download and a copy. Release 0.12.1 starts cn on Windows through the signed Python interpreter
 (`py -m cn_tool.webui`, and `--create-shortcut` for a shortcut without a console window) and
-keeps one browser session per user.
+keeps one browser session per user. Release 0.12.2 adds **Ping these** and **Monitor these** to the IP and
+Subnets result tables: they open Ping or Monitor with the listed addresses as its targets.
 See the [WebUI guide](https://github.com/evdanil/cn-tool/blob/main/docs/webui.md) for details.
 Closing a tab keeps the application running; **Quit application** ends it and runs
 configured exit actions, including email when enabled.

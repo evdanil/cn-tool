@@ -16,6 +16,17 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
+## 0.12.2
+
+In the web interface, the IP results table, the Subnets summary and the Subnets detail tables that
+list addresses (in use, fixed, DNS records, **Unused addresses**) have **Ping these (N)** and
+**Monitor these (N)** above them. They open Ping or Monitor with the table's addresses, as it is
+filtered, in **Targets**; nothing is started until you select **Run Ping** or **Run monitor**. The
+Subnets summary sends its subnets, which Ping and Monitor test host by host. You are asked to
+confirm before unsent text in Targets is replaced, for more than 1,024 addresses, and for a subnet
+larger than a /16. See [Ping these and Monitor these](webui.md#ping-these-and-monitor-these).
+No configuration change or migration is needed.
+
 ## 0.12.1
 
 On Windows, `py -m cn_tool.webui` and `py -m cn_tool` start cn through the signed Python

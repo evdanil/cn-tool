@@ -599,6 +599,11 @@ def render_subnets(controller, lookup_type='subnet'):
         if summary and 'Resolved Subnet' in keys:
             columns[0]['label'] = 'Network / target'
         with ui.column().classes('w-full'):
+            if lookup_type != 'ping':
+                from .send_targets import render_send_group, target_column
+                target_key = target_column(keys)
+                if target_key:  # the rows here are the table's own: every page, as filtered and sorted
+                    render_send_group(rows, target_key, name=table_id if isinstance(table_id, str) else 'detail')
             desktop_table(display_rows, columns, summary, table_id)
 
     def desktop_table(display_rows, columns, summary, table_id):
