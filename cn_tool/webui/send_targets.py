@@ -2,12 +2,13 @@
 Ping these / Monitor these: the rows of a lookup table, as filtered, become the Targets of Ping or Monitor.
 
 Nothing is started here. The targets replace the tab's unsent draft of that tool (the ``sessionStorage`` entry its
-form restores on load) and the tool opens, so the user reviews them and selects Run Ping or Run monitor. Pure but
+form restores when it is built) and the tool opens, so the user reviews them and selects Run Ping or Run monitor. Pure but
 for ``render_send_group``: no request, and never a shortened list.
 """
 import ipaddress
 import json
 
+from .lookup_inputs import SOURCES, handoff_entry
 from .table_actions import count_text
 
 # The column that holds a table's targets: IP results, the detail tables' addresses, the Subnets summary.
@@ -70,15 +71,12 @@ def button_label(tool, count):
     return f"{TOOLS[tool]['label']} ({count_text(count)})"
 
 
-def scope_description(tool, count, skipped=0):
-    """What the button takes, for ``aria-description`` and the tooltip."""
-    tool = TOOLS[tool]
-    noun = 'target' if count == 1 else 'targets'
-    text = (f"Opens {tool['name']} with the {count_text(count)} {noun} of this table, every page, as filtered. "
-            f"Nothing starts until you select {tool['run']}.")
+def scope_line(count, skipped=0):
+    """The visible line beside the two buttons: what they do, and what they leave out."""
     if not count:
-        text = 'No row of this table, as filtered, holds an address or a subnet.'
-    elif skipped:
+        return 'No row of this table, as filtered, holds an address or a subnet.'
+    text = 'Opens the tool with these targets. Nothing starts until you select Run.'
+    if skipped:
         text += f" {count_text(skipped)} {'row has' if skipped == 1 else 'rows have'} no address and {'is' if skipped == 1 else 'are'} left out."
     return text
 
@@ -105,59 +103,79 @@ def read_draft_script(tool):
     return f"sessionStorage.getItem({json.dumps(TOOLS[tool]['draft'])}) || ''"
 
 
-def handoff_script(tool, targets):
-    """Store the targets as the tab's draft of ``tool`` and open it."""
+def handoff_script(tool, targets, source='this table'):
+    """Store the targets as the tab's draft of ``tool``, tell it where they came from (``lookup_inputs``) and open it:
+    inside the root without a load (``cnShell.go``, router.py) when the tool is routed there, else by a load. The tool
+    reads the draft and the handoff when it is built, as on a load."""
+    tool_name = tool
     tool = TOOLS[tool]
+    entry = handoff_entry(tool_name, targets, source)
     return (f"sessionStorage.setItem({json.dumps(tool['draft'])}, {json.dumps(chr(10).join(targets))}); "
-            f"window.location.href = {json.dumps(tool['route'])};")
+            f"sessionStorage.setItem({json.dumps('cn-tool-handoff-' + tool_name)}, {json.dumps(entry)}); "
+            f"window.cnShell ? window.cnShell.go({json.dumps(tool['route'])}) "
+            f": window.location.assign({json.dumps(tool['route'])});")
 
 
-def render_send_group(rows, column, *, name):
-    """The two buttons above a table. ``rows`` are the table's rows as filtered; ``name`` marks the buttons."""
+class SendGroup:
+    """The two buttons and their line, for the rows last given to ``update``."""
+
+    def __init__(self, column, buttons, line):
+        self.column, self.buttons, self.line = column, buttons, line
+        self.targets, self.skipped = [], 0
+
+    def update(self, rows):
+        """Take the table's rows as they are filtered now: the counts on the buttons and what a click sends."""
+        self.targets, self.skipped = targets_of(rows, self.column)
+        for tool, button in self.buttons.items():
+            button.set_text(button_label(tool, len(self.targets)))
+            # aria-disabled, not disabled: a native disabled button drops the focus the user has on it while typing
+            # in the filter or after a click; the click is ignored in ``send``.
+            off = 'false' if self.targets else 'true'
+            if button._props.get('aria-disabled') != off:
+                button._props['aria-disabled'] = off
+                button.classes(add='disabled') if off == 'true' else button.classes(remove='disabled')
+                button.update()
+        self.line.set_text(scope_line(len(self.targets), self.skipped))
+
+
+def render_send_group(rows, column, *, name, source=None):
+    """The two buttons above a table. ``rows`` are the table's rows as filtered (``SendGroup.update`` gives it new
+    ones); ``name`` marks the buttons and, unless ``source`` says it, names where the targets came from."""
     from nicegui import ui
 
-    targets, skipped = targets_of(rows, column)
-
-    asking = []  # a second click while one is being asked (a double click) opens no second dialog
+    source = source or SOURCES.get(name, 'this table')
 
     async def send(tool):
-        if asking:
-            return
-        asking.append(tool)
-        try:
-            await ask_and_send(tool)
-        finally:
-            asking.clear()
-
-    async def ask_and_send(tool):
         client = ui.context.client
+        targets = list(group.targets)
+        if not targets:
+            return
         try:
             draft = await client.run_javascript(read_draft_script(tool), timeout=5)
         except TimeoutError:
             draft = ''
+        if group.line.is_deleted:
+            return  # the page of this table was left while the draft was read: no question over the next page
         lines = confirm_lines(tool, targets, draft if isinstance(draft, str) else '')
-        if not lines:
-            client.run_javascript(handoff_script(tool, targets))
-            return
-        with ui.dialog() as dialog, ui.card().props('role=alertdialog'):
-            ui.label(f"{button_label(tool, len(targets))}?").classes('text-h6')
-            for line in lines:
-                ui.label(line)
-            ui.label(f"Nothing starts until you select {TOOLS[tool]['run']}.").classes('cn-muted')
-            with ui.row():
-                ui.button(CANCEL, on_click=lambda: dialog.submit(False)).props('outline')
-                ui.button(CONTINUE, on_click=lambda: dialog.submit(True))
-        confirmed = await dialog
-        dialog.delete()
-        if confirmed:
-            client.run_javascript(handoff_script(tool, targets))
+        if lines:
+            from .dialogs import confirm_dialog
+            if not await confirm_dialog(f"{button_label(tool, len(targets))}?", lines, confirm=CONTINUE, cancel=CANCEL,
+                                        note=f"Nothing starts until you select {TOOLS[tool]['run']}.",
+                                        fallback=f'[data-send-targets="{name}-{tool}"]'):
+                return
+        if group.line.is_deleted:
+            return  # the page of this table was left while the question or the draft's read was awaited
+        client.run_javascript(handoff_script(tool, targets, source))
 
     with ui.element('div').props('role=group aria-label="Send targets"').classes('row items-center gap-2 cn-send-targets'):
+        buttons = {}
         for tool in TOOLS:
-            button = ui.button(button_label(tool, len(targets)), on_click=lambda _, tool=tool: send(tool)).props('outline dense no-caps')
+            button = ui.button(button_label(tool, 0), on_click=lambda _, tool=tool: send(tool)).props('outline dense no-caps')
             button._props['data-send-targets'] = f'{name}-{tool}'
-            description = scope_description(tool, len(targets), skipped)
-            button._props['aria-description'] = description
-            button.tooltip(description)
-            if not targets:
-                button.disable()
+            buttons[tool] = button
+        line = ui.label('').classes('cn-muted text-sm')  # beside the buttons, always visible
+        for button in buttons.values():
+            button._props['aria-describedby'] = line.html_id
+    group = SendGroup(column, buttons, line)
+    group.update(rows)
+    return group

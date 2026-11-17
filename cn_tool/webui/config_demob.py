@@ -54,12 +54,15 @@ class DemobPreviewPage:
 
 
 def ordered_page_rows(rows, *, value, sort_by=None, descending=False, filter_by=None, filter_text='',
-                      numeric=(), addresses=()):
-    """Filter and stably sort a copy, keeping absent values last in either direction."""
+                      numeric=(), addresses=(), filter_keys=()):
+    """Filter and stably sort a copy, keeping absent values last in either direction. A filter text with ``filter_by``
+    None is the table's quick filter: a row stays when any of ``filter_keys`` holds the text (literal, no case)."""
     selected = list(rows)
-    if filter_by is not None and filter_text:
+    if filter_text and (filter_by is not None or filter_keys):
         needle = filter_text.casefold()
-        selected = [row for row in selected if needle in str('' if value(row, filter_by) is None else value(row, filter_by)).casefold()]
+        keys = (filter_by,) if filter_by is not None else tuple(filter_keys)
+        selected = [row for row in selected
+                    if any(needle in str('' if value(row, key) is None else value(row, key)).casefold() for key in keys)]
     if sort_by is None:
         return selected
     present = [row for row in selected if value(row, sort_by) not in (None, '')]
@@ -109,7 +112,7 @@ class DemobPreviewVault:
 
     def __init__(self, *, clock: Callable[[], float] = monotonic,
                  max_rows: int = 10000, max_bytes: int = 8 * 1024 * 1024,
-                 max_page_rows: int = 100, max_page_bytes: int = 256 * 1024):
+                 max_page_rows: int = 1024, max_page_bytes: int = 256 * 1024):
         if min(max_rows, max_bytes, max_page_rows, max_page_bytes) < 1:
             raise ValueError('Preview limits must be positive')
         self._clock = clock
@@ -162,12 +165,11 @@ class DemobPreviewVault:
                 return None
             original = entry[3]
             columns = list(dict.fromkeys(key for row in original for key in row))
-            if (sort_by is not None and sort_by not in columns or filter_by is not None and filter_by not in columns
-                    or filter_text and filter_by is None):
+            if sort_by is not None and sort_by not in columns or filter_by is not None and filter_by not in columns:
                 return None
             rows = ordered_page_rows(original, value=lambda row, key: row.get(key), sort_by=sort_by,
                                      descending=descending, filter_by=filter_by, filter_text=filter_text,
-                                     numeric=('DHCP utilization %',), addresses=('network',))
+                                     numeric=('DHCP utilization %',), addresses=('network',), filter_keys=columns)
             if include_metadata and len(json.dumps(dict(rows=[], total=len(rows), next_offset=None,
                                                        columns=columns, overall_total=len(original)),
                                                    ensure_ascii=False).encode('utf-8')) > byte_budget:

@@ -1,103 +1,74 @@
 """Local, bounded presentation for live configuration search."""
 import asyncio
-import json
-from dataclasses import replace
 
 from cn_tool.utils import oscompat
 
-from .subnets import CSS, report_display
-from .report_actions import render_report_delete
+from . import config_table
+from . import outcome as outcome_banner
+from . import search_text, texts, view_state
+from .results_first import form_field
+from .shell import render_shell
+from .tables import TableState, apply_table_assets, cn_table
+from .theme import apply_theme
 
 
-def render_config_search(controller):
+def render_config_search(controller, scope):
     from nicegui import ui
+    from .scope import tab_state
 
     client = ui.context.client
-    ui.add_css(CSS + '''
+    # The table's arrangement (page, filter, sort) of the result on screen, found again after a visit to another tool.
+    kept = tab_state(client).setdefault('config_search', {})
+    apply_theme()
+    scope.head_once('config-search', css='''
 .cn-config { min-width:0; overflow-wrap:anywhere; }
 .cn-config .q-field, .cn-config .q-btn { max-width:100%; min-width:0; }
 .cn-config-form { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; gap:12px; }
 .cn-config-input { width:100%; min-width:0; gap:6px; }
-.cn-config textarea { resize:vertical; max-height:180px; }
+.cn-config textarea { resize:vertical; max-height:calc(10 * 1.5em + 16px); }
 .cn-config-panel { display:flex; flex-direction:column; gap:8px; }
-.cn-config-scroll { width:100%; max-height:58vh; overflow:auto; border:1px solid #CBD5DF; border-radius:6px; }
-.cn-config-table { width:100%; min-width:540px; border-collapse:separate; border-spacing:0; table-layout:fixed; }
-.cn-config-table th { position:sticky; top:0; z-index:1; background:#EDF2F6; text-align:left; font-weight:600; }
-.cn-config-table th, .cn-config-table td { padding:8px 12px; border-bottom:1px solid #CBD5DF; vertical-align:top; }
-.cn-config-sort { text-align:left; max-width:100%; }
-.cn-config-sort .q-btn__content { white-space:normal; }
-.cn-config-table th[aria-sort=ascending] .cn-config-sort::after { content:' ▲'; }
-.cn-config-table th[aria-sort=descending] .cn-config-sort::after { content:' ▼'; }
-.cn-config-table th:first-child { width:160px; }
-.cn-config-table th:nth-child(2) { width:64px; }
-.cn-config-table tbody tr:last-child td { border-bottom:0; }
-.cn-config-table tbody tr:nth-child(even) { background:#F5F7FA; }
 .cn-config details { min-width:0; }
-.cn-config summary { color:#145C87; cursor:pointer; width:fit-content; }
+.cn-config summary { color:var(--cn-link); cursor:pointer; width:fit-content; }
 .cn-config summary::before { content:"▸ "; }
 .cn-config details[open] > summary::before { content:"▾ "; }
-.cn-config summary:focus-visible, .cn-config-scroll:focus-visible { outline:2px solid #145C87; outline-offset:2px; }
-.cn-config-source { font-size:12px; margin-top:4px; }
-.cn-config [aria-disabled=true] { opacity:.5; cursor:default; }
+[data-config-results]:focus-visible, .cn-config summary:focus-visible { outline:2px solid var(--cn-link); outline-offset:2px; }
 @media(max-width:700px) {
   .cn-config-form { grid-template-columns:minmax(0,1fr); }
-  .cn-config-table { min-width:0; }
-  .cn-config-table thead, .cn-config-table thead tr { display:block; }
-  .cn-config-table thead tr { display:flex; flex-wrap:wrap; }
-  .cn-config-table th { position:static; width:auto !important; max-width:100%; min-width:0; padding:3px; }
-  .cn-config-table tbody, .cn-config-table tr { display:block; }
-  .cn-config-table tbody tr { display:grid; grid-template-columns:minmax(0,1fr) auto; border-bottom:1px solid #CBD5DF; }
-  .cn-config-table tbody tr:last-child { border:0; }
-  .cn-config-table td { border:0; min-width:0; }
-  .cn-config-table td:nth-child(1), .cn-config-table td:nth-child(2) { padding-bottom:0; }
-  .cn-config-table td:nth-child(2) .cn-config-line::before { content:"Line "; color:#526675; font:12px system-ui,sans-serif; }
-  .cn-config-table td:nth-child(3) { grid-column:1 / -1; }
 }
-
-.cn-config-line { white-space:pre-wrap; overflow-wrap:anywhere; font-family:ui-monospace,monospace; }
 .cn-config-actions { flex-wrap:wrap; min-width:0; gap:8px; }
-.cn-config-filter { display:flex; flex-wrap:wrap; align-items:center; gap:8px; width:100%; }
-.cn-config-filter .q-field { flex:1 1 145px; min-width:0; }
 ''')
-    ui.colors(primary='#145C87')
-    latest = dict(job=None, result=None, page=None, query=None, offsets=[0], download=None, download_error='',
-                  attempt=None, outcome=None, result_revision=None, attempt_revision=None,
-                  attempt_result=None, sort_by=None, descending=False, sort_focus=None, filter_by=None, filter_text='')
+    apply_table_assets()
+    scope.head_once('config-matches', css=config_table.MATCH_CSS, script=config_table.COPY_SCRIPT)
+    latest = dict(job=None, result=None, attempt=None, outcome=None, result_revision=None, attempt_revision=None,
+                  attempt_result=None, table=TableState())
     lock = asyncio.Lock()
-    with ui.row().classes('w-full items-center justify-between cn-config'):
-        ui.label('Configuration Search').mark('title').classes('text-h4')
-        quit_button = ui.button('Quit application', on_click=controller.quit).props('outline')
-    with ui.element('nav').props('aria-label=Tools').classes('row items-center gap-4 cn-config'):
-        ui.link('Subnets', '/')
-        ui.link('IP', '/ip')
-        ui.link('Ping', '/ping')
-        ui.link('Monitor', '/monitor')
-        ui.link('Configuration Search', '/config-search').props('aria-current=page')
-        ui.link('Site Demobilization', '/demobilization')
-        ui.link('Settings', '/settings')
+    shell = render_shell(controller, 'config_search')
+    shell.set_help(search_text.CONFIG_HELP)
     if oscompat.is_macos():
-        ui.label('Configuration search is currently unavailable on macOS. Other tools remain available.').props('role=status').classes('text-warning')
-    status = ui.label('Attaching…').props('role=status aria-live=polite').classes('text-weight-bold')
-    report_warning = ui.label('').props('role=status aria-live=polite').classes('text-warning')
+        ui.label('Configuration search is currently unavailable on macOS. Other tools remain available.').props('role=status').classes('cn-notice')
+    with ui.row().classes('w-full items-baseline gap-3'):
+        shell.status = ui.label('Attaching…').props('role=status').classes('text-weight-bold')
+        shell.add_elapsed()
+    report_warning = ui.label('').props('role=status').classes('text-warning')
+    # The matches table's arrangement is in the URL (R2-08): the tab state is the truth, the URL its projection.
+    link = view_state.ViewState(scope, view_state.MATCHES_SCHEMA,
+                                lambda: view_state.table_values(latest['table'] if latest['job'] else None))
+    link.notice()
     with ui.element('section').classes('cn-panel cn-config cn-config-panel'):
         with ui.element('div').classes('cn-config-form'):
             with ui.column().classes('cn-config-input'):
-                terms = ui.textarea('Search terms', placeholder='192.0.2.0/24\nrouter-name').props('outlined rows=3').classes('w-full')
-                ui.label('One IPv4 network, address, site code or regular expression per line.').classes('cn-muted')
+                _, terms = form_field('textarea', 'Search terms', props='rows=4 autogrow')  # the one form style
+                ui.label('One IPv4 network, address, site code or regular expression per line, for example 192.0.2.0/24 or router-name. '
+                         'Ctrl+Enter searches.').classes('cn-muted')
             actions = ui.row().classes('cn-config-actions')
-        with ui.element('details'):
-            with ui.element('summary'):
-                ui.label('Search help').classes('inline')
-            ui.label('Search the configured live configuration repository. Cached search is not supported here; use the menu or change the configuration to live search.').classes('cn-muted')
-            ui.label('Keywords use regular expressions and need at least five characters unless recognized as site codes.').classes('cn-muted')
-            ui.label('A site code searches configuration text as a regular expression; it does not run the Site Demobilization Check.').classes('cn-muted')
-            ui.label('Up to 200 lines, 1,024 characters per line and 64 KiB in total.').classes('cn-muted')
         error = ui.label('').props('role=alert').classes('text-negative')
         error.set_visibility(False)
         def show_error(message):
             error.set_text(message)
             error.set_visibility(bool(message))
         async def submit():
+            if not scope.alive:
+                return
             text = terms.value or ''
             lines = text.splitlines()
             if not text.strip():
@@ -114,150 +85,71 @@ def render_config_search(controller):
                 return
             show_error('')
             await poll()
-        def stop_search():
-            state = controller.page_snapshot('config_search').state
-            if state.active_lookup_type == 'config_search' and state.active_job_id and state.phase == 'running':
-                controller.cancel(state.active_job_id)
+        async def retry():
+            if not scope.alive:
+                return
+            try:
+                request = outcome_banner.repeat(controller, 'config_search')
+            except (ValueError, RuntimeError, OSError, EOFError) as exc:
+                show_error(str(exc) or 'Search could not start. Try again.')
+                return
+            terms.set_value('\n'.join(request['inputs']))  # what is repeated is shown
+            show_error('')
+            await poll()
+        handlers = dict(retry=retry, open_settings=outcome_banner.open_settings, show_lines=outcome_banner.show_lines)
+        def submit_from_keyboard():
+            if run.enabled:
+                return submit()
+        terms.on('keydown.ctrl.enter', submit_from_keyboard)
+        terms.on('keydown.meta.enter', submit_from_keyboard)
         with actions:
-            run = ui.button('Search configurations', on_click=submit)
+            run = shell.waits(ui.button('Search configurations', on_click=submit))
             run.disable()
-            stop = ui.button('Stop search', on_click=stop_search).props('outline')
-            stop.set_visibility(False)
+            shell.add_stop()  # shown only while this page's search runs, and it ends only that one
             view_matches = ui.button('View matches', on_click=lambda: client.run_javascript(
                 "document.querySelector('[data-config-results]')?.focus()")).props('flat')
             view_matches.set_visibility(False)
     with ui.column().classes('cn-panel cn-config cn-config-panel'):
         ui.label('Latest search').classes('text-weight-bold')
-        outcome = ui.label('No search yet.').props('role=status aria-live=polite tabindex=-1 data-config-outcome')
-        diagnostics = ui.column().props('role=status aria-live=polite data-config-diagnostics').classes('w-full cn-config')
-        report = ui.html('').props('role=status aria-live=polite tabindex=-1 data-report-status').classes('cn-muted')
-        def download_report():
-            try:
-                latest['download'] = controller.request_report_snapshot()
-                latest['download_error'] = ''
-                download.disable()
-            except (RuntimeError, OSError, EOFError):
-                latest['download_error'] = 'Report download is unavailable.'
-        with ui.row().classes('cn-config-actions items-center'):
-            download = ui.button('Download accumulated report', on_click=download_report).props('outline dense')
-            download.disable()
-            report_delete = render_report_delete(controller, dense=True)
-        # Its own line: a status text that appears in the button row must not move it.
-        ui.label('May include earlier searches and whole configurations, including sensitive information.').classes('cn-muted')
+        banner = outcome_banner.Banner(heading=False, marker='data-config-outcome')
+        banner.set(outcome_banner.INFORMATION, 'No search yet.')
+        diagnostics = ui.column().props('role=status data-config-diagnostics').classes('w-full cn-config')
+        # What this search did to the report, when a save was due. The workbook, its download and its deletion are
+        # the header's Report menu.
+        report = ui.label('').props('role=status').classes('cn-muted')
+        ui.label('Saved searches go to the shared report. It may include whole configurations, including sensitive information.').classes('cn-muted')
     with ui.element('section').props('aria-label="Configuration results" tabindex=-1 data-config-results').classes('cn-panel cn-config cn-config-panel') as results_area:
-        with ui.row().classes('w-full items-center justify-between cn-config-actions'):
-            ui.label('Configuration matches').classes('text-h6')
-            with ui.element('nav').props('aria-label="Configuration result pages"').classes('row cn-config-actions'):
-                previous_button = ui.button('Previous page', on_click=lambda: change_page('previous')).props('outline dense aria-disabled=true')
-                next_button = ui.button('Next page', on_click=lambda: change_page('next')).props('outline dense aria-disabled=true')
-        results_message = ui.label('').props('role=status aria-live=polite').classes('cn-muted')
-        with ui.element('div').classes('cn-config-filter'):
-            filter_field = ui.select({'device': 'Device', 'line': 'Line', 'configuration': 'Matching configuration'},
-                                     value='device', label='Filter field').props('outlined dense')
-            filter_value = ui.input('Filter value').props('outlined dense maxlength=256')
-            ui.button('Apply filter', on_click=lambda: apply_filter()).props('outline dense')
-            ui.button('Clear filter', on_click=lambda: apply_filter(clear=True)).props('flat dense')
-        ui.label('Line numbers start at 0.').classes('cn-muted text-xs')
+        with ui.element('h2').classes('text-h6 q-my-none'):
+            ui.label('Configuration matches')
         results_body = ui.column().props('data-config-results-body').classes('w-full cn-config')
     results_area.set_visibility(False)
 
     def update_navigation():
-        page = latest['page'] or {}
-        ready = page.get('status') == 'ready' and not latest['query']
-        previous_button.props(f'aria-disabled={str(not (ready and len(latest["offsets"]) > 1)).lower()}')
-        next_button.props(f'aria-disabled={str(not (ready and page.get("next_offset") is not None)).lower()}')
         results_area.set_visibility(bool(latest['job']))
         view_matches.set_visibility(bool(latest['job']))
 
-    async def change_page(direction):
-        if latest['query'] or not latest['page'] or latest['page'].get('status') != 'ready':
-            return
-        if direction == 'previous' and len(latest['offsets']) > 1:
-            latest['offsets'].pop()
-        elif direction == 'next' and latest['page'] and latest['page'].get('next_offset') is not None:
-            latest['offsets'].append(latest['page']['next_offset'])
-        else:
-            return
-        latest['page'] = None
-        await request_page()
-        await draw_results.refresh()
-
-    async def change_sort(key):
-        latest['descending'] = not latest['descending'] if latest['sort_by'] == key else False
-        latest['sort_by'] = key
-        latest['sort_focus'] = key
-        latest['offsets'] = [0]
-        latest['page'] = None
-        await request_page()
-        await draw_results.refresh()
-
-    async def apply_filter(*, clear=False):
-        if clear:
-            filter_value.set_value('')
-        latest['filter_text'] = filter_value.value or ''
-        latest['filter_by'] = filter_field.value if latest['filter_text'] else None
-        latest['offsets'] = [0]
-        latest['page'] = None
-        await request_page()
-        await draw_results.refresh()
-
     @ui.refreshable
     def draw_results():
-        page = latest['page']
-        if not page:
-            return
-        if page.get('status') != 'ready':
-            ui.label('Results are unavailable. Run the search again.').props('role=alert')
-            return
-        rows = page['rows']
-        if not rows:
-            return
-        with ui.element('div').props('role=region aria-label="Scrollable configuration matches" tabindex=0').classes('cn-config-scroll'):
-            with ui.element('table').props('aria-label="Configuration matches"').classes('cn-config-table'):
-                with ui.element('thead'):
-                    with ui.element('tr'):
-                        for heading, key in (('Device', 'device'), ('Line', 'line'), ('Matching configuration', 'configuration')):
-                            direction = ('descending' if latest['descending'] else 'ascending') if latest['sort_by'] == key else None
-                            with ui.element('th').props('scope=col' + (f' aria-sort={direction}' if direction else '')) as header:
-                                header._props['aria-label'] = heading
-                                button = ui.button(heading, on_click=lambda _, column=key: change_sort(column)).props('flat dense no-caps').classes('cn-config-sort')
-                                button._props['aria-label'] = f'Sort by {heading}' + (f', {direction}' if direction else '')
-                                button._props['data-config-sort'] = key
-                with ui.element('tbody'):
-                    for row in rows:
-                        with ui.element('tr'):
-                            with ui.element('td'):
-                                ui.label(str(row[1])).classes('text-weight-medium')
-                            with ui.element('td'):
-                                ui.label(str(row[2])).classes('cn-config-line')
-                            with ui.element('td'):
-                                ui.label(str(row[3])).classes('cn-config-line')
-                                with ui.element('details').classes('cn-config-source'):
-                                    with ui.element('summary') as source_summary:
-                                        source_summary._props['aria-label'] = f'Source details for {row[1]}, line {row[2]}'
-                                        ui.label('Details').classes('inline')
-                                    ui.label(f'Search: {row[0]}').classes('cn-muted')
-                                    ui.label(f'File: {row[4]}').classes('cn-muted')
+        # The table is built once for a result and updates itself in place (filter, sort, pages); the worker holds the
+        # rows. A new result is a new table with a new arrangement.
+        if latest['job']:
+            cn_table(name='config-matches', label='Configuration matches', columns=config_table.match_columns(),
+                     source=config_table.match_pages(controller, latest['job']), state=latest['table'],
+                     empty='No configuration matches.', grouping=config_table.GROUPING, intro=config_table.search_line,
+                     export_extra=config_table.EXPORT_EXTRA, on_change=lambda _: link.replace(), link=True)
     with results_body:
         draw_results()
 
-    async def request_page():
-        if latest['query']:
-            controller.release_config_search_page(latest['query'])
-            latest['query'] = None
-        if not latest['job']:
-            results_message.set_text('')
-            update_navigation()
+    async def popped(values):
+        """Back or Forward to an entry of this tool: that entry's table arrangement (a field it omits is its default), as
+        a click would set it; the entry is not rewritten."""
+        if not scope.alive or not latest['job']:
             return
-        try:
-            sort = dict(sort_by=latest['sort_by'], descending=latest['descending']) if latest['sort_by'] else {}
-            filtering = dict(filter_by=latest['filter_by'], filter_text=latest['filter_text']) if latest['filter_by'] else {}
-            latest['query'] = controller.request_config_search_page(latest['job'], latest['offsets'][-1], 50, **sort, **filtering)
-            results_message.set_text('Loading matches…')
-        except (ValueError, RuntimeError, OSError, EOFError):
-            latest['page'] = {'status': 'unavailable'}
-            results_message.set_text('Results are unavailable. Run the search again.')
-        update_navigation()
+        view_state.set_table(latest['table'], values)
+        await draw_results.refresh()
+        if scope.alive:
+            link.replace()
+    link.on_pop(popped)
 
     async def preserve_replaced_focus(source, target):
         # Guard in the browser, so a delayed reply never steals focus from the form.
@@ -270,6 +162,8 @@ def render_config_search(controller):
 
     async def render_diagnostics(result):
         await preserve_replaced_focus('data-config-diagnostics', "document.querySelector('[data-config-outcome]')")
+        if not scope.alive:
+            return
         diagnostics.clear()
         if not result:
             diagnostics.set_visibility(False)
@@ -281,6 +175,8 @@ def render_config_search(controller):
                 if not items:
                     continue
                 with ui.element('details') as disclosure:
+                    if items is errors:
+                        disclosure.props('data-lines-not-understood')
                     if not result.get('total'):
                         disclosure.props('open')
                     with ui.element('summary'):
@@ -293,13 +189,14 @@ def render_config_search(controller):
         diagnostics.set_visibility(bool(result.get('errors') or result.get('missing_nets')))
 
     async def poll():
-        if lock.locked() or client.is_deleted:
+        # A poll that a click awaits is no timer tick: nothing cancels it when the tool is left (PageScope), so it asks
+        # scope.alive at its start and after every await.
+        if lock.locked() or client.is_deleted or not scope.alive:
             return
         async with lock:
             page_state = controller.page_snapshot('config_search', result_revision=latest['result_revision'],
                                                   attempt_revision=latest['attempt_revision'])
             state = page_state.state
-            await report_delete.update(state)
             deleting = state.report_delete_pending
             if page_state.result_changed:
                 latest['result_revision'] = page_state.result_revision
@@ -310,95 +207,52 @@ def render_config_search(controller):
                 latest['attempt_result'] = page_state.attempt_result
             phase = state.phase
             active = bool(state.active_job_id and state.active_lookup_type == 'config_search')
-            message = {'ready': 'Ready', 'starting': 'Starting application…', 'stopping': 'Stopping search…',
-                       'saving': 'Saving report…', 'closing': 'Finishing active work…',
-                       'closed': 'Application closed.', 'failed': 'Application failed. Quit and relaunch.',
-                       'setup_required': 'Application setup is required.'}.get(phase, phase)
-            if phase == 'running':
-                message = ('Searching configurations' if active else 'Another operation is running')
-                if state.progress_stage:
-                    message += ': ' + state.progress_stage
-            if state.error:
-                message = str(state.error.get('message', state.error) if isinstance(state.error, dict) else state.error)
-            if status.text != message:
-                status.set_text(message)
+            shell.update(state)  # the status line, Stop, the banner of another tool's job and the end of the session
             if report_warning.text != (state.report_warning or ''):
                 report_warning.set_text(state.report_warning or '')
             report_warning.set_visibility(bool(state.report_warning))
             run.set_enabled(not deleting and not oscompat.is_macos() and phase == 'ready' and not state.active_job_id)
-            stop.set_visibility(active and phase in {'running', 'stopping', 'saving'})
-            stop.set_enabled(active and phase == 'running')
-            quit_button.set_enabled(phase not in {'closing', 'closed'})
             attempt_value = latest['outcome'] or {}
             previous = bool(page_state.result_job_id and page_state.attempt_job_id != page_state.result_job_id)
-            title = str(attempt_value.get('message') or ('Search in progress.' if active else 'No search yet.'))
+            title = search_text.headline(attempt_value) or ('Search in progress.' if active else 'No search yet.')
             if previous:
-                title += ' Showing results from an earlier completed search.'
-            if outcome.text != title:
-                outcome.set_text(title)
+                title = texts.sentence(title, 'Showing results from an earlier completed search')
+            lines = len((latest['attempt_result'] or {}).get('errors', []))
+            banner.set(outcome_banner.tone_for(attempt_value) if attempt_value else outcome_banner.INFORMATION, title,
+                       actions=outcome_banner.actions_for('config_search', attempt_value, handlers, lines=lines,
+                                                          can_repeat=bool(controller.last_request('config_search'))))
             diagnostic_result = latest['attempt_result'] or {}
             diagnostic_key = (page_state.attempt_job_id, latest['attempt_revision'])
             if latest['attempt'] != diagnostic_key:
                 latest['attempt'] = diagnostic_key
                 await render_diagnostics(diagnostic_result)
-            display = report_display(replace(state, latest_report_state=page_state.attempt_report_state or state.latest_report_state))
-            report_text = latest['download_error'] or display['text']
-            if report.content != report_text:
-                report.set_content(report_text)
-            download.set_enabled(not deleting and display['available'] and latest['download'] is None)
-            if latest['download']:
-                completion = controller.report_completion(latest['download']) or {}
-                if completion.get('status') == 'ready':
-                    with client:
-                        ui.download('/download/' + latest['download'])
-                    latest['download'] = None
-                elif completion.get('status') == 'failed':
-                    controller.acknowledge_report_completion(latest['download'])
-                    latest['download'] = None
-                    latest['download_error'] = 'Report download failed.'
+                if not scope.alive:
+                    return
+            note = texts.attempt_report_note(page_state.attempt_report_state, state.report_state)
+            if report.text != note:
+                report.set_text(note)
             job = page_state.result_job_id
+            arrived = link.take()  # the URL's arrangement, at the first poll (None: the tab's stands)
+            if arrived is not None and not job and view_state.table_named(arrived):
+                link.gone()  # a link to matches that are not here
             if job != latest['job']:
                 # A fresh result may replace a focused source-details disclosure.
                 # Move only that focus, before removing its node, never focus in the form.
                 focus_target = ("document.querySelector('[data-config-results]')" if job else
                                 f"document.getElementById('{terms.html_id}')?.querySelector('textarea')")
                 await preserve_replaced_focus('data-config-results-body', focus_target)
-                latest.update(job=job, page=None, offsets=[0], sort_by=None, descending=False, sort_focus=None,
-                              filter_by=None, filter_text='')
-                filter_value.set_value('')
-                filter_field.set_value('device')
-                await request_page()
+                if not scope.alive:
+                    return
+                table = kept['table'] if job and kept.get('job') == job else TableState()
+                if arrived is not None and job:
+                    view_state.set_table(table, arrived)
+                kept.update(job=job, table=table)
+                latest.update(job=job, table=table)
+                update_navigation()
                 await draw_results.refresh()
-            if latest['query']:
-                page = controller.config_search_page(latest['query'])
-                if page is not None:
-                    controller.release_config_search_page(latest['query'])
-                    latest['query'] = None
-                    latest['page'] = page
-                    if page.get('status') == 'ready':
-                        rows = page['rows']
-                        if rows:
-                            scope = f" (of {page['overall_total']} total)" if latest['filter_by'] and 'overall_total' in page else ''
-                            results_message.set_text(f"Showing {page['offset'] + 1}–{page['offset'] + len(rows)} of {page['total']} matches{scope}.")
-                        else:
-                            total = page.get('overall_total')
-                            message = (f"No matches for this filter (of {total} total)." if total is not None else 'No matches for this filter.') + ' Clear filter to see all results.'
-                            results_message.set_text(message if latest['filter_by'] else 'No configuration matches.')
-                    else:
-                        results_message.set_text('Results are unavailable. Run the search again.')
-                    await draw_results.refresh()
-                    if latest['sort_focus']:
-                        selector = json.dumps(f"[data-config-sort='{latest['sort_focus']}']")
-                        client.run_javascript(f"if (document.activeElement === document.body) document.querySelector({selector})?.focus();")
-                        latest['sort_focus'] = None
-                    update_navigation()
+                if not scope.alive:
+                    return
+            link.replace()
 
-    def release_query():
-        if latest['query']:
-            controller.release_config_search_page(latest['query'])
-        if latest['download']:
-            controller.release_report_request(latest['download'])
-            latest['download'] = None
-    client.on_delete(release_query)
-    ui.timer(0, poll, once=True)
-    ui.timer(.5, poll)
+    scope.timer(0, poll, once=True)
+    scope.timer(.5, poll)

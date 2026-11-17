@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 from types import SimpleNamespace
 
-from cn_tool.modules.config_search import BoundedSearchResult, search_live_bounded
+from cn_tool.modules.config_search import BoundedSearchResult, match_spans, search_live_bounded
 from cn_tool.plugins.sdwan_yaml_search import SDWANYamlSearchPlugin
 
 MAX_MESSAGE = 8 * 1024 * 1024 - 256
@@ -170,7 +170,9 @@ def _apply_yaml(result, snapshot, networks, terms):
     patterns = {term: re.compile(term, re.IGNORECASE) for term in terms}
     network_objects = {net: ipaddress.ip_network(net, strict=False) for net in networks}
     rows = result.rows
-    size = len(json.dumps(rows, ensure_ascii=False).encode('utf-8'))
+    if len(result.spans) != len(rows):
+        result.spans = [[] for _ in rows]
+    size = len(json.dumps([rows, result.spans], ensure_ascii=False).encode('utf-8'))
     for filename, content in data.items():
         if not content:
             continue
@@ -184,10 +186,12 @@ def _apply_yaml(result, snapshot, networks, terms):
             row = [criterion, device, index, line, filename]
             # Network criteria retain the plugin's network object type.
             encoded = json.dumps([str(criterion), *row[1:]], ensure_ascii=False).encode('utf-8')
-            size += len(encoded) + 1
+            found = match_spans(line, list(network_objects.values()), list(terms))
+            size += len(encoded) + len(json.dumps(found)) + 2
             if len(rows) >= MAX_ITEMS or size > MAX_MESSAGE:
                 raise ValueError('YAML results exceed limits')
             rows.append(row)
+            result.spans.append(found)
             if criterion in network_objects:
                 result.matched_nets.add(criterion)
     return result

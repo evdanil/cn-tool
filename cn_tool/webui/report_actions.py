@@ -1,4 +1,14 @@
-"""Shared, client-owned presentation for deleting the session workbook."""
+"""The Report menu: what the shared workbook is, its download and its deletion.
+
+The menu belongs to the header (``shell.render_shell`` draws it on every page, ``PageShell.update`` feeds it the
+session's snapshot), so a page never draws a report button. It holds one line about the workbook
+(``texts.report_menu_line``), the sentence that says what Download copies, **Download accumulated report**,
+**Delete report…** and the one live status line (``data-report-status``) that the download and the deletion share.
+
+``ReportMenu`` owns the download request, its completion and its release; ``ReportDeleteAction`` owns the deletion
+(its confirmation, its request and its completion), and the controller owns the shared operation. NiceGUI is imported
+inside the functions.
+"""
 from __future__ import annotations
 
 import json
@@ -7,28 +17,43 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .controller import SessionSnapshot
 
+PREPARING = 'Preparing a consistent report download…'
+DOWNLOAD_UNAVAILABLE = 'Report download is unavailable.'
+DOWNLOAD_FAILED = 'Report download failed.'
+DELETING = 'Deleting report…'
+
+CSS = '''
+.cn-report-menu { padding:12px 16px; gap:8px; max-width:min(440px, 92vw); align-items:stretch; }
+.cn-report-menu .cn-report-state { font-weight:600; overflow-wrap:anywhere; }
+.cn-report-menu .cn-report-status:empty { display:none; }
+.cn-report-menu .cn-report-status { overflow-wrap:anywhere; }
+.cn-report-menu .cn-report-actions { gap:8px; }
+'''
+
 
 class ReportDeleteAction:
-    """Follow cheap page metadata; the controller owns the shared operation."""
+    """Follow cheap page metadata; the controller owns the shared operation.
 
-    def __init__(self, controller, dense=False):
+    The dialog is created where the caller stands (outside the menu, which draws its content only while it is open) and
+    the button where ``draw_button`` is called (inside the menu). ``changed`` is called whenever ``text`` changes."""
+
+    def __init__(self, controller, trigger, menu, changed=lambda: None):
         from nicegui import ui
 
         self.controller = controller
         self.client = ui.context.client
+        self.trigger = trigger  # the Report button: focus comes back to it
+        self.menu = menu
+        self.changed = changed
         self.state = None
         self.request_id = None
         self.generation = None  # the settings generation the open confirmation belongs to
         self.closed = False
         self.message = ''
         self.refused = False  # the message is a refusal of a click: it goes when the cause has passed
-        self.button = ui.button('Delete report', on_click=self._open).props(
-            'outline color=negative data-report-delete' + (' dense' if dense else ''))
-        description = ('Deletes the accumulated report shared by all tools, after confirmation. '
-                       'Available when nothing is running or saving.')
-        self.button._props['aria-description'] = description
-        self.button.disable()
-        self.status = ui.label('').props('role=status aria-live=polite tabindex=-1 data-report-delete-status').classes('cn-muted')
+        self.text = ''  # what the status line says about the deletion: "Deleting report…", a refusal or a failure
+        self.failed = False
+        self.button = None
         with ui.dialog().props('no-refocus') as self.dialog:
             with ui.card().classes('w-full').style('max-width: 540px; overflow-wrap: anywhere') as self.card:
                 title = ui.label('Delete accumulated report?').classes('text-h6')
@@ -40,23 +65,33 @@ class ReportDeleteAction:
             self.dialog.props(f'aria-labelledby={title.html_id}')
         # QDialog's default refocus can override a user's new focus after submit. Take focus back when nothing holds
         # it (document.body: a click outside the dialog, whatever the before-hide check saw) or when it is still in
-        # the card and the dialog owned it; leave focus that moved elsewhere alone. Use a stable status when the
-        # trigger became disabled during an accepted deletion.
-        card, button, status = map(json.dumps, (self.card.html_id, self.button.html_id, self.status.html_id))
+        # the card and the dialog owned it; leave focus that moved elsewhere alone. The place it returns to is the
+        # Report button: the menu that held the Delete button is closed by then.
+        card, trigger_id = json.dumps(self.card.html_id), json.dumps(self.trigger.html_id)
         self.dialog.on('before-hide', js_handler=f'''() => {{
-const status = document.getElementById({status});
-if (status) status.cnDeleteOwnedFocus = !!document.getElementById({card})?.contains(document.activeElement);
+const trigger = document.getElementById({trigger_id});
+if (trigger) trigger.cnDeleteOwnedFocus = !!document.getElementById({card})?.contains(document.activeElement);
 }}''')
         self.dialog.on('hide', js_handler=f'''() => {{
-const status = document.getElementById({status});
+const trigger = document.getElementById({trigger_id});
 const active = document.activeElement;
-if (active === document.body || (status?.cnDeleteOwnedFocus && document.getElementById({card})?.contains(active))) {{
-  const button = document.getElementById({button});
-  (button && !button.matches(':disabled') ? button : status)?.focus({{preventScroll:true}});
+if (active === document.body || (trigger?.cnDeleteOwnedFocus && document.getElementById({card})?.contains(active))) {{
+  trigger?.focus({{preventScroll:true}});
 }}
-if (status) delete status.cnDeleteOwnedFocus;
+if (trigger) delete trigger.cnDeleteOwnedFocus;
 }}''')
         self.client.on_delete(self.close)
+
+    def draw_button(self):
+        """The Delete button, in the menu where the caller stands."""
+        from nicegui import ui
+
+        self.button = ui.button('Delete report…', on_click=self._open).props('outline color=negative data-report-delete')
+        description = ('Deletes the accumulated report shared by all tools, after confirmation. '
+                       'Available when nothing is running or saving.')
+        self.button._props['aria-description'] = description
+        self.button.disable()
+        return self.button
 
     def _available(self):
         state = self.state
@@ -64,6 +99,21 @@ if (status) delete status.cnDeleteOwnedFocus;
                     and (state.report_state or {}).get('available')
                     and not state.report_delete_pending and not state.report_snapshot_pending
                     and not self.request_id)
+
+    def _show(self):
+        pending = bool(self.state and self.state.report_delete_pending) or bool(self.request_id)
+        text, failed = (DELETING, False) if pending else (self.message, bool(self.message))
+        if (text, failed) != (self.text, self.failed):
+            self.text, self.failed = text, failed
+            self.changed()
+
+    def _say(self, message, *, negative=False):
+        """Tell the tab that asked, whose menu is closed by now: a toast, as the status line is out of sight."""
+        from nicegui import ui
+
+        if message and not self.client.is_deleted:
+            with self.client:
+                ui.notify(message, type='negative' if negative else 'info')
 
     def _open(self):
         if self.closed or not self._available():
@@ -73,9 +123,10 @@ if (status) delete status.cnDeleteOwnedFocus;
         name = str((self.state.report_state or {}).get('filename') or '')
         self.filename.set_text('Report file: ' + name.replace('\\', '/').rsplit('/', 1)[-1])
         self.message, self.refused = '', False
-        self.status.set_text('')
+        self._show()
         self.generation = self.state.config_generation
         self.confirm.enable()
+        self.menu.close()
         self.dialog.open()
 
     def _submit(self):
@@ -90,16 +141,16 @@ if (status) delete status.cnDeleteOwnedFocus;
             self.message = (str(refusal) if isinstance(refusal, RuntimeError) and str(refusal) else
                             'Report deletion could not be started. Try again.')
             self.refused = True
-            self.status.set_text(self.message)
-            self.status.classes(add='text-negative')
+            self._show()
+            self._say(self.message, negative=True)
         else:
             self.refused = False
-            self.button.disable()
-            self.status.set_text('Deleting report…')
-            self.status.classes(remove='text-negative')
+            if self.button is not None:
+                self.button.disable()
+            self._show()
         self.dialog.close()
 
-    async def update(self, state: SessionSnapshot) -> None:
+    def update(self, state: SessionSnapshot) -> None:
         if self.closed or self.client.is_deleted:
             return
         self.state = state
@@ -122,28 +173,22 @@ if (status) delete status.cnDeleteOwnedFocus;
                 self.controller.release_report_delete_result(self.request_id)
                 self.request_id = None
                 self.message, self.refused = 'The session ended before report deletion was confirmed.', False
+                self._say(self.message, negative=True)
             elif result is not None:
                 self.controller.release_report_delete_result(self.request_id)
                 self.request_id = None
                 if result['status'] in {'deleted', 'missing'}:
-                    self.message, self.refused = '', False  # The global workbook status announces success.
-                    status, card = map(json.dumps, (self.status.html_id, self.card.html_id))
-                    self.client.run_javascript(f'''(() => {{
-const active = document.activeElement;
-if (active === document.getElementById({status}) || document.getElementById({card})?.contains(active)) {{
-  document.querySelector('[data-report-status]')?.focus({{preventScroll:true}});
-}}
-}})()''')
+                    self.message, self.refused = '', False  # The workbook's status line announces success.
+                    self._say(result.get('message') or report.get('message') or 'Accumulated report deleted.')
                 else:
                     self.message = result.get('message') or 'Report could not be deleted. Try again.'
                     self.refused = False
+                    self._say(self.message, negative=True)
         if report.get('state') == 'deleted' and not report.get('available'):
             self.message, self.refused = '', False  # The workbook is gone, so advice about retrying no longer applies.
-        pending = state.report_delete_pending or bool(self.request_id)
-        self.button.set_enabled(self._available())
-        self.status.set_text('Deleting report…' if pending else self.message)
-        self.status.classes(add='text-negative' if self.message and not pending else '',
-                            remove='text-negative' if pending or not self.message else '')
+        if self.button is not None:
+            self.button.set_enabled(self._available())
+        self._show()
 
     def close(self) -> None:
         """Abandon this page's completion without cancelling the shared deletion."""
@@ -157,5 +202,135 @@ if (active === document.getElementById({status}) || document.getElementById({car
             self.dialog.close()
 
 
-def render_report_delete(controller, dense=False) -> ReportDeleteAction:
-    return ReportDeleteAction(controller, dense)
+class ReportMenu:
+    """The header's Report button and its menu; one per page, updated by ``PageShell.update``.
+
+    It owns this page's report download (the request, its completion and its release), and holds the deletion in
+    ``delete``. Everything it shows follows the session's snapshot, so every tab says the same about the workbook."""
+
+    def __init__(self, controller):
+        from nicegui import ui
+        from . import texts
+        from .scope import add_once
+
+        self.controller = controller
+        self.client = ui.context.client
+        add_once(self.client, 'report-menu', css=CSS)
+        self.state = None
+        self.request_id = None  # this page's download in flight
+        self.error = ''  # why the last download did not start or finish
+        self.closed = False
+        with ui.button('Report').props('outline icon-right=expand_more aria-haspopup=dialog aria-expanded=false '
+                                       'data-report-menu') as self.trigger:
+            self.menu = ui.menu().props('no-refocus role=dialog aria-label=Report')
+        # The dialog goes beside the button: the menu draws its content only while it is open.
+        self.delete = ReportDeleteAction(controller, self.trigger, self.menu, changed=self._show)
+        with self.menu, ui.column().classes('cn-report-menu'):
+            self.line = ui.label('').classes('cn-report-state').props('data-report-state')
+            self.status = ui.label('').classes('cn-report-status cn-muted').props(
+                'role=status aria-live=polite tabindex=-1 data-report-status')
+            help_text = ui.label(texts.REPORT_DOWNLOAD_HELP)
+            with ui.row().classes('items-center cn-report-actions'):
+                self.download = ui.button('Download accumulated report', on_click=self._download).props('outline')
+                self.download._props['aria-describedby'] = help_text.html_id
+                # Off until the first poll reports: nothing is known about the workbook before it.
+                self.download.disable()
+                self.delete.draw_button()
+        trigger = json.dumps(self.trigger.html_id)
+        # Say whether the menu is open, and when it closes with focus nowhere (Escape, a click on the page's own
+        # background) give it back to the button: what the menu's own refocus would do, without taking focus from the
+        # confirmation dialog that Delete opens.
+        self.menu.on('show', js_handler=f"() => document.getElementById({trigger})?.setAttribute('aria-expanded', 'true')")
+        self.menu.on('hide', js_handler=f'''() => {{
+const trigger = document.getElementById({trigger});
+trigger?.setAttribute('aria-expanded', 'false');
+if (!document.activeElement || document.activeElement === document.body) trigger?.focus({{preventScroll:true}});
+}}''')
+        self.client.on_delete(self.close)
+
+    # -- the download ------------------------------------------------------------------------------------------------
+
+    def _download(self):
+        if self.closed or self.request_id is not None:
+            return
+        self.error = ''
+        self.download.disable()
+        try:
+            self.request_id = self.controller.request_report_snapshot()
+        except (RuntimeError, OSError, EOFError):
+            self.error = DOWNLOAD_UNAVAILABLE  # at the click: the menu is open and its status line says it
+        self._show()
+
+    def _finish_download(self):
+        """Start the browser's download when the worker has prepared the copy, or say that it could not."""
+        from nicegui import ui
+
+        if self.request_id is None:
+            return
+        prepared = self.controller.report_completion(self.request_id) or {}
+        if prepared.get('request_id', self.request_id) != self.request_id:
+            return
+        if prepared.get('status') == 'ready':
+            with self.client:
+                ui.download('/download/' + self.request_id)
+            self.request_id = None
+        elif prepared.get('status') == 'failed':
+            self.error = prepared.get('error') or DOWNLOAD_FAILED
+            if not self.menu.value:
+                # The menu is closed by now, and its status line is drawn only while it is open: a toast, as for
+                # a deletion.
+                self.delete._say(self.error, negative=True)
+            self.controller.acknowledge_report_completion(self.request_id)
+            self.request_id = None
+
+    # -- what it shows -----------------------------------------------------------------------------------------------
+
+    def _status(self):
+        """The one live line: the deletion's words first, then the download's, then the outcome of a deletion that
+        another tab made."""
+        report = (self.state.report_state or {}) if self.state is not None else {}
+        if self.delete.text:
+            return self.delete.text, self.delete.failed
+        if self.request_id is not None:
+            return PREPARING, False
+        if self.error:
+            return self.error, True
+        if report.get('state') == 'deleted' and not report.get('available'):
+            return report.get('message') or 'No accumulated report exists.', False
+        return '', False
+
+    def _show(self):
+        text, failed = self._status()
+        if self.status.text != text:
+            self.status.set_text(text)
+        if failed != ('text-negative' in self.status.classes):
+            if failed:
+                self.status.classes(add='text-negative')
+            else:
+                self.status.classes(remove='text-negative')
+
+    def update(self, state: SessionSnapshot) -> None:
+        """Called from ``PageShell.update`` with the session's snapshot."""
+        from . import texts
+
+        if self.closed or self.client.is_deleted:
+            return
+        self.state = state
+        self.trigger.set_enabled(state.phase not in {'closing', 'closed'})
+        self.delete.update(state)
+        self._finish_download()
+        line = texts.report_menu_line(state)
+        if self.line.text != line:
+            self.line.set_text(line)
+        available = (state.report_state or {}).get('available') is True
+        self.download.set_enabled(not state.report_delete_pending and available and self.request_id is None)
+        self._show()
+
+    def close(self) -> None:
+        """The page is gone: give up its download (the copy is released). The deletion's presentation closes itself."""
+        if self.closed:
+            return
+        self.closed = True
+        if self.request_id is not None:
+            self.controller.release_report_request(self.request_id)
+            self.request_id = None

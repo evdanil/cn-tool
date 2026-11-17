@@ -3,10 +3,10 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import multiprocessing
 from threading import RLock, Thread
-from time import monotonic
+from time import monotonic, time
 from uuid import uuid4
 
-from .protocol import decode, encode, envelope, validate, valid_monitor_history_item
+from .protocol import PING_PARTIAL_BYTES_MAX, PING_ROWS_MAX, decode, encode, envelope, validate, valid_monitor_history_item
 
 
 def _remove_file(path):
@@ -34,6 +34,11 @@ class SessionSnapshot:
     phase: str = 'starting'
     active_job_id: object = None
     active_lookup_type: object = None
+    # The running job's facts, both None when nothing runs: the wall clock at its submit (seconds since the epoch) and
+    # a summary of what was asked: {'lines': n}; Ping and Monitor add 'tcp_ports', Monitor 'interval_seconds' and
+    # 'duration_seconds'. Never the inputs themselves: a snapshot is copied for every tab, four times a second.
+    active_started_at: object = None
+    active_request: object = None
     results_by_type: dict = field(default_factory=lambda: {'subnet': None, 'ip': None, 'ping': None, 'monitor': None, 'config_search': None, 'demob': None})
     attempts_by_type: dict = field(default_factory=lambda: {'subnet': None, 'ip': None, 'ping': None, 'monitor': None, 'config_search': None, 'demob': None})
     demob_preview: object = None
@@ -50,6 +55,9 @@ class SessionSnapshot:
     latest_report_state: object = None
     report_state: object = None
     credential_request: object = None
+    # True while Infoblox checks the password that the sign-in dialog was answered with: from the reply until the
+    # worker says credentials_checked, asks again, or the job ends or is stopping. A flag: the reply is kept nowhere.
+    sign_in_checking: bool = False
     credential_store: object = None
     saved_login_restored: bool = False
     error: object = None
@@ -65,6 +73,11 @@ class SessionSnapshot:
     scope: str = ''
     username: str = ''
     report_warning: str = ''
+    # What the worker's last ready event said about the settings: whether an Infoblox API endpoint is set and
+    # Infoblox is on, and whether any configuration file was read. None until the first ready, and again while no
+    # runtime is open (setup_required).
+    infoblox_configured: object = None
+    config_found: object = None
 
 
 @dataclass
@@ -80,6 +93,9 @@ class PageSnapshot:
     outcome: object
     attempt_result: object
     attempt_report_state: object
+    # The page's latest attempt: {'started_at', 'ended_at', 'request'} (wall clock; 'ended_at' is None while it runs;
+    # 'request' is the summary that was SessionSnapshot.active_request), or None when the tool has not been used.
+    attempt_meta: object = None
 
 
 class SessionController:
@@ -95,6 +111,7 @@ class SessionController:
         self._reload_mode = None
         self._disconnected = False
         self._reader_finished = False
+        self._sign_in_job = None  # the job whose typed password Infoblox is checking (sign_in_checking)
         self._delete_pending = None
         self._delete_abandoned = False
         self._delete_results = {}
@@ -120,6 +137,11 @@ class SessionController:
         self._report_streams = set()
         self._result_revisions = dict.fromkeys(('subnet', 'ip', 'ping', 'monitor', 'config_search', 'demob'), 0)
         self._attempt_revisions = dict.fromkeys(('subnet', 'ip', 'ping', 'monitor', 'config_search', 'demob'), 0)
+        # What each tool was last asked, for last_request(): in memory only, in no snapshot.
+        self._last_requests = {}
+        # The running Ping's rows so far (partial_result), for ping_partial(): never in a snapshot, which is copied
+        # on every poll. Dropped when the job ends, however it ends, and when a job starts.
+        self._ping_partial = None
 
     def start(self, config_file=None, *, config_search_connection=None):
         from .worker_entry import worker_main
@@ -247,6 +269,11 @@ class SessionController:
             self._clear_demob()
             self._state.demob_discovery = None
             self._send('lookup', job, payload)
+            self._last_requests[lookup_type] = {key: deepcopy(value) for key, value in payload.items()
+                                                if key != 'lookup_type'}
+            summary = {'lines': sum(1 for line in inputs if line.strip())}
+            summary.update({key: deepcopy(value) for key, value in payload.items()
+                            if key in ('tcp_ports', 'interval_seconds', 'duration_seconds')})
             if lookup_type == 'monitor':
                 self._state.results_by_type['monitor'] = None
                 self._result_revisions['monitor'] += 1
@@ -255,9 +282,7 @@ class SessionController:
                 self._monitor_pages.clear()
                 self._map_requests.clear()
                 self._map_answers.clear()
-            self._state.active_job_id = job
-            self._state.active_lookup_type = lookup_type
-            self._state.attempts_by_type[lookup_type] = dict(job_id=job, outcome=None, report_state=None)
+            self._job_started(job, lookup_type, summary)
             self._attempt_revisions[lookup_type] += 1
             self._state.latest_attempt_id = job
             self._state.latest_outcome = None
@@ -272,6 +297,67 @@ class SessionController:
             self._state.elapsed_seconds = 0
             self._started_at = monotonic()
             return job
+
+    def _job_started(self, job, lookup_type, summary):
+        """The facts of the job that now runs, and its attempt; the caller holds the lock."""
+        started = time()
+        self._ping_partial = None
+        self._state.active_job_id = job
+        self._state.active_lookup_type = lookup_type
+        self._state.active_started_at = started
+        self._state.active_request = summary
+        self._state.attempts_by_type[lookup_type] = dict(job_id=job, outcome=None, report_state=None,
+                                                         started_at=started, ended_at=None, request=deepcopy(summary))
+
+    def _signed_in(self):
+        """Infoblox accepted this session's login: no attempt offers "Sign in again" any more (the refused login
+        was the session's, whichever page it was typed on). What the attempt did stays said. The caller holds
+        the lock."""
+        for lookup_type, attempt in self._state.attempts_by_type.items():
+            if attempt and (attempt.get('outcome') or {}).pop('sign_in_again', False):
+                self._attempt_revisions[lookup_type] += 1
+        if isinstance(self._state.latest_outcome, dict):
+            self._state.latest_outcome.pop('sign_in_again', None)
+
+    def _job_ended(self):
+        """Nothing runs any more: the job's facts leave the snapshot and its attempt gets the time it ended. The
+        caller holds the lock."""
+        lookup_type = self._state.active_lookup_type
+        attempt = self._state.attempts_by_type.get(lookup_type) if lookup_type is not None else None
+        if (attempt is not None and attempt.get('job_id') == self._state.active_job_id
+                and attempt.get('ended_at') is None):
+            attempt['ended_at'] = time()
+        self._ping_partial = None
+        self._state.active_job_id = None
+        self._state.active_lookup_type = None
+        self._state.active_started_at = None
+        self._state.active_request = None
+
+    def ping_partial(self, job_id=None, after=0):
+        """The running Ping's rows so far, or None while it has none: ``{job_id, count, completed, total, revision,
+        rows}``. ``rows`` are those after the first ``after`` of the job ``job_id``; a page that held another job's rows
+        (or none) gets them all. They are copies. The final result replaces them (this answers None from then on), and
+        a job that ends any other way leaves none, so a stopped or failed Ping presents no partial row as a result."""
+        if type(after) is not int or after < 0:  # not a bool (True is not 1 here), not a float, not negative
+            raise ValueError('after is a count of rows: a whole number, 0 or more')
+        with self._lock:
+            held = self._ping_partial
+            if held is None:
+                return None
+            start = after if job_id == held['job_id'] else 0
+            return dict(job_id=held['job_id'], count=len(held['rows']), completed=held['completed'],
+                        total=held['total'], revision=held['revision'], rows=deepcopy(held['rows'][start:]))
+
+    def last_request(self, lookup_type):
+        """What the tool was last asked in this session, for a tab that has no draft of its own (a new tab), or None.
+
+        ``{'inputs': lines}`` as they were submitted; Ping and Monitor add ``'tcp_ports'``, Monitor
+        ``'interval_seconds'`` and ``'duration_seconds'``; Configuration Search's inputs are its terms; Site
+        Demobilization gives ``{'site': text}``. It is the last request the controller accepted and sent, whatever
+        became of it, and it outlives its job. Kept in memory only: never in a snapshot, a URL or a file, and gone
+        when the session closes."""
+        with self._lock:
+            return deepcopy(self._last_requests.get(lookup_type))
 
     def _clear_demob(self):
         self._state.demob_preview = None
@@ -290,9 +376,9 @@ class SessionController:
             raise self._lookup_refusal()
         job = uuid4().hex
         self._send(kind, job, payload)
-        self._state.active_job_id = job
-        self._state.active_lookup_type = 'demob'
-        self._state.attempts_by_type['demob'] = dict(job_id=job, outcome=None, report_state=None)
+        if kind == 'demob_lookup':
+            self._last_requests['demob'] = {'site': payload['site']}
+        self._job_started(job, 'demob', {'lines': 1})
         self._attempt_revisions['demob'] += 1
         self._state.latest_attempt_id = job
         self._state.latest_outcome = None
@@ -389,16 +475,42 @@ class SessionController:
             self.cancel(self._state.active_job_id)
 
     def reply_credentials(self, request_id, reply, *, remember=False):
+        """Answer the worker's credential request. True when the answer is a password that the lookup checks at
+        Infoblox before it goes on (the request names ``tries_left``): `sign_in_checking` is then true until the
+        worker's verdict, and the dialog may stay open for it."""
         with self._lock:
             request = self._state.credential_request
             if not request or request['request_id'] != request_id:
-                return
+                return False
             self._send('credentials_reply', self._state.active_job_id, {
                 'request_id': request_id,
                 'reply': None if reply is None else {'username': reply.username, 'password': reply.password},
                 'remember': remember,
             })
             self._state.credential_request = None
+            self._sign_in_job = self._state.active_job_id if reply is not None and request.get('tries_left') else None
+            return self._checking()
+
+    def sign_in_checking(self):
+        """SessionSnapshot.sign_in_checking, without a snapshot."""
+        with self._lock:
+            return self._checking()
+
+    def cancel_sign_in(self):
+        """Stop the lookup whose sign-in Infoblox is checking (Cancel in the dialog that waits for the answer)."""
+        with self._lock:
+            if self._checking():
+                self.cancel(self._state.active_job_id)
+            elif self._sign_in_job is not None and self._sign_in_job == self._state.active_job_id:
+                # The refusal's request came in before this Cancel was handled: answer it with nothing, as the
+                # dialog's own Cancel does, so the lookup ends instead of asking for a password again.
+                request = self._state.credential_request
+                if request and self._state.phase == 'running':
+                    self.reply_credentials(request['request_id'], None)
+
+    def _checking(self):
+        return (self._sign_in_job is not None and self._sign_in_job == self._state.active_job_id
+                and self._state.phase == 'running' and self._state.credential_request is None)
 
     def forget_credentials(self):
         with self._lock:
@@ -411,6 +523,7 @@ class SessionController:
                     and monotonic() >= self._demob_expires):
                 self._clear_demob()
             state = deepcopy(self._state)
+            state.sign_in_checking = self._checking()
             if self._started_at is not None:
                 state.elapsed_seconds = monotonic() - self._started_at
             return state
@@ -430,7 +543,7 @@ class SessionController:
             # These fields contain the large per-tool data; never copy them as
             # part of routine metadata or expose references into controller state.
             state = deepcopy(replace(self._state, results_by_type={}, attempts_by_type={},
-                                     result=None, latest_outcome=None))
+                                     result=None, latest_outcome=None, sign_in_checking=self._checking()))
             if self._started_at is not None:
                 state.elapsed_seconds = monotonic() - self._started_at
             diagnostic = attempt.get('result') or {}
@@ -444,10 +557,11 @@ class SessionController:
             elif attempt_changed and lookup_type == 'monitor' and 'result' in attempt:
                 # Monitor's validated result is compact and includes failures from finalization.
                 attempt_result = deepcopy(attempt['result'])
+            meta = {key: deepcopy(attempt.get(key)) for key in ('started_at', 'ended_at', 'request')} if attempt else None
             return PageSnapshot(state, result_version, attempt_version, result_changed, attempt_changed,
                 result.get('job_id'), deepcopy(result.get('result')) if result_changed else None,
                 attempt.get('job_id'), deepcopy(attempt.get('outcome')) if attempt_changed else None,
-                attempt_result, deepcopy(attempt.get('report_state')))
+                attempt_result, deepcopy(attempt.get('report_state')), meta)
 
     def current_credential_request(self):
         """Revalidate a prompt without traversing retained results."""
@@ -515,7 +629,9 @@ class SessionController:
             self._monitor_requests.pop(query_id, None)
             self._monitor_pages.pop(query_id, None)
 
-    def request_monitor_live_page(self, job_id, run_id, revision, offset, limit=100, sort=None, descending=False, group='all', filter_field='host', filter_text=''):
+    def request_monitor_live_page(self, job_id, run_id, revision, offset, limit=100, sort=None, descending=False, group='all', filter_field='host', filter_text='', filter_exact=False):
+        """``filter_exact`` lists the hosts whose filtered field is ``filter_text`` (case-folded), not those that
+        contain it; it needs the filter it qualifies, so a request without ``sort`` is refused with it."""
         with self._lock:
             update = self._state.monitor_update
             selected = self._state.attempts_by_type['monitor'] or {}
@@ -526,6 +642,8 @@ class SessionController:
             payload = dict(job_id=job_id, run_id=run_id, revision=revision, offset=offset, limit=limit, query_id=query_id)
             if sort is not None:
                 payload.update(sort=sort, descending=descending, group=group, filter_field=filter_field, filter_text=filter_text)
+            if filter_exact:
+                payload['filter_exact'] = True
             self._send('monitor_live_page', None, payload)
             self._monitor_requests[query_id] = payload
             return query_id
@@ -732,6 +850,7 @@ class SessionController:
             if self._state.phase == 'closing':
                 return
             self._state.phase = 'closing'
+            self._last_requests.clear()
             self._clear_demob()
             self._state.demob_discovery = None
             self._clear_report_availability()
@@ -787,6 +906,8 @@ class SessionController:
             if kind == 'ready':
                 self._state.scope, self._state.username = payload['scope'], payload['username']
                 self._state.report_warning = payload.get('report_warning', '')
+                self._state.infoblox_configured = payload.get('infoblox_configured')
+                self._state.config_found = payload.get('config_found')
                 if self._state.phase != 'closing':
                     self._state.phase = 'ready'
                 if 'report_state' in payload:
@@ -795,11 +916,14 @@ class SessionController:
                 if self._state.phase != 'closing':
                     self._state.phase = 'setup_required'
                 self._clear_report_availability()
+                self._state.infoblox_configured = self._state.config_found = None
                 self._state.error = payload['message']
                 self._state.credential_request = None
             elif kind == 'credentials_required':
                 if job and job == self._state.active_job_id and self._state.phase != 'closing':
-                    self._state.credential_request = payload
+                    self._state.credential_request = payload  # `_sign_in_job` stays: Cancel may still be on its way
+            elif kind == 'credentials_checked':
+                self._sign_in_job = None
             elif kind == 'credential_store_state':
                 self._state.credential_store = payload
             elif kind == 'saved_login_restored':
@@ -871,8 +995,7 @@ class SessionController:
                 if self._state.phase == 'stopping':
                     self._send('demob_decline', None, {})
                     self._clear_demob()
-                    self._state.active_job_id = None
-                    self._state.active_lookup_type = None
+                    self._job_ended()
                     self._state.credential_request = None
                     self._started_at = None
                     self._state.phase = 'ready'
@@ -883,8 +1006,7 @@ class SessionController:
                                             message='The site lookup was not saved as a report.',
                                             available=previous.get('available', False), saved_for_attempt=False))
                 self._demob_expires = monotonic() + 300 if payload['token'] else 0
-                self._state.active_job_id = None
-                self._state.active_lookup_type = None
+                self._job_ended()
                 self._state.credential_request = None
                 self._started_at = None
                 self._state.phase = 'ready'
@@ -917,6 +1039,27 @@ class SessionController:
                 self._config_pages[payload['query_id']] = deepcopy(payload)
             elif kind == 'lookup_context':
                 self._state.username, self._state.scope = payload['username'], payload['scope']
+                self._signed_in()
+            elif kind == 'partial_result':
+                # Only the running Ping's own batches, in the order they come; a late one after the job ended, or
+                # one for another tool's job, is dropped. The rows are bounded; the counts of hosts go on.
+                if (job == self._state.active_job_id and self._state.active_lookup_type == 'ping' and
+                        self._state.phase in {'running', 'stopping'}):
+                    held = self._ping_partial
+                    if held is None or held['job_id'] != job:
+                        held = self._ping_partial = dict(job_id=job, rows=[], completed=0, total=0, revision=0,
+                                                         bytes=0, full=False)
+                    # Bounded by rows and by bytes: past either limit no batch is kept (the rows stay a run from the
+                    # first, and the counts of hosts and the final result go on).
+                    kept = payload['rows'][:max(0, PING_ROWS_MAX - len(held['rows']))]
+                    size = sum(len(key) + len(value) for row in kept for key, value in row.items())
+                    if held['full'] or held['bytes'] + size > PING_PARTIAL_BYTES_MAX:
+                        held['full'] = True
+                    else:
+                        held['rows'].extend(deepcopy(kept))
+                        held['bytes'] += size
+                    held['completed'], held['total'] = payload['completed'], payload['total']
+                    held['revision'] += 1
             elif kind == 'progress':
                 self._state.progress_stage = payload['stage']
                 self._state.progress_completed = payload.get('completed')
@@ -957,17 +1100,19 @@ class SessionController:
                         self._state.latest_attempt_id = job
                         self._state.latest_outcome = dict(kind='lookup_error', message=payload['message'],
                             matched_count=0, invalid_count=0, resolution_error_count=0, miss_count=0,
-                            warning_count=0, stopped=False, details={})
+                            warning_count=0, stopped=False, details={},
+                            **({'sign_in_again': True} if payload.get('sign_in_again') else {}))
                         self._state.attempts_by_type[self._state.active_lookup_type]['outcome'] = deepcopy(self._state.latest_outcome)
                         self._attempt_revisions[self._state.active_lookup_type] += 1
+                        # A lookup error is not a report failure: the error stays in the attempt's outcome, and the
+                        # report says nothing (the workbook, if there is one, stays available).
                         previous = self._state.latest_report_state or {}
-                        self._set_report_state(dict(state='failed', status='failed', filename=previous.get('filename', ''),
-                            message=payload['message'], available=previous.get('available', False), saved_for_attempt=False))
+                        self._set_report_state(dict(state='idle', status='idle', filename=previous.get('filename', ''),
+                            message='', available=previous.get('available', False), saved_for_attempt=False))
                 if self._started_at is not None:
                     self._state.elapsed_seconds = monotonic() - self._started_at
                     self._started_at = None
-                self._state.active_job_id = None
-                self._state.active_lookup_type = None
+                self._job_ended()
                 self._state.credential_request = None
                 if self._state.phase != 'closing':
                     self._state.phase = 'ready' if job else 'failed'
@@ -1022,8 +1167,8 @@ class SessionController:
                 self._report_paths.clear()
                 self._report_completions.clear()
                 self._report_streams.clear()
-                self._state.active_job_id = None
-                self._state.active_lookup_type = None
+                self._last_requests.clear()
+                self._job_ended()
 
     def _receive(self):
         try:
@@ -1042,12 +1187,12 @@ class SessionController:
                 self._config_requests.clear()
                 self._config_pages.clear()
                 self._state.results_by_type['config_search'] = None
+                self._last_requests.clear()
                 if self._state.phase != 'closed':
                     self._state.phase = 'failed'
                     self._clear_report_availability()
                     self._state.error = 'Worker connection closed unexpectedly. Relaunch to start a new session.'
-                    self._state.active_job_id = None
-                    self._state.active_lookup_type = None
+                    self._job_ended()
                     self._state.credential_request = None
         finally:
             with self._lock:

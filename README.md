@@ -153,6 +153,10 @@ download and a copy. Release 0.12.1 starts cn on Windows through the signed Pyth
 keeps one browser session per user. Release 0.12.2 adds **Ping these** and **Monitor these** to the IP and
 Subnets result tables: they open Ping or Monitor with the listed addresses as its targets. Release 0.12.3
 shows Monitor's latest round as a **Map**, one character for each address, with the Table as the other view.
+Release 0.13.0 opens every tool inside one browser page and folds the form into one line after a run, so the results
+are on the first screen; it gives every table one filter and one footer, shows a Ping's progress, puts the view in the
+address (with **Copy view link**), adds keyboard shortcuts and a dark theme that follows the system, keeps the
+sign-in open after a refused password, and says what **Stop** and **Quit** will do.
 See the [WebUI guide](https://github.com/evdanil/cn-tool/blob/main/docs/webui.md) for details.
 Closing a tab keeps the application running; **Quit application** ends it and runs
 configured exit actions, including email when enabled.

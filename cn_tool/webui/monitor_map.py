@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from html import escape
+import json
 from typing import Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from cn_tool.utils import ping_grid
@@ -19,6 +20,9 @@ from cn_tool.utils import ping_grid
 CAP_CELLS = 65536  # one /16: the grid is drawn while the subnet blocks together hold no more cells
 CAP_NAMES = 2048  # and the Hosts block no more names
 MAX_COLS = 400
+# The font of the map grows with the free width of its box: the largest of these sizes (px) at which the widest line
+# still fits. The first is the base size, and the layout (how many characters a row holds) is always chosen at it.
+FONT_STEPS = (13, 15, 17, 20)
 _UNBOUNDED = 10 ** 9
 _PLAIN = {'text': '', 'label': 'm-lab', 'header': 'm-hd'}
 
@@ -53,6 +57,18 @@ def snapshot(blocks: Sequence[ping_grid.Block], tracker) -> Snapshot:
     numbers.append(f'{len(summaries):,} seen of {len(cells):,}')
     return Snapshot(tuple(blocks), cells, frozenset(tracker.changed()), frozenset(tracker.partial()),
                     tuple(tracker.hosts), seen, tracker.rounds, ' · '.join(numbers))
+
+
+def font_step(available: float, used: int, char_width: float) -> int:
+    """The size of the map's font: the largest of ``FONT_STEPS`` at which ``used`` characters (the widest line drawn)
+    still fit in ``available`` px, ``char_width`` being the width of one character at the base size. The base size
+    when none fits (the box scrolls sideways), when nothing is drawn or when a measure is missing. The page's script
+    has the same rule (``fontStep``), and a browser test holds the two together."""
+    base = FONT_STEPS[0]
+    if not (available > 0 and used > 0 and char_width > 0):
+        return base
+    fitting = [step for step in FONT_STEPS if used * char_width * step / base <= available]
+    return fitting[-1] if fitting else base
 
 
 def _size(block: ping_grid.Block) -> int:
@@ -205,6 +221,46 @@ def _address_data(network) -> str:
     return f' data-ip6="{escape(stem)}" data-ip6first="{escape(str(network.network_address))}" data-ip6low="{first & 0xFFFF}"'
 
 
+# The states of a host that answered (`ping_grid.LEGEND`): it replied, it rejected the probe (up, firewalled) or it
+# answered on TCP only. A block "with answers" has at least one such host.
+ANSWERS = '!RT'
+
+
+def _answering(item: Mapping[str, object]) -> int:
+    """How many hosts of one payload block answered (`ANSWERS`): counted from its characters, or read from the
+    counters line of a block that is not drawn (``title: 3 ! · 2 R · 61,102 .``)."""
+    if item['kind'] != 'compact':
+        return sum(str(item['chars']).count(state) for state in ANSWERS)
+    text = str(item['text'])
+    text = text[len(str(item['title'])) + 2:] if text.startswith(f"{item['title']}: ") else text
+    total = 0
+    for part in text.split(' · '):
+        count, _, state = part.rpartition(' ')
+        if len(state) == 1 and state in ANSWERS and count.replace(',', '').isdigit():
+            total += int(count.replace(',', ''))
+    return total
+
+
+def jumps(payload: Mapping[str, object]) -> List[dict]:
+    """What the block index's jumps need per block, in the payload's order, as plain values for the page's script:
+    ``t`` title, ``a`` hosts that answered, ``f`` the first cell of the block that did (-1 if none or not drawn),
+    ``k`` the kind, ``s`` the words the status line says on landing. Sent with every round (it is no part of the
+    rows, so a round that changes the counts redraws no more than the rows it changed)."""
+    out = []
+    for item in payload['blocks']:
+        answering = _answering(item)
+        if item['kind'] == 'compact':
+            words = f"{item['title']}: {answering:,} answering, not drawn" + ('; Show this block draws it' if item['can_show'] else '')
+            first = -1
+        else:
+            chars = str(item['chars'])
+            hosts = len(chars) - chars.count(' ')  # the network and broadcast addresses are no hosts
+            words = f"{item['title']}: {answering:,} of {hosts:,} answering"
+            first = min((at for at in (chars.find(state) for state in ANSWERS) if at >= 0), default=-1)
+        out.append(dict(t=str(item['title']), a=answering, f=first, k=item['kind'], s=words))
+    return out
+
+
 def render(payload: Mapping[str, object], cols: int) -> dict:
     """``payload`` laid out for a box ``cols`` characters wide: per block its opening tag, its rows as
     ``(id, attributes, inner HTML)`` and what follows them. A box too narrow for the smallest row, or for a name of
@@ -244,6 +300,7 @@ def render(payload: Mapping[str, object], cols: int) -> dict:
     lines = ping_grid.grid_lines(drawn, chars, width=width, height=_UNBOUNDED, changed=changed, partial=partial)
     if lines is None:
         raise ValueError('The map cannot be laid out')
+    used = max((sum(len(text) for text, _ in line) for line in lines), default=0)
     out, at = [], 0
     for number, (item, block) in enumerate(zip(payload['blocks'], blocks)):
         head = f'<div class="b" data-b="{number}" data-kind="{item["kind"]}"'
@@ -272,18 +329,42 @@ def render(payload: Mapping[str, object], cols: int) -> dict:
                 rows.append((f'cnm-{number}-{len(rows)}', '', inner))
                 at += 1
         out.append(dict(open=head + '>', rows=rows, tail=''))
-    return dict(blocks=out, size=size, label_width=label_width, group=ping_grid.GROUP, width=width)
+    return dict(blocks=out, size=size, label_width=label_width, group=ping_grid.GROUP, width=width, used=used,
+                jumps=jumps(payload))
+
+
+def _block_html(block: Mapping[str, object]) -> str:
+    parts = [block['open']]
+    for identity, attrs, inner in block['rows']:
+        parts.append(f'<div class="r{" hd" if identity.endswith("-h") else ""}" id="{identity}"{attrs}>{inner}</div>')
+    parts.append(block['tail'] + '</div>')
+    return ''.join(parts)
 
 
 def full_html(drawn: Mapping[str, object]) -> str:
-    """The whole map as one string of HTML."""
-    parts: List[str] = []
-    for block in drawn['blocks']:
-        parts.append(block['open'])
-        for identity, attrs, inner in block['rows']:
-            parts.append(f'<div class="r{" hd" if identity.endswith("-h") else ""}" id="{identity}"{attrs}>{inner}</div>')
-        parts.append(block['tail'] + '</div>')
+    """The whole map as one string of HTML. The blocks that are not drawn (a counter line and a button each) are one
+    index in front of the drawn ones, sticky at the top of the box: after a /16 their buttons are not thousands of
+    pixels down. The rows are found by their ids, so the order of the DOM is no matter to ``diff``."""
+    index = [_block_html(block) for block in drawn['blocks'] if 'data-kind="compact"' in block['open']]
+    parts = [_block_html(block) for block in drawn['blocks'] if 'data-kind="compact"' not in block['open']]
+    jump = _jump_html() if len(drawn.get('jumps', ())) > 1 else ''
+    if index or jump:
+        label = 'Blocks not shown' if parts and index else 'Blocks' if index else 'Block index'
+        parts.insert(0, f'<div class="cn-map-index" role="group" aria-label="{label}">' + jump + ''.join(index) + '</div>')
     return ''.join(parts)
+
+
+JUMP_NEXT = 'Next block with answers'
+JUMP_PREVIOUS = 'Previous block with answers'
+
+
+def _jump_html() -> str:
+    """The jumps of the block index: two buttons and the line that says where the last one landed (plain text, set
+    by the page's script only when a jump is made, so no round speaks it)."""
+    return ('<div class="cn-map-jump">'
+            f'<button type="button" class="cn-map-jumpbtn" data-jump="-1">{JUMP_PREVIOUS}</button>'
+            f'<button type="button" class="cn-map-jumpbtn" data-jump="1">{JUMP_NEXT}</button>'
+            '<span class="cn-map-jumpnote" role="status" data-jump-note></span></div>')
 
 
 def _shape(drawn: Mapping[str, object]) -> list:
@@ -310,19 +391,33 @@ def legend_html() -> str:
 
 
 CSS = '''
-.cn-live-view { --cn-map-ok:#205E3C; --cn-map-info:#145C87; --cn-map-warning:#775110; --cn-map-error:#922D2D; --cn-map-dim:#5B6B77; --cn-map-bg:#FFFFFF; --cn-map-ink:#1F2D38; }
+.cn-live-view { --cn-map-bg:var(--cn-panel); --cn-map-ink:var(--cn-ink); }
 .cn-live-view:not([data-cn-live-view=map]) .cn-live-map-area { display:none; }
 .cn-live-view[data-cn-live-view=map] .cn-live-table-area { display:none; }
 .cn-map-summary { font-variant-numeric:tabular-nums; }
-.cn-map { position:relative; padding:8px 10px; background:var(--cn-map-bg); color:var(--cn-map-ink); font-family:ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; font-size:13px; line-height:18px; white-space:pre; font-variant-ligatures:none; cursor:default; -webkit-text-size-adjust:100%; text-size-adjust:100%; }
+.cn-map { position:relative; padding:8px 10px; background:var(--cn-map-bg); color:var(--cn-map-ink); font-family:ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; font-size:var(--cn-map-size, 13px); line-height:var(--cn-map-line, 18px); scrollbar-gutter:stable; white-space:pre; font-variant-ligatures:none; cursor:default; -webkit-text-size-adjust:100%; text-size-adjust:100%; }
+.cn-map[data-size="15"] { --cn-map-size:15px; --cn-map-line:21px; }
+.cn-map[data-size="17"] { --cn-map-size:17px; --cn-map-line:24px; }
+.cn-map[data-size="20"] { --cn-map-size:20px; --cn-map-line:28px; }
 /* The ruler (100 characters) is fixed, like the popup: an absolute one would be part of what the box scrolls,
    and a box narrower than it would scroll sideways over nothing. */
 .cn-map .cn-map-probe { position:fixed; visibility:hidden; pointer-events:none; top:0; left:0; }
-.cn-map .b { width:max-content; min-width:100%; margin-bottom:18px; }
+/* The layout is chosen at the base size, so a larger font never changes how many characters a row holds. */
+.cn-map .cn-map-probe.base { font-size:13px; }
+.cn-map .b { width:max-content; min-width:100%; margin-bottom:var(--cn-map-line, 18px); }
 .cn-map .b:last-child { margin-bottom:0; }
-.cn-map .r { height:18px; }
-.cn-map .hd { position:sticky; top:0; z-index:1; background:var(--cn-map-bg); }
-.cn-map .m-lab { color:#334D60; }
+.cn-map .r { height:var(--cn-map-line, 18px); }
+.cn-map .hd { position:sticky; top:var(--cn-map-hd-top, 0px); z-index:1; background:var(--cn-map-bg); }
+/* Over the cap: the blocks that are not drawn stay in view while the drawn one scrolls. */
+/* The box has 8px of padding that a sticky element's "top" counts from: the index covers it, so no row shows above. */
+.cn-map .cn-map-index { position:sticky; top:-8px; z-index:3; max-height:10em; overflow:auto; width:max-content; min-width:100%; box-sizing:border-box; margin:-8px 0 var(--cn-map-line, 18px); padding:8px 0 6px; background:var(--cn-map-bg); border-bottom:1px solid var(--cn-map-dim); }
+.cn-map .cn-map-index .b { margin-bottom:6px; }
+.cn-map .cn-map-jump { width:0; min-width:100%; display:flex; flex-wrap:wrap; align-items:center; gap:4px 8px; margin:0 0 6px; white-space:normal; font-family:Roboto, -apple-system, "Segoe UI", sans-serif; font-size:13px; line-height:1.4; }
+.cn-map .cn-map-jumpbtn { min-height:32px; padding:2px 10px; font:inherit; color:var(--cn-map-info); background:var(--cn-map-bg); border:1px solid var(--cn-map-info); border-radius:4px; cursor:pointer; }
+.cn-map .cn-map-jumpbtn:focus-visible { outline:2px solid var(--cn-focus); outline-offset:2px; }
+.cn-map .cn-map-jumpnote { min-width:0; overflow-wrap:anywhere; }
+.cn-map .b.cn-map-landed { outline:2px solid var(--cn-map-info); outline-offset:2px; }
+.cn-map .m-lab { color:var(--cn-ink); }
 .cn-map .m-hd { color:var(--cn-map-dim); }
 .cn-map .m-ok { color:var(--cn-map-ok); font-weight:700; }
 .cn-map .m-info { color:var(--cn-map-info); font-weight:700; }
@@ -338,44 +433,75 @@ CSS = '''
 .cn-map .m-dim.m-rev { background:var(--cn-map-dim); }
 .cn-map .cn-map-cursor { display:none; position:absolute; z-index:2; pointer-events:none; box-sizing:border-box; border:2px solid var(--cn-map-info); border-radius:2px; }
 .cn-map .cn-map-cursor.on { display:block; }
-.cn-map:focus-visible .cn-map-cursor.on { box-shadow:0 0 0 2px #FFFFFF, 0 0 0 4px var(--cn-map-info); }
-.cn-map .cn-map-show { margin:2px 0 0 2ch; min-height:28px; padding:2px 10px; font:inherit; color:var(--cn-map-info); background:#FFFFFF; border:1px solid var(--cn-map-info); border-radius:4px; cursor:pointer; }
+.cn-map:focus-visible .cn-map-cursor.on { box-shadow:0 0 0 2px var(--cn-ring-gap), 0 0 0 4px var(--cn-map-info); }
+.cn-map .cn-map-show { margin:2px 0 0 2ch; min-height:28px; padding:2px 10px; font:inherit; color:var(--cn-map-info); background:var(--cn-map-bg); border:1px solid var(--cn-map-info); border-radius:4px; cursor:pointer; }
 .cn-map [data-kind=compact] { display:flex; flex-wrap:wrap; align-items:center; }
 .cn-map-sr { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
-.cn-map-popup { position:fixed; z-index:6000; box-sizing:border-box; max-width:min(360px, calc(100vw - 16px)); padding:10px 12px; background:#FFFFFF; color:#1F2D38; border:1px solid #9FB2C0; border-radius:6px; box-shadow:0 4px 16px rgba(16,40,60,.22); font-family:Roboto, -apple-system, "Segoe UI", sans-serif; font-size:13px; line-height:1.45; white-space:normal; cursor:auto; }
+.cn-map-popup { position:fixed; z-index:6000; box-sizing:border-box; max-width:min(360px, calc(100vw - 16px)); padding:10px 12px; background:var(--cn-panel); color:var(--cn-ink); border:1px solid var(--cn-field-line); border-radius:6px; box-shadow:0 4px 16px var(--cn-shadow); font-family:Roboto, -apple-system, "Segoe UI", sans-serif; font-size:13px; line-height:1.45; white-space:normal; cursor:auto; }
 .cn-map-popup[hidden] { display:none; }
 .cn-map-popup[data-pinned=false] { pointer-events:none; }
 .cn-map-popup dl { display:grid; grid-template-columns:auto minmax(0,1fr); gap:2px 10px; margin:0; }
-.cn-map-popup dt { color:#5B6B77; white-space:nowrap; }
+.cn-map-popup dt { color:var(--cn-muted); white-space:nowrap; }
 .cn-map-popup dd { margin:0; overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
-.cn-map-popup .cn-map-note { margin-top:4px; color:#5B6B77; }
+.cn-map-popup .cn-map-note { margin-top:4px; color:var(--cn-muted); }
 .cn-map-popup .cn-map-acts { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
-.cn-map-popup button { min-width:44px; min-height:44px; padding:0 12px; font:inherit; color:#145C87; background:#FFFFFF; border:1px solid #145C87; border-radius:4px; cursor:pointer; }
-.cn-map-popup button:focus-visible, .cn-map .cn-map-show:focus-visible { outline:2px solid #145C87; outline-offset:2px; }
+.cn-map-popup button { min-width:44px; min-height:44px; padding:0 12px; font:inherit; color:var(--cn-link); background:var(--cn-panel); border:1px solid var(--cn-link); border-radius:4px; cursor:pointer; }
+.cn-map-popup button:focus-visible, .cn-map .cn-map-show:focus-visible { outline:2px solid var(--cn-focus); outline-offset:2px; }
 .cn-map-legend { font-family:ui-monospace, Menlo, Consolas, "Liberation Mono", monospace; font-size:13px; line-height:20px; }
 .cn-map-legend .cn-map-key { display:inline-block; max-width:100%; margin-right:2ch; overflow-wrap:anywhere; }
-.cn-live-switch .q-btn[aria-pressed=true] { background:#E5F0F7 !important; box-shadow:inset 0 -3px #145C87; font-weight:700; }
+.cn-live-switch .q-btn[aria-pressed=true] { background:var(--cn-action-hover) !important; box-shadow:inset 0 -3px var(--cn-focus); font-weight:700; }
 .cn-map-legend .m-ok, .cn-map-legend .m-info, .cn-map-legend .m-warning, .cn-map-legend .m-error { font-weight:700; }
-.cn-map-legend .m-ok { color:#205E3C; } .cn-map-legend .m-info { color:#145C87; } .cn-map-legend .m-warning { color:#775110; }
-.cn-map-legend .m-error { color:#922D2D; } .cn-map-legend .m-dim { color:#5B6B77; }
+.cn-map-legend .m-ok { color:var(--cn-map-ok); } .cn-map-legend .m-info { color:var(--cn-map-info); } .cn-map-legend .m-warning { color:var(--cn-map-warning); }
+.cn-map-legend .m-error { color:var(--cn-map-error); } .cn-map-legend .m-dim { color:var(--cn-map-dim); }
 .cn-map-legend .m-part { text-decoration:underline; text-decoration-thickness:2px; text-underline-offset:2px; }
-.cn-map-legend .m-ok.m-rev { color:#FFFFFF; background:#205E3C; padding:0 2px; }
+.cn-map-legend .m-ok.m-rev { color:var(--cn-panel); background:var(--cn-map-ok); padding:0 2px; }
+@media (forced-colors: active) {
+  .cn-map .m-rev, .cn-map .m-ok.m-rev, .cn-map .m-info.m-rev, .cn-map .m-warning.m-rev, .cn-map .m-error.m-rev, .cn-map .m-dim.m-rev,
+  .cn-map-legend .m-rev, .cn-map-legend .m-ok.m-rev { forced-color-adjust:none; color:HighlightText; background:Highlight; }
+  /* Quasar's button keeps its own background with !important: the label inside it takes the system colours. */
+  .cn-live-switch .q-btn[aria-pressed=true] .q-btn__content { forced-color-adjust:none; color:HighlightText; background:Highlight; padding:0 4px; }
+}
 @media print { .cn-map.cn-monitor-scroll { max-height:none; overflow:visible; } .cn-map-popup, .cn-map .cn-map-cursor { display:none; } }
 '''
 
 SCRIPT = r'''<script>
 window.cnMonitorMap = window.cnMonitorMap || (() => {
   const KEY = 'cn-tool-monitor-live-view';
-  const S = {wrap: null, box: null, body: null, cursor: null, popup: null, live: null, probe: null, words: {},
+  const STEPS = __STEPS__;
+  const S = {wrap: null, box: null, body: null, cursor: null, popup: null, live: null, probe: null, base: null, used: 0, words: {},
              group: 8, rev: null, cur: null, shown: null, pinned: false, say: false, cache: new Map(), timer: 0,
-             view: 'map', sent: '', note: ''};
+             view: 'map', sent: '', note: '', jumps: [], jumpAt: null, jumpNote: '', noteEl: null, moved: false};
   const stored = () => { try { return sessionStorage.getItem(KEY); } catch (error) { return null; } };
   const store = view => { try { sessionStorage.setItem(KEY, view); } catch (error) { /* a private tab */ } };
-  const send = (name, data) => { if (window.emitEvent) window.emitEvent(name, data); };
+  // Every event carries the token of the init that set this map up: the page ignores one whose token is not its own (an
+  // event of a map that was left, still on its way when the Monitor was opened again).
+  const send = (name, data) => { if (window.emitEvent) window.emitEvent(name, Object.assign({token: S.token}, data)); };
   const charWidth = () => S.probe ? S.probe.getBoundingClientRect().width / 100 : 0;
 
+  // The layout is chosen at the base size (a larger font changes no row), and the font is then fitted to it.
+  const baseWidth = () => S.base ? S.base.getBoundingClientRect().width / 100 : 0;
+  function fontStep(available, used, width) {
+    if (!(available > 0 && used > 0 && width > 0)) return STEPS[0];
+    let best = STEPS[0];
+    for (const step of STEPS) if (used * width * step / STEPS[0] <= available) best = step;
+    return best;
+  }
+  function fit() {
+    if (!S.box || !S.body) return;
+    const style = getComputedStyle(S.box);
+    const available = S.box.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+    const step = String(S.view === 'map' ? fontStep(available, S.used, baseWidth()) : STEPS[0]);
+    const index = S.body.querySelector('.cn-map-index');
+    if (index) S.box.style.setProperty('--cn-map-hd-top', (index.offsetHeight - 8) + 'px');
+    else S.box.style.removeProperty('--cn-map-hd-top');
+    if (S.box.dataset.size === step) return;
+    S.box.dataset.size = step;
+    place(false);
+    if (S.shown) position();
+  }
+
   function columns() {
-    const width = charWidth();
+    const width = baseWidth();
     if (!S.box || !S.box.clientWidth || !width) return 0;
     const style = getComputedStyle(S.box);
     return Math.max(1, Math.floor((S.box.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)) / width));
@@ -393,7 +519,7 @@ window.cnMonitorMap = window.cnMonitorMap || (() => {
     S.view = view === 'table' ? 'table' : 'map';
     if (S.wrap) S.wrap.dataset.cnLiveView = S.view;
   }
-  function setView(view) { apply(view); store(S.view); hide(); report(true, false); }
+  function setView(view) { apply(view); store(S.view); hide(); if (S.box) report(true, false); }
 
   const blockOf = b => S.body ? S.body.querySelector('.b[data-b="' + b + '"]') : null;
   const same = (a, b) => !!a && !!b && a.b === b.b && a.c === b.c;
@@ -582,8 +708,9 @@ window.cnMonitorMap = window.cnMonitorMap || (() => {
     if (!range) { S.cursor.classList.remove('on'); return; }
     let cell = range.getBoundingClientRect();
     const box = S.box.getBoundingClientRect();
+    const lead = 28 + Math.max(0, (S.body.querySelector('.cn-map-index')?.offsetHeight || 0) - 8);  // the sticky rows hide what is under them
     if (scroll) {
-      if (cell.top < box.top + 28) S.box.scrollTop -= box.top + 28 - cell.top;
+      if (cell.top < box.top + lead) S.box.scrollTop -= box.top + lead - cell.top;
       else if (cell.bottom > box.bottom - 10) S.box.scrollTop += cell.bottom - box.bottom + 10;
       if (cell.left < box.left + 10) S.box.scrollLeft -= box.left + 10 - cell.left;
       else if (cell.right > box.right - 10) S.box.scrollLeft += cell.right - box.right + 10;
@@ -651,20 +778,63 @@ window.cnMonitorMap = window.cnMonitorMap || (() => {
     return across(neighbour(d.b, step), step, d, d.c % size);
   }
 
+  // The jumps of the block index: to the next (or previous) block in which a host answered (it replied, rejected
+  // or answered on TCP only). A drawn block gets the keyboard cursor on its first such host; a block that is not drawn is marked and brought into the index's
+  // view. The status line beside the buttons says where it landed; it is written by a jump only, never by a round.
+  function jump(step) {
+    const list = S.jumps, note = S.body && S.body.querySelector('[data-jump-note]');
+    const here = S.jumpAt !== null ? S.jumpAt : (S.cur && S.moved ? S.cur.b : -1);  // the cursor a focus puts on the first cell is no place to go on from
+    let at = -1;
+    for (let i = here + step; i >= 0 && i < list.length; i += step) if (list[i].a > 0) { at = i; break; }
+    let text;
+    if (at < 0) text = !list.some(item => item.a > 0) ? 'No block has answers yet.'
+      : step > 0 ? 'No later block has answers.' : 'No earlier block has answers.';
+    else {
+      const item = list[at], block = blockOf(at);
+      for (const old of S.body.querySelectorAll('.cn-map-landed')) old.classList.remove('cn-map-landed');
+      S.jumpAt = at;
+      text = 'Block ' + (at + 1) + ' of ' + list.length + ', ' + item.s + '.';
+      if (item.k !== 'compact' && item.f >= 0) {
+        S.cur = {b: at, c: item.f};
+        hide();
+        place(true);
+        const where = target(S.cur);
+        if (where) text += ' Cursor on ' + where + '.';
+      } else if (block) {
+        block.classList.add('cn-map-landed');
+        const index = S.body.querySelector('.cn-map-index'), bar = index && index.querySelector('.cn-map-jump');
+        if (index) index.scrollTop = Math.max(0, block.offsetTop - (bar ? bar.offsetHeight : 0) - 4);
+      }
+    }
+    S.jumpNote = text;
+    if (note) { note.textContent = text; S.noteEl = note; }
+  }
+
   function draw(message) {
     if (!S.body) return;
-    if (message.full !== undefined) S.body.innerHTML = message.full;
-    else for (const [id, inner] of message.rows) {
+    const held = S.body.contains(document.activeElement) && document.activeElement.dataset.jump;
+    if (message.full !== undefined) {
+      S.body.innerHTML = message.full;
+      if (!message.full) { S.jumpNote = ''; S.jumpAt = null; S.noteEl = null; }
+      const fresh = S.body.querySelector('[data-jump-note]');
+      if (fresh && S.noteEl) fresh.replaceWith(S.noteEl);  // the line (a live region) outlives the redraw of the index that holds it
+      else if (fresh) { S.noteEl = fresh; fresh.textContent = S.jumpNote; }
+      const again = held && S.body.querySelector('[data-jump="' + held + '"]');
+      if (again) again.focus({preventScroll: true});
+    } else for (const [id, inner] of message.rows) {
       const row = document.getElementById(id);
       if (row) row.innerHTML = inner;
     }
+    S.jumps = message.jumps || (message.full === '' ? [] : S.jumps);
     S.rev = message.rev;
     S.cache.clear();
     if (message.label) S.box.setAttribute('aria-label', message.label);
+    S.used = message.used || 0;
     if (S.cur && !rowOf(S.cur)) { S.cur = null; delete S.box.dataset.cursor; }
     place(false);
     if (S.shown) { if (rowOf(S.shown)) show(S.shown, S.pinned, true); else hide(); }
     S.box.dataset.rev = String(message.rev);
+    fit();
   }
 
   function onMove(event) {
@@ -675,7 +845,8 @@ window.cnMonitorMap = window.cnMonitorMap || (() => {
     if (!same(d, S.shown)) { S.say = false; show(d, false); }
   }
   function copy(button) {
-    const done = ok => { S.note = ok ? 'Copied.' : 'Could not copy: select the text instead.';
+    const popup = S.popup;  // the answer of the clipboard may come after a leave or another box: it is then nobody's
+    const done = ok => { if (!popup || S.popup !== popup) return; S.note = ok ? 'Copied.' : 'Could not copy: select the text instead.';
       const note = S.popup.querySelector('.cn-map-note') || S.popup.insertBefore(document.createElement('div'), S.popup.querySelector('.cn-map-acts'));
       note.className = 'cn-map-note'; note.textContent = S.note;
       if (S.live) { S.live.textContent = S.note; S.said = null; } };
@@ -691,12 +862,16 @@ window.cnMonitorMap = window.cnMonitorMap || (() => {
       else { hide(); S.box.focus({preventScroll: true}); }
       return;
     }
+    const jumper = element && element.closest('[data-jump]');
+    if (jumper) { jump(+jumper.dataset.jump); return; }
     const more = element && element.closest('[data-show]');
     if (more) { send('cn_monitor_map_show', {b: +more.dataset.show}); return; }
     const d = hit(event);
     if (d === undefined) return;
     if (!d) { hide(); return; }
     S.cur = d;
+    S.jumpAt = null;
+    S.moved = true;
     S.say = true;
     place(false);
     show(d, true);
@@ -711,6 +886,8 @@ window.cnMonitorMap = window.cnMonitorMap || (() => {
     if (key === 'Escape') { if (S.shown) { hide(); event.preventDefault(); } return; }
     if (key === 'Enter' || key === ' ') {
       if (!S.cur) S.cur = firstCell();
+      S.jumpAt = null;
+      S.moved = true;
       if (S.cur) { S.say = true; place(true); show(S.cur, true); }
       event.preventDefault();
       return;
@@ -720,28 +897,65 @@ window.cnMonitorMap = window.cnMonitorMap || (() => {
     const next = S.cur ? move(S.cur, key) : firstCell();
     if (!next) return;
     S.cur = next;
+    S.jumpAt = null;
+    S.moved = true;
     S.say = true;
     place(true);
     show(next, false);
   }
 
+  // What init adds outside the box's own elements, and the box's listeners: dispose() takes them all away. The page's
+  // scope (monitor_live_map.py) sends init when the Monitor is built and dispose when it is left, so the document holds
+  // one set however often the Monitor is opened inside the root page (R2-11).
+  let observer = null;
+  const onLeave = () => { if (!S.pinned) hide(); };
+  const onFocus = () => { if (!S.cur && S.body) { S.cur = firstCell(); place(false); } };
+  const onDocumentClick = event => { if (S.pinned && S.box && !S.box.contains(event.target)) hide(); };
+  const onResize = () => report(false, false);
+  const resized = () => { report(false, false); fit(); place(false); if (S.shown) position(); };
+  const BOX = [['pointermove', onMove], ['pointerleave', onLeave], ['click', onClick], ['keydown', onKey],
+               ['focus', onFocus], ['scroll', follow, {passive: true}]];
+  function dispose() {
+    if (!S.box) return;
+    clearTimeout(S.timer);
+    hide();
+    for (const [type, handler, options] of BOX) S.box.removeEventListener(type, handler, options);
+    document.removeEventListener('click', onDocumentClick);
+    window.removeEventListener('scroll', follow, {passive: true});
+    if (observer) { observer.disconnect(); observer = null; }
+    else window.removeEventListener('resize', onResize);  // the fallback of a browser without ResizeObserver
+    S.cache.clear();
+    Object.assign(S, {token: null, wrap: null, box: null, body: null, cursor: null, popup: null, live: null, probe: null, base: null,
+                      used: 0, rev: null, cur: null, shown: null, sent: '', jumps: [], jumpAt: null, jumpNote: '',
+                      noteEl: null, moved: false});
+  }
+
   function init(options) {
     const box = document.getElementById(options.box), wrap = document.getElementById(options.wrap);
-    if (!box || !wrap) return false;
+    if (!box || !wrap) return false;  // not drawn (the History panel is shown): the Live panel's choice inits again
+    const fresh = S.box !== box || !box.querySelector('.cn-map-body');
+    if (fresh) dispose();  // another box: the old one's listeners go first
+    S.token = options.token;
     S.words = options.words;
     S.group = options.group;
     S.live = document.getElementById(options.live);
-    const fresh = S.box !== box || !box.querySelector('.cn-map-body');
     if (fresh) {
       S.box = box;
       S.wrap = wrap;
       S.cur = S.shown = null;
       S.rev = null;
+      S.jumps = [];
+      S.jumpAt = null;
+      S.moved = false;
+      S.jumpNote = '';
+      S.noteEl = null;
       box.textContent = '';
       S.probe = document.createElement('span');
       S.probe.className = 'cn-map-probe';
       S.probe.setAttribute('aria-hidden', 'true');
       S.probe.textContent = '0'.repeat(100);
+      S.base = S.probe.cloneNode(true);
+      S.base.classList.add('base');
       S.body = document.createElement('div');
       S.body.className = 'cn-map-body';
       S.cursor = document.createElement('div');
@@ -750,27 +964,19 @@ window.cnMonitorMap = window.cnMonitorMap || (() => {
       S.popup = document.createElement('div');
       S.popup.className = 'cn-map-popup';
       S.popup.hidden = true;
-      box.append(S.probe, S.body, S.cursor, S.popup);
-      box.addEventListener('pointermove', onMove);
-      box.addEventListener('pointerleave', () => { if (!S.pinned) hide(); });
-      box.addEventListener('click', onClick);
-      box.addEventListener('keydown', onKey);
-      box.addEventListener('focus', () => { if (!S.cur && S.body) { S.cur = firstCell(); place(false); } });
-      box.addEventListener('scroll', follow, {passive: true});
-      if (!window.cnMonitorMapGlobal) {
-        window.cnMonitorMapGlobal = true;
-        document.addEventListener('click', event => { if (S.pinned && S.box && !S.box.contains(event.target)) hide(); });
-        window.addEventListener('scroll', follow, {passive: true});
-      }
-      if (window.ResizeObserver) new ResizeObserver(() => { report(false, false); place(false); if (S.shown) position(); }).observe(box);
-      else window.addEventListener('resize', () => report(false, false));
-      if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => report(false, false));
+      box.append(S.probe, S.base, S.body, S.cursor, S.popup);
+      for (const [type, handler, options] of BOX) box.addEventListener(type, handler, options);
+      document.addEventListener('click', onDocumentClick);
+      window.addEventListener('scroll', follow, {passive: true});
+      if (window.ResizeObserver) { observer = new ResizeObserver(resized); observer.observe(box); }
+      else window.addEventListener('resize', onResize);
+      if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { if (S.box === box) { report(false, false); fit(); } });
     }
-    apply(stored() || 'map');
+    apply(options.view || stored() || 'map');  // a link's view for this load wins, and is not stored
     S.sent = '';
     report(true, fresh);
     return true;
   }
-  return {init: init, draw: draw, details: details, setView: setView};
+  return {token: () => S.token, init: init, dispose: dispose, draw: draw, details: details, setView: setView, fontStep: fontStep};
 })();
-</script>'''
+</script>'''.replace('__STEPS__', json.dumps(list(FONT_STEPS)))

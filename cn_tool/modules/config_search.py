@@ -122,6 +122,8 @@ class BoundedSearchResult:
     status: str
     message: str = ""
     source_identities: Dict[str, Tuple[Any, ...]] = field(default_factory=dict)
+    # One list of [start, end] pieces of the line for each row, in the rows' order (or empty: none were computed).
+    spans: List[List[List[int]]] = field(default_factory=list)
 
 
 class _SearchLimit(Exception):
@@ -155,6 +157,45 @@ def _match_config_line(line: str, vendor_stop_list: tuple, networks: List, terms
         re.search(term, line, re.IGNORECASE) for term in terms
     )
     return bool(matched) or term_match, matched
+
+
+MAX_SPANS = 20          # pieces of one line that are kept
+_SPAN_ATTEMPTS = 200    # matches looked at for one term (empty matches count): a line is never walked without end
+
+
+def match_spans(line: str, networks: List, terms: List[str], stop_list: tuple = ()) -> List[List[int]]:
+    """Where ``line`` matched, as ascending, apart ``[start, end]`` offsets into ``line`` (at most ``MAX_SPANS``).
+
+    The same rules as ``_match_config_line``: each IPv4 address of the line that lies in a network, and what each term
+    matches without case unless the line starts with a stop word. It runs a user's regular expression, so it runs only
+    in the search child (killable); the page that shows the spans never does.
+    """
+    found = []
+    for match in re.finditer(ip_regexp, line) if networks else ():
+        try:
+            address = ipaddress.ip_address(match.group())
+        except ValueError:
+            continue
+        if isinstance(address, ipaddress.IPv4Address) and any(address in network for network in networks):
+            found.append(match.span())
+    if not line.startswith(stop_list):
+        for term in terms:
+            try:
+                pattern = re.compile(term, re.IGNORECASE)
+            except re.error:
+                continue
+            for count, match in enumerate(pattern.finditer(line)):
+                if count >= _SPAN_ATTEMPTS or len(found) >= MAX_SPANS * 4:
+                    break
+                if match.end() > match.start():
+                    found.append(match.span())
+    merged: List[List[int]] = []
+    for start, end in sorted(found):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(end, merged[-1][1])
+        else:
+            merged.append([start, end])
+    return merged[:MAX_SPANS]
 
 
 def _bounded_lines(stream, max_bytes, digest=None):
@@ -199,6 +240,7 @@ def search_live_bounded(ctx: ScriptContext, networks: List, search_terms: List[s
     entries = work_bytes = 0
     result_bytes = 2  # JSON array brackets
     rows: List[List[Any]] = []
+    spans: List[List[List[int]]] = []
     matched_nets: Set[ipaddress.IPv4Network] = set()
     source_identities: Dict[str, Tuple[Any, ...]] = {}
     excluded = {str(item).strip().lower() for item in ctx.cfg.get("config_repo_excluded_dirs", []) if str(item).strip()}
@@ -312,10 +354,12 @@ def search_live_bounded(ctx: ScriptContext, networks: List, search_terms: List[s
                                 matched_nets.update(matched)
                                 if hit:
                                     row = [search_input, filename.stem.upper(), index, line, str(filename)]
-                                    size = len(json.dumps(row, ensure_ascii=False).encode("utf-8")) + bool(rows)
+                                    found = match_spans(line, networks, search_terms, stop_list)
+                                    size = len(json.dumps([row, found], ensure_ascii=False).encode("utf-8")) + bool(rows)
                                     if len(rows) >= limits.max_rows or result_bytes + size > limits.max_result_bytes:
                                         raise _SearchLimit
                                     rows.append(row)
+                                    spans.append(found)
                                     result_bytes += size
                             if _file_identity(before) != _file_identity(os.fstat(stream.fileno())):
                                 raise OSError("File changed")
@@ -334,7 +378,7 @@ def search_live_bounded(ctx: ScriptContext, networks: List, search_terms: List[s
         return BoundedSearchResult([], set(), "limit", "Search exceeded its limits. Narrow the search.")
     except (OSError, UnicodeError, RuntimeError):
         return BoundedSearchResult([], set(), "incomplete", "A configuration file or directory could not be read or changed during the search.")
-    return BoundedSearchResult(rows, matched_nets, "complete", source_identities=source_identities)
+    return BoundedSearchResult(rows, matched_nets, "complete", source_identities=source_identities, spans=spans)
 
 
 class ConfigSearchModule(BaseModule):

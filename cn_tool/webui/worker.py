@@ -8,8 +8,11 @@ from uuid import uuid4
 from cn_tool.core.interaction import AuthenticationFailed, AuthenticationRequired, CredentialReply
 from cn_tool.core.operation import OperationCancelled, OperationControl
 from cn_tool.core.runtime import RuntimeSession, SetupRequired, abort_initialization
+from . import ping_partial
+from .config_pages import config_search_page
 from .interrupts import ignore_console_interrupts as _ignore_parent_interrupts
-from .protocol import COMMANDS, decode, encode, envelope, valid_monitor_history_item
+from .lookup_scope import _remember_refusal, ensure_lookup_scope, infoblox_configured
+from .protocol import COMMANDS, SIGN_IN_TRIES, decode, encode, envelope, valid_monitor_history_item
 
 _ignore_parent_interrupts()
 
@@ -83,159 +86,6 @@ def coverage_export(history_ctx, directory, parent, stop=None):
     return path, name
 
 
-def _refusal_key(runtime, account):
-    """Keep session-local refusal fingerprints without retaining old passwords."""
-    import hashlib
-    import secrets
-    if not hasattr(runtime, '_webui_refusal_key'):
-        runtime._webui_refusal_key = secrets.token_bytes(32)
-        runtime._webui_refusals = set()
-        runtime._webui_refusal_lock = Lock()
-    digest = hashlib.blake2b(key=runtime._webui_refusal_key, digest_size=32)
-    for value in (account.username, account.password):
-        encoded = value.encode('utf-8')
-        digest.update(len(encoded).to_bytes(8, 'big'))
-        digest.update(encoded)
-    return digest.digest()
-
-
-def _remember_refusal(runtime, account):
-    fingerprint = _refusal_key(runtime, account)
-    with runtime._webui_refusal_lock:
-        runtime._webui_refusals.add(fingerprint)
-
-
-def _was_refused(runtime, account):
-    fingerprint = _refusal_key(runtime, account)
-    with runtime._webui_refusal_lock:
-        return fingerprint in runtime._webui_refusals
-
-
-def ensure_lookup_scope(runtime, interaction, control, budget=None):
-    """Resolve the view afresh for one lookup, checking the grid before trusting a login."""
-    from cn_tool.modules.subnet_request import request_result
-    from cn_tool.core.base import Credentials
-    from cn_tool.utils import api, auth
-    from cn_tool.utils.network_views import view_scope
-    import os
-
-    ctx = runtime.ctx
-    cfg = ctx.cfg
-    endpoint = str(cfg.get('api_endpoint') or '').strip()
-    if not cfg.get('infoblox_enabled') or not endpoint or endpoint == 'API_URL':
-        from cn_tool.utils.config import user_config_path
-        paths = cfg.get('config_files') or []
-        path = paths[-1] if paths else user_config_path()
-        hint = 'Run cn init, then configure' if not paths else 'Configure'
-        raise SetupRequired(f'Infoblox API endpoint is not configured or enabled. {hint} [api] endpoint in {path}.')
-    control.checkpoint()
-    previous = (ctx.username, ctx.password, ctx.infoblox_credentials, api.session.auth,
-                getattr(ctx, '_webui_infoblox_account', None))
-    refused_attempt = False
-    try:
-        account = ctx.infoblox_credentials
-        own = auth.infoblox_account_configured(ctx)
-        own_username = (auth._env_user(ctx) or auth._api_user(ctx)) if own else ''
-        previous_own_username = getattr(runtime, '_webui_own_username', own_username)
-        if account is not None and (not own or own_username != previous_own_username):
-            ctx.infoblox_credentials = account = None
-        needs_device_login = not own and not ctx.password
-        prompt_count = getattr(interaction, 'prompt_count', 0)
-        if not own:
-            source = getattr(runtime, '_webui_device_source', None)
-            if ctx.password and source == auth._name(ctx, 'auth_device_password_var'):
-                if os.getenv(source) != ctx.password or (os.getenv(auth._name(ctx, 'auth_device_user_var')) or ctx.username) != ctx.username:
-                    ctx.username = ctx.password = ''
-            if not ctx.password:
-                password_name = auth._name(ctx, 'auth_device_password_var')
-                runtime._webui_device_source = password_name if os.getenv(password_name) else None
-                needs_device_login = True
-        if account is not None and account.source not in ('', 'prompt'):
-            found = auth._infoblox_settings(ctx)
-            if (found.conflict or found.password != account.password or found.password_from != account.source
-                    or (found.username and found.username != account.username)):
-                ctx.infoblox_credentials = None
-        username, _ = auth.ensure_infoblox_auth(ctx)
-        if (needs_device_login and runtime._webui_device_source is None
-                and getattr(interaction, 'prompt_count', 0) != prompt_count):
-            runtime._webui_device_source = 'prompt'
-        control.checkpoint()
-        refused = getattr(runtime, '_webui_refused', None)
-        account = ctx.infoblox_credentials
-        if not own:
-            current = getattr(ctx, '_webui_infoblox_account', None)
-            if current is None or (current.username, current.password) != (ctx.username, ctx.password):
-                current = Credentials(ctx.username, ctx.password)
-            ctx._webui_infoblox_account = current
-            account = current
-        if refused is not None and account is not None and (account.username, account.password) == (refused.username, refused.password):
-            if own:
-                ctx.infoblox_credentials = refused
-            else:
-                ctx._webui_infoblox_account = refused
-        if account is not None and _was_refused(runtime, account):
-            runtime._webui_refused = account
-            refused_attempt = True
-            raise SetupRequired('Infoblox previously refused this login. Enter different credentials.')
-        responses = []
-        def discover(*args, **kwargs):
-            if budget is not None:
-                result = request_result(*args, **kwargs, paged=True, budget=budget)
-            else:
-                result = request_result(*args, **kwargs)
-            responses.append(result)
-            return result
-        scope = view_scope(ctx, None, discover)
-        scope.grid()
-        result = responses[-1]
-        if result.status_code == 401 and account is not None:
-            refused_attempt = True
-            _remember_refusal(runtime, account)
-            runtime._webui_refused = refused if refused is not None and (account.username, account.password) == (refused.username, refused.password) else account
-            if own and account.source == 'prompt':
-                ctx.infoblox_credentials = None
-            elif not own and getattr(runtime, '_webui_device_source', None) == 'prompt':
-                ctx.username = ctx.password = ''
-        control.checkpoint()
-        if budget is not None:
-            if result.status == 'redirect_error':
-                raise SetupRequired('Infoblox redirected the preview request; check the configured API endpoint.')
-            if result.truncated:
-                raise SetupRequired('Network view lookup is incomplete; narrow the lookup.')
-            fallback_403 = result.status_code == 403 and not scope.requested
-            if not fallback_403 and (not result.ok or scope.grid().error):
-                raise SetupRequired('Network view lookup failed; check the Infoblox API endpoint and access.')
-        if not result.ok and (result.status_code != 403 or scope.requested):
-            if result.status == 'not_found':
-                raise SetupRequired(f'Network view discovery failed (HTTP {result.status_code}). Check the Infoblox API endpoint.')
-            raise SetupRequired(result.message)
-        problem = scope.problem()
-        if problem:
-            raise SetupRequired(problem.message)
-        interaction.select('infoblox' if auth.infoblox_account_configured(ctx) else 'device', username)
-        scope._webui_verified = result.ok
-        scope._webui_username = username
-        scope._webui_fallback = bool(scope.grid().error)
-        scope._webui_previous = previous
-        scope._webui_previous_own_username = previous_own_username
-        runtime._webui_own_username = own_username
-        return scope
-    except BaseException:
-        ctx.username, ctx.password, ctx.infoblox_credentials, api.session.auth, ctx._webui_infoblox_account = previous
-        refused = getattr(runtime, '_webui_refused', None)
-        if refused_attempt and refused is not None:
-            restored = ctx.infoblox_credentials
-            if restored is refused and restored.source == 'prompt':
-                ctx.infoblox_credentials = None
-                api.session.auth = None
-            elif (restored is None and getattr(runtime, '_webui_device_source', None) == 'prompt'
-                  and (ctx.username, ctx.password) == (refused.username, refused.password)):
-                ctx.username = ctx.password = ''
-                ctx._webui_infoblox_account = None
-                api.session.auth = None
-        raise
-
-
 class VaultCancellation:
     """Cancel the active helper without poisoning later queued vault actions."""
     def __init__(self):
@@ -276,6 +126,9 @@ class WorkerInteraction:
         self.store_support = {}
         self.restore_attempts = set()
         self.prompt_count = 0
+        self.typed_count = 0  # passwords the dialog was answered with (lookup_scope asks again only for those)
+        self.typed_username = ''
+        self.tries_left = 0  # above 0: lookup_scope checks the password asked for, and takes this many more
 
     def rebind(self, endpoint):
         """
@@ -357,6 +210,7 @@ class WorkerInteraction:
     def forget(self):
         with self.condition:
             self.generation += 1
+            self.request_generation = self.generation  # Remember ticked in the dialog that is open still saves
             self.pending_save = None
             if self.closing:
                 return
@@ -426,8 +280,15 @@ class WorkerInteraction:
             self.request = request
             self.request_generation = generation
             self.request_supported = supported
+            tries = {}
+            if self.tries_left and request.need_password:
+                tries = dict(tries_left=self.tries_left)
+                if self.tries_left < SIGN_IN_TRIES:
+                    tries['refused'] = True
+                    if request.need_username and not request.username:
+                        request = self.request = replace(request, username=self.typed_username)
             self.emit('credentials_required', dict(asdict(request), request_id=self.request_id,
-                      store_supported=supported and request.need_password))
+                      store_supported=supported and request.need_password, **tries))
             while not self.answered and not self.closing and not self.stopping.is_set():
                 self.condition.wait(.1)
             reply = self.reply if self.answered else None
@@ -440,6 +301,9 @@ class WorkerInteraction:
             if self.closing or request_id != self.request_id or self.answered:
                 return
             self.reply = None if reply is None else CredentialReply(**reply)
+            if self.reply is not None and self.request.need_password:
+                self.typed_count += 1
+                self.typed_username = self.reply.username.strip() if self.request.need_username else self.request.username
             if self.reply is not None and self.store is not None:
                 username = self.reply.username.strip() if self.request.need_username else self.request.username
                 from .credential_store import CredentialScope
@@ -450,6 +314,24 @@ class WorkerInteraction:
                     self.pending_save = (scope, username, self.reply.password, self.generation)
             self.answered = True
             self.condition.notify_all()
+
+    def sign_in_begins(self, tries):
+        """A lookup resolves its scope: a password asked for from now on is checked there, ``tries`` times at most."""
+        with self.condition:
+            self.tries_left = tries
+
+    def sign_in_refused(self, tries_left):
+        """Infoblox refused the password just typed and the lookup asks again: it is never saved."""
+        with self.condition:
+            self.pending_save = None
+            self.tries_left = tries_left
+
+    def sign_in_settled(self, checked):
+        """The sign-in of a lookup's scope is over; ``checked``: a typed password was used and not refused."""
+        with self.condition:
+            self.tries_left = 0
+            if checked and not self.closing and not self.stopping.is_set():
+                self.emit('credentials_checked', {})
 
     def cancel(self):
         with self.condition:
@@ -659,25 +541,47 @@ def run_lookup(runtime, module, scope, inputs, control):
 
 def classify_ping_outcome(result, report):
     rows, invalid, errors = result['rows'], result['input_errors'], result['resolution_errors']
+    probe_errors = report.get('probe_errors', 0)
     if report.get('operation_failed'):
-        kind, message = 'lookup_error', report['operation_message']
+        kind, message, probe_errors = 'lookup_error', report['operation_message'], 0
     elif report.get('probe_failed'):
-        kind, message = 'lookup_error', report['message']
+        kind, message, probe_errors = 'lookup_error', report['message'], 0
     elif result['stopped']:
         kind, message = 'stopped', 'Ping stopped.'
+    elif probe_errors:
+        kind, message = 'partial', 'Ping completed with probe errors.'
     elif rows:
         kind, message = ('partial', 'Ping completed with diagnostics.') if invalid or errors else ('matched', 'Ping completed.')
     elif errors:
         kind, message = 'lookup_error', 'Ping could not resolve inputs.'
     else:
         kind, message = 'invalid', 'No valid targets to ping.'
+    details = dict(unattempted=report.get('unattempted', []), attempted_incomplete=report.get('attempted_incomplete', []))
+    if probe_errors:
+        details['probe_errors'] = probe_errors
     return dict(kind=kind, message=message, matched_count=len(rows), invalid_count=len(invalid),
                 resolution_error_count=len(errors), miss_count=0, warning_count=0, stopped=result['stopped'],
-                details=dict(unattempted=report.get('unattempted', []),
-                             attempted_incomplete=report.get('attempted_incomplete', [])))
+                details=details)
 
 
-def perform_ping_lookup(runtime, module, inputs, tcp_ports, control):
+def mark_probe_errors(report, rows, tcp_ports):
+    """Note the rows whose probe ended in error (the larger count of two looks: before and after the hook).
+
+    The run is not saved to the report, but it is no report failure; with no row left to show, it is one.
+    """
+    from cn_tool.modules import bulk_ping
+    count = max(report.get('probe_errors', 0), sum(1 for row in rows if bulk_ping._probe_failed(row, tcp_ports)))
+    if count and rows:
+        report.update(state='idle', status='idle', probe_errors=count,
+                      message='Not saved to the report: a probe ended in error.')
+    elif count:
+        report.pop('probe_errors', None)
+        report.update(state='failed', status='failed', probe_failed=True,
+                      message='A Ping probe failed. Completed results remain available.')
+
+
+def perform_ping_lookup(runtime, module, inputs, tcp_ports, control, partial=None):
+    """``partial(batch, completed, total)``, when given, is called after each batch of hosts (ping_partial.sender)."""
     from cn_tool.modules import bulk_ping
     from cn_tool.utils.validation import parse_tcp_ports
     tcp_ports = parse_tcp_ports(','.join(str(port) for port in tcp_ports)) if tcp_ports else ()
@@ -711,9 +615,9 @@ def perform_ping_lookup(runtime, module, inputs, tcp_ports, control):
                         completed.update(host for host, _ in finished)
                         rows.extend(batch)
                         control.counted_stage('probing', len(rows), len(targets))
-                if any(bulk_ping._probe_failed(row, tcp_ports) for row in rows):
-                    report.update(state='failed', status='failed', probe_failed=True,
-                                  message='A Ping probe failed. Completed results remain available.')
+                        if partial is not None:
+                            partial(batch, len(rows), len(targets))
+                mark_probe_errors(report, rows, tcp_ports)
                 if not control.stop.is_set() and rows:
                     rows = module.execute_hook('process_data', ctx, rows)
                     result['rows'] = rows
@@ -724,14 +628,13 @@ def perform_ping_lookup(runtime, module, inputs, tcp_ports, control):
         except Exception:
             report.update(state='failed', status='failed', probe_failed=True,
                           message='Ping failed while probing targets. Completed results remain available.')
-        if not report.get('probe_failed') and any(bulk_ping._probe_failed(row, tcp_ports) for row in rows):
-            report.update(state='failed', status='failed', probe_failed=True,
-                          message='A Ping probe failed. Completed results remain available.')
+        if not report.get('probe_failed'):
+            mark_probe_errors(report, rows, tcp_ports)
         result['stopped'] = control.stop.is_set()
         failed = {item['object'] for item in errors}
         report['attempted_incomplete'] = [host for host in hosts if host in attempted and host not in completed]
         report['unattempted'] = [host for host in hosts if host not in completed and host not in attempted and host not in failed]
-        if not result['stopped'] and not report.get('probe_failed'):
+        if not result['stopped'] and not report.get('probe_failed') and not report.get('probe_errors'):
             if rows and ctx.cfg.get('report_auto_save'):
                 control.progress('saving report')
             if control.stop.is_set():
@@ -749,55 +652,25 @@ def perform_ping_lookup(runtime, module, inputs, tcp_ports, control):
             report.update(operation_failed=True, operation_message='Ping post-run hook failed. Completed results remain available.')
 
 
-def run_ping_lookup(runtime, module, inputs, tcp_ports, control):
+def run_ping_lookup(runtime, module, inputs, tcp_ports, control, partial=None):
     from cn_tool.main import _run_tracked
     def outcome(pair):
         result, report = pair
-        return 'failed' if report.get('operation_failed') or report.get('status') == 'failed' else 'interrupted' if result['stopped'] else 'completed'
+        # A run with a probe error is still counted as failed, though its report is only withheld.
+        return ('failed' if report.get('operation_failed') or report.get('status') == 'failed' or report.get('probe_errors')
+                else 'interrupted' if result['stopped'] else 'completed')
     return _run_tracked(runtime.ctx, module,
-        lambda: perform_ping_lookup(runtime, module, inputs, tcp_ports, control), outcome=outcome)
+        lambda: perform_ping_lookup(runtime, module, inputs, tcp_ports, control, partial), outcome=outcome)
 
 
 def monitor_history_error(error):
     return 'Ping history is unavailable. Check its availability and permissions.' if error else ''
 
 
-def config_search_page(rows, query):
-    """Return a bounded configuration page without reordering the retained result."""
-    import json
-    from .config_demob import ordered_page_rows
-
-    page = dict(job_id=query['job_id'], offset=query['offset'], query_id=query['query_id'],
-                rows=[], total=0, next_offset=None, status='unavailable')
-    if 'sort_by' in query:
-        page.update({key: query[key] for key in ('sort_by', 'descending', 'filter_by', 'filter_text')})
-        page['overall_total'] = 0
-    if rows is None:
-        return page
-    columns = {'device': 1, 'line': 2, 'configuration': 3}
-    ordered = ordered_page_rows(rows, value=lambda row, key: row[columns[key]],
-                                sort_by=query.get('sort_by'), descending=query.get('descending', False),
-                                filter_by=query.get('filter_by'), filter_text=query.get('filter_text', ''),
-                                numeric=('line',))
-    if query['offset'] > len(ordered):
-        return page
-    page.update(total=len(ordered), status='ready')
-    if 'overall_total' in page:
-        page['overall_total'] = len(rows)
-    index = query['offset']
-    while index < len(ordered) and len(page['rows']) < query['limit']:
-        page['rows'].append(ordered[index])
-        if len(json.dumps(page, ensure_ascii=False).encode('utf-8')) > 1024 * 1024 - 1024:
-            page['rows'].pop()
-            if not page['rows']:
-                page.update(total=0, next_offset=None, status='unavailable')
-                if 'overall_total' in page:
-                    page['overall_total'] = 0
-                return page
-            break
-        index += 1
-    page['next_offset'] = index if index < len(ordered) else None
-    return page
+def _moment(value):
+    """``value`` as a time the protocol takes (seconds since the epoch, up to ``MOMENT_MAX``); anything else is 0, none."""
+    from .protocol import MOMENT_MAX
+    return value if type(value) in (int, float) and 0 <= value <= MOMENT_MAX else 0
 
 
 class MonitorLiveCache:
@@ -811,8 +684,13 @@ class MonitorLiveCache:
         self.blocks = None  # the run's grid blocks, built at its first round
         self.map_snapshot = None  # the Map view's copy of the tracker at the latest complete round
         self.rows_by_host = {}
+        # round_at: when the latest complete round started. next_at: when the next one is due, set only while the run
+        # waits for it. Both are seconds since the epoch and 0 means none; a page counts down from them by itself.
+        # hosts: the size of the run, 0 until it is known: what the first round probes, then the hosts of the latest
+        # complete round. 'total' is 0 between two rounds, so a page opened then reads the size here.
         self.update = dict(lookup_type='monitor', run_id='', revision=0, stage='starting', completed=0, total=0,
-                           current_rounds=0, earlier_rounds=0, skipped_slots=0, history_error='')
+                           current_rounds=0, earlier_rounds=0, skipped_slots=0, history_error='',
+                           round_at=0, next_at=0, hosts=0)
 
     def on_started(self, run_id):
         with self.lock:
@@ -824,6 +702,24 @@ class MonitorLiveCache:
     def on_status(self, stage, completed, total):
         with self.lock:
             self.update.update(stage=stage, completed=completed, total=total)
+            if stage != 'waiting':
+                self.update['next_at'] = 0
+            if stage == 'probing' and total and not self.update['revision']:
+                self.update['hosts'] = total  # before the first complete round: what it probes
+            update = dict(self.update)
+        self.emit(update)
+
+    def on_wait(self, until):
+        """The next round is due at ``until``. Nothing is sent here: the ``waiting`` status that follows carries it."""
+        with self.lock:
+            self.update['next_at'] = _moment(until)
+
+    def on_ended(self):
+        """The run is over (stopped, finished or failed), so no round is due: say so if one was."""
+        with self.lock:
+            if not self.update['next_at']:
+                return
+            self.update['next_at'] = 0
             update = dict(self.update)
         self.emit(update)
 
@@ -844,6 +740,7 @@ class MonitorLiveCache:
             if self.blocks is None:
                 self.blocks = tuple(outcome.request.blocks())
             snapshot = monitor_map.snapshot(self.blocks, tracker)
+        round_at = _moment(getattr(tracker, 'last_round', None))
         with self.lock:
             if run_id != self.run_id or revision <= self.update['revision']:
                 return
@@ -851,7 +748,8 @@ class MonitorLiveCache:
             self.map_snapshot = snapshot
             self.rows_by_host = {row[0]: row for row in rows} if snapshot is not None else {}
             self.update.update(revision=revision, current_rounds=outcome.rounds, earlier_rounds=outcome.earlier,
-                               skipped_slots=outcome.late, history_error=monitor_history_error(outcome.store_error))
+                               skipped_slots=outcome.late, history_error=monitor_history_error(outcome.store_error),
+                               round_at=round_at, next_at=0, hosts=len(rows))
             update = dict(self.update)
         self.emit(update)
 
@@ -901,7 +799,8 @@ class MonitorLiveCache:
             result['status'] = 'ready'
             if 'group' in query:
                 from collections import Counter
-                from cn_tool.utils.ping_history import observation
+                from cn_tool.utils.ping_history import ANY_FIELD, filter_matches, observation
+                from .protocol import LIVE_FILTERS
                 def group(row):
                     host, address, value, tcp = row
                     values = {'Result': value, **{f'TCP {port}': text for port, text in tcp}}
@@ -923,12 +822,16 @@ class MonitorLiveCache:
                 if selected != 'all':
                     rows = tuple(row for row in rows if group(row) == selected)
                 field, pattern = query.get('filter_field', 'host'), query.get('filter_text', '').casefold()
-                if pattern:
-                    def filter_value(row):
+                if pattern:  # 'any': every column the table shows
+                    def filter_value(row, name):
                         return {'host': row[0] or 'Unknown', 'address': row[1] or 'Unknown',
                                 'result': row[2] or 'Unknown',
-                                'tcp': ', '.join(f'{port}: {text}' for port, text in row[3]) or 'Not checked'}[field]
-                    rows = tuple(row for row in rows if pattern in filter_value(row).casefold())
+                                'tcp': ', '.join(f'{port}: {text}' for port, text in row[3]) or 'Not checked'}[name]
+                    names = LIVE_FILTERS if field == ANY_FIELD else (field,)
+                    if query.get('filter_exact'):  # the whole shown text, not a part of it: 10.20.30.1 is one host
+                        rows = tuple(row for row in rows if any(pattern == filter_value(row, name).casefold() for name in names))
+                    else:
+                        rows = tuple(row for row in rows if filter_matches(field, pattern, lambda name, row=row: filter_value(row, name), LIVE_FILTERS))
                 sort = query['sort']
                 if sort:
                     import ipaddress
@@ -1027,9 +930,14 @@ def run_monitor_lookup(runtime, module, payload, control, observer):
                 observer.on_status(stage, completed, total)
             def on_round(self, run_id, revision, outcome):
                 observer.on_round(run_id, revision, outcome)
+            def on_wait(self, until):
+                observer.on_wait(until)
         report = None
         try:
-            outcome = module.track_controlled(runtime.ctx, request, plan, control, Observer())
+            try:
+                outcome = module.track_controlled(runtime.ctx, request, plan, control, Observer())
+            finally:
+                observer.on_ended()  # before the report is saved: a stopped run counts down to nothing
             if runtime.ctx.cfg.get('report_auto_save'):
                 control.progress('saving report')
             report = asdict(finish_monitor_report(runtime.ctx, module, outcome))
@@ -1165,10 +1073,13 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 state['report_deleting'] = None
 
     def emit_ready():
+        from cn_tool.utils.config import no_config_file_found
         cfg = getattr(state['runtime'].ctx, 'cfg', {})
         emit('ready', {'scope': '', 'username': '',
                        'report_warning': cfg.get('report_directory_warning', ''),
-                       'report_state': state['report']})
+                       'report_state': state['report'],
+                       'infoblox_configured': infoblox_configured(cfg),
+                       'config_found': not no_config_file_found(cfg)})
 
     def discard_runtime():
         """Close the runtime without exit actions (they belong to Quit); the next start opens one from the files."""
@@ -1341,6 +1252,10 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                         search = SearchOutcome('stopped', 'Search stopped.', errors=search.errors)
                     rows = remove_duplicate_rows_sorted_by_col(search.rows, 2) if search.status == 'complete' else []
                     rows = [[str(row[0]), row[1], row[2], row[3], row[4]] for row in rows]
+                    spans = {}  # the child's spans of a row (a row is its five fields: a duplicate has the same spans)
+                    for source, found in zip(search.rows, search.spans):
+                        spans.setdefault((str(source[0]), *source[1:5]), found)
+                    rows = [row + [spans[tuple(row)]] if spans.get(tuple(row)) else row for row in rows]
                     missing = [str(net)[:-3] if str(net).endswith('/32') else str(net)
                                for net in sorted(set(search.networks) - search.matched_nets)] if search.status == 'complete' else []
                     errors = [dict(line=error.line, reason=error.reason) for error in search.errors]
@@ -1353,9 +1268,9 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                                                   'Search completed.' if rows else 'No matches found.')
                     outcome = dict(kind=kind, message=message, matched_count=len(rows), invalid_count=len(errors),
                                    resolution_error_count=0, miss_count=len(missing), warning_count=0,
-                                   stopped=search.status == 'stopped', details={})
+                                   stopped=search.status == 'stopped', details=dict(device_count=len({row[1] for row in rows})))
                     if demob_scope:
-                        outcome['details'] = dict(discovery_status=demob_scope.status,
+                        outcome['details'].update(discovery_status=demob_scope.status,
                                                   discovery_message=demob_scope.message,
                                                   notices=list(demob_scope.notices))
                         outcome['warning_count'] = len(demob_scope.notices) + int(demob_scope.status == 'partial_error')
@@ -1410,7 +1325,8 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 emit('result', {'result': result, 'outcome': summary, 'lookup_type': lookup_type}, job)
                 return
             if lookup_type == 'ping':
-                result, report = run_ping_lookup(runtime, module, payload['inputs'], payload['tcp_ports'], control)
+                result, report = run_ping_lookup(runtime, module, payload['inputs'], payload['tcp_ports'], control,
+                                                 ping_partial.sender(emit, job))
                 outcome = classify_ping_outcome(result, report)
                 report = report_state_for_context(runtime.ctx, report)
                 update_report(report)
@@ -1520,7 +1436,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 stopped()
             else:
                 state['job'] = None
-                emit('error', {'message': exc.message, 'lookup_type': payload['lookup_type']}, job)
+                emit('error', {'message': exc.message, 'lookup_type': payload['lookup_type'], 'sign_in_again': getattr(exc, 'sign_in_again', False)}, job)
         except Exception:
             interaction.discard()
             rollback()

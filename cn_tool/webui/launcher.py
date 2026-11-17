@@ -1,11 +1,13 @@
 """Lazy local launcher. No UI dependencies are paid by ordinary cn commands."""
 import argparse
 import asyncio
+import errno
 import io
 import os
 import socket
 import sys
 import threading
+import time
 import webbrowser
 
 from cn_tool.utils import oscompat
@@ -14,12 +16,27 @@ from . import session_file
 _GRACEFUL_SHUTDOWN_TIMEOUT = 5
 _ERROR_BOX_TIMEOUT = 60
 _REOPEN_TIMEOUT = 5
+_REOPEN_TRIES = 3
+_REOPEN_PAUSE = .2
 
 TITLE = 'cn-tool Web'
+# EADDRINUSE; WSAEADDRINUSE and WSAEACCES (a port another program holds exclusively) on Windows.
+_IN_USE = {errno.EADDRINUSE, 10048, 10013}
+
+
+def _in_use(error):
+    """Whether a failed bind says the port is taken, in the host's spelling (``errno``, or Windows' ``winerror``)."""
+    return error.errno in _IN_USE or getattr(error, 'winerror', None) in _IN_USE
+
+
 START_FAILED = 'The web interface could not start. Check the installation and local network configuration.'
 # MessageBoxW's MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST: a box that comes to the front even when an
 # Explorer double-click started cn without a console.
 _MESSAGE_BOX_FLAGS = 0x0 | 0x10 | 0x10000 | 0x40000
+
+
+class PortInUse(Exception):
+    """The requested port cannot be bound; the message names it."""
 
 
 class _NullStream(io.TextIOWrapper):
@@ -145,21 +162,42 @@ def _open_in_browser(url, no_browser):
 
 
 def _reopen(session):
-    """Ask the running session for a fresh bootstrap token (``POST /reopen``): the token, or None when stale."""
+    """Ask the running session for a fresh bootstrap token (``POST /reopen``): the token, or None when stale.
+
+    A session that answers "no" (a wrong secret, any other 4xx) or whose port refuses the connection is stale at
+    once (where the system reports a closed port as a timeout instead, as Windows can, it is asked again like any
+    timeout). A timeout, a connection dropped without a reply or a 5xx may be a loaded machine, not a dead session, and
+    one of them must not make a live session stale for good (the caller would start a second one): those are asked
+    again, ``_REOPEN_TRIES`` times in all.
+    """
+    import http.client
     import json
+    import urllib.error
     import urllib.request
     request = urllib.request.Request(
         f'http://127.0.0.1:{session.port}/reopen', method='POST',
         data=json.dumps({'secret': session.secret}).encode('utf-8'), headers={'Content-Type': 'application/json'})
     # Never through a proxy that the environment names: the session is on this machine.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    try:
-        with opener.open(request, timeout=_REOPEN_TIMEOUT) as response:
-            payload = json.loads(response.read().decode('utf-8'))
-    except (OSError, ValueError):  # refused, 403 (a wrong secret), a timeout, not JSON
-        return None
-    token = payload.get('token') if isinstance(payload, dict) else None
-    return token if isinstance(token, str) and token else None
+    for attempt in range(_REOPEN_TRIES):
+        try:
+            with opener.open(request, timeout=_REOPEN_TIMEOUT) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+        except ValueError:  # not JSON
+            return None
+        except (OSError, http.client.HTTPException) as error:
+            reason = error.reason if isinstance(error, urllib.error.URLError) and not isinstance(
+                error, urllib.error.HTTPError) else error
+            momentary = (isinstance(reason, (TimeoutError, ConnectionResetError, ConnectionAbortedError,
+                                             http.client.HTTPException))
+                         or (isinstance(error, urllib.error.HTTPError) and error.code >= 500))
+            if momentary and attempt + 1 < _REOPEN_TRIES:
+                time.sleep(_REOPEN_PAUSE)
+                continue
+            return None  # refused, 403 (a wrong secret), or still failing
+        token = payload.get('token') if isinstance(payload, dict) else None
+        return token if isinstance(token, str) and token else None
+    return None
 
 
 def _publish(access, port, config_file):
@@ -200,12 +238,31 @@ def _start_config_search_guardian():
         return None
 
 
+def _listen(port):
+    """The loopback listener, bound: ``port`` 0 is any free port. Needs nothing of the web stack, so a port in use is
+    named whether or not the rest could start."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if port and not (oscompat.is_windows() or oscompat.is_macos()):
+        # So a restart on the same fixed port right after Quit does not wait for TIME_WAIT. Never for port 0 (a new
+        # port each time), and never on Windows or macOS: there the option lets a second process bind a port that
+        # another one is listening on.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        listener.bind(('127.0.0.1', port))
+    except OSError as error:
+        listener.close()
+        if port and _in_use(error):
+            raise PortInUse(f'{TITLE} could not listen on port {port}: it is in use. '
+                            'Try again in a minute or start without --port.') from error
+        raise
+    return listener
+
+
 async def serve(controller, *, config_file=None, no_browser=False, port=0, config_search_guardian=None):
+    listener = _listen(port)
     import uvicorn
     from .access import LocalAccess
     from .app import create_app
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(('127.0.0.1', port))
     listener.listen(128)
     bound = listener.getsockname()[1]
     access = LocalAccess(f'127.0.0.1:{bound}')
@@ -325,6 +382,9 @@ def main(argv=None):
             session_file.release_lock()
     except KeyboardInterrupt:
         raise SystemExit(130) from None
+    except PortInUse as error:
+        _show_error(str(error))
+        raise SystemExit(3) from None
     except Exception:
         _show_error(START_FAILED)
         raise SystemExit(3)

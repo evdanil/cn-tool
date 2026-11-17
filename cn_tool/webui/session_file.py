@@ -62,8 +62,25 @@ def read_session() -> Optional[Session]:
     return Session(pid, port, secret, config_file)
 
 
+def _replace(source: Path, target: Path, tries: int = 50, pause: float = .02) -> None:
+    # On Windows a file that another handle has open (a waiting start reads the session file every few milliseconds)
+    # cannot be replaced: try again for a moment, as _remove_lock does, instead of leaving the session unpublished.
+    for attempt in range(tries):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt + 1 == tries:
+                raise
+            time.sleep(pause)
+
+
 def write_session(session: Session) -> None:
-    """Write the file through a temporary file beside it and ``os.replace``, so a reader never sees half of it."""
+    """Write the file through a temporary file beside it and ``os.replace``, so a reader never sees half of it.
+
+    The replace is tried again for a moment when the file system refuses it with ``PermissionError`` (Windows, while a
+    reader has the old file open); any other error, or a refusal that lasts, raises ``OSError``.
+    """
     target = session_path()
     temporary = target.with_name(f'{SESSION_NAME}.{os.getpid()}.tmp')
     content = json.dumps({'pid': session.pid, 'port': session.port, 'secret': session.secret,
@@ -72,7 +89,7 @@ def write_session(session: Session) -> None:
         descriptor = os.open(str(temporary), os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
         with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
             handle.write(content)
-        os.replace(temporary, target)
+        _replace(temporary, target)
     except BaseException:
         try:
             temporary.unlink()
@@ -116,19 +133,29 @@ def lock_holder() -> Optional[int]:
 def _break_lock(holder: Optional[int]) -> None:
     # Only the lock that was judged: one another start took since is left alone.
     if lock_holder() == holder:
+        _remove_lock()
+
+
+def _remove_lock(tries: int = 50, pause: float = .02) -> None:
+    # On Windows a file that another process has open cannot be removed, and a waiting start reads the lock every few
+    # milliseconds: try again for a moment instead of leaving the lock behind.
+    for attempt in range(tries):
         try:
             lock_path().unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if attempt + 1 < tries:
+                time.sleep(pause)
         except OSError:
-            pass
+            return
 
 
 def release_lock() -> None:
     """Remove the lock if this process holds it."""
     if lock_holder() == os.getpid():
-        try:
-            lock_path().unlink()
-        except OSError:
-            pass
+        _remove_lock()
 
 
 def claim(reopen: Callable[[Session], Optional[str]], *, wait: float = WAIT_SECONDS,

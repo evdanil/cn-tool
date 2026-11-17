@@ -14,6 +14,7 @@ from cn_tool.modules.config_search import (
     ParsedConfigSearch, config_search_mode, parse_search_inputs,
 )
 from cn_tool.plugins.sdwan_yaml_search import SDWANYamlSearchPlugin
+from .config_marks import valid_spans
 from .config_search_worker import MAX_MESSAGE, SearchRequest, snapshot_yaml_plugin
 
 
@@ -29,6 +30,7 @@ class SearchOutcome:
     demob_status: str = ''
     demob_message: str = ''
     demob_notices: list = field(default_factory=list)
+    spans: list = field(default_factory=list)     # one list of [start, end] for each row (or empty), see ``valid_spans``
 
 
 def _hook_plugin(module):
@@ -70,8 +72,10 @@ def _valid_result(result, networks):
         return False
     if not result.matched_nets <= set(networks):
         return False
+    if type(result.spans) is not list or (result.spans and len(result.spans) != len(result.rows)):
+        return False
     size = 2
-    for row in result.rows:
+    for index, row in enumerate(result.rows):
         if type(row) is not list or len(row) != 5 or type(row[2]) is not int or row[2] < 0:
             return False
         if not (type(row[0]) is str or type(row[0]) is ipaddress.IPv4Network):
@@ -82,6 +86,10 @@ def _valid_result(result, networks):
             if len(row[3].encode('utf-8')) > 16384:
                 return False
             size += len(json.dumps([str(row[0]), *row[1:]], ensure_ascii=False).encode('utf-8')) + 1
+            if result.spans:
+                if not valid_spans(row[3], result.spans[index]):
+                    return False
+                size += len(json.dumps(result.spans[index]).encode('utf-8')) + 1
         except UnicodeError:
             return False
         if size > 8 * 1024 * 1024:
@@ -246,7 +254,7 @@ def _perform_search(runtime, parsed, plugin, control, connection):
                 messages = {'complete': '', 'limit': 'Search exceeded its limits. Narrow the search.',
                             'incomplete': 'A configuration file or directory could not be read or changed during the search.'}
                 return SearchOutcome(candidate.status, messages[candidate.status], candidate.rows, candidate.matched_nets,
-                                     parsed.networks, parsed.errors, candidate.source_identities)
+                                     parsed.networks, parsed.errors, candidate.source_identities, spans=candidate.spans)
             elif tag == 'stopped' and stopping:
                 return SearchOutcome('stopped', 'Search stopped.', errors=parsed.errors)
             elif tag == 'failed':

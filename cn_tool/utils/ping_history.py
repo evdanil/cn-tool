@@ -48,6 +48,20 @@ WINDOW_MESSAGE = "'{text}' is not a time: give an age (30m, 24h, 7d) or a date (
 _DURATION = re.compile(r"(?P<count>[0-9]{1,4})(?P<unit>[smhdw])", re.IGNORECASE)
 _DURATION_UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
 
+# The filter field of the web tables' quick filter: the text is looked for in every column the table filters by.
+ANY_FIELD = "any"
+
+
+def filter_matches(field: str, pattern: str, text_of: Callable[[str], object], fields: Sequence[str]) -> bool:
+    """Whether a row matches a page query's filter: ``pattern`` (already case-folded; empty matches every row) is in
+    the text of ``field``, or of any of ``fields`` when ``field`` is ``ANY_FIELD``. ``text_of(name)`` gives the text
+    a column shows for the row; the comparison ignores case."""
+    if not pattern:
+        return True
+    names = fields if field == ANY_FIELD else (field,)
+    return any(pattern in str(text_of(name)).casefold() for name in names)
+
+
 GAP_FACTOR = 2.5  # rounds further apart than this many expected spacings leave a coverage gap
 MIN_STALE_SECONDS = 60.0  # a running run silent for longer than this (or 2.5 intervals) is lost
 
@@ -719,7 +733,7 @@ def read_monitor_history(
         return result(error="invalid")
     allowed_fields = {'hosts': ('host', 'status', 'address', 'result'), 'coverage': PAGE_SORTS,
                       'requests': ('targets', 'ports', 'hosts'), 'runs': ('started', 'status', 'rounds', 'interval')}
-    filter_fields = dict(allowed_fields, coverage=PAGE_FILTERS)
+    filter_fields = {name: (*fields, ANY_FIELD) for name, fields in dict(allowed_fields, coverage=PAGE_FILTERS).items()}
     groups = {'hosts': ('all', 'answered', 'no_response', 'problem', 'other'), 'coverage': PAGE_GROUPS}.get(kind, ('all',))
     if ordered and (kind not in allowed_fields or query['sort'] not in ('', *allowed_fields[kind]) or
                     type(query['descending']) is not bool or query['group'] not in groups or

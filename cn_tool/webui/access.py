@@ -9,10 +9,13 @@ A launch hands out one-use bootstrap tokens: the first with the launch itself, a
 """
 import hashlib
 import hmac
+from html import escape
 from http.cookies import SimpleCookie
 import json
 import secrets
 from threading import Lock
+
+from cn_tool.webui.theme import root_css
 
 _REOPEN_BODY_LIMIT = 4096
 # Unused bootstrap tokens kept at once: each /reopen adds one, and the oldest lapses first.
@@ -80,7 +83,35 @@ class LocalAccess:
         return bool(separator) and secrets.compare_digest(signature, expected)
 
 
-async def _deny(send):
+_CARD = """<!doctype html><html lang="en-US"><head><meta charset="utf-8"><title>cn-tool</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"><style>
+{palette}body{{margin:0;background:var(--cn-page);color:var(--cn-ink);font:15px system-ui,sans-serif}}
+main{{max-width:34rem;margin:12vh auto;padding:20px 24px;background:var(--cn-panel);border:1px solid var(--cn-line);border-radius:6px}}
+h1{{font-size:24px;line-height:1.2;margin:0 0 12px}}p{{margin:8px 0;line-height:1.5}}a{{color:var(--cn-link)}}
+</style></head><body><main><h1>{title}</h1>{lines}</main></body></html>"""
+
+
+def card_html(title, lines):
+    """One static page for the launch edges: no script, the theme's colours inline, titled "cn-tool"."""
+    return _CARD.format(palette=root_css(), title=escape(title), lines=''.join(f'<p>{escape(line)}</p>' for line in lines))
+
+
+DENIED_TITLE = 'Access denied'
+DENIED_LINES = ('This page belongs to a cn-tool session on this computer. '
+                'Open it from the cn-tool Web shortcut or with cn-web.',)
+NOT_FOUND_LINES = ('No such page.',)
+
+
+async def send_card(send, status, title, lines):
+    body = card_html(title, lines).encode('utf-8')
+    await send({'type': 'http.response.start', 'status': status,
+                'headers': [(b'content-type', b'text/html; charset=utf-8'), (b'cache-control', b'no-store')]})
+    await send({'type': 'http.response.body', 'body': body})
+
+
+async def _deny(send, *, page=False):
+    if page:
+        return await send_card(send, 403, DENIED_TITLE, DENIED_LINES)
     await send({'type': 'http.response.start', 'status': 403, 'headers': [(b'content-type', b'text/plain')]})
     await send({'type': 'http.response.body', 'body': b'Local application access denied.'})
 
@@ -117,7 +148,7 @@ class AccessMiddleware:
         if scope['type'] == 'http' and scope['path'] == '/reopen':
             return await self._reopen(scope, receive, send, duplicate=duplicate, host=host, origin=origin)
         action = scope['type'] == 'websocket' or scope.get('method', 'GET') not in {'GET', 'HEAD'}
-        public = scope['type'] == 'http' and ((scope['path'] == '/bootstrap' and not action)
+        public = scope['type'] == 'http' and ((scope['path'] == '/bootstrap' and scope.get('method', 'GET') == 'GET')
                                                    or (scope['path'] == '/exchange' and scope.get('method') == 'POST'))
         cookies = SimpleCookie()
         try:
@@ -134,7 +165,9 @@ class AccessMiddleware:
         if scope['type'] == 'websocket':
             await send({'type': 'websocket.close', 'code': 1008})
         else:
-            await _deny(send)
+            # A browser's page request gets the card; every other refused request keeps the plain 403.
+            page = scope.get('method', 'GET') == 'GET' and 'text/html' in headers.get('accept', '').lower()
+            await _deny(send, page=page)
 
     async def _reopen(self, scope, receive, send, *, duplicate, host, origin):
         """``POST /reopen {"secret": ...}`` from this machine: ``{"token": ...}``, a new one-use bootstrap token.

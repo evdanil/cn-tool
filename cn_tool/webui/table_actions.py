@@ -26,24 +26,9 @@ _CLIPBOARD = '''(async () => {
   try { await navigator.clipboard.writeText(%s); return 'ok'; }
   catch (error) { return (error && error.name || 'Error') + ': ' + (error && error.message || ''); }
 })()'''
+CLIPBOARD_SCRIPT = _CLIPBOARD  # its argument is a script expression (``json.dumps(text)``, or ``location.href``)
 
-# One listener for every kept table: the scroll position of each, with the page it belongs to.
-SCROLL_SCRIPT = '''<script>
-window.cnScroll = window.cnScroll || {};
-document.addEventListener('scroll', event => {
-  const box = event.target;
-  if (box && box.dataset && box.dataset.cnScroll) {
-    window.cnScroll[box.dataset.cnScroll] = {page: box.dataset.cnScrollPage, top: box.scrollTop, left: box.scrollLeft};
-  }
-}, true);
-window.cnRestoreScroll = (name) => {
-  const box = document.querySelector('[data-cn-scroll="' + name + '"]');
-  const kept = window.cnScroll[name];
-  if (!box) return;
-  if (kept && kept.page === box.dataset.cnScrollPage) { box.scrollTop = kept.top; box.scrollLeft = kept.left; }
-  else { window.cnScroll[name] = {page: box.dataset.cnScrollPage, top: 0, left: 0}; }
-};
-</script>'''
+EXPORT_FAILED = 'The table could not be exported.'
 
 
 def count_text(count):
@@ -86,23 +71,27 @@ def scope_description(count, noun='rows'):
     return f'All {count_text(count)} matching {noun}, every page, as filtered and sorted.'
 
 
-def render_export_group(*, name, on_download, on_copy, on_cancel=None, description=''):
+def render_export_group(*, name, on_download, on_copy, on_cancel=None, description='', on_link=None):
     """
-    The group of a table's toolbar. Returns ``dict(download=, copy=, cancel=, status=)``; ``cancel`` is None without
-    ``on_cancel``. ``name`` makes the markers (``data-table-export="<name>-download"``) that focus restoration uses.
+    The group of a table's toolbar. Returns ``dict(download=, copy=, cancel=, link=, status=)``; ``cancel`` is None
+    without ``on_cancel``, ``link`` (Copy view link, R2-08) without ``on_link``. ``name`` makes the markers
+    (``data-table-export="<name>-download"``) that focus restoration uses.
     """
     from nicegui import ui
 
     controls = {}
     with ui.element('div').props('role=group aria-label="Table export"').classes('row items-center gap-2 cn-table-export'):
+        from .view_state import LINK, LINK_DESCRIPTION
         for key, label, handler in (('download', DOWNLOAD, on_download), ('copy', COPY, on_copy),
-                                    ('cancel', CANCEL, on_cancel)):
+                                    ('link', LINK, on_link), ('cancel', CANCEL, on_cancel)):
             if handler is None:
                 controls[key] = None
                 continue
             button = ui.button(label, on_click=handler).props('outline dense no-caps')
             button._props['data-table-export'] = f'{name}-{key}'
-            if description and key != 'cancel':
+            if key == 'link':
+                button._props['aria-description'] = LINK_DESCRIPTION
+            elif description and key != 'cancel':
                 button._props['aria-description'] = description
             controls[key] = button
         if controls['cancel'] is not None:
@@ -141,13 +130,3 @@ async def write_clipboard(client, text, count):
     except Exception:  # the tab went away
         result = ''
     return clipboard_message(result, count)
-
-
-def keep_scroll(element, name, page):
-    """
-    Keep ``element``'s scroll position across redraws of the same ``page`` (any value that names it: offset, size,
-    sort, filter, group); a different page starts at the top. Needs ``SCROLL_SCRIPT`` in the page head.
-    """
-    element._props['data-cn-scroll'] = name
-    element._props['data-cn-scroll-page'] = json.dumps(page, sort_keys=True, default=str)
-    element.client.run_javascript(f'setTimeout(() => window.cnRestoreScroll && window.cnRestoreScroll({json.dumps(name)}), 0)')

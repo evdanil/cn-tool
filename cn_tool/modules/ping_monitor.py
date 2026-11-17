@@ -242,7 +242,10 @@ class RunOutcome:
 
 
 class MonitorObserver(Protocol):
-    """Callbacks run synchronously on the run thread; consumers copy values they retain."""
+    """Callbacks run synchronously on the run thread; consumers copy values they retain.
+
+    An observer may also have ``on_wait(until)``: a run that waits for its next round calls it, before the
+    ``waiting`` status, with the time that round is due (seconds since the epoch, on the wall clock)."""
 
     def on_started(self, run_id: str) -> None: ...
     def on_status(self, stage: str, completed: int, total: int) -> None: ...
@@ -1645,6 +1648,10 @@ class _Run:
         wait is at most one interval of the monotonic clock, and ends early when the run's clock jumps past the slot
         (a suspend)."""
         if self.observer is not None:
+            on_wait = getattr(self.observer, "on_wait", None)
+            if on_wait is not None:
+                # The slot on the wall clock: what is left on the run's clock (which leads it after a step back), from now.
+                on_wait(time.time() + (until - self.clock.now()))
             self.observer.on_status("waiting", 0, 0)
         deadline = time.monotonic() + min(until - self.clock.now(), self.plan.every or 0.0)
         while not stop.stopped:

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-from cn_tool.utils.ping_history import GAP_FACTOR
+from cn_tool.utils.ping_history import ANY_FIELD, GAP_FACTOR, filter_matches
 
 if TYPE_CHECKING:  # only for the annotations: sqlite3 is imported where it is used
     import sqlite3
@@ -792,7 +792,7 @@ class PingStore:
         from datetime import datetime, timezone
 
         fields = {'requests': ('targets', 'ports', 'hosts'), 'runs': ('started', 'status', 'rounds', 'interval')}
-        if (kind not in fields or sort not in ('', *fields[kind]) or filter_field not in fields[kind] or
+        if (kind not in fields or sort not in ('', *fields[kind]) or filter_field not in (*fields[kind], ANY_FIELD) or
                 type(descending) is not bool or not isinstance(filter_text, str) or len(filter_text) > 256 or
                 type(limit) is not int or not 1 <= limit <= 100 or
                 (kind == 'requests' and parent is not None) or
@@ -804,26 +804,36 @@ class PingStore:
         with self._transaction(write=False) as connection:
             if kind == 'runs' and not connection.execute('SELECT 1 FROM request WHERE id = ?', (parent,)).fetchone():
                 raise HistoryExpired()
+            pattern = filter_text.casefold()
+            # The ``any`` filter looks at what fits: a request's targets or ports that are too large to read (or that
+            # would pass the work limit) are searched by their preview, so one large saved target never makes every
+            # filter of the list fail (a sort, or a filter on that one column, still refuses a value too large to read).
+            any_filter = bool(filter_text) and filter_field == ANY_FIELD
             def rows():
                 if kind == 'requests':
-                    needed = {field for field in ('targets', 'ports')
-                              if sort == field or (filter_text and filter_field == field)}
+                    needed = {field for field in ('targets', 'ports') if sort == field or (filter_text and filter_field == field)}
+                    read = needed | ({'targets', 'ports'} if any_filter else set())
                     query = connection.execute(
                         'SELECT id, substr(key, 1, 65), substr(targets, 1, ?), substr(tcp_ports, 1, ?), length(hosts),'
                         ' CASE WHEN ? THEN substr(targets, 1, ?) END, CASE WHEN ? THEN substr(tcp_ports, 1, ?) END'
                         ' FROM request ORDER BY id',
                         (_HISTORY_ARRAY_CHARS + 1, _HISTORY_ARRAY_CHARS + 1) + tuple(value for field in ('targets', 'ports')
-                            for value in (field in needed, _HISTORY_SEARCH_CHARS + 1)))
-                    sort_work = 0
+                            for value in (field in read, _HISTORY_SEARCH_CHARS + 1)))
+                    sort_work = filter_work = 0
                     for request_id, key, targets, ports, hosts_length, full_targets, full_ports in query:
-                        for data in (full_targets, full_ports):
-                            if isinstance(data, (str, bytes)):
+                        loaded = dict(targets=full_targets, ports=full_ports)
+                        for name, data in loaded.items():
+                            if not isinstance(data, (str, bytes)):
+                                continue
+                            if name in needed:
                                 sort_work += len(data)
-                            if sort_work > _HISTORY_SORT_WORK_CHARS:
-                                raise HistoryTooLarge()
-                        for name, data in (('targets', full_targets), ('ports', full_ports)):
-                            if name in needed and isinstance(data, (str, bytes)) and len(data) > _HISTORY_SEARCH_CHARS:
-                                raise HistoryTooLarge()
+                                if sort_work > _HISTORY_SORT_WORK_CHARS or len(data) > _HISTORY_SEARCH_CHARS:
+                                    raise HistoryTooLarge()
+                            elif len(data) > _HISTORY_SEARCH_CHARS or filter_work + len(data) > _HISTORY_SORT_WORK_CHARS:
+                                loaded[name] = None  # ``any``: searched by its preview only
+                            else:
+                                filter_work += len(data)
+                        full_targets, full_ports = loaded['targets'], loaded['ports']
                         targets_preview, target_count = _request_array_summary(targets)
                         ports_preview, port_count = _request_array_summary(ports, ports=True)
                         host_count = None
@@ -843,13 +853,13 @@ class PingStore:
                                     targets_preview=targets_preview, ports_preview=ports_preview,
                                     target_count=target_count, port_count=port_count, host_count=host_count)
                         target_values = tuple(targets_preview) if target_count is not None else None
-                        if 'targets' in needed and isinstance(full_targets, str):
+                        if isinstance(full_targets, str):
                             try:
                                 target_values = tuple(_host_names(full_targets))
                             except ValueError:
                                 target_values = None
                         port_values = tuple(ports_preview) if port_count is not None else None
-                        if 'ports' in needed and isinstance(full_ports, str):
+                        if isinstance(full_ports, str):
                             try:
                                 decoded = json.loads(full_ports)
                                 if not isinstance(decoded, list) or any(type(port) is not int or not 1 <= port <= 65535 for port in decoded):
@@ -858,6 +868,13 @@ class PingStore:
                             except (ValueError, TypeError, RecursionError):
                                 port_values = None
                         values = dict(targets=target_values, ports=port_values, hosts=host_count)
+                        if any_filter:
+                            # decided here, request by request: only what a sort needs stays in memory afterwards
+                            hit = filter_matches(ANY_FIELD, pattern, lambda name: display(values[name], name, item), fields[kind])
+                            values = dict(
+                                targets=target_values if sort == 'targets' else tuple(targets_preview) if target_count is not None else None,
+                                ports=port_values if sort == 'ports' else tuple(ports_preview) if port_count is not None else None,
+                                hosts=host_count, _hit=hit)
                         yield item, values
                 else:
                     query = connection.execute(f'SELECT {_RUN_COLUMNS} FROM run WHERE run.request_id = ? ORDER BY run.started, run.id', (parent,))
@@ -913,11 +930,14 @@ class PingStore:
             if after is not None and (anchor is None or after[1] != signature):
                 raise HistoryExpired()
             total = 0
-            pattern = filter_text.casefold()
             def selected():
                 nonlocal total
                 for pair in rows():
-                    if pattern not in display(pair[1][filter_field], filter_field, pair[0]).casefold():
+                    hit = pair[1].get('_hit')
+                    if hit is None:
+                        hit = filter_matches(filter_field, pattern, lambda name: display(pair[1][name], name, pair[0]),
+                                             fields[kind])
+                    if not hit:
                         continue
                     total += 1
                     if anchor is None or compare(pair, anchor) > 0:
@@ -937,7 +957,7 @@ class PingStore:
         fields = ('host', 'status', 'address', 'result')
         if (not _history_integer(round_id) or sort not in ('', *fields) or type(descending) is not bool or
                 group not in ('all', 'answered', 'no_response', 'problem', 'other') or
-                filter_field not in fields or not isinstance(filter_text, str) or len(filter_text) > 256 or
+                filter_field not in (*fields, ANY_FIELD) or not isinstance(filter_text, str) or len(filter_text) > 256 or
                 type(limit) is not int or not 1 <= limit <= SORTED_PAGE_MAX or
                 (after is not None and (not isinstance(after, (list, tuple)) or len(after) != 2 or
                  not _history_integer(after[0], 0) or not isinstance(after[1], str) or
@@ -1015,10 +1035,11 @@ class PingStore:
                 for row in rows():
                     if group != 'all' and category(row) != group:
                         continue
-                    text = str(value(row, filter_field)).casefold()
-                    explanation = ({'T': 'Answered on TCP', '?': 'DNS name did not resolve'}
-                                   .get(row['observation'], '').casefold() if filter_field == 'status' else '')
-                    if pattern not in text and pattern not in explanation:
+                    explanation = {'T': 'Answered on TCP', '?': 'DNS name did not resolve'}.get(row['observation'], '')
+
+                    def shown(name, row=row, explanation=explanation):  # a status is found by its long words too
+                        return f'{value(row, name)}\n{explanation}' if name == 'status' else value(row, name)
+                    if not filter_matches(filter_field, pattern, shown, fields):
                         continue
                     total += 1
                     if anchor is None or compare(row, anchor) > 0:

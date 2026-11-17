@@ -16,6 +16,33 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
+## 0.13.0
+
+The web interface is reworked so that every tool reads the same way and the results are on the first screen. The command
+line and the menu are unchanged.
+
+- Every tool opens inside one browser page, without a load: the header and the running-job pill stay, and **Back** and
+  **Forward** move between tools. After **Look up**, **Run Ping** or **Run monitor** the form folds into one line with
+  **Run again** and **Edit**. See [Moving between pages](webui.md#moving-between-pages) and
+  [After you run: the form folds](webui.md#after-you-run-the-form-folds).
+- The address in the browser names the view (a network's details, how a table is filtered, sorted and paged, a Monitor
+  round), a reload opens it again, and **Copy view link** copies it. It never holds targets, search terms or passwords.
+- Every table has one **Filter** box over all columns (there is no field to choose, no **Apply filter** and no **Clear
+  filter**) and one footer, and **Download table (CSV)** and **Copy table** are on every table. Ping tables start at 25
+  rows per page. Configuration matches are grouped by device with the match highlighted and **Copy path**.
+- A running Ping shows a progress bar and the hosts probed so far. The Monitor has a line giving the round, the next
+  round's countdown and the run's settings in UTC, and its Map has **Previous block with answers** and **Next block with
+  answers**.
+- Keys: a skip link, `/`, `?`, `g` then a letter, and Ctrl+Enter; **Single-key shortcuts** in **Help** turns the single
+  keys off. The pages follow the system's light or dark setting.
+- A password that Infoblox refuses keeps the sign-in dialog open, for up to three passwords in one lookup, and the lookup
+  then offers **Sign in again**. **Stop** is on the page of the tool that owns the job, **Quit** says what it will do
+  before it does it, and the **Report** menu in the header downloads or deletes the accumulated workbook.
+- A page with no session, an expired launch link and an unknown address each get one plain card, and a port that is in use
+  is named.
+
+No configuration change or migration is needed.
+
 ## 0.12.3
 
 In the web interface, Monitor's latest complete round opens as a **Map**: the grid of `cn monitor`,

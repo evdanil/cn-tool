@@ -30,7 +30,7 @@ SILENT_NOTE = "no IP in this subnet ever replied"
 # The web page's query (``coverage_page``): what a page sorts by, filters on and groups by. The history reader and the
 # worker's protocol check both read these lists, so a query is refused by one list.
 PAGE_SORTS = ("host", "status", "first_seen", "last_seen", "answered")
-PAGE_FILTERS = ("host", "status", "note")
+PAGE_FILTERS = ("host", "status", "first_seen", "last_seen", "answered", "failed", "note")  # every displayed column
 PAGE_GROUPS = ("all", "seen", "unseen", "not_tested")
 PAGE_COUNTS = ("seen", "unseen", "not_tested")
 PAGE_SILENT_SUBNETS = 64  # the names a page's summary carries
@@ -202,8 +202,8 @@ def coverage_page(
     offset: int,
 ) -> Dict[str, Any]:
     """
-    One page of the web table: the hosts of ``group`` (``PAGE_GROUPS``) whose ``filter_field`` text holds
-    ``filter_text`` (case-insensitively), ordered by ``sort`` (``PAGE_SORTS``; ``host`` and none are the host order,
+    One page of the web table: the hosts of ``group`` (``PAGE_GROUPS``) whose ``filter_field`` text (any of
+    ``PAGE_FILTERS`` for ``ping_history.ANY_FIELD``) holds ``filter_text`` (case-insensitively), ordered by ``sort`` (``PAGE_SORTS``; ``host`` and none are the host order,
     ``index``), from ``offset`` for ``limit``. A host with no ``first_seen`` or ``last_seen`` sorts last either way, and
     equal values keep the host order. Returns ``items`` (a dict for each host, the fields of ``HostCoverage``), ``total``
     (the matches of the group and the filter), ``next_offset`` (None on the last page), ``counts`` (the hosts of each
@@ -212,10 +212,25 @@ def coverage_page(
     """
     wanted = _GROUP_STATUS.get(group)
     pattern = filter_text.casefold()
+
+    def shown(host: HostCoverage) -> Callable[[str], object]:
+        """The text of each column of ``host`` exactly as the table shows it (``monitor_text.coverage_row``, the one
+        formatter: dates, ``12 of 30``, the dash). Made on first use: an empty filter never formats a host."""
+        row: Dict[str, Any] = {}
+
+        def text_of(name: str) -> object:
+            if not row:
+                from cn_tool.webui.monitor_text import coverage_row
+
+                row.update(coverage_row(asdict(host)))
+            return row[name]
+
+        return text_of
+
     matches = [
         host
         for host in coverage.hosts
-        if (wanted is None or host.status == wanted) and pattern in str(getattr(host, filter_field)).casefold()
+        if (wanted is None or host.status == wanted) and ph.filter_matches(filter_field, pattern, shown(host), PAGE_FILTERS)
     ]
     if sort == "status":
         matches.sort(key=lambda host: host.status.casefold(), reverse=descending)  # a reversed sort keeps equal keys' order

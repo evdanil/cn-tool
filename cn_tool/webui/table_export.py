@@ -60,7 +60,7 @@ def safe_cell(value):
 def csv_text(columns, rows):
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator='\r\n')
-    writer.writerow(columns)
+    writer.writerow([safe_cell(column) for column in columns])
     for row in rows:
         writer.writerow([safe_cell(row.get(column)) for column in columns])
     return buffer.getvalue()

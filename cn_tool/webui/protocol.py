@@ -3,13 +3,19 @@ import json
 import math
 import re
 
+from .config_marks import valid_spans
+
 FIELDS = {
     'delete_report': {'request_id'},
     'report_delete_result': {'request_id', 'status', 'message', 'report_state'},
     'initialize': {'config_file'}, 'reload_config': {'config_file'}, 'reload_result': {'status', 'message'}, 'credentials_reply': {'request_id', 'reply', 'remember'}, 'forget_credentials': set(),
     'lookup': {'inputs', 'lookup_type', 'tcp_ports', 'interval_seconds', 'duration_seconds'}, 'cancel': set(), 'snapshot_report': {'request_id'}, 'shutdown': {'interrupted'},
-    'ready': {'scope', 'username', 'report_warning', 'report_state'}, 'setup_required': {'message', 'code'},
-    'credentials_required': {'request_id', 'account', 'username', 'need_username', 'need_password', 'message', 'store_supported'},
+    'ready': {'scope', 'username', 'report_warning', 'report_state', 'infoblox_configured', 'config_found'}, 'setup_required': {'message', 'code'},
+    # 'tries_left': the password is checked at once (lookup_scope) and the worker then says credentials_checked or
+    # asks again; how many passwords the lookup still takes, this one included. 'refused': the last one was refused.
+    'credentials_required': {'request_id', 'account', 'username', 'need_username', 'need_password', 'message', 'store_supported',
+                             'refused', 'tries_left'},
+    'credentials_checked': set(),  # the login typed for this lookup was used and not refused
     'credential_store_state': {'account', 'username', 'status', 'message', 'pending'},
     'saved_login_restored': set(),
     'demob_lookup': {'site'}, 'demob_confirm': {'token'}, 'demob_decline': set(),
@@ -23,28 +29,51 @@ FIELDS = {
     'monitor_history': {'kind', 'parent', 'cursor', 'limit', 'query_id', 'sort', 'descending', 'group', 'filter_field', 'filter_text'},
     'monitor_history_result': {'items', 'next_cursor', 'error', 'query_id', 'counts', 'total', 'summary'},
     'monitor_coverage_export': {'request_id', 'parent'},
-    'monitor_live_page': {'job_id', 'run_id', 'revision', 'offset', 'limit', 'query_id', 'sort', 'descending', 'group', 'filter_field', 'filter_text'},
+    'monitor_live_page': {'job_id', 'run_id', 'revision', 'offset', 'limit', 'query_id', 'sort', 'descending', 'group', 'filter_field', 'filter_text', 'filter_exact'},
     'monitor_live_page_result': {'job_id', 'run_id', 'revision', 'offset', 'rows', 'next_offset', 'status', 'current_revision', 'query_id', 'total', 'counts'},
     'monitor_live_map': {'job_id', 'run_id', 'revision', 'show', 'query_id'},
     'monitor_live_map_result': {'job_id', 'run_id', 'revision', 'show', 'query_id', 'status', 'current_revision', 'map'},
     'monitor_live_host': {'job_id', 'run_id', 'revision', 'block', 'cell', 'query_id'},
     'monitor_live_host_result': {'job_id', 'run_id', 'revision', 'block', 'cell', 'query_id', 'status', 'current_revision', 'host'},
-    'monitor_update': {'lookup_type', 'run_id', 'revision', 'stage', 'completed', 'total', 'current_rounds', 'earlier_rounds', 'skipped_slots', 'history_error'},
-    'progress': {'stage', 'lookup_type', 'completed', 'total'}, 'result': {'result', 'outcome', 'lookup_type'}, 'report_state': {'state', 'lookup_type'},
+    'monitor_update': {'lookup_type', 'run_id', 'revision', 'stage', 'completed', 'total', 'current_rounds', 'earlier_rounds', 'skipped_slots', 'history_error',
+                       'round_at', 'next_at', 'hosts'},
+    'progress': {'stage', 'lookup_type', 'completed', 'total'},
+    'partial_result': {'lookup_type', 'rows', 'completed', 'total'},
+    'result': {'result', 'outcome', 'lookup_type'}, 'report_state': {'state', 'lookup_type'},
     'lookup_context': {'lookup_type', 'username', 'scope'},
-    'error': {'message', 'lookup_type'}, 'report_snapshot': {'request_id', 'path', 'error', 'filename'}, 'closed': set(),
+    'error': {'message', 'lookup_type', 'sign_in_again'}, 'report_snapshot': {'request_id', 'path', 'error', 'filename'}, 'closed': set(),
 }
 _PAGE_OPTIONS = {'sort_by', 'descending', 'filter_by', 'filter_text'}
+# The columns of a configuration match a page may sort or filter by (``config_pages.COLUMN_INDEX`` indexes the row).
+CONFIG_COLUMNS = ('device', 'line', 'configuration', 'search', 'file')
+# The rows of one configuration or site-network page: the web "All" page size (table_export.MAX_PAGE_ROWS).
+PAGE_ROWS_MAX = 1024
 # The rows of one live Monitor page: the web "All" page size (table_export.MAX_PAGE_ROWS).
 LIVE_PAGE_MAX = 1024
+LIVE_FILTERS = ('host', 'address', 'result', 'tcp')  # the live table's columns; 'any' filters by all of them
+# A Ping's partial result: the rows of one batch (``bulk_ping.BATCH_SIZE``) and the most rows the controller keeps for a
+# running Ping (``bulk_ping.MAX_PING_HOSTS``, 65,534, and one for an IPv6 /112, which has 65,535 hosts).
+PARTIAL_BATCH_MAX = 100
+PING_ROWS_MAX = 65536
+# A row count does not bound memory: each value of a partial row is at most PARTIAL_VALUE_MAX characters (a column name
+# PARTIAL_KEY_MAX) and the controller keeps at most PING_PARTIAL_BYTES_MAX bytes of them for a running Ping.
+PARTIAL_VALUE_MAX = 8192
+PARTIAL_KEY_MAX = 128
+PING_PARTIAL_BYTES_MAX = 32 * 1024 * 1024
 # The Map view (monitor_map.CAP_CELLS and CAP_NAMES): the cells one answer may draw, and the grid's characters.
 MAP_CELLS_MAX = 65536
 MAP_NAMES_MAX = 2048
 MAP_CHARS = frozenset('!RTxUE?. ')
+# How many passwords one lookup takes from the sign-in dialog (lookup_scope.ensure_lookup_scope). Each one that this
+# session has not seen refused is a real sign-in at Infoblox, and repeated refusals can lock an account.
+SIGN_IN_TRIES = 3
+# A time on the wire is seconds since the epoch, and 0 means none. The bound is 9999-12-31T23:59:59Z, the last second
+# a datetime can show, so a page formats whatever passed here.
+MOMENT_MAX = 253402300799
 for _kind in ('demob_page', 'demob_page_result', 'config_search_page', 'config_search_page_result'):
     FIELDS[_kind] |= _PAGE_OPTIONS
 FIELDS['demob_page_result'] |= {'columns', 'overall_total'}
-FIELDS['config_search_page_result'] |= {'overall_total'}
+FIELDS['config_search_page_result'] |= {'overall_total', 'device_counts'}
 COMMANDS = frozenset(('delete_report', 'initialize', 'reload_config', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_live_map', 'monitor_live_host', 'monitor_history', 'monitor_coverage_export', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
 
 
@@ -109,6 +138,11 @@ def _valid_live_host(answer):
                 1 <= item['port'] <= 65535 and _short_text(item['result'], 64) for item in answer['tcp']))
 
 
+def _valid_moment(value):
+    """``round_at`` and ``next_at`` of a Monitor update: a finite number from 0 (none) to ``MOMENT_MAX``."""
+    return type(value) in (int, float) and 0 <= value <= MOMENT_MAX  # a NaN fails both comparisons
+
+
 def envelope(session_id, job_id, kind, payload):
     return dict(version=1, session_id=session_id, job_id=job_id, kind=kind, payload=payload)
 
@@ -119,10 +153,10 @@ def _valid_page_options(payload, *, dynamic=False):
     keys = (payload['sort_by'], payload['filter_by'])
     def valid(key):
         return key is None or (type(key) is str and 0 < len(key) <= 1024 and
-                               (dynamic or key in ('device', 'line', 'configuration')))
+                               (dynamic or key in CONFIG_COLUMNS))
+    # ``filter_by`` None with a text is the quick filter over every column; a column narrows it to that one.
     return (all(valid(key) for key in keys) and type(payload['descending']) is bool and
-            type(payload['filter_text']) is str and len(payload['filter_text']) <= 256 and
-            (not payload['filter_text'] or payload['filter_by'] is not None))
+            type(payload['filter_text']) is str and len(payload['filter_text']) <= 256)
 
 
 def _valid_page_progress(payload):
@@ -315,10 +349,10 @@ def validate(message):
             if not identifier(payload['query_id']) or type(payload['offset']) is not int or not 0 <= payload['offset'] <= 10000:
                 raise ValueError('Invalid preview page')
             if kind == 'demob_page':
-                if type(payload['limit']) is not int or not 1 <= payload['limit'] <= 100:
+                if type(payload['limit']) is not int or not 1 <= payload['limit'] <= PAGE_ROWS_MAX:
                     raise ValueError('Invalid preview page limit')
             elif (payload['status'] not in ('ready', 'unavailable') or type(payload['rows']) is not list or
-                  len(payload['rows']) > 100 or any(type(row) is not dict for row in payload['rows']) or
+                  len(payload['rows']) > PAGE_ROWS_MAX or any(type(row) is not dict for row in payload['rows']) or
                   type(payload['total']) is not int or not 0 <= payload['total'] <= 10000 or
                   (payload['next_offset'] is not None and (type(payload['next_offset']) is not int or
                    not 0 <= payload['next_offset'] <= payload['total'])) or
@@ -338,10 +372,13 @@ def validate(message):
             raise ValueError('Demobilization message exceeds limit')
         return message
     if kind in {'config_search_page', 'config_search_page_result'}:
-        optional = _PAGE_OPTIONS | ({'overall_total'} if kind == 'config_search_page_result' else set())
+        optional = _PAGE_OPTIONS | ({'overall_total', 'device_counts'} if kind == 'config_search_page_result' else set())
         base = FIELDS[kind] - optional
-        allowed = (base, base | _PAGE_OPTIONS) if kind == 'config_search_page' else (base, base | _PAGE_OPTIONS | {'overall_total'})
-        if message['job_id'] is not None or set(payload) not in allowed:
+        extra = set(payload) - base
+        # The options come all together (with ``overall_total`` only beside them); ``device_counts`` stands alone.
+        options = extra - {'device_counts'}
+        if (message['job_id'] is not None or not base <= set(payload) or not extra <= optional or
+                options not in (set(), _PAGE_OPTIONS, _PAGE_OPTIONS | {'overall_total'})):
             raise ValueError('Invalid configuration page envelope')
         if 'sort_by' in payload and not _valid_page_options(payload):
             raise ValueError('Invalid configuration page options')
@@ -351,18 +388,19 @@ def validate(message):
         if type(payload['offset']) is not int or not 0 <= payload['offset'] <= 10000:
             raise ValueError('Invalid configuration page offset')
         if kind == 'config_search_page':
-            if type(payload['limit']) is not int or not 1 <= payload['limit'] <= 50:
+            if type(payload['limit']) is not int or not 1 <= payload['limit'] <= PAGE_ROWS_MAX:
                 raise ValueError('Invalid configuration page limit')
         else:
             rows, total, position = payload['rows'], payload['total'], payload['next_offset']
             if (payload['status'] not in ('ready', 'unavailable') or type(total) is not int or
-                    not 0 <= total <= 10000 or type(rows) is not list or len(rows) > 50 or
+                    not 0 <= total <= 10000 or type(rows) is not list or len(rows) > PAGE_ROWS_MAX or
                     (position is not None and (type(position) is not int or not 0 <= position <= total))):
                 raise ValueError('Invalid configuration page result')
             for row in rows:
-                if (type(row) is not list or len(row) != 5 or type(row[2]) is not int or row[2] < 0 or
+                if (type(row) is not list or len(row) not in (5, 6) or type(row[2]) is not int or row[2] < 0 or
                         any(type(row[index]) is not str for index in (0, 1, 3, 4)) or
-                        len(row[3].encode('utf-8')) > 16384):
+                        len(row[3].encode('utf-8')) > 16384 or
+                        (len(row) == 6 and (type(row[5]) is not list or not valid_spans(row[3], row[5])))):
                     raise ValueError('Invalid configuration row')
             if len(json.dumps(payload, ensure_ascii=False).encode('utf-8')) > 1024 * 1024:
                 raise ValueError('Configuration page exceeds limit')
@@ -370,6 +408,12 @@ def validate(message):
                 raise ValueError('Unavailable page contains data')
             if payload['status'] == 'ready' and not _valid_page_progress(payload):
                 raise ValueError('Invalid configuration page progress')
+            if 'device_counts' in payload:
+                counts = payload['device_counts']
+                # one count for each device on the page: how many matches that device has under the filter
+                if (type(counts) is not dict or set(counts) != {row[1] for row in rows} or
+                        any(type(value) is not int or not 1 <= value <= total for value in counts.values())):
+                    raise ValueError('Invalid configuration device counts')
             if 'overall_total' in payload and (type(payload['overall_total']) is not int or
                     not total <= payload['overall_total'] <= 10000 or
                     payload['status'] == 'unavailable' and payload['overall_total']):
@@ -407,7 +451,7 @@ def validate(message):
                 fields = {'hosts': ('host', 'status', 'address', 'result'), 'coverage': PAGE_SORTS,
                           'requests': ('targets', 'ports', 'hosts'),
                           'runs': ('started', 'status', 'rounds', 'interval')}.get(page_kind, ())
-                filters = PAGE_FILTERS if page_kind == 'coverage' else fields
+                filters = (*(PAGE_FILTERS if page_kind == 'coverage' else fields), 'any')  # 'any': every column
                 groups = {'hosts': ('all', 'answered', 'no_response', 'problem', 'other'),
                           'coverage': PAGE_GROUPS}.get(page_kind, ('all',))
                 if (not fields or payload['sort'] not in ('', *fields) or
@@ -474,10 +518,11 @@ def validate(message):
         return message
     if kind in {'monitor_live_page', 'monitor_live_page_result'}:
         optional = {'sort', 'descending', 'group', 'filter_field', 'filter_text'} if kind == 'monitor_live_page' else {'total', 'counts'}
-        base = FIELDS[kind] - optional
+        base = FIELDS[kind] - optional - {'filter_exact'}
         allowed = (base, base | optional)
         if kind == 'monitor_live_page':
-            allowed += (base | {'sort', 'descending', 'group'},)
+            # ``filter_exact`` qualifies a filter, so it travels only with one.
+            allowed += (base | {'sort', 'descending', 'group'}, base | optional | {'filter_exact'})
         if message['job_id'] is not None or set(payload) not in allowed:
             raise ValueError('Invalid live page envelope')
         if any(not isinstance(payload[k], str) or not payload[k] or len(payload[k]) > 128 or
@@ -493,8 +538,9 @@ def validate(message):
                                       type(payload['descending']) is not bool or
                                       payload['group'] not in ('all', 'answered', 'no_response', 'problem', 'other')):
                 raise ValueError('Invalid live page ordering')
-            if 'filter_field' in payload and (payload['filter_field'] not in ('host', 'address', 'result', 'tcp') or
-                    not isinstance(payload['filter_text'], str) or len(payload['filter_text']) > 256):
+            if 'filter_field' in payload and (payload['filter_field'] not in (*LIVE_FILTERS, 'any') or
+                    not isinstance(payload['filter_text'], str) or len(payload['filter_text']) > 256 or
+                    type(payload.get('filter_exact', False)) is not bool):
                 raise ValueError('Invalid live page filter')
         else:
             rows = payload['rows']
@@ -532,11 +578,13 @@ def validate(message):
             if 'tcp_ports' in payload:
                 raise ValueError('Ports require Ping or Monitor')
     if kind == 'monitor_update':
-        counts = ('revision', 'completed', 'total', 'current_rounds', 'earlier_rounds', 'skipped_slots')
+        # 'hosts': how many hosts the run probes, 0 until it knows; it stays between two rounds, when 'total' is 0.
+        counts = ('revision', 'completed', 'total', 'current_rounds', 'earlier_rounds', 'skipped_slots', 'hosts')
         if (payload.get('lookup_type') != 'monitor' or not isinstance(payload.get('run_id'), str)
                 or not payload['run_id'] or len(payload['run_id']) > 128 or not payload['run_id'].isascii()
                 or not payload['run_id'].isprintable() or any(type(payload.get(k)) is not int or payload[k] < 0 for k in counts)
-                or payload['completed'] > payload['total']):
+                or payload['completed'] > payload['total']
+                or not all(_valid_moment(payload.get(k)) for k in ('round_at', 'next_at'))):
             raise ValueError('Invalid Monitor update')
     if kind == 'progress':
         required -= {'completed', 'total'}
@@ -546,23 +594,42 @@ def validate(message):
                 any(type(payload[k]) is not int or payload[k] < 0 for k in ('completed', 'total')) or
                 payload['completed'] > payload['total']):
             raise ValueError('Invalid progress counts')
+    if kind == 'partial_result':
+        rows, completed, total = payload.get('rows'), payload.get('completed'), payload.get('total')
+        # The rows of one batch of a Ping, as the final result will hold them (the columns of a plugin come later).
+        if (payload.get('lookup_type') != 'ping' or type(rows) is not list or not 1 <= len(rows) <= PARTIAL_BATCH_MAX or
+                any(not isinstance(row, dict) or not {'Host', 'Address', 'Result'} <= set(row) or
+                    any(not isinstance(k, str) or not isinstance(v, str) or len(k) > PARTIAL_KEY_MAX or
+                        len(v) > PARTIAL_VALUE_MAX for k, v in row.items()) for row in rows) or
+                type(completed) is not int or type(total) is not int or
+                not len(rows) <= completed <= total <= PING_ROWS_MAX):
+            raise ValueError('Invalid partial result')
+        if len(json.dumps(rows, ensure_ascii=False, allow_nan=False).encode('utf-8')) > 512 * 1024:
+            raise ValueError('Partial result exceeds limit')
+    if kind == 'error':
+        required -= {'sign_in_again'}  # only a job whose typed password Infoblox refused says it
     if kind == 'error' and message['job_id'] is None:
         required -= {'lookup_type'}
-        if 'lookup_type' in payload:
+        if {'lookup_type', 'sign_in_again'} & payload.keys():
             raise ValueError('Session error must be untyped')
     if kind == 'credentials_reply':
         required -= {'remember'}
     if kind == 'shutdown':
         required -= {'interrupted'}
     if kind == 'credentials_required':
-        required -= {'store_supported'}
+        required -= {'store_supported', 'refused', 'tries_left'}
+        refused, tries = payload.get('refused', False), payload.get('tries_left', SIGN_IN_TRIES)
+        if type(tries) is not int or not 1 <= tries <= SIGN_IN_TRIES or ('tries_left' in payload and payload.get('need_password') is not True):
+            raise ValueError('Invalid sign-in tries')
+        if type(refused) is not bool or refused != ('tries_left' in payload and tries < SIGN_IN_TRIES):
+            raise ValueError('Invalid refused sign-in')
     if kind == 'ready':
         required -= {'report_warning', 'report_state'}
     if not required <= set(payload):
         raise ValueError('Missing payload fields')
     for key, value in payload.items():
-        if key in {'reply', 'result', 'state', 'outcome', 'report_state'}:
-            continue
+        if key in {'reply', 'result', 'state', 'outcome', 'report_state'} or (key == 'rows' and kind == 'partial_result'):
+            continue  # (a partial result's rows are validated above)
         if key == 'tcp_ports':
             if (not isinstance(value, list) or len(value) > 5 or
                     any(type(port) is not int or not 1 <= port <= 65535 for port in value) or
@@ -573,12 +640,14 @@ def validate(message):
                 continue
             if type(value) is not int or not 10 <= value <= 2**53 - 1:
                 raise ValueError('Invalid Monitor timing')
-        elif key in {'completed', 'total', 'revision', 'current_rounds', 'earlier_rounds', 'skipped_slots'}:
+        elif key in {'completed', 'total', 'revision', 'current_rounds', 'earlier_rounds', 'skipped_slots',
+                     'round_at', 'next_at', 'hosts', 'tries_left'}:
             continue
         elif key == 'inputs':
             if not isinstance(value, list) or not all(isinstance(i, str) for i in value):
                 raise ValueError('Invalid inputs')
-        elif key.startswith('need_') or key in {'interrupted', 'remember', 'pending', 'store_supported'}:
+        elif key.startswith('need_') or key in {'interrupted', 'remember', 'pending', 'store_supported', 'sign_in_again', 'refused',
+                                               'infoblox_configured', 'config_found'}:
             if type(value) is not bool:
                 raise ValueError('Invalid credential flag')
         elif key == 'code':
@@ -658,7 +727,10 @@ def validate(message):
                         for item in result[key]) for key in ('input_errors', 'resolution_errors'))):
                 raise ValueError('Invalid Ping result')
             details = outcome['details']
-            if (set(details) - {'unattempted', 'attempted_incomplete'} or
+            probe_errors = details.get('probe_errors', 0)
+            if (set(details) - {'unattempted', 'attempted_incomplete', 'probe_errors'} or
+                    type(probe_errors) is not int or 'probe_errors' in details and probe_errors < 1 or
+                    probe_errors and outcome['kind'] not in {'partial', 'stopped'} or
                     any(not isinstance(details.get(key, []), list) or
                         any(not isinstance(item, str) for item in details.get(key, []))
                         for key in ('unattempted', 'attempted_incomplete')) or
@@ -674,7 +746,7 @@ def validate(message):
                     (not result['stopped'] and outcome['kind'] == 'stopped') or
                     (outcome['kind'] in {'matched', 'partial'} and not result['rows']) or
                     (outcome['kind'] == 'matched' and (result['input_errors'] or result['resolution_errors'])) or
-                    (outcome['kind'] == 'partial' and not (result['input_errors'] or result['resolution_errors'])) or
+                    (outcome['kind'] == 'partial' and not (result['input_errors'] or result['resolution_errors'] or probe_errors)) or
                     (outcome['kind'] == 'invalid' and (result['rows'] or result['resolution_errors']))):
                 raise ValueError('Invalid Ping outcome')
         try:
@@ -685,7 +757,8 @@ def validate(message):
     if kind == 'report_state' or (kind == 'ready' and 'report_state' in payload):
         if not _valid_report_state(report):
             raise ValueError('Invalid report state')
-    if (kind in {'lookup', 'cancel', 'result', 'progress', 'report_state', 'lookup_context', 'credentials_required', 'monitor_update'}
+    if (kind in {'lookup', 'cancel', 'result', 'progress', 'partial_result', 'report_state', 'lookup_context', 'credentials_required',
+                 'credentials_checked', 'monitor_update'}
             or (kind == 'error' and message['job_id'] is not None)) and not message['job_id']:
         raise ValueError('Job ID required')
     return message
