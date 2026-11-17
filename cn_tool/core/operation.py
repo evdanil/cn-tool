@@ -60,19 +60,27 @@ class ControlledExecutor(ThreadPoolExecutor):
 
 
 def controlled_map(fn, items, control: OperationControl, max_workers: int):
-    """Yield ordered completed units with at most W submitted, draining on Stop."""
+    """Yield ordered completed units with at most W submitted, draining on Stop.
+
+    A worker thread that cannot start (``RuntimeError`` from ``submit``: a process or thread limit) schedules nothing
+    more: the units already submitted are yielded, and then the refusal is raised, so the caller knows which ran.
+    """
     from collections import deque
     pending = deque()
     iterator = iter(items)
+    refused = []
     with ControlledExecutor(control, max_workers) as pool:
         def schedule():
-            if control.stop.is_set():
+            if control.stop.is_set() or refused:
                 return
             try:
                 item = next(iterator)
             except StopIteration:
                 return
-            pending.append((item, pool.submit(fn, item)))
+            try:
+                pending.append((item, pool.submit(fn, item)))
+            except RuntimeError as exc:
+                refused.append(exc)
         for _ in range(max_workers):
             schedule()
         while pending:
@@ -83,3 +91,5 @@ def controlled_map(fn, items, control: OperationControl, max_workers: int):
                 continue
             yield item, result
             schedule()
+    if refused:
+        raise refused[0]

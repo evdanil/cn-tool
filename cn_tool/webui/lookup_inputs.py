@@ -12,13 +12,19 @@ focus on Run. Nothing runs.
 """
 import json
 
+from . import target_cap
+
 EXAMPLE = 'For example 192.0.2.1 or 2001:db8::/64'
+_SEPARATORS = 'one per line, or separated by commas or spaces'
 TARGET_HELP = {
-    'subnet': f'One IP address or subnet per line. {EXAMPLE}.',
-    'ip': 'One IP address per line. For example 192.0.2.1 or 2001:db8::1.',
-    'ping': f'One IP address, hostname or subnet per line. Hostnames use system DNS. {EXAMPLE}.',
-    'monitor': 'One IP address, hostname or subnet per line. Hostnames use system DNS. '
-               'For example 192.0.2.1 or example.com.',
+    'subnet': f'IP addresses or subnets, {_SEPARATORS}. A mask pair (10.20.40.0 255.255.255.192) and a URL work too, '
+              f'and # starts a comment. {EXAMPLE}.',
+    'ip': f'IP addresses, {_SEPARATORS}. A range such as 192.0.2.10-20 stands for each address, and # starts a '
+          'comment. For example 192.0.2.1 or 2001:db8::1.',
+    'ping': f'IP addresses, ranges, subnets or hostnames, {_SEPARATORS}. Hostnames use system DNS, and one on a line '
+            f'that also holds an address is ignored. {EXAMPLE}.',
+    'monitor': f'IP addresses, ranges, subnets or hostnames, {_SEPARATORS}. Hostnames use system DNS, and one on a '
+               'line that also holds an address is ignored. For example 192.0.2.1 or example.com.',
 }
 PORT_HELP = 'Optional: up to five comma-separated ports, for example 22, 443. ICMP is used when available.'
 KEYBOARD_HELP = ('Ctrl+Enter (Cmd+Enter on a Mac) in a box runs the tool, like the button; on the line the form folds into, '
@@ -68,12 +74,22 @@ def draft_keys(lookup_type):
     return keys + ['cn-tool-draft-ping-ports'] if lookup_type == 'ping' else keys
 
 
+def typed_text(request):
+    """The text of the Targets box that made ``request``: what was typed when the page gave it, else its lines (a
+    request made by Retry of an older one, or by another page)."""
+    typed = request.get('typed')
+    if isinstance(typed, str):
+        return typed  # it came through the box's guard (target_cap), so it fits
+    text = '\n'.join(str(line) for line in request['inputs'])
+    return '' if target_cap.too_long(text) else text  # a box cannot take it: a page always gives ``typed``
+
+
 def request_form(request, lookup_type):
     """``(targets, ports)`` of the last accepted request of this tool (``controller.last_request``), or None."""
     if not request or 'inputs' not in request:
         return None
     ports = ', '.join(str(port) for port in request.get('tcp_ports') or ()) if lookup_type == 'ping' else ''
-    return '\n'.join(str(line) for line in request['inputs']), ports
+    return typed_text(request), ports
 
 
 def new_tab_value(keys, text):

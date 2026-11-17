@@ -17,12 +17,15 @@ NiceGUI is imported inside the functions.
 import asyncio
 import json
 import secrets
+from time import monotonic
 
 from . import monitor_map
 
 # What the live view says while it has no round to show: its first round is on its way, or no monitor runs.
 WAITING = 'Waiting for the first complete round.'
 NOT_RUNNING = 'No monitor is running. Start one above, or open History.'
+WANT_SECONDS = 10  # how long a "Show on map" waits for the Map to have the cell
+NOT_ON_MAP = 'That host has no place the Map can draw. It is in the Table.'
 UNAVAILABLE = 'The map of the latest round is unavailable.'
 NOT_READY = 'Waiting for the first complete round. No result is inferred for an unfinished round.'
 DISPOSE = 'window.cnMonitorMap && window.cnMonitorMap.dispose()'
@@ -60,6 +63,7 @@ class LiveMap:
         self.buttons = {}
         self.changed = None  # called when the tab reports its view (the URL follows it, R2-08)
         self.forced = None   # a link's Map or Table for this load: shown, not stored (the tab's own choice stays)
+        self.want = None     # (block, cell) the change list asked for: moved to once the Map shows it
         self.token = secrets.token_hex(8)  # in the map's init and in each of its events: another page's are ignored
 
     # --- drawn by the page, in its order ---------------------------------------------------------------------------
@@ -120,6 +124,7 @@ class LiveMap:
 
     def choose(self, view):
         # The tab keeps the choice (sessionStorage) and answers with the view and the width of its map box.
+        self.want = None  # a "Show on map" still waiting is the reader's earlier wish
         self.view, self.forced = view, None  # the reader's own click ends a link's view for this load, and is stored
         self.set_buttons()
         self.client.run_javascript(f'window.cnMonitorMap && window.cnMonitorMap.setView({json.dumps(view)})')
@@ -149,8 +154,11 @@ class LiveMap:
         set_changed(self.summary, self.payload['summary'])
         set_changed(self.status, f'Showing complete round revision {self.revision}.')
         self.client.run_javascript(f'window.cnMonitorMap && window.cnMonitorMap.draw({json.dumps(message)})')
+        if self.want is not None:
+            self.scope.task(self._reach(), name='monitor-map-focus')
 
     def clear(self, message):
+        self.want = None
         if self.payload is not None or self.drawn is not None:
             self.client.run_javascript('window.cnMonitorMap && window.cnMonitorMap.draw({rev: null, full: ""})')
         self.payload = self.drawn = self.revision = None
@@ -158,6 +166,7 @@ class LiveMap:
         set_changed(self.status, message)
 
     def release(self):
+        self.want = None
         for name, release in (('query', 'release_monitor_live_map'), ('host_query', 'release_monitor_live_host')):
             if getattr(self, name):
                 getattr(self.controller, release, lambda query: None)(getattr(self, name))
@@ -202,6 +211,46 @@ class LiveMap:
         if not active and self.status.text.startswith(WAITING):
             set_changed(self.status, NOT_RUNNING)  # the run ended before its first round: none is on its way
 
+    # --- the change list's "Show on map" ------------------------------------------------------------------------------
+    async def focus_cell(self, block, cell):
+        """Move the Map's one cursor to ``cell`` of ``block``: the page's JavaScript does it when the cell is on screen;
+        otherwise the Map view is chosen, and a block that is not drawn is shown, and the cursor goes there when the next
+        draw has it. Nothing is hidden or filtered (D2)."""
+        if not self.scope.alive:
+            return
+        if self.view != 'map':
+            self.choose('map')  # the tab reports the view, the poll asks for the map, and its draw reaches the cell
+            self.want = (block, cell, monotonic() + WANT_SECONDS)
+            return
+        self.want = (block, cell, monotonic() + WANT_SECONDS)
+        if self.payload is not None:
+            await self._reach()
+
+    async def _reach(self):
+        want = self.want
+        if want is not None and monotonic() > want[2]:  # asked long ago: the reader has moved on, so nothing moves now
+            self.want = want = None
+        if want is None or not self.scope.alive or self.payload is None:
+            return
+        block, cell, _ = want
+        blocks = self.payload.get('blocks') or []
+        item = blocks[block] if block < len(blocks) else None
+        if item is None or cell < 0:
+            self.want = None
+            self.live.set_text(NOT_ON_MAP)
+            return
+        if item['kind'] == 'compact':
+            if not item.get('can_show'):
+                self.want = None
+                self.live.set_text(NOT_ON_MAP)
+                return
+            if self.show != block:
+                self.show = block  # the next poll asks for the map with that block drawn; its draw comes back here
+                await self.poll()
+                return
+        self.want = None
+        self.client.run_javascript(f'window.cnMonitorMap && window.cnMonitorMap.focusCell({block}, {cell})')
+
     # --- the map's events (scope.on_event: none reaches a page that was left) ----------------------------------------
     async def _view_reported(self, event):
         if not self.scope.alive:
@@ -210,6 +259,8 @@ class LiveMap:
         if args is None:
             return
         self.view = 'table' if args.get('view') == 'table' else 'map'  # a report, however often: a link's view stays
+        if self.view == 'table':
+            self.want = None
         self.set_buttons()
         if self.changed is not None:
             self.changed()

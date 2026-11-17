@@ -26,6 +26,7 @@ and setup](infoblox.md#access-and-setup) requirements before using them.
 | 0.12.2 | The same tools; **Ping these** and **Monitor these** on the IP and Subnets result tables |
 | 0.12.3 | The same tools; the Monitor **Map** view of the latest round, an icon for the Windows shortcut, and the version on every page |
 | 0.13.0 | The same tools in one browser page: results first with **Run again**, one table style with a quick filter, Ping progress, view links, single-key shortcuts, a dark theme that follows the system, a sign-in that stays open, and a clearer **Stop** and **Quit** |
+| 0.14.0 | The same tools; a Monitor beside one other tool with both jobs in the header and **Stop…** for each, smart paste on every Targets box, the Monitor's **Changes** list, tab-title count and opt-in desktop notification, the unused addresses of several networks in a table on the Subnets summary, and `[ping] parallel_probes` |
 
 The browser tools beyond Subnets are available in 0.9.0 and are not part of 0.8.4.
 The menu and CLI have their own established workflows.
@@ -89,7 +90,8 @@ Keep the launcher running. A one-use launch link attaches the browser. From 0.12
 session per user: starting `cn-web` (or its shortcut) again while it runs reopens the
 browser on that session with a new link, and a different `-c FILE` is refused until the
 running session is quit. Tabs share one
-runtime, account and active operation. Closing or refreshing a tab leaves the application
+runtime, account and running jobs (a Monitor runs beside one other tool; see
+[Reports, Stop and Quit](#reports-stop-and-quit)). Closing or refreshing a tab leaves the application
 running; use **Quit application** to finish the session. **Settings** edits the
 configuration file and can apply it without a relaunch; see [Settings](#settings).
 
@@ -104,7 +106,20 @@ Ping and Site Demobilization show **Setup required** with the reason, **Retry se
 link to Settings (see [Settings](#settings)). Missing credentials open the sign-in dialog
 (below). Environment and GPG values retain precedence.
 
-Paste IPv4/IPv6 addresses or subnets, one per line, and select **Look up**. The configured
+Paste IPv4/IPv6 addresses or subnets, one per line or separated by commas, semicolons or spaces, and select
+**Look up**. Every Targets box (Subnets, IP, Ping and Monitor) reads what you type the same way: a mask pair such as
+`10.20.40.0 255.255.255.192` (or a wildcard mask) is one network, a range `192.0.2.10-20` is each address (not in
+Subnets), a URL or `host:port` gives its host, and `#` starts a comment. A line under the box says what it holds
+("14 targets: 3 subnets (766 hosts), 9 addresses · 2 not understood") and lists what was not understood, or counts
+them when there are more than five. The box keeps your text; what is sent is one item per line, and an item that
+is not understood is sent as typed, so the tool reports it as before. A text over 64 KiB gets no line ("Too long to preview") but is read
+the same way when you run it. A Targets box holds what the page can send to the server in one message, about 900 KB (roughly 75,000 addresses one per
+line; the size counts a line break as three bytes and a control character as seven): a paste or an edit that would pass it
+is refused whole, the box keeps what it had, and a message under it says "Too long: this list is larger than a Targets box
+can send (about 900 KB). Split the list, use ranges or CIDR, or use a file with the command line. The box keeps what it
+had." (the command line reads a list of any size with `--file`). With TCP ports set, Ping and Monitor warn when the box holds more hosts than the tool tests
+with ports (1,024). On Ping and Monitor a hostname on a line that also holds an address is ignored. A box of comments only
+asks for a target. The configured
 network view applies, or every view when none is selected. Inputs and resolved networks
 are deduplicated per applicable view. One network opens details directly; several open
 a summary. **View details**, **Back to summary** and **Show all details** reuse fetched
@@ -313,7 +328,9 @@ From 0.10.0, a **Show Available** checkbox beside the result's buttons lists the
 any type in Infoblox. It is unticked on every page load and works on the result on screen, so ticking it sends no
 request. Each subnet's details gain **Unused addresses (N)**: a table of `network view` (where the other tables show
 one, and first, as they do) and `IP address` (there is no status column, because every row would say the same) with the
-usual text filter and paging. A line above the results gives the total (`Unused addresses: 344 in 2 networks`), says that
+usual text filter and paging. When a lookup found several networks, the summary shows the same addresses of all of them
+in one table (`network view`, `network`, `IP address`; text filter, sorting, paging and a CSV of the table), so a quick look
+needs no spreadsheet. A line above the results gives the total (`Unused addresses: 344 in 2 networks`), says that
 Unused means no record of any type in Infoblox and does not prove that nothing answers there, and names every input that
 could not be listed, with its reason: not a network in Infoblox, records that could not all be read (a stopped lookup
 included), network views that could not be listed, a container, an IPv6 subnet, or a network over 65,536 addresses.
@@ -323,7 +340,7 @@ them, so a short file cannot pass for a complete one; it is separate from **Down
 change it, and it is disabled while there are no rows. Unused means no record in Infoblox, not that nothing answers on
 the address: see [Unused addresses](infoblox.md#unused-addresses-show-available).
 
-IP accepts individual IPv4/IPv6 addresses, one per line. Results show address, network
+IP accepts individual IPv4/IPv6 addresses (and ranges such as `192.0.2.10-20`), read as in every Targets box (above). Results show address, network
 status, network view and available data and plugin columns in a compact paged table.
 Narrow screens scroll within the table to reach remaining fields. Invalid inputs, misses, request failures, PTR warnings
 and unchecked work are shown separately. The latest attempt remains visible if it
@@ -345,7 +362,9 @@ says "No row of this table, as filtered, holds an address or a subnet."
 Selecting a button opens Ping or Monitor in the same tab, without loading the page again, with the
 targets in **Targets** (the Monitor on **Live monitor**, where its form is). Nothing is started:
 review the list, add TCP ports or an interval, and select **Run Ping** or **Run monitor**. The list is never
-shortened. You are asked to confirm first when the tab already holds different unsent text in that Targets box
+shortened: when it is too long for a Targets box to send (see above; about 75,000 addresses), consecutive
+addresses are written as ranges such as `10.0.0.1-10.0.253.232`, which the box reads as every address in them, and
+when that is not enough the buttons say so on the line beside them and open nothing. You are asked to confirm first when the tab already holds different unsent text in that Targets box
 (it is replaced), when the targets cover more than 1,024 addresses (the most that TCP ports can be tested for),
 or when a subnet is larger than a /16, which Ping and Monitor refuse.
 
@@ -366,8 +385,8 @@ page at first and keep the rows per page you choose for the next result; **Rows 
 offers 5 to 100 and **All (up to 1,024)**. Diagnostic lists use pages of up to 50 items, with
 page-number entry.
 
-While a Ping runs, a progress bar says how many hosts have been probed ("300 of 1,024"),
-and the hosts probed so far appear below it in a table, **Ping hosts so far**, under the
+While a Ping runs, a progress bar says how many hosts have been probed ("300 of 1,024"; it moves after each batch of
+`[ping] parallel_probes` hosts, 100 by default), and the hosts probed so far appear below it in a table, **Ping hosts so far**, under the
 line "Hosts probed so far. The final result replaces these rows." The rows arrive in place,
 so a filter or a sort you set there stays. They are not a result: the table has no
 download or copy, and when the run ends its result takes their place. A run that is
@@ -456,6 +475,30 @@ The counters line above it reads as on the command line, for example
   block is drawn up to 2,048 names, and a long name makes the Map wider.
 - The Map is text: it can be selected, copied, searched with the browser's find, and printed.
   Round-trip times are not measured, so none is shown.
+
+#### Changes and notifications
+
+**Changes**, a closed box on the line of the **Map** and **Table** buttons (select it to open it), lists the hosts whose state a complete round changed, newest first: the
+time the round began (UTC), the host and its address, and what it went from and to, in the words of the Map's legend
+("10:39:50 UTC · gw-vlan30 (10.20.30.1) · replied → gone"). Only changes between answering (`!`, `R`, `T`) and not
+answering are listed; the first round of a run changes nothing. The list shows the last 20; **Show all** shows the last
+200, which is all the Monitor keeps. When some were let go (more than 200 in a run, or changes made before this page
+first looked at a long run), a line in the list says how many are not available; they are not guessed. **Show on map**
+beside an entry opens the Map if the Table is shown, draws the block if it is only a counter line, and puts the one
+cursor on that host with its details open. Nothing is filtered or hidden. After a Stop the list stays until the next
+Monitor starts; reloading the page lists the changes again.
+
+The list is not read out as it changes. The summary line says "3 changes in the latest round." once per round.
+
+While the tab is in the background, its title counts the hosts that went to no answer since you last looked:
+"(3↓) Monitor – cn-tool". A host whose probe failed or whose name did not resolve is not counted; the notification names those separately ("could not be probed"). The count goes when the tab is visible again.
+
+**Notify me about changes** turns on one desktop notification for each round that changed hosts. It is off until you
+select it, and only then does the browser ask for its permission. A notification says how many hosts changed ("3 hosts
+changed: 2 stopped answering, 1 answers again") and never which; none is sent while this page is visible and has the
+focus. Select the button again to turn it off. If the browser refuses or blocks notifications, the page says so and none
+are sent; a browser without notifications has no button. The choice is kept for this browser and this session of
+cn-tool (the address changes at each start).
 
 The latest-round, saved-round and Show Available host tables are tables like the others
 (see [Sorting and filtering](#sorting-and-filtering-results-in-093)): one **Filter** box over
@@ -627,7 +670,8 @@ reads, in order: a later file overrides an earlier one.
   exists. Otherwise it writes only the settings you set, so that the earlier files stay in
   effect. **Save changes** rewrites only the lines that change, and keeps your comments and
   every setting the page does not show.
-- Values are checked when you leave a box and when you save. Numbers must be whole, an
+- Values are checked when you leave a box and when you save. Numbers must be whole (`[ping] parallel_probes` from 1
+  to 1024: how many hosts Ping and the Monitor probe at once; a Monitor run uses the value it started with), an
   endpoint must be an `http://` or `https://` URL, and `[auth]` entries must be variable
   names. Patterns must be valid regular expressions.
 - If the file changed on disk after the page loaded it, nothing is saved. Reload, with or
@@ -684,27 +728,46 @@ existing workbook. It does not enable reporting or save a selected view. After a
 or disabled save, the downloaded file may contain only earlier results. The accumulated
 workbook may hold earlier sensitive information as well as the current result.
 
-**One operation at a time.** While a tool works, the other tools wait. A pill in the
-header of every page names the running job, how far it is (a Ping's hosts probed, a
-Monitor's round) and how long it has run. Every page that
-does not own the job shows a banner under the navigation: what runs, since when (UTC),
-and that other tools wait until it finishes (for a Monitor: until it stops), for example
-"Monitor is running: 320 hosts, since 10:34 UTC. Other tools wait until it
-stops." Both lead to the tool that owns the job. The page's start button stays disabled
-meanwhile, and the page says once when the job has ended. The status line of the page
-that owns the job reads **Running:** with the stage (and the count, for Ping and
-Monitor), with the elapsed time beside it.
+**Two jobs at most: a Monitor beside one lookup.** The Monitor has a place of its own, so a Monitor and one
+other job run together, and nothing else does. What may run beside what:
 
-**Stop** is shown only on the page of the tool that owns the running job, and it ends
-only that job: **Stop lookup** on Subnets and IP, **Stop Ping**, **Stop search**,
-**Stop site check** and **Stop this session's monitor**. No page can stop another tool's
-job. Stop cooperatively prevents new work after in-flight requests finish within configured
-timeouts. It is disabled during saving. In 0.9.0, Subnets and IP can retain
+| Running | Can start beside it |
+| --- | --- |
+| nothing | any tool |
+| a Subnets, IP or Ping lookup, a configuration search or a Site Demobilization check | a Monitor; no other lookup (the other four tools wait) |
+| a Monitor | any one lookup (Subnets, IP, Ping, configuration search, Site Demobilization); no second Monitor |
+| a Monitor and a lookup | nothing until one of them ends |
+
+A Ping beside a Monitor means two sweeps at once, up to twice as many `ping` processes and TCP probes as either alone
+(`[ping] parallel_probes` is the limit of each); lower it if the machine or the network feels it. Report downloads
+work at any time. **Delete report…**, **Use the new settings now** and **Retry setup** wait until both jobs have ended,
+and each says so where it is: the Report menu shows under its buttons, and Settings under **Use the new settings
+now**, "Monitor is running. Delete report is available once nothing is running or saving." (a lookup is named the same
+way). A report deletion in progress holds every start, the Monitor's included.
+
+A **pill in the header** of every page names each running job, how far it is (a Ping's hosts probed, a Monitor's round)
+and how long it has run, one pill for the lookup and one for the Monitor, each leading to its tool. A page that does not
+own a running lookup shows a banner under the navigation: what runs, since when (UTC), and that other lookups wait until
+it finishes, for example "Ping is running: 1,024 hosts, since 10:34 UTC. Other lookups wait until it finishes." A
+Monitor has no banner, because it makes no tool wait. The page's start button stays disabled while a lookup runs, and
+the page says once when a job of another tool has ended. The status line of the page that owns a job reads **Running:**
+with the stage (and the count, for Ping and Monitor), with the elapsed time beside it. While a Monitor runs, its rounds
+go on and its page stays live whatever else runs.
+
+**Stop** is on the page of the tool that owns the running job, and it ends only that job: **Stop lookup** on Subnets
+and IP, **Stop Ping**, **Stop search**, **Stop site check** and **Stop this session's monitor**. From any other page
+the header's pill has **Stop…** beside each job that page does not own (**Stop Monitor…**, **Stop Ping…** to a screen
+reader): it asks first, naming the run ("The Monitor is running: 320 hosts, 30 rounds. Stop ends it once the probes in
+flight have finished, and saves what it has."), with **Cancel** selected, and then stops that job alone; the other job
+runs on. If the job ended while the question was open, nothing is stopped. Stop cooperatively prevents new work after
+in-flight requests finish within configured timeouts. It is disabled during saving, with one exception: a lookup that waits to save because the other job holds the
+report (the status line says "Waiting to save the report…", the pill "waiting to save") can be stopped, and then it
+is not saved. A Monitor that saves cannot be stopped again: it saves what it has. In 0.9.0, Subnets and IP can retain
 completed fetch-stage data. Their resolution is collected per input, so stopping during
 multi-view resolution can omit an input even if one view has answered. Existing completed
 results and reports remain available. A stopped
 configuration search or Site Demobilization check does not publish unfinished matches
-or save a report.
+or save a report. A stopped Monitor saves the rounds it has.
 
 **Quit application** runs configured exit actions once (including email and
 delete-after-send when enabled), then closes the worker and server. In 0.9.0,
@@ -716,7 +779,7 @@ Quit closes at once when nothing would be lost. Otherwise it asks first, with **
 selected, and names each thing it will do:
 
 - a running Subnets, IP or Ping lookup is finished and saved before the application closes;
-- a running Monitor is stopped and saves what it has;
+- a running Monitor is stopped and saves what it has (with a lookup running too, one question names both);
 - a running configuration search or Site Demobilization check is stopped, and its results
   are not saved;
 - a report save in progress is waited for;

@@ -281,7 +281,7 @@ OUTCOME_ROW_CSS = '''
 
 def render_subnets(controller, scope, lookup_type='subnet'):
     from nicegui import ui
-    from . import dialogs, lookup_inputs, texts
+    from . import dialogs, lookup_inputs, target_preview, texts
     from . import outcome as outcome_banner
     from .setup_card import needs_endpoint, render_setup
     from .shell import render_shell
@@ -338,17 +338,28 @@ def render_subnets(controller, scope, lookup_type='subnet'):
         _, targets = form_field('textarea', 'Targets', props='rows=3 autogrow aria-label=Targets', classes='w-full cn-ping-targets',
                                 label_classes='cn-ping-target-label')
         lookup_inputs.helper_text(targets, lookup_inputs.TARGET_HELP[lookup_type], 'cn-muted cn-ping-target-help')
+        preview = target_preview.attach(targets, lookup_type, scope, 'cn-ping-target-preview')  # the live line (7.3)
         ports = None
         if lookup_type == 'ping':
             _, ports = form_field('input', 'TCP ports', props='aria-label="TCP ports"', classes='w-full cn-ping-ports', label_classes='cn-ping-ports-label')
             lookup_inputs.helper_text(ports, lookup_inputs.PORT_HELP, 'cn-muted cn-ping-port-help')
+            preview.use_ports(ports)  # the live line warns when the hosts are more than the tool tests with ports
         port_error = ui.label('').props('role=alert').classes('text-negative cn-ping-port-error' + empty_class)
         with ui.row().classes('cn-ping-run-controls cn-form-actions'):
+            reading = []  # set while a Run reads the box: a second click or Ctrl+Enter meanwhile is the same Run
+
             async def submit():
                 # A click handler is not cancelled with the scope (scope.py): it asks scope.alive at its start and
                 # after every await, so a page that was left never starts a job, builds UI or polls.
-                if not scope.alive:
+                if not scope.alive or reading:
                     return None
+                reading.append(True)
+                try:
+                    return await read_and_start()
+                finally:
+                    reading.clear()
+
+            async def read_and_start():
                 if lookup_type == 'ping':
                     from .ping import parse_ports
                     try:
@@ -357,9 +368,20 @@ def render_subnets(controller, scope, lookup_type='subnet'):
                         port_error.set_text(str(exc))
                         return ports  # Run again opens the form at the field that is wrong
                     port_error.set_text('')
-                    start = lambda: controller.submit(targets.value.splitlines(), lookup_type=lookup_type, tcp_ports=parsed)
                 else:
-                    start = lambda: controller.submit(targets.value.splitlines(), lookup_type=lookup_type)
+                    parsed = ()
+                    port_error.set_text('')
+                typed = targets.value or ''
+                lines = await target_preview.lines_for_submit(typed, lookup_type)  # off the event loop
+                if not scope.alive:
+                    return None
+                if not lines:  # blank, or comments only
+                    port_error.set_text(target_preview.NO_TARGETS)
+                    return targets
+                if lookup_type == 'ping':
+                    start = lambda: controller.submit(lines, lookup_type=lookup_type, tcp_ports=parsed, typed=typed)
+                else:
+                    start = lambda: controller.submit(lines, lookup_type=lookup_type, typed=typed)
                 try:
                     start()
                 except RuntimeError as refusal:
@@ -369,6 +391,7 @@ def render_subnets(controller, scope, lookup_type='subnet'):
                     return
                 started_here()
                 fold.ran()  # results first: the form is its one line now
+                reading.clear()  # started: a Run from here on is a new one (Run again), whatever refresh_now takes
                 await refresh_now()
             run = shell.waits(ui.button('Run Ping' if lookup_type == 'ping' else 'Look up', on_click=submit))
             setup.form.append(form)
@@ -399,10 +422,10 @@ def render_subnets(controller, scope, lookup_type='subnet'):
             if not request:
                 raise RuntimeError('The lookup to repeat is no longer known. Enter the targets and look up again.')
             # What is repeated is shown: the request's inputs go back into Targets (and the tab's draft) first.
-            text = '\n'.join(request['inputs'])
+            text = lookup_inputs.typed_text(request)
             targets.set_value(text)
             ui.run_javascript(f"sessionStorage.setItem({json.dumps('cn-tool-draft-' + lookup_type)}, {json.dumps(text)});")
-            controller.submit(request['inputs'], lookup_type=lookup_type)
+            controller.submit(request['inputs'], lookup_type=lookup_type, typed=text)
         except RuntimeError as refusal:
             port_error.set_text(str(refusal) or 'The lookup could not start. Try again.')
             fold.edit(focus=False)  # the message is in the form, which the fold hides
@@ -698,6 +721,16 @@ restore();
             for refusal in found['refusals']:
                 ui.label(refusal_line(refusal)).props('role=status').classes('cn-notice')
 
+    def render_available_table(found):
+        """The unused addresses of every listed network, in one paged table (the details of one network hold their own)."""
+        rows = found['rows']
+        with ui.element('section').props('id=unused-addresses').classes('w-full'):
+            with ui.element('h2'):
+                ui.label(f'{UNUSED_TITLE} ({len(rows)})')
+            lead = tuple(key for key in ('network view', 'network', 'IP address') if key in rows[0])
+            data_table(rows, name='unused-addresses', label=f'{UNUSED_TITLE}, all networks', table_id='unused-addresses', lead=lead,
+                       sticky='IP address' if 'network view' not in lead else '')
+
     @ui.refreshable
     def draw_results():
         snapshot = latest.get('displayed_snapshot')
@@ -733,6 +766,8 @@ restore();
         available = available_result(result, cache=view.available_cache) if listable and view.show_available else None
         if available is not None:
             render_available_panel(result, available)
+            if view.selection is None and len(groups) > 1 and available['rows']:
+                render_available_table(available)  # the summary has no details to hold it: every listed address, paged
         if not groups:
             ui.label('No matching networks.').classes('text-weight-bold')
         if result.get('containers'):
@@ -858,7 +893,7 @@ restore();
         forget.set_visibility(saved)
         shown = snapshot.result or {}
         show_results.set_visibility(bool(shown.get('rows') or shown.get('detail_groups')))
-        fold.set_summary(form_summary(targets.value or '', ports=(ports.value or '') if ports is not None else ''))
+        fold.set_summary(form_summary(targets.value or '', ports=(ports.value or '') if ports is not None else '', tool=lookup_type))
         # Folded only beside something to look at: rows, networks or containers, the hosts probed so far, or its own job.
         own_job = bool(snapshot.active_job_id) and snapshot.active_lookup_type == lookup_type
         fold.show(bool(shown.get('rows') or shown.get('detail_groups') or shown.get('containers'))
@@ -977,7 +1012,10 @@ if (!active?.closest(interactive) || active.matches('[data-form-edit]:not([data-
 
     targets.disable()
     targets.on_value_change(lambda _: poll())
-    async def restore_draft():
+    async def restore_draft(again=False):
+        # ``again``: a try after one that had no answer in time. The box is enabled and its listener sent, so the script
+        # that writes the box goes at once: it does its work when it arrives, answered in time or not (a slow server never
+        # answered the question first in five seconds, and the box stayed empty: test_webui_send_targets_slow_restore_browser).
         client = ui.context.client
         if client.is_deleted or not scope.alive:
             return
@@ -988,6 +1026,7 @@ if (!active?.closest(interactive) || active.matches('[data-form-edit]:not([data-
         install = f'''const root = document.getElementById({element_id});
 const input = root?.matches('textarea') ? root : root?.querySelector('textarea');
 if (!input) return false;
+{preview.guard_js()}
 if (!input.cnDraftListener) {{
     input.cnDraftListener = true;
     input.addEventListener('input', () => {{
@@ -997,12 +1036,13 @@ if (!input.cnDraftListener) {{
 }}'''
         try:
             await asyncio.wait_for(client.connected(), timeout=5)
-            installed = await client.run_javascript(f'(() => {{{install}\nreturn true;}})()', timeout=5)
-            if not scope.alive:
-                return
-            if not installed:
-                raise TimeoutError
-            targets.enable()
+            if not again:
+                installed = await client.run_javascript(f'(() => {{{install}\nreturn true;}})()', timeout=5)
+                if not scope.alive:
+                    return
+                if not installed:
+                    raise TimeoutError
+                targets.enable()
             restored = await client.run_javascript(f'''(() => {{
 {install}
 {lookup_inputs.keep_typed(key)}
@@ -1027,11 +1067,11 @@ return true;
             client.run_javascript(f'(() => {{{install}}})()')
             await asyncio.sleep(0)
             targets.enable()
-            scope.timer(1, restore_draft, once=True)
+            scope.timer(1, lambda: restore_draft(again=True), once=True)
     scope.timer(0, restore_draft, once=True)
     if ports is not None:
         ports.disable()
-        async def restore_ports():
+        async def restore_ports(again=False):  # ``again``: as restore_draft's
             client = ui.context.client
             if client.is_deleted or not scope.alive:
                 return
@@ -1049,12 +1089,13 @@ if (!input.cnDraftListener) {{
 }}'''
             try:
                 await asyncio.wait_for(client.connected(), timeout=5)
-                installed = await client.run_javascript(f'(() => {{{install}\nreturn true;}})()', timeout=5)
-                if not scope.alive:
-                    return
-                if not installed:
-                    raise TimeoutError
-                ports.enable()
+                if not again:
+                    installed = await client.run_javascript(f'(() => {{{install}\nreturn true;}})()', timeout=5)
+                    if not scope.alive:
+                        return
+                    if not installed:
+                        raise TimeoutError
+                    ports.enable()
                 restored = await client.run_javascript(f'''(() => {{
 {install}
 {lookup_inputs.keep_typed("'cn-tool-draft-ping-ports'")}
@@ -1075,7 +1116,7 @@ return true;
                 client.run_javascript(f'(() => {{{install}}})()')
                 await asyncio.sleep(0)
                 ports.enable()
-                scope.timer(1, restore_ports, once=True)
+                scope.timer(1, lambda: restore_ports(again=True), once=True)
         scope.timer(0, restore_ports, once=True)
     scope.timer(0, poll, once=True)
     scope.timer(.25, poll)

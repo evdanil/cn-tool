@@ -18,7 +18,7 @@ import json
 from dataclasses import dataclass
 from weakref import WeakKeyDictionary
 
-from . import keys
+from . import job_indicator, keys
 from .keys import GO_LETTERS, SWITCH_LABEL
 
 TITLE_SUFFIX = 'cn-tool'
@@ -97,15 +97,12 @@ CSS = '''
 .cn-help-section h3 { font-size:var(--cn-text-body); font-weight:600; }
 .cn-job-notice { display:flex; flex-wrap:wrap; align-items:center; gap:4px 12px; }
 .cn-job-notice a { font-weight:600; }
-/* The pill's place is kept while nothing runs, at one width and one line, so a job that starts (or a pill that says
-   more) wraps nothing in the title row and moves nothing below it. On a phone the place is a line of its own. */
-.cn-job-slot { display:flex; align-items:center; justify-content:flex-end; width:20rem; max-width:100%; min-width:0; height:32px; }
-@media (max-width: 599px) { .cn-shell-tools { width:100%; } .cn-job-slot { width:100%; justify-content:flex-start; } }
+@media (max-width: 599px) { .cn-shell-tools { width:100%; } }
 a.cn-job-pill { display:inline-flex; align-items:center; gap:0 6px; height:32px; max-width:100%; padding:2px 12px; border-radius:16px;
   border:1px solid var(--cn-attention-line); background:var(--cn-attention-bg); color:var(--cn-attention-ink);
-  text-decoration:none; font-weight:600; min-width:0; white-space:nowrap; }
+  text-decoration:none; font-weight:600; min-width:0; white-space:nowrap; overflow:hidden; }
 a.cn-job-pill > * { flex:none; }
-a.cn-job-pill > .cn-pill-text { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; }
+a.cn-job-pill > .cn-pill-text { flex:0 1 auto; min-width:3.5rem; overflow:hidden; text-overflow:ellipsis; }
 a.cn-job-pill .cn-clock:not(:empty)::before { content:'·'; margin-right:6px; }
 .cn-pill-prefix { position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; }
 .cn-clock { font-variant-numeric:tabular-nums; }
@@ -253,14 +250,14 @@ class PageShell:
         self._state = None  # the snapshot of the latest update
         self._asking = False  # the Quit confirmation is open
         self._waiting = []  # the controls that cannot start while another job runs: the banner describes them
-        self._size = (None, None)  # (job id, hosts): the size of the running Ping or Monitor, kept between its rounds
-        self._foreign = None  # the job of another tool seen at the latest update
+        self._size = {}  # job id -> hosts: the size of a running Ping or Monitor, kept between its rounds
+        self._foreign = {}  # slot -> the job of another tool seen there at the latest update (R3-03: two slots)
         self._notice = None
-        self._indicator = None
+        self._indicator = None  # the header's job_indicator.JobIndicator
         self._closing = False
         self._closed = ''
         self._banner = self._banner_text = self._banner_link = None
-        self._pill = self._pill_text = self._pill_clock = None
+        self._watchers = []  # functions the page gave (watch): called with every snapshot, for what only it shows
         self._failed_reason = None
         self._revisions = (None, None)
         self.report = None  # the header's ReportMenu (render_shell)
@@ -295,12 +292,21 @@ class PageShell:
     def stop_own(self):
         """End this page's own job: the one its latest poll saw, and only while it is still the running job of this
         page's tool. A click can therefore never end another tool's job, nor a job that began after that poll."""
-        seen = self._state
-        if seen is None or not _owns(seen, self.active) or seen.phase != 'running':
+        from .job_slots import own_view
+
+        from .job_slots import stoppable
+
+        seen = own_view(self._state, self.active)
+        if seen is None or not _owns(seen, self.active) or not stoppable(seen):
             return
-        now = self.controller.page_snapshot(self.active).state
-        if now.active_job_id == seen.active_job_id and _owns(now, self.active) and now.phase == 'running':
+        now = own_view(self.controller.page_snapshot(self.active).state, self.active)
+        if now.active_job_id == seen.active_job_id and _owns(now, self.active) and stoppable(now):
             self.controller.cancel(seen.active_job_id)
+
+    def watch(self, watcher):
+        """Call ``watcher(state)`` with every snapshot the shell reads, until the tool is left (``set_active``): for what
+        a page shows that follows the session's work (Settings' reason that Use the new settings now waits)."""
+        self._watchers.append(watcher)
 
     def set_unsaved(self, check):
         """``check()`` says whether the page holds unsaved changes (Settings): Quit then asks about them too, from
@@ -323,7 +329,7 @@ class PageShell:
         self.status = self.elapsed = self._stop = None
         self._waiting = []
         self._polled = False
-        self._foreign = None  # a job the left page called another tool's may be this page's own
+        self._foreign = {}  # a job the left page called another tool's may be this page's own
         self._notice = False  # not a notice: the next update draws the banner for this page
         self.set_unsaved(None)
         if self._title.text != page.label:
@@ -341,6 +347,7 @@ class PageShell:
                 link.props.pop('aria-current', None)
                 link.update()
         self._failed_settings.set_visibility(key != 'settings')
+        self._watchers = []
         self._help_lines = ()
         self._draw_help()
 
@@ -376,9 +383,11 @@ class PageShell:
         from . import texts
 
         size = texts.job_size(state)
+        if state is None or not state.active_job_id:
+            return None
         if size:
-            self._size = (state.active_job_id, size)
-        return self._size[1] if state is not None and self._size[0] == state.active_job_id else None
+            self._size[state.active_job_id] = size
+        return self._size.get(state.active_job_id)
 
     def _read(self):
         """The session as it is now. A page snapshot carries it without the tools' results; naming the revisions
@@ -401,28 +410,43 @@ class PageShell:
         waiting controls, the toast for a job that ended elsewhere, and the closed card. An element is touched only
         when what it shows changes, so an idle page sends nothing."""
         from . import texts
+        from .job_slots import monitor_view, own_view, stoppable
 
         self._state = state
         self._polled = self._polled or _page
         phase = state.phase
         self.quit_button.set_enabled(phase not in {'closing', 'closed'})
+        # The page's own slot as the one job (R3-03): the Monitor's page reads the monitor slot, every other page the
+        # one-shot slot, so its status line, Stop, clock and banner are about the slot its Run starts.
+        view = own_view(state, self.active)
         if self.status is not None and (_page or not self._polled):
-            text = texts.own_status(state, page=self.active) if own is None else own
+            text = texts.own_status(view, page=self.active) if own is None else own
             if self.status.text != text:
                 self.status.set_text(text)
-        running = bool(state.active_job_id) and phase in {'running', 'stopping', 'saving'}
-        mine = running and _owns(state, self.active)
+        mine = bool(view.active_job_id) and view.phase in {'running', 'stopping', 'saving'} and _owns(view, self.active)
         if self._stop is not None:
             self._stop.set_visibility(mine)
-            self._stop.set_enabled(mine and phase == 'running')
+            self._stop.set_enabled(mine and stoppable(view))
         if self.elapsed is not None:
-            set_clock(self.elapsed, state.active_started_at if mine else None)
-        hosts = self._hosts(state)
-        self._show_notice(self._failed_notice(state) or texts.job_notice(state, page=self.active, hosts=hosts))
-        self._show_indicator(texts.job_indicator(state), state.active_started_at if running else None)
-        self._toast(state, hosts)
+            set_clock(self.elapsed, view.active_started_at if mine else None)
+        monitor = monitor_view(state)
+        self._size = {job: known for job, known in self._size.items()  # an ended job's size is forgotten
+                      if job in (state.active_job_id, state.monitor_job_id)}
+        hosts = self._hosts(view)
+        self._hosts(monitor if view is state else state)  # the other slot's size is kept too (Quit names it)
+        # A Monitor makes no page wait (5.7): the banner is the one-shot job's, on a one-shot page.
+        self._show_notice(self._failed_notice(state) or texts.job_notice(view, page=self.active, hosts=hosts))
+        # The indicator lists both jobs, each with its own clock and its own Stop… (R3-04).
+        live = {'running', 'stopping', 'saving'}
+        self._indicator.update(
+            {'oneshot': state, 'monitor': monitor}, self.active,
+            {name: view.active_started_at if view.active_job_id and view.phase in live else None
+             for name, view in (('oneshot', state), ('monitor', monitor))})
+        self._toast(state, monitor)
         self._show_end(state)
         self.report.update(state)
+        for watcher in list(self._watchers):
+            watcher(state)
 
     def _failed_notice(self, state):
         """Settings stays usable in a failed session (it edits a file), so it gets a notice where the tools get the
@@ -450,33 +474,40 @@ class PageShell:
                 control._props.pop('aria-describedby', None)
             control.update()
 
-    def _show_indicator(self, indicator, started):
-        if indicator != self._indicator:
-            self._indicator = indicator
-            self._pill_text.set_text(indicator.text if indicator else '')
-            self._pill._props['href'] = indicator.route if indicator else '/'
-            self._pill.update()
-            self._pill.set_visibility(indicator is not None)
-        set_clock(self._pill_clock, started if indicator else None)
-
-    def _toast(self, state, hosts):
-        """Say once that the job of another tool has ended; not while the application itself is ending."""
+    def _toast(self, state, monitor):
+        """Say once that the job of another tool has ended, for each slot (``state`` is the one-shot slot's view,
+        ``monitor`` the Monitor's); not while the application itself is ending."""
         from nicegui import ui
         from . import texts
 
         ending = state.phase in {'closing', 'closed', 'failed'}
-        running = state.active_job_id is not None and state.active_lookup_type in texts.TOOL_NAMES and not ending
-        job = state.active_job_id if running and state.active_lookup_type != self.active else None
-        before = self._foreign
-        if before is not None and before['job'] != job and not ending:
-            with self._client:
-                ui.notify(texts.job_ended_notice(before['tool'], hosts=before['hosts'], stopped=before['stopped']))
-        if job is None:
-            self._foreign = None
-        else:
-            same = before is not None and before['job'] == job
-            self._foreign = dict(job=job, tool=state.active_lookup_type, hosts=hosts,
-                                 stopped=(same and before['stopped']) or state.phase == 'stopping')
+        for slot, view in (('oneshot', state), ('monitor', monitor)):
+            running = view.active_job_id is not None and view.active_lookup_type in texts.TOOL_NAMES and not ending
+            job = view.active_job_id if running and view.active_lookup_type != self.active else None
+            before = self._foreign.get(slot)
+            if before is not None and before['job'] != job and not ending:
+                with self._client:
+                    ui.notify(texts.job_ended_notice(before['tool'], hosts=before['hosts'],
+                                                     stopped=self._ended_stopped(before)))
+            if job is None:
+                self._foreign.pop(slot, None)
+            else:
+                same = before is not None and before['job'] == job
+                # "Stopped" only for a job that was stopped before it began to save: a Stop that reaches a job inside the
+                # report gate is ignored by the worker, and its lookup is complete and saved.
+                saved = view.phase == 'saving' or (same and before['saving'])
+                self._foreign[slot] = dict(job=job, tool=view.active_lookup_type, hosts=self._size.get(job), saving=saved,
+                                           stopped=not saved and ((same and before['stopped']) or view.phase == 'stopping'))
+
+    def _ended_stopped(self, before):
+        """Whether the job that ended was stopped: what its attempt's outcome says (a Stop that reached a job inside the
+        report gate is ignored and the job is saved; one that reached it while it waited ended it unsaved), and only
+        when no outcome is known the phases seen before it ended."""
+        page = self.controller.page_snapshot(before['tool'])
+        outcome = page.outcome
+        if page.attempt_job_id == before['job'] and isinstance(outcome, dict) and 'stopped' in outcome:
+            return outcome['stopped'] is True
+        return before['stopped']
 
     def _show_end(self, state):
         phase = state.phase
@@ -517,7 +548,10 @@ class PageShell:
         try:
             while True:
                 state = self._read()
-                warning = texts.quit_warning(state, unsaved=unsaved_changes(self.controller), hosts=self._hosts(state))
+                from .job_slots import monitor_view
+                self._hosts(state)
+                warning = texts.quit_warning(state, unsaved=unsaved_changes(self.controller),
+                                             hosts=self._hosts(monitor_view(state)))
                 if warning is None or set(warning.facts) <= asked:
                     break
                 asked |= set(warning.facts)
@@ -564,22 +598,18 @@ def render_shell(controller, active, *, poll=False):
         existing.set_active(active)
         return existing
     apply_theme()
-    add_once(client, 'shell', css=CSS + keys.CSS, script=CLOCK_SCRIPT)
+    add_once(client, 'shell', css=CSS + job_indicator.CSS + keys.CSS, script=CLOCK_SCRIPT)
     add_once(client, 'keys', script=keys.keys_script({letter: _BY_KEY[key].route for letter, key in GO_LETTERS.items()}))
     shell = PageShell(controller, active)
     bind_client(shell, client)
     shell.root = active is None
     keys.skip_link()
-    with ui.row().classes('w-full items-center justify-between cn-shell'):
+    with ui.row().classes('w-full items-center justify-between cn-shell cn-title-row'):
         # tabindex=-1: a tool opened without a load moves the focus here, so a screen reader says the page's name.
         with ui.element('h1').classes('text-h4 cn-page-title').props('tabindex=-1'):
             shell._title = ui.label('').mark('title')
         with ui.row().classes('items-center gap-2 cn-shell-tools'):
-            with ui.element('div').classes('cn-job-slot'), ui.link(target='/').classes('cn-job-pill') as shell._pill:
-                ui.label('Running:').classes('cn-pill-prefix')  # for a screen reader: what the pill is about
-                shell._pill_text = ui.label('').classes('cn-pill-text')
-                shell._pill_clock = since(coarse=True)
-            shell._pill.set_visibility(False)
+            shell._indicator = job_indicator.JobIndicator(shell)  # up to two entries, each with its own Stop…
             with ui.dialog() as help_dialog, ui.card() as help_card:
                 with ui.element('h2').classes('text-h6 q-my-none') as help_title:
                     ui.label('Help')

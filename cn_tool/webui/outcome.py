@@ -139,6 +139,8 @@ def repeat(controller, tool):
         controller.submit_demob_lookup(request['site'])
     else:
         extra = {key: request[key] for key in ('tcp_ports', 'interval_seconds', 'duration_seconds') if key in request}
+        if isinstance(request.get('typed'), str):
+            extra['typed'] = request['typed']
         controller.submit(request['inputs'], lookup_type=tool, **extra)
     return request
 

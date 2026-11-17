@@ -67,7 +67,22 @@ config_file = ~/.ssh/config
 # Days a recorded round is kept; a run removes older rounds when it starts. A list of IPs that never
 # replied (cn monitor --available) rests on the rounds kept, so cover the period you want to judge
 # history_days = 180
+# The most hosts Ping and the Ping Monitor ping, and TCP-probe, at the same time: 1 to 1024
+# parallel_probes = 100
 ```
+
+`[ping] parallel_probes` sets how many hosts `cn ping`, `cn monitor`, the menu's Bulk PING and Ping Monitor and the
+browser's Ping and Monitor probe at once (100 by default, as before it existed). A value that is not a whole number from
+1 to 1024 is not used: a run says `cn: ping: [ping] parallel_probes must be a whole number from 1 to 1024; using 100`
+(`cn: monitor:` for the Monitor) on stderr and in the log, `cn doctor` shows a `Ping probes` error and exits 2, and the
+browser's Settings page refuses to save it. The number is an upper bound. On Linux and macOS each ping keeps a file open
+and each TCP probe another, and the system limits the files a process may open (often 1,024 on Linux and 256 on macOS
+for a new shell, under a higher hard limit). A run raises its own limit as far as it needs and the hard limit allows;
+when that is still not enough it probes as many as fit and says so once when it starts, on stderr and in the log (in
+the browser, only in the log file); the default, 100, is never lowered. Windows has no such limit. A high value can also
+meet the system's process or thread limits: a ping that cannot start is that host's `ERROR`, and a TCP probe that gets
+no thread is an `error` cell. A Monitor run reads the setting when it starts, so a
+change applies to its next run.
 
 From 0.10.0 the Ping Monitor history keeps 180 days of rounds unless `history_days` says otherwise (it kept
 30, and a configuration that sets a value keeps it). A run deletes older rounds, and they do not come back, so a long watch

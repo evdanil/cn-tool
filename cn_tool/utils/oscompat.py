@@ -145,6 +145,48 @@ def child_process_kwargs() -> dict:
     return {"creationflags": flags} if flags else {}
 
 
+def open_files_allowed(needed: int, *, headroom: int = 0):
+    """
+    How many files this process may keep open, once a soft ``RLIMIT_NOFILE`` below ``needed`` has been raised toward the
+    hard limit to ``needed + headroom`` (never further, never lowered); None when nothing limits them, or nothing is
+    known: a Python without ``resource``, or a limit that cannot be read.
+
+    Linux and macOS count every pipe and socket against that limit, and a shell often starts with a soft limit of
+    1,024 (Linux) or 256 (macOS) under a much higher hard one, so a run that needs more raises it for itself. A raise the
+    system refuses leaves the limit as it was. Windows has no such limit for a ping's pipe or a socket (they are
+    handles, and the C runtime's 8,192 file numbers are far above 1,024 pings): None, without importing ``resource``,
+    which exists only on POSIX. ``resource`` is reached through ``_resource()`` so that a test drives every branch with
+    a fake, never the real limit of the test process.
+    """
+    if is_windows():
+        return None
+    try:
+        resource = _resource()
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ImportError, OSError, ValueError):
+        return None
+    if soft == resource.RLIM_INFINITY:
+        return None
+    if soft >= needed:
+        return soft
+    wanted = needed + headroom
+    target = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+    if target > soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        except (ValueError, OSError):
+            return soft
+        return target
+    return soft
+
+
+def _resource():
+    """The POSIX ``resource`` module, imported when a run first asks for its open-file limit. Tests replace this."""
+    import resource
+
+    return resource
+
+
 def _kernel32():
     """``kernel32`` with the prototypes ``pid_exists`` and ``no_console_window_flags`` need declared. Tests replace this with a fake.
 

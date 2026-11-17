@@ -2,9 +2,10 @@
 import asyncio
 import json
 
-from . import lookup_inputs, monitor_map, monitor_style, monitor_tables, tab_aria, texts, view_state
+from . import job_slots, lookup_inputs, monitor_map, monitor_style, monitor_tables, tab_aria, target_preview, texts, view_state
 from . import outcome as outcome_banner
 from .dialogs import confirm_dialog
+from .monitor_feed import ChangesPanel
 from .monitor_link import MonitorLink
 from .monitor_live_map import NOT_RUNNING, WAITING, LiveMap, set_changed  # noqa: F401 (WAITING: re-exported)
 from .monitor_state import MonitorTab
@@ -105,6 +106,7 @@ def render_monitor(controller, scope):
         link.push()
         if panel() == 'live' and alive():
             live_map.restart()
+            feed.restart()
             for args in pending:
                 scope.timer(0, lambda args=args: restore(*args), once=True)
             pending.clear()
@@ -119,9 +121,11 @@ def render_monitor(controller, scope):
         _, targets = form_field('textarea', 'Targets', props='autogrow')
         target_error = ui.label('').props('role=alert').classes('text-negative')
         lookup_inputs.helper_text(targets, lookup_inputs.TARGET_HELP['monitor'])
+        preview = target_preview.attach(targets, 'monitor', scope)  # the live line (7.3)
         _, ports = form_field('input', 'TCP ports')
         port_error = ui.label('').props('role=alert').classes('text-negative')
         lookup_inputs.helper_text(ports, lookup_inputs.PORT_HELP)
+        preview.use_ports(ports)  # the live line warns when the hosts are more than the tool tests with ports
         with ui.row().classes('w-full cn-monitor-row'):
             with ui.column().classes('grow gap-0'):
                 _, interval = form_field('input', 'Interval (seconds)', value='60', props='inputmode=numeric')
@@ -136,9 +140,18 @@ def render_monitor(controller, scope):
                   'interval': (interval, interval_error), 'duration': (duration, duration_error)}
         for control, error_label in fields.values():
             control._props['aria-describedby'] = f"{error_label.html_id} {control._props.get('aria-describedby', '')}".strip()  # the error, then the helper line
+        reading = []  # set while a Run reads the box: a second click or Ctrl+Enter meanwhile is the same Run
+
         async def submit():
-            if not alive():
+            if not alive() or reading:
                 return
+            reading.append(True)
+            try:
+                return await read_and_start()
+            finally:
+                reading.clear()
+
+        async def read_and_start():
             for control, error_label in fields.values():
                 control._props.pop('aria-invalid', None)
                 control.update()
@@ -148,8 +161,14 @@ def render_monitor(controller, scope):
                 if not (targets.value or '').strip():
                     raise MonitorFormError('targets', 'Enter at least one target.')
                 parsed_ports, every, until = parse_monitor_form(ports.value or '', interval.value or '', duration.value or '')
-                controller.submit(targets.value.splitlines(), 'monitor', tcp_ports=parsed_ports,
-                                  interval_seconds=every, duration_seconds=until)
+                typed = targets.value or ''
+                lines = await target_preview.lines_for_submit(typed, 'monitor')  # off the event loop
+                if not alive():
+                    return
+                if not lines:  # comments only
+                    raise MonitorFormError('targets', target_preview.NO_TARGETS)
+                controller.submit(lines, 'monitor', tcp_ports=parsed_ports, interval_seconds=every,
+                                  duration_seconds=until, typed=typed)
             except MonitorFormError as error:
                 control, error_label = fields[error.field]
                 error_label.set_text(str(error))
@@ -162,6 +181,7 @@ def render_monitor(controller, scope):
                 form_error.set_text(str(error))
                 return
             fold.ran()  # results first: the form is its one line, under the round once the run is on
+            reading.clear()  # started: a Run from here on is a new one, whatever the poll takes
             await poll()
         handoff_note = lookup_inputs.handoff_note()  # targets sent by "Monitor these" (said once; nothing runs)
         with ui.row().classes('cn-monitor-actions'):
@@ -197,6 +217,7 @@ def render_monitor(controller, scope):
         history_status = ui.label('').props('role=status').classes('text-negative')
         # What this monitor's report save did, when one was due; the workbook is the header's Report menu.
         report = ui.label('').props('role=status').classes('cn-muted')
+        feed = ChangesPanel(controller, scope)  # "Changes" (R3-08): drawn beside the Map / Table switch, below
         async def show_in_table(target):
             handle = latest['live_handle']
             if handle is None or not handle._alive():
@@ -216,10 +237,13 @@ document.getElementById({json.dumps(handle.region.html_id)})?.focus();
 }})()""")
 
         live_map = LiveMap(controller, scope, poll=lambda: poll(), show_in_table=show_in_table)
+        feed.live_map = live_map
         link.bind(panel=panel, latest=latest, history=history, live_map=live_map, tabs=tabs, live_tab=live_tab,
                   history_tab=history_tab, request_history=lambda **kw: request_history(**kw),
                   live_handle=lambda: latest['live_handle'])
-        live_map.switch()
+        with ui.element('div').classes('cn-live-bar'):  # the switch and the closed "Changes" share a line: the Map stays high
+            live_map.switch()
+            feed.build()
         # One wrapper, two areas: the tab shows the area of its view (monitor_map.CSS) and both stay in the page.
         live_view = ui.column().classes('w-full cn-live-view')
         live_map.area(live_view)
@@ -838,7 +862,7 @@ if (!requested && fallback) {{
                 latest['result'], latest['result_revision'] = page.result, page.result_revision
             if page.attempt_changed:
                 latest['outcome'], latest['attempt_result'], latest['attempt_revision'] = page.outcome, page.attempt_result, page.attempt_revision
-            state = page.state
+            state = job_slots.monitor_view(page.state)  # the page's own slot is the Monitor's (R3-03): its phase, job and facts
             generation = state.config_generation
             if latest['config_generation'] is None:
                 latest['config_generation'] = generation
@@ -859,18 +883,18 @@ if (!requested && fallback) {{
             update = state.monitor_update
             data = ((update or {}) if active else (latest.get('attempt_result') or latest['result'] or update or {}))
             phase = state.phase
-            shell.update(state)  # the status line, Stop, the banner of another tool's job and the end of the session
+            shell.update(page.state)  # the status line, Stop, the pill, the toast and the end of the session
             run.set_enabled(not deleting and phase == 'ready' and not state.active_job_id and all(control.enabled for control, _ in fields.values()))
             place_round(active)
             fold.set_summary(form_summary(targets.value or '', ports=ports.value or '', interval=interval.value or '',
-                                          duration=duration.value or ''))
+                                          duration=duration.value or '', tool='monitor'))
             outcome = latest['outcome'] or {}
             if data:
                 previous = bool(page.attempt_job_id and page.result_job_id and page.attempt_job_id != page.result_job_id)
-                set_changed(summary, monitor_summary(data, active=active, previous=previous))
+                summary_text = monitor_summary(data, active=active, previous=previous)
             else:  # a run before its first round, or one that ended without one; nothing at all says nothing here
-                set_changed(summary, 'No complete round yet. An unfinished round does not indicate an outage.'
-                            if active or outcome else '')
+                summary_text = ('No complete round yet. An unfinished round does not indicate an outage.'
+                                if active or outcome else '')
             rounds = data.get('current_rounds', 0)
             # The run has ended and left something to say: a result, or rounds the session still holds.
             ended = not active and bool(outcome) and (latest.get('attempt_result') is not None or bool(rounds))
@@ -917,6 +941,11 @@ if (!requested && fallback) {{
                     handle.source.key = (job, run_id, revision)
                     scope.task(handle.refresh(), name='monitor-live-round')
             live_map.follow(job, run_id, revision, active)
+            # The change list (R3-08): asked when the run's changes_seq moved. The round summary says the round's count (the
+            # difference of changes_seq between two revisions: exact) once, and never a partial one.
+            feed.follow((job, run_id) if update and job and run_id is not None else None, update, active=active)
+            note = feed.note(revision)
+            set_changed(summary, summary_text + (' ' + note if note else ''))
             # The line above the live view and the notice of an ended run. The run's size is in the snapshot only
             # while it probes: the round on screen gives it too (the Map's answer, the table's counts), and it is
             # kept for the run, so a tab opened between two rounds names the hosts as soon as it has drawn one.
@@ -1038,12 +1067,12 @@ if (!requested && fallback) {{
                     sync_coverage_download()
 
     # Built in the order the session is in now, so that the first poll moves nothing.
-    place_round(controller.snapshot().active_lookup_type == 'monitor')
+    place_round(bool(controller.snapshot().monitor_job_id))
     # A tab's form is its draft (sessionStorage). A tab with none of the four values, a new one, shows what this
     # session's Monitor was last asked; a tab that holds any, even an empty one, keeps its own. Decided once.
     drafts = [(targets, 'targets', ''), (ports, 'ports', ''), (interval, 'interval', '60'), (duration, 'duration', '')]
     draft_keys = json.dumps(['cn-tool-draft-monitor-' + suffix for _, suffix, _ in drafts])
-    async def restore(control, suffix, default, index):  # one function for the four fields: a try again is for its own field
+    async def restore(control, suffix, default, index, again=False):  # the four fields; ``again``: subnets' restore_draft
         if not alive():
             return
         if panel() != 'live':  # the form is not drawn: restored when the Live panel is chosen (panel_changed)
@@ -1055,19 +1084,21 @@ if (!requested && fallback) {{
 const input = root?.matches('input,textarea') ? root : root?.querySelector('input,textarea');
 if (!input) return false;
 const key = %s;
+%s
 if (!input.cnDraftListener) {
   input.cnDraftListener = true;
   input.addEventListener('input', () => { input.cnDraftEdited = true; sessionStorage.setItem(key, input.value); });
 }
-''' % (json.dumps(control.html_id), json.dumps('cn-tool-draft-monitor-' + suffix))
+''' % (json.dumps(control.html_id), json.dumps('cn-tool-draft-monitor-' + suffix), preview.guard_js() if control is targets else '')
         try:
             await asyncio.wait_for(client.connected(), timeout=5)
-            installed = alive() and await client.run_javascript(f'(() => {{{install} return true;}})()', timeout=5)
-            if not alive():
-                return
-            if not installed:
-                raise TimeoutError
-            control.enable()  # first: the value the script restores is an event, and a disabled field's are ignored
+            if not again:
+                installed = alive() and await client.run_javascript(f'(() => {{{install} return true;}})()', timeout=5)
+                if not alive():
+                    return
+                if not installed:
+                    raise TimeoutError
+                control.enable()  # first: the value the script restores is an event, and a disabled field's are ignored
             restored = await client.run_javascript(f'''(() => {{{install}{lookup_inputs.keep_typed('key', default)}
 if (!input.cnDraftEdited) {{
   window.cnMonitorNewTab ??= {draft_keys}.every(name => sessionStorage.getItem(name) === null);
@@ -1089,7 +1120,7 @@ return true;
             client.run_javascript(f'(() => {{{install}}})()')
             await asyncio.sleep(0)
             control.enable()
-            scope.timer(1, lambda: restore(control, suffix, default, index), once=True)
+            scope.timer(1, lambda: restore(control, suffix, default, index, again=True), once=True)
     for index, (control, suffix, default) in enumerate(drafts):
         control.disable()
         scope.timer(0, lambda c=control, s=suffix, d=default, i=index: restore(c, s, d, i), once=True)
@@ -1112,6 +1143,7 @@ return true;
             controller.release_monitor_history_page(latest['template_query'])
             latest['template_query'] = None
         live_map.release()
+        feed.release()
         if latest['history_query']:
             controller.release_monitor_history_page(latest['history_query'])
             latest['history_query'] = None

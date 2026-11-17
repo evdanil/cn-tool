@@ -80,7 +80,8 @@ Infoblox is configured, and they find the credential source, log in and read the
 `<endpoint>?_schema`, check that `[site] ea_name` is defined on the grid and allowed on networks,
 and list the network views and check the one the lookups search (`--view` or `[api] network_view`;
 see [Network views](infoblox.md#network-views)). The Config Repo row is an `error` when none of the configured
-repository directories can be read. `status` is `ok`, `warning`, `error`, `off` (not configured),
+repository directories can be read. A `Ping probes` row, before Theme, appears only when `[ping] parallel_probes` is not
+a whole number from 1 to 1024, as an `error` (exit 2). `status` is `ok`, `warning`, `error`, `off` (not configured),
 `info` or `skipped`. Nothing is changed, and it never prompts without a terminal. The Application
 Setup status block in the menu shows the same rows without the live checks.
 

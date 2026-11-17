@@ -1475,6 +1475,7 @@ class _Run:
         self.started = 0.0
         self.without_own: Optional[ph.Tracker] = None  # a one-round run's earlier rounds without its start
         self.outcome = RunOutcome(request, ph.Tracker(request.hosts, request.ports), interval=plan.every, running=True)
+        self.probes, self.probe_notes = bulk_ping.probe_count(ctx, tcp=bool(request.ports))  # a reload: the next run
 
     # -- the store ---------------------------------------------------------------------------------------
     def _store_call(self, call: Callable[[PingStore], Any]) -> Any:
@@ -1610,14 +1611,16 @@ class _Run:
         self._store_call(lambda store: store.end_run(self.run_id, ended=self.clock.now(), status=status))
 
     def _warn_overrun(self) -> None:
-        """Before the first round: one warning when a round is likely to take longer than the interval (4.2)."""
+        """Before the first round: ``probe_count``'s notes, then one warning when a round is likely to outlast the interval (4.2)."""
+        for note in self.probe_notes:
+            _say(f"cn: monitor: {note}")
         if not self.plan.every:
             return
         hosts = len(self.request.hosts)
         per_batch = BATCH_ESTIMATE
         if oscompat.is_macos() and any(":" in host for host in self.request.hosts):
             per_batch = MACOS_IPV6_BATCH_ESTIMATE
-        estimate = math.ceil(hosts / bulk_ping.BATCH_SIZE) * per_batch
+        estimate = math.ceil(hosts / self.probes) * per_batch
         if estimate > self.plan.every:
             _say(f"about {hosts:,} hosts: a round takes up to {estimate:.0f} s, longer than the "
                  f"{_span(self.plan.every)} interval; slots will be skipped.")
@@ -1728,9 +1731,9 @@ class _Run:
             self.observer.on_status("probing", 0, len(targets))
         try:
             if self.control is None:
-                sweep = self.module._sweep(targets, logger, ports, self.plan.icmp)
+                sweep = self.module._sweep(targets, logger, ports, self.plan.icmp, probes=self.probes)
             else:
-                sweep = self.module._sweep(targets, logger, ports, self.plan.icmp, control=self.control)
+                sweep = self.module._sweep(targets, logger, ports, self.plan.icmp, control=self.control, probes=self.probes)
         except bulk_ping.PingCleanupError:
             raise  # An unreaped child is a distinct cleanup failure, not a finished sweep.
         except OSError:

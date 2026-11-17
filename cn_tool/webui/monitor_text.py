@@ -350,7 +350,8 @@ def request_form(request):
     if not request or 'inputs' not in request:
         return None
     every, lasting = request.get('interval_seconds'), request.get('duration_seconds')
-    return ('\n'.join(str(line) for line in request['inputs']),
+    typed = request.get('typed')
+    return (typed if isinstance(typed, str) else '\n'.join(str(line) for line in request['inputs']),
             ', '.join(str(port) for port in request.get('tcp_ports') or ()),
             '' if every is None else str(every), '' if lasting is None else str(lasting))
 

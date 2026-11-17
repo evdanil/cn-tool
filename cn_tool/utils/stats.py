@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import threading
 import uuid
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -155,8 +156,23 @@ def _period_label(period_key: str) -> str:
     return PERIOD_PRESETS[0].label
 
 
+@dataclass(frozen=True)
+class RunHandle:
+    """One run begun with ``StatsManager.begin_run``: its place in the session's ``runs``."""
+
+    index: int
+
+
 class StatsManager:
-    """Tracks session/module stats and aggregates shared stats files."""
+    """Tracks session/module stats and aggregates shared stats files.
+
+    A session has one *active* run (``start_module_run`` / ``finish_module_run``: the menu, the command line and the
+    web UI's one-shot lookups); starting another marks it interrupted, and module details
+    (``stats:module_detail``) land on it. A run begun with ``begin_run`` takes a handle instead and runs beside it
+    (the web UI's Monitor): it never interrupts nor is interrupted, gets no module details, and ends with
+    ``end_run(handle, status)``, or at the session's end with the session's status. Every change is made under one
+    lock, so two worker threads may end their runs at once.
+    """
 
     def __init__(self, ctx: ScriptContext) -> None:
         self.ctx = ctx
@@ -171,6 +187,8 @@ class StatsManager:
         self.session_path: Optional[Path] = None
         self.session: Dict[str, Any] = {}
         self.active_run_index: Optional[int] = None
+        self._open_handles: set[int] = set()
+        self._lock = threading.RLock()
         self.subscription_token: Optional[int] = None
         self.cached_shared_report: Optional[Dict[str, Any]] = None
 
@@ -257,12 +275,37 @@ class StatsManager:
         self.record_module_detail(payload)
 
     def start_module_run(self, module: BaseModule) -> None:
-        if not self.collect_enabled or not self.session:
-            return
+        with self._lock:
+            if not self.collect_enabled or not self.session:
+                return
 
-        if self.active_run_index is not None:
-            self._finish_active_run("interrupted", utc_now())
+            if self.active_run_index is not None:
+                self._finish_active_run("interrupted", utc_now())
 
+            self.active_run_index = self._append_run(module)
+
+    def begin_run(self, module: BaseModule) -> Optional[RunHandle]:
+        """Record a run beside the active one; None when nothing is collected. End it with ``end_run``."""
+        with self._lock:
+            if not self.collect_enabled or not self.session:
+                return None
+            index = self._append_run(module)
+            self._open_handles.add(index)
+            return RunHandle(index)
+
+    def end_run(self, handle: Optional[RunHandle], status: str, *, session_status: Optional[str] = None) -> None:
+        """End a ``begin_run`` run once (later calls and None change nothing). ``session_status`` also sets the
+        session's status, as ``prepare_for_shutdown`` does for a one-shot run that raised."""
+        with self._lock:
+            if handle is None or not self.collect_enabled or handle.index not in self._open_handles:
+                return
+            self._open_handles.discard(handle.index)
+            normalized_status = status if status in VALID_RUN_STATUSES else "failed"
+            if session_status is not None:
+                self.session["status"] = session_status if session_status in VALID_SESSION_STATUSES else "failed"
+            self._finish_run(handle.index, normalized_status, utc_now())
+
+    def _append_run(self, module: BaseModule) -> int:
         started_at = utc_now()
         run_record = {
             "module_key": module.menu_key,
@@ -274,10 +317,14 @@ class StatsManager:
             "metrics": {},
         }
         self.session.setdefault("runs", []).append(run_record)
-        self.active_run_index = len(self.session["runs"]) - 1
         self._touch_session(started_at)
+        return len(self.session["runs"]) - 1
 
     def record_module_detail(self, payload: Dict[str, Any]) -> None:
+        with self._lock:
+            self._record_module_detail(payload)
+
+    def _record_module_detail(self, payload: Dict[str, Any]) -> None:
         if not self.collect_enabled or self.active_run_index is None:
             return
 
@@ -300,12 +347,19 @@ class StatsManager:
         self._touch_session(utc_now())
 
     def finish_module_run(self, status: str) -> None:
-        if not self.collect_enabled or self.active_run_index is None:
-            return
-        normalized_status = status if status in VALID_RUN_STATUSES else "failed"
-        self._finish_active_run(normalized_status, utc_now())
+        with self._lock:
+            if not self.collect_enabled or self.active_run_index is None:
+                return
+            normalized_status = status if status in VALID_RUN_STATUSES else "failed"
+            self._finish_active_run(normalized_status, utc_now())
 
     def prepare_for_shutdown(self, final_status: str) -> None:
+        """End the active run and set the session's status. Runs with a handle stay open: this is also what a
+        one-shot run that raised calls (``_run_tracked``), and ``finalize_session`` ends them."""
+        with self._lock:
+            self._prepare_for_shutdown(final_status)
+
+    def _prepare_for_shutdown(self, final_status: str) -> None:
         if not self.collect_enabled or not self.session:
             return
 
@@ -320,15 +374,22 @@ class StatsManager:
         self._touch_session(shutdown_time)
 
     def finalize_session(self, final_status: str) -> None:
+        with self._lock:
+            self._finalize_session(final_status)
+
+    def _finalize_session(self, final_status: str) -> None:
         if not self.collect_enabled or not self.session:
             return
 
         final_time = utc_now()
+        run_status = "completed" if final_status == "completed" else final_status
+        if run_status not in VALID_RUN_STATUSES:
+            run_status = "failed"
         if self.active_run_index is not None:
-            run_status = "completed" if final_status == "completed" else final_status
-            if run_status not in VALID_RUN_STATUSES:
-                run_status = "failed"
             self._finish_active_run(run_status, final_time)
+        for index in sorted(self._open_handles):
+            self._finish_run(index, run_status, final_time)
+        self._open_handles.clear()
 
         self.session["status"] = final_status if final_status in VALID_SESSION_STATUSES else "failed"
         self.session["ended_at"] = utc_iso(final_time)
@@ -639,14 +700,16 @@ class StatsManager:
         if self.active_run_index is None or not self.collect_enabled:
             return
 
-        run = self.session["runs"][self.active_run_index]
+        index, self.active_run_index = self.active_run_index, None
+        self._finish_run(index, status, ended_at)
+
+    def _finish_run(self, index: int, status: str, ended_at: datetime) -> None:
+        run = self.session["runs"][index]
         started_at = parse_utc_iso(run.get("started_at")) or ended_at
         duration_seconds = max(0.0, round((ended_at - started_at).total_seconds(), 3))
         run["ended_at"] = utc_iso(ended_at)
         run["duration_seconds"] = duration_seconds
         run["status"] = status if status in VALID_RUN_STATUSES else "failed"
-
-        self.active_run_index = None
         self._touch_session(ended_at)
 
     def _touch_session(self, now: datetime) -> None:

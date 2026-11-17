@@ -810,6 +810,23 @@ window.cnMonitorMap = window.cnMonitorMap || (() => {
     if (note) { note.textContent = text; S.noteEl = note; }
   }
 
+  // From the change list (R3-08): the one cursor to a cell of a drawn block, the box focused and the popup open as for Enter.
+  // False when the cell is not on screen (the Table is shown, or its block is not drawn): the page then makes it so.
+  function focusCell(b, c) {
+    if (!S.box || !S.body || S.view !== 'map') return false;
+    const d = {b: +b, c: +c};
+    if (!rowOf(d)) return false;
+    S.cur = d;
+    S.jumpAt = null;
+    S.moved = true;
+    S.say = true;
+    S.box.focus({preventScroll: true});
+    S.box.scrollIntoView({block: 'nearest'});
+    place(true);
+    show(d, true);
+    return true;
+  }
+
   function draw(message) {
     if (!S.body) return;
     const held = S.body.contains(document.activeElement) && document.activeElement.dataset.jump;
@@ -977,6 +994,7 @@ window.cnMonitorMap = window.cnMonitorMap || (() => {
     report(true, fresh);
     return true;
   }
-  return {token: () => S.token, init: init, dispose: dispose, draw: draw, details: details, setView: setView, fontStep: fontStep};
+  return {token: () => S.token, init: init, dispose: dispose, draw: draw, details: details, setView: setView, fontStep: fontStep,
+          focusCell: focusCell};
 })();
 </script>'''.replace('__STEPS__', json.dumps(list(FONT_STEPS)))

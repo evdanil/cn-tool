@@ -86,12 +86,13 @@ _ASKING = 'cn_confirm_open'  # set on the NiceGUI client while its confirmation 
 
 
 async def confirm_dialog(title: str, lines: Sequence[str], *, confirm: str, cancel: str = 'Cancel',
-                         danger: bool = False, note: str = '', fallback: str | None = None) -> bool:
+                         danger: bool = False, note: str = '', fallback: str | None = None, opened=None) -> bool:
     """Ask the user to confirm; True only for the confirm button.
 
     Cancel comes first and holds the first focus; Escape, a click outside and Cancel all answer False. The dialog is
     named by its title, Tab and Shift+Tab wrap inside the card, and focus returns to the element that opened it, or
-    to the first element matching the CSS selector `fallback` when that element is gone.
+    to the first element matching the CSS selector `fallback` when that element is gone. ``opened(dialog)`` is called
+    once the dialog is open, for a caller that answers it itself.
 
     One question at a time per tab: a call made while this tab's confirmation is open (Enter pressed twice on the
     opener, before the dialog takes the focus) answers False at once and opens nothing.
@@ -102,12 +103,12 @@ async def confirm_dialog(title: str, lines: Sequence[str], *, confirm: str, canc
         return False
     setattr(client, _ASKING, True)
     try:
-        return await _ask(title, lines, confirm, cancel, danger, note, fallback)
+        return await _ask(title, lines, confirm, cancel, danger, note, fallback, opened)
     finally:
         setattr(client, _ASKING, False)
 
 
-async def _ask(title, lines, confirm, cancel, danger, note, fallback):
+async def _ask(title, lines, confirm, cancel, danger, note, fallback, opened=None):
     from nicegui import ui
     with ui.dialog().props('no-refocus') as dialog:
         with ui.card().classes('w-full').style('max-width: 540px; overflow-wrap: anywhere') as card:
@@ -125,6 +126,8 @@ async def _ask(title, lines, confirm, cancel, danger, note, fallback):
     dialog.on('before-show', js_handler=_REMEMBER % values)
     dialog.on('hide', js_handler=_RETURN % values, handler=dialog.delete)
     dialog.open()
+    if opened is not None:
+        opened(dialog)  # the caller may answer it itself (``dialog.submit(False)``): the question went stale
     result = await dialog
     return result is True
 

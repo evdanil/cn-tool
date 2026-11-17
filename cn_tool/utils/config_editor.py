@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from cn_tool.utils.config import SECTION_ALIASES, is_env_name, parse_optional_bool
+from cn_tool.utils.config import SECTION_ALIASES, is_env_name, parse_optional_bool, whole_number_rule
 
 # Settings that hold a secret: never listed, read back or written by the editor.
 SECRET_KEYS = frozenset({"email_password"})
@@ -73,6 +73,8 @@ class Field:
     label: str = ""
     common: bool = False
     regex: Optional[Tuple[str, ...]] = None
+    minimum: Optional[int] = None  # an int with limits: its schema entry's "min" and "max"
+    maximum: Optional[int] = None
 
 
 @dataclass
@@ -167,6 +169,7 @@ def settings_fields(schema: Mapping[str, Mapping[str, Any]], template: str = "",
             default=_display_default(spec), help=str(spec.get("help") or explanation), example=example,
             choices=tuple(str(choice) for choice in spec.get("choices") or ()),
             label=prompts.get(key) or ini_key, common=key in prompts, regex=REGEX_KEYS.get(key),
+            minimum=spec.get("min"), maximum=spec.get("max"),
         ))
     rank = {name: index for index, name in enumerate(order)}
     return sorted(fields, key=lambda item: rank.get(item.section, len(rank)))
@@ -212,9 +215,14 @@ def validate_value(item: Field, raw: Optional[str]) -> Tuple[Optional[str], str]
     if item.type == "int":
         if not text:
             return None, "enter a whole number, or remove the setting"
+        limited = item.minimum is not None and item.maximum is not None
         try:
             number = int(text)
         except ValueError:
+            number = None
+        if limited and (number is None or not item.minimum <= number <= item.maximum):
+            return None, "must be " + whole_number_rule({"min": item.minimum, "max": item.maximum})
+        if number is None:
             return None, "must be a whole number"
         if number < 0:
             return None, "must not be negative"

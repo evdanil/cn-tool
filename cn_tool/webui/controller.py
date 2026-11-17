@@ -6,7 +6,8 @@ from threading import RLock, Thread
 from time import monotonic, time
 from uuid import uuid4
 
-from .protocol import PING_PARTIAL_BYTES_MAX, PING_ROWS_MAX, decode, encode, envelope, validate, valid_monitor_history_item
+from . import texts
+from .protocol import CHANGES_PAGE_MAX, PING_PARTIAL_BYTES_MAX, PING_ROWS_MAX, SEQ_MAX, decode, encode, envelope, validate, valid_monitor_history_item
 
 
 def _remove_file(path):
@@ -19,6 +20,13 @@ def _remove_file(path):
 
 
 STALE_CONFIRMATION = 'The settings were reloaded since this was opened. Nothing was deleted.'
+# The session can take a job (plan 5.2): a Monitor may start beside a one-shot job in any of these phases.
+USABLE = frozenset({'ready', 'running', 'stopping', 'saving'})
+# The tools that may run beside a Monitor (owner's answer to Q4: all five, one at a time). A narrower set would make
+# the one-shot slot wait for the Monitor for the tools left out.
+ONE_SHOT_BESIDE_MONITOR = frozenset({'subnet', 'ip', 'ping', 'config_search', 'demob'})
+# The worker's own answer for a busy monitor slot (worker_slots.BUSY_MESSAGES; a test holds the two together).
+MONITOR_BUSY = 'A Monitor is already running. Try again when it finishes.'
 
 
 class ReportDeletionInProgress(RuntimeError):
@@ -78,6 +86,26 @@ class SessionSnapshot:
     # runtime is open (setup_required).
     infoblox_configured: object = None
     config_found: object = None
+    # The monitor slot (plan 5.3, R3-03): the running Monitor's job, its phase ('idle', 'running', 'stopping',
+    # 'saving'), its start (wall clock) and the summary of what it was asked. ``phase`` and the ``active_*`` fields
+    # above are the one-shot slot's: a Monitor alone leaves ``phase`` at 'ready'.
+    monitor_job_id: object = None
+    monitor_phase: str = 'idle'
+    monitor_started_at: object = None
+    monitor_request: object = None
+    # A job whose phase is 'saving' may be waiting for the report gate behind the other slot's save (plan 5.9): the
+    # worker said `waiting` and has not said `saving` since. One flag for each slot; a one-shot job can be stopped
+    # while it waits (it leaves unsaved), a Monitor never (it saves whatever it is told).
+    save_waiting: bool = False
+    monitor_save_waiting: bool = False
+
+    @property
+    def quiet(self):
+        """Nothing runs and nothing waits on the workbook: the session is ``ready``, neither slot holds a job and no
+        report deletion or download is pending. The gate of Delete report and of reloading the settings (plan 5.3).
+        Computed: never stored, copied or sent."""
+        return (self.phase == 'ready' and not self.active_job_id and not self.monitor_job_id
+                and not self.report_delete_pending and not self.report_snapshot_pending)
 
 
 @dataclass
@@ -121,6 +149,8 @@ class SessionController:
         self._monitor_pages = {}
         self._map_requests = {}  # the Map view's questions (the map and one cell), by query id
         self._map_answers = {}
+        self._changes_requests = {}  # the change feed's questions (plan 7.4), by query id
+        self._changes_answers = {}
         self._config_requests = {}
         self._config_pages = {}
         self._demob_requests = {}
@@ -203,12 +233,10 @@ class SessionController:
             if self._state.phase == 'setup_required':
                 self.retry_initialize()
                 return self._reload_started('retry')
-            if self._state.phase != 'ready':
+            if self._state.phase not in {'ready', 'running', 'stopping', 'saving'}:
                 raise RuntimeError('The settings can be reloaded once the application has started.')
-            if (self._state.active_job_id is not None or self._state.report_delete_pending
-                    or self._workbook_snapshots):
-                raise RuntimeError('The settings can be reloaded when no work is running. '
-                                   'Try again when it finishes.')
+            if not self._state.quiet or self._workbook_snapshots:  # the set itself, as before: kept in step with the flag
+                raise RuntimeError(texts.reload_refusal(self._state))
             self._send('reload_config', None, {'config_file': self._config_file})
             self._state.phase = 'starting'
             self._state.error = None
@@ -250,11 +278,18 @@ class SessionController:
                 self._clear_report_requests()
             raise
 
-    def submit(self, inputs, lookup_type='subnet', *, tcp_ports=(), interval_seconds=60, duration_seconds=None):
+    def submit(self, inputs, lookup_type='subnet', *, tcp_ports=(), interval_seconds=60, duration_seconds=None,
+               typed=None):
+        """Start a lookup. ``typed`` is the text the user typed into the Targets box when ``inputs`` are the lines read
+        from it (``target_preview``): kept beside the request for ``last_request`` (a Retry or a new tab shows what was
+        typed, not the expanded lines), never sent to the worker."""
         if lookup_type not in ('subnet', 'ip', 'ping', 'monitor', 'config_search'):
             raise ValueError('Invalid lookup type')
         with self._lock:
-            if self._state.phase != 'ready' or self._state.active_job_id or self._state.report_delete_pending:
+            if lookup_type == 'monitor':
+                if self._state.phase not in USABLE or self._state.monitor_job_id or self._state.report_delete_pending:
+                    raise self._monitor_refusal()
+            elif not self._one_shot_admitted(lookup_type):
                 raise self._lookup_refusal()
             job = uuid4().hex
             payload = {'inputs': inputs, 'lookup_type': lookup_type}
@@ -264,13 +299,16 @@ class SessionController:
                     payload.update(interval_seconds=interval_seconds, duration_seconds=duration_seconds)
             elif tcp_ports:
                 raise ValueError('Ports require Ping')
-            if self._state.demob_preview and self._state.demob_preview['token']:
-                self._send('demob_decline', None, {})
-            self._clear_demob()
-            self._state.demob_discovery = None
+            if lookup_type != 'monitor':  # a Monitor has nothing to do with a Site Demobilization preview (5.6)
+                if self._state.demob_preview and self._state.demob_preview['token']:
+                    self._send('demob_decline', None, {})
+                self._clear_demob()
+                self._state.demob_discovery = None
             self._send('lookup', job, payload)
             self._last_requests[lookup_type] = {key: deepcopy(value) for key, value in payload.items()
                                                 if key != 'lookup_type'}
+            if isinstance(typed, str):
+                self._last_requests[lookup_type]['typed'] = typed
             summary = {'lines': sum(1 for line in inputs if line.strip())}
             summary.update({key: deepcopy(value) for key, value in payload.items()
                             if key in ('tcp_ports', 'interval_seconds', 'duration_seconds')})
@@ -282,6 +320,8 @@ class SessionController:
                 self._monitor_pages.clear()
                 self._map_requests.clear()
                 self._map_answers.clear()
+                self._changes_requests.clear()
+                self._changes_answers.clear()
             self._job_started(job, lookup_type, summary)
             self._attempt_revisions[lookup_type] += 1
             self._state.latest_attempt_id = job
@@ -289,7 +329,10 @@ class SessionController:
             previous = self._state.latest_report_state or {}
             self._set_report_state(dict(state='pending', status='pending', filename=previous.get('filename', ''),
                                         message='Lookup in progress.', available=previous.get('available', False),
-                                        saved_for_attempt=False))
+                                        saved_for_attempt=False), lookup_type, job)
+            if lookup_type == 'monitor':  # the monitor slot: the one-shot slot's phase, clock and error stay
+                self._state.monitor_phase = 'running'
+                return job
             self._state.phase = 'running'
             self._state.error = None
             self._state.progress_stage = ''
@@ -299,13 +342,18 @@ class SessionController:
             return job
 
     def _job_started(self, job, lookup_type, summary):
-        """The facts of the job that now runs, and its attempt; the caller holds the lock."""
+        """The facts of the job that now runs in its slot, and its attempt; the caller holds the lock."""
         started = time()
-        self._ping_partial = None
-        self._state.active_job_id = job
-        self._state.active_lookup_type = lookup_type
-        self._state.active_started_at = started
-        self._state.active_request = summary
+        if lookup_type == 'monitor':
+            self._state.monitor_job_id = job
+            self._state.monitor_started_at = started
+            self._state.monitor_request = summary
+        else:
+            self._ping_partial = None
+            self._state.active_job_id = job
+            self._state.active_lookup_type = lookup_type
+            self._state.active_started_at = started
+            self._state.active_request = summary
         self._state.attempts_by_type[lookup_type] = dict(job_id=job, outcome=None, report_state=None,
                                                          started_at=started, ended_at=None, request=deepcopy(summary))
 
@@ -332,6 +380,30 @@ class SessionController:
         self._state.active_lookup_type = None
         self._state.active_started_at = None
         self._state.active_request = None
+        self._state.save_waiting = False
+
+    def _monitor_ended(self):
+        """The monitor slot is idle again: its job's facts leave the snapshot and its attempt gets the time it ended.
+        The one-shot slot and ``phase`` are not touched. The caller holds the lock."""
+        attempt = self._state.attempts_by_type.get('monitor')
+        if (attempt is not None and attempt.get('job_id') == self._state.monitor_job_id
+                and self._state.monitor_job_id is not None and attempt.get('ended_at') is None):
+            attempt['ended_at'] = time()
+        self._state.monitor_job_id = None
+        self._state.monitor_phase = 'idle'
+        self._state.monitor_started_at = None
+        self._state.monitor_request = None
+        self._state.monitor_save_waiting = False
+
+    def _slot_of(self, job):
+        """The slot that runs job ``job`` now: 'monitor', 'oneshot', or None (no job, or one that has ended)."""
+        if job is None:
+            return None
+        if job == self._state.monitor_job_id:
+            return 'monitor'
+        if job == self._state.active_job_id:
+            return 'oneshot'
+        return None
 
     def ping_partial(self, job_id=None, after=0):
         """The running Ping's rows so far, or None while it has none: ``{job_id, count, completed, total, revision,
@@ -351,7 +423,8 @@ class SessionController:
     def last_request(self, lookup_type):
         """What the tool was last asked in this session, for a tab that has no draft of its own (a new tab), or None.
 
-        ``{'inputs': lines}`` as they were submitted; Ping and Monitor add ``'tcp_ports'``, Monitor
+        ``{'inputs': lines}`` as they were submitted, and ``'typed'`` (the text of the Targets box they were read from)
+        when the page gave it; Ping and Monitor add ``'tcp_ports'``, Monitor
         ``'interval_seconds'`` and ``'duration_seconds'``; Configuration Search's inputs are its terms; Site
         Demobilization gives ``{'site': text}``. It is the last request the controller accepted and sent, whatever
         became of it, and it outlives its job. Kept in memory only: never in a snapshot, a URL or a file, and gone
@@ -365,14 +438,29 @@ class SessionController:
         self._demob_requests.clear()
         self._demob_pages.clear()
 
+    def _one_shot_admitted(self, lookup_type):
+        """Whether a one-shot job of ``lookup_type`` may start now (plan 5.2): the session is ``ready`` with the
+        one-shot slot idle and no report deletion, and, for a tool that may not run beside a Monitor, no Monitor.
+        The caller holds the lock."""
+        return (self._state.phase == 'ready' and not self._state.active_job_id and not self._state.report_delete_pending
+                and (lookup_type in ONE_SHOT_BESIDE_MONITOR or not self._state.monitor_job_id))
+
     def _lookup_refusal(self):
         """Why a lookup cannot start now; the caller holds the lock."""
         if self._state.phase == 'ready' and not self._state.active_job_id and self._state.report_delete_pending:
             return ReportDeletionInProgress()
         return RuntimeError('A lookup is already active or session is unavailable')
 
+    def _monitor_refusal(self):
+        """Why a Monitor cannot start now; the caller holds the lock."""
+        if self._state.phase in USABLE and not self._state.monitor_job_id and self._state.report_delete_pending:
+            return ReportDeletionInProgress()
+        if self._state.phase in USABLE and self._state.monitor_job_id:
+            return RuntimeError(MONITOR_BUSY)
+        return RuntimeError('A lookup is already active or session is unavailable')
+
     def _start_demob(self, kind, payload):
-        if self._state.phase != 'ready' or self._state.active_job_id or self._state.report_delete_pending:
+        if not self._one_shot_admitted('demob'):
             raise self._lookup_refusal()
         job = uuid4().hex
         self._send(kind, job, payload)
@@ -385,7 +473,7 @@ class SessionController:
         previous = self._state.latest_report_state or {}
         self._set_report_state(dict(state='pending', status='pending', filename=previous.get('filename', ''),
                                     message='Site check in progress.', available=previous.get('available', False),
-                                    saved_for_attempt=False))
+                                    saved_for_attempt=False), 'demob', job)
         self._state.phase = 'running'
         self._state.error = None
         self._state.progress_stage = ''
@@ -394,7 +482,7 @@ class SessionController:
 
     def submit_demob_lookup(self, site):
         with self._lock:
-            if self._state.phase != 'ready' or self._state.active_job_id or self._state.report_delete_pending:
+            if not self._one_shot_admitted('demob'):
                 raise self._lookup_refusal()
             # Invalidate the old preview even if the new input is invalid.
             if self._state.demob_preview and self._state.demob_preview['token']:
@@ -420,7 +508,7 @@ class SessionController:
     def discard_demob_for_replacement(self):
         """Invalidate the current preview for a replacement attempt, including blank input."""
         with self._lock:
-            if self._state.phase != 'ready' or self._state.active_job_id or self._state.report_delete_pending:
+            if not self._one_shot_admitted('demob'):
                 raise self._lookup_refusal()
             preview = self._state.demob_preview
             self._clear_demob()
@@ -465,14 +553,18 @@ class SessionController:
             self._demob_pages.pop(query_id, None)
 
     def cancel(self, job_id):
+        """Stop job ``job_id``: only the slot that runs it stops (plan 5.2). A one-shot job stops while it runs and
+        while it waits for the report gate (``saving`` with ``save_waiting``; once it is inside the gate the worker
+        ignores the stop and the attempt is saved, so none is sent); a Monitor while it runs (a stopped Monitor saves what it has anyway)."""
         with self._lock:
-            if job_id == self._state.active_job_id and self._state.phase == 'running':
+            slot = self._slot_of(job_id)
+            if slot == 'oneshot' and (self._state.phase == 'running'
+                                      or (self._state.phase == 'saving' and self._state.save_waiting)):
                 self._send('cancel', job_id, {})
                 self._state.phase = 'stopping'
-
-    def cancel_active(self):
-        with self._lock:
-            self.cancel(self._state.active_job_id)
+            elif slot == 'monitor' and self._state.monitor_phase == 'running' and self._state.phase in USABLE:
+                self._send('cancel', job_id, {})
+                self._state.monitor_phase = 'stopping'
 
     def reply_credentials(self, request_id, reply, *, remember=False):
         """Answer the worker's credential request. True when the answer is a password that the lookup checks at
@@ -687,6 +779,37 @@ class SessionController:
     monitor_live_map = monitor_live_host = _map_answer
     release_monitor_live_map = release_monitor_live_host = _release_map
 
+    def request_monitor_live_changes(self, job_id, run_id, after=0, limit=CHANGES_PAGE_MAX):
+        """Ask for the run's change feed after sequence number ``after`` (0: from the start): at most ``limit``
+        entries, oldest first. Ask again from the last entry's ``seq`` while it is below the answer's ``last_seq``.
+        The feed is the run's, not a round's: it is asked whenever ``monitor_update``'s ``changes_seq`` moved, and
+        it stays after the run ends, until the next Monitor."""
+        if (type(after) is not int or not 0 <= after <= SEQ_MAX or
+                type(limit) is not int or not 1 <= limit <= CHANGES_PAGE_MAX):  # never a bool or a float
+            raise RuntimeError('Monitor change feed position or limit is invalid')
+        with self._lock:
+            update = self._state.monitor_update
+            selected = self._state.attempts_by_type['monitor'] or {}
+            if (self._state.phase in {'closing', 'closed', 'failed'} or not update or
+                    selected.get('job_id') != job_id or update['run_id'] != run_id):
+                raise RuntimeError('Monitor change feed is unavailable')
+            if len(self._changes_requests) + len(self._changes_answers) >= 8:
+                raise RuntimeError('Too many outstanding change feed queries')
+            query_id = uuid4().hex
+            payload = dict(job_id=job_id, run_id=run_id, after=after, limit=limit, query_id=query_id)
+            self._send('monitor_live_changes', None, payload)
+            self._changes_requests[query_id] = payload
+            return query_id
+
+    def monitor_live_changes(self, query_id):
+        with self._lock:
+            return deepcopy(self._changes_answers.get(query_id))
+
+    def release_monitor_live_changes(self, query_id):
+        with self._lock:
+            self._changes_requests.pop(query_id, None)
+            self._changes_answers.pop(query_id, None)
+
     def request_config_search_page(self, job_id, offset, limit=50, *, sort_by=None, descending=False, filter_by=None, filter_text=''):
         with self._lock:
             result = (self._state.results_by_type['config_search'] or {})
@@ -722,8 +845,10 @@ class SessionController:
                 raise RuntimeError(STALE_CONFIRMATION)
             if self._state.report_delete_pending:
                 raise ReportDeletionInProgress()
-            if (self._state.phase != 'ready' or self._state.active_job_id or self._state.report_snapshot_pending):
-                raise RuntimeError('The report is busy or the session is unavailable. Try again when it is ready.')
+            if not self._state.quiet:
+                raise RuntimeError(texts.sentence(texts.busy_reason(self._state),
+                                                  'The report is busy or the session is unavailable. '
+                                                  'Try again when it is ready'))
             if not (self._state.report_state or {}).get('available'):
                 raise RuntimeError('No accumulated report exists.')
             request_id = uuid4().hex
@@ -863,7 +988,9 @@ class SessionController:
                 return
             self._send('shutdown', None, {'interrupted': interrupted})
 
-    def _set_report_state(self, report):
+    def _set_report_state(self, report, lookup_type=None, job=None):
+        """The workbook's state is the latest report the session heard of; ``lookup_type`` and ``job`` name the
+        attempt it is also about (a slot's own job), which keeps it: two slots' reports are two attempts' states."""
         if self._state.phase in {'setup_required', 'closing', 'failed', 'closed'}:
             report = dict(report, available=False)
         self._state.latest_report_state = report
@@ -872,27 +999,46 @@ class SessionController:
         current = self._state.report_state or {}
         if current.get('state') != 'deleted' or report.get('available'):
             self._state.report_state = report
-        lookup_type = self._state.active_lookup_type
-        if lookup_type is not None:
-            attempt = self._state.attempts_by_type[lookup_type]
-            if attempt is not None and attempt['job_id'] == self._state.active_job_id:
-                attempt['report_state'] = deepcopy(report)
+        # Without ``lookup_type`` it is about the workbook only (ready, a deletion): no attempt takes it as its own.
+        attempt = self._state.attempts_by_type.get(lookup_type) if lookup_type is not None and job is not None else None
+        if attempt is not None and attempt['job_id'] == job:
+            attempt['report_state'] = deepcopy(report)
+
+    def _running_attempts(self):
+        """The attempts of the jobs both slots run now."""
+        for kind, owner in ((self._state.active_lookup_type, self._state.active_job_id),
+                            ('monitor', self._state.monitor_job_id)):
+            attempt = self._state.attempts_by_type.get(kind) if kind is not None and owner is not None else None
+            if attempt is not None and attempt['job_id'] == owner:
+                yield attempt
 
     def _clear_report_availability(self):
+        """The workbook is no longer available: the session's state says so, and each running attempt keeps its own
+        state with ``available`` off (never another slot's save)."""
         report = self._state.latest_report_state or self._state.report_state
         if report is not None:
             self._set_report_state(dict(report, available=False))
+        for attempt in self._running_attempts():
+            if attempt.get('report_state') is not None:
+                attempt['report_state'] = dict(attempt['report_state'], available=False)
 
     def _accept(self, event):
         with self._lock:
             if event['session_id'] != self.session_id:
                 return
             kind, payload, job = event['kind'], event['payload'], event['job_id']
-            if job is not None and job != self._state.active_job_id:
+            # The slot is found from the event's job (plan 5.6): an event of a job that neither slot runs is dropped.
+            slot = self._slot_of(job)
+            if job is not None and slot is None:
                 return
+            slot_type = 'monitor' if slot == 'monitor' else self._state.active_lookup_type
             if kind in {'progress', 'report_state', 'result', 'lookup_context', 'monitor_update'} or (kind == 'error' and job is not None):
-                if not job or payload.get('lookup_type') != self._state.active_lookup_type:
+                if not job or payload.get('lookup_type') != slot_type:
                     return
+            if slot == 'monitor' and kind not in {'monitor_update', 'report_state', 'result', 'error'}:
+                return  # progress, prompts, partial rows and the sign-in's context are the one-shot job's
+            if slot == 'oneshot' and kind == 'monitor_update':
+                return
             if self._state.phase in {'failed', 'closed'}:
                 return
             if kind == 'reload_result':
@@ -932,10 +1078,7 @@ class SessionController:
                 previous = self._state.monitor_update
                 if previous and (payload['run_id'] != previous['run_id'] or payload['revision'] < previous['revision']):
                     return
-                self._state.monitor_update = deepcopy(payload)
-                self._state.progress_stage = payload['stage']
-                self._state.progress_completed = payload['completed']
-                self._state.progress_total = payload['total']
+                self._state.monitor_update = deepcopy(payload)  # its stage and counts are the Monitor's, not progress_*
             elif kind == 'report_delete_result':
                 try:
                     validate(event)
@@ -980,6 +1123,14 @@ class SessionController:
                     return
                 self._monitor_requests.pop(payload['query_id'], None)
                 self._monitor_pages[payload['query_id']] = deepcopy(payload)
+            elif kind == 'monitor_live_changes_result':
+                expected = self._changes_requests.get(payload['query_id'])
+                current = self._state.monitor_update
+                if (not expected or any(payload[key] != expected[key] for key in ('job_id', 'run_id', 'after')) or
+                        len(payload['entries']) > expected['limit'] or not current or current['run_id'] != payload['run_id']):
+                    return
+                self._changes_requests.pop(payload['query_id'], None)
+                self._changes_answers[payload['query_id']] = deepcopy(payload)
             elif kind in ('monitor_live_map_result', 'monitor_live_host_result'):
                 expected = self._map_requests.get(payload['query_id'])
                 current = self._state.monitor_update
@@ -1004,7 +1155,8 @@ class SessionController:
                 previous = self._state.latest_report_state or {}
                 self._set_report_state(dict(state='idle', status='idle', filename=previous.get('filename', ''),
                                             message='The site lookup was not saved as a report.',
-                                            available=previous.get('available', False), saved_for_attempt=False))
+                                            available=previous.get('available', False), saved_for_attempt=False),
+                                       'demob', self._state.active_job_id)
                 self._demob_expires = monotonic() + 300 if payload['token'] else 0
                 self._job_ended()
                 self._state.credential_request = None
@@ -1065,8 +1217,8 @@ class SessionController:
                 self._state.progress_completed = payload.get('completed')
                 self._state.progress_total = payload.get('total')
             elif kind in {'result', 'error'}:
+                lookup_type = slot_type
                 if kind == 'result':
-                    lookup_type = self._state.active_lookup_type
                     result = payload['result']
                     useful = (result.get('status') == 'complete' if lookup_type in ('config_search', 'demob') else
                               bool(result.get('current_rounds')) if lookup_type == 'monitor' else
@@ -1102,27 +1254,42 @@ class SessionController:
                             matched_count=0, invalid_count=0, resolution_error_count=0, miss_count=0,
                             warning_count=0, stopped=False, details={},
                             **({'sign_in_again': True} if payload.get('sign_in_again') else {}))
-                        self._state.attempts_by_type[self._state.active_lookup_type]['outcome'] = deepcopy(self._state.latest_outcome)
-                        self._attempt_revisions[self._state.active_lookup_type] += 1
+                        self._state.attempts_by_type[lookup_type]['outcome'] = deepcopy(self._state.latest_outcome)
+                        self._attempt_revisions[lookup_type] += 1
                         # A lookup error is not a report failure: the error stays in the attempt's outcome, and the
                         # report says nothing (the workbook, if there is one, stays available).
                         previous = self._state.latest_report_state or {}
                         self._set_report_state(dict(state='idle', status='idle', filename=previous.get('filename', ''),
-                            message='', available=previous.get('available', False), saved_for_attempt=False))
+                            message='', available=previous.get('available', False), saved_for_attempt=False),
+                            lookup_type, job)
+                if slot == 'monitor':  # only the monitor slot ends: the one-shot job, its clock and its prompt go on
+                    self._monitor_ended()
+                    return
                 if self._started_at is not None:
                     self._state.elapsed_seconds = monotonic() - self._started_at
                     self._started_at = None
                 self._job_ended()
                 self._state.credential_request = None
+                if not job:  # the runtime itself failed: the Monitor has ended with it
+                    self._monitor_ended()
                 if self._state.phase != 'closing':
                     self._state.phase = 'ready' if job else 'failed'
                     if not job:
                         self._clear_report_requests()
                         self._clear_report_availability()
             elif kind == 'report_state':
-                self._set_report_state(payload['state'])
-                if payload['state'].get('state') == 'saving' and self._state.phase not in {'closing', 'stopping'}:
-                    self._state.phase = 'saving'
+                self._set_report_state(payload['state'], slot_type, job)
+                said = payload['state'].get('state')
+                if said in {'saving', 'waiting'} and self._state.phase != 'closing':
+                    waiting = said == 'waiting'
+                    if slot == 'monitor':
+                        if waiting or self._state.monitor_phase != 'stopping':  # a stopped Monitor still saves
+                            self._state.monitor_phase = 'saving'
+                        self._state.monitor_save_waiting = waiting
+                    elif slot == 'oneshot':
+                        if self._state.phase != 'stopping':
+                            self._state.phase = 'saving'
+                        self._state.save_waiting = waiting
             elif kind == 'report_snapshot' and payload['request_id'] not in self._report_requests:
                 # Released before it was ready: nobody will download it, so the file goes now. The worker has
                 # finished preparing it, though, which is what report_snapshot_pending stands for.
@@ -1156,6 +1323,8 @@ class SessionController:
                 self._monitor_pages.clear()
                 self._map_requests.clear()
                 self._map_answers.clear()
+                self._changes_requests.clear()
+                self._changes_answers.clear()
                 self._config_requests.clear()
                 self._config_pages.clear()
                 self._state.results_by_type['config_search'] = None
@@ -1169,6 +1338,7 @@ class SessionController:
                 self._report_streams.clear()
                 self._last_requests.clear()
                 self._job_ended()
+                self._monitor_ended()
 
     def _receive(self):
         try:
@@ -1193,6 +1363,7 @@ class SessionController:
                     self._clear_report_availability()
                     self._state.error = 'Worker connection closed unexpectedly. Relaunch to start a new session.'
                     self._job_ended()
+                    self._monitor_ended()
                     self._state.credential_request = None
         finally:
             with self._lock:

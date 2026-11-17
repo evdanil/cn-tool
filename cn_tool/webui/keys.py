@@ -25,8 +25,8 @@ MAIN_LABEL = 'Page content'
 MAIN_ID = 'cn-main'
 REPORT_HELP = ('The report is one workbook for the whole session. The Report menu in the header names it and '
                'downloads it; a page only says what its own latest run did to it.')
-STOP_HELP = ('Stop ends only the job of the page you are on, never another tool\'s job. A Monitor is stopped '
-             'from the Monitor page.')
+STOP_HELP = ('Stop ends only the job of the page you are on. For a job of another tool, the header has Stop… '
+             'beside its pill: it asks first and ends only that job.')
 
 
 @dataclass(frozen=True)

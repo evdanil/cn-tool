@@ -16,6 +16,63 @@ reference must use a tag containing those documents. Do not point the new guides
 at an older tag that contains only the original README. Validate local staged
 files and fragments before publishing, and check their public URLs after publication.
 
+## Unreleased
+
+## 0.14.0
+
+A Monitor can now run beside one other tool in the browser, every Targets box reads pasted lists the same way, and the
+Monitor says what changed. The command line and the menu are unchanged, except for the new `[ping] parallel_probes`
+setting.
+
+**A Monitor runs beside one other tool in the browser.** Start a Subnets, IP or Ping lookup, a configuration search or a
+Site Demobilization check while a Monitor runs, and the Monitor's rounds go on; each job stops, saves and ends alone.
+Two lookups still do not run together, and a second Monitor does not start. The header shows both jobs, each with a
+pill and, on a page that does not own the job, **Stop…**, which asks first. The banner on a page that cannot start a
+lookup says "Other lookups wait until it finishes." (a Monitor makes nothing wait). A job that is only waiting to save
+its report, because the other job is saving, can be stopped, and then it is not saved. **Delete report…** and **Use the
+new settings now** wait until both jobs have ended and say which job is in the way. A Ping beside a Monitor is two
+sweeps at once, so up to twice the `ping` processes and TCP probes of either alone; `[ping] parallel_probes` limits
+each. See [Reports, Stop and Quit](webui.md#reports-stop-and-quit).
+
+**Every Targets box reads what you paste the same way.** On Subnets, IP, Ping and Monitor, items may be separated by
+lines, commas, semicolons or spaces; `10.20.40.0 255.255.255.192` is one network, `192.0.2.10-20` is a range (not on
+Subnets), a URL or `host:port` gives its host, and `#` starts a comment. A line under the box says what it holds and
+lists what was not understood. The box keeps your text, what is sent is one item per line, and the command line is
+unchanged. A Targets box holds what it can send, about 900 KB (roughly 75,000 addresses, one per line): a paste or an edit that
+would pass that is refused whole, the box keeps what it had, and a message under it says to split the list, use ranges or
+CIDR, or use a file with the command line (before, a paste of about a megabyte was silently lost). **Ping these** and
+**Monitor these** write a long run of consecutive addresses as one range, which reads the same, and say so when a list
+cannot be written to fit.
+
+**The Monitor lists what changed.** A closed **Changes** box beside the Map and Table buttons shows the hosts that started or
+stopped answering in each complete round, newest first, with the time (UTC), the host and its address and the Map's
+words for the old and new state; **Show on map** puts the Map's cursor on the host. The last 200 changes are kept, and a
+gap is said, not guessed. While the tab is in the background its title counts the hosts that stopped answering
+("(3↓) Monitor – cn-tool"). **Notify me about changes** is an opt-in desktop notification, one per changed round, with
+counts and no host names, sent only while the page is not visible and focused. See
+[Changes and notifications](webui.md#changes-and-notifications).
+
+**Subnets: Show Available as a table.** On a lookup of several networks, **Show Available** shows the unused addresses of
+all of them in a table on the page, above the summary (paged, with a filter), as well as the **Download available IPs**
+button; before, the table was only inside each network's details.
+
+**A new setting, `[ping] parallel_probes`,** sets how many hosts Ping and the Ping Monitor ping, and TCP-probe, at the same
+time: in `cn ping`, `cn monitor`, the menu and the browser. It takes a whole number from 1 to 1024; the default is 100,
+the number every earlier version used, so a configuration without it behaves as before. It is an upper bound: on Linux
+and macOS every ping keeps a file open and every TCP probe another, and when the system's open-file limit is too low
+even after cn has raised its own, fewer run at once and the run says so when it starts (on the command line; in the
+browser only in the log file). A value outside 1 to 1024 is reported and 100 is used; `cn doctor` shows it as an error,
+and the browser's **Settings** page does not save it. A Monitor run uses the value it started with. A ping that cannot
+start because no file or process is left now reads `ERROR` for that host, and a TCP probe that gets no thread reads
+`error`, instead of ending the run with an error. The default, 100, is never lowered. See
+[Configuration](configuration.md).
+
+**A restored Targets box no longer stays empty on a slow machine.** After **Ping these**, **Monitor these**, a reload or
+a return to a tab, the box could be enabled but left empty when the browser's answer took more than five seconds, and
+text typed then replaced the kept list. The page now writes the kept text as soon as it can.
+
+No configuration change or migration is needed, and no dependency changed.
+
 ## 0.13.0
 
 The web interface is reworked so that every tool reads the same way and the results are on the first screen. The command

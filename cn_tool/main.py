@@ -957,13 +957,22 @@ def _run_tracked(
     call: Callable[[], T],
     *,
     outcome: Optional[Callable[[T], str]] = lambda _result: "completed",
+    concurrent: bool = False,
 ) -> T:
     """
     Run ``call`` (a module's menu or command-line entry point), recording the run in the statistics.
     ``outcome`` names the recorded status of a run that returned (the menu's always completed);
     None leaves the run open for the caller to finish once it knows the real outcome.
+
+    ``concurrent`` records the run with its own handle (``StatsManager.begin_run``), beside the session's one
+    active run, which it neither interrupts nor ends: the web UI's Monitor. It needs an ``outcome``. Alone, it
+    writes the same record as the default path.
     """
     stats = _tracked_stats(ctx, module)
+    if concurrent:
+        if outcome is None:
+            raise ValueError("A concurrent run is recorded to its end: give it an outcome")
+        return _run_with_handle(ctx, module, call, stats, outcome)
     tracked = stats is not None
     if tracked:
         stats.start_module_run(module)
@@ -982,6 +991,28 @@ def _run_tracked(
         raise
     if tracked and outcome is not None:
         stats.finish_module_run(outcome(result))
+    return result
+
+
+def _run_with_handle(ctx: ScriptContext, module: BaseModule, call: Callable[[], T], stats: Any,
+                     outcome: Callable[[T], str]) -> T:
+    """``_run_tracked(concurrent=True)``: the same statuses, on this run's own handle only."""
+    handle = stats.begin_run(module) if stats is not None else None
+    try:
+        result = call()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        if stats is not None:
+            stats.end_run(handle, "interrupted", session_status="interrupted")
+        raise
+    except Exception:
+        ctx.logger.exception("Unhandled exception while running module '%s'", module.menu_title)
+        if stats is not None:
+            stats.end_run(handle, "failed", session_status="failed")
+        raise
+    if stats is not None:
+        stats.end_run(handle, outcome(result))
     return result
 
 

@@ -35,8 +35,11 @@ FIELDS = {
     'monitor_live_map_result': {'job_id', 'run_id', 'revision', 'show', 'query_id', 'status', 'current_revision', 'map'},
     'monitor_live_host': {'job_id', 'run_id', 'revision', 'block', 'cell', 'query_id'},
     'monitor_live_host_result': {'job_id', 'run_id', 'revision', 'block', 'cell', 'query_id', 'status', 'current_revision', 'host'},
+    # The change feed (plan 7.4): the entries after sequence number ``after``, oldest first; ``last_seq`` the newest.
+    'monitor_live_changes': {'job_id', 'run_id', 'after', 'limit', 'query_id'},
+    'monitor_live_changes_result': {'job_id', 'run_id', 'after', 'query_id', 'status', 'entries', 'last_seq'},
     'monitor_update': {'lookup_type', 'run_id', 'revision', 'stage', 'completed', 'total', 'current_rounds', 'earlier_rounds', 'skipped_slots', 'history_error',
-                       'round_at', 'next_at', 'hosts'},
+                       'round_at', 'next_at', 'hosts', 'changes_seq'},
     'progress': {'stage', 'lookup_type', 'completed', 'total'},
     'partial_result': {'lookup_type', 'rows', 'completed', 'total'},
     'result': {'result', 'outcome', 'lookup_type'}, 'report_state': {'state', 'lookup_type'},
@@ -51,10 +54,13 @@ PAGE_ROWS_MAX = 1024
 # The rows of one live Monitor page: the web "All" page size (table_export.MAX_PAGE_ROWS).
 LIVE_PAGE_MAX = 1024
 LIVE_FILTERS = ('host', 'address', 'result', 'tcp')  # the live table's columns; 'any' filters by all of them
-# A Ping's partial result: the rows of one batch (``bulk_ping.BATCH_SIZE``) and the most rows the controller keeps for a
-# running Ping (``bulk_ping.MAX_PING_HOSTS``, 65,534, and one for an IPv6 /112, which has 65,535 hosts).
-PARTIAL_BATCH_MAX = 100
+# A Ping's partial result: the rows of one batch, at most the largest [ping] parallel_probes
+# (``config.MAX_PING_PARALLEL_PROBES``), and the most rows the controller keeps for a running Ping
+# (``bulk_ping.MAX_PING_HOSTS``, 65,534, and one for an IPv6 /112, which has 65,535 hosts). One event carries at most
+# PARTIAL_BYTES_MAX bytes of rows: ``ping_partial.sender`` splits a batch whose rows are more.
+PARTIAL_BATCH_MAX = 1024
 PING_ROWS_MAX = 65536
+PARTIAL_BYTES_MAX = 512 * 1024
 # A row count does not bound memory: each value of a partial row is at most PARTIAL_VALUE_MAX characters (a column name
 # PARTIAL_KEY_MAX) and the controller keeps at most PING_PARTIAL_BYTES_MAX bytes of them for a running Ping.
 PARTIAL_VALUE_MAX = 8192
@@ -70,11 +76,17 @@ SIGN_IN_TRIES = 3
 # A time on the wire is seconds since the epoch, and 0 means none. The bound is 9999-12-31T23:59:59Z, the last second
 # a datetime can show, so a page formats whatever passed here.
 MOMENT_MAX = 253402300799
+# The Monitor's change feed (monitor_changes.ChangeFeed): the entries it keeps, the most one answer carries, and the
+# largest sequence number (a JavaScript number counts exactly up to it).
+CHANGES_KEPT = 200
+CHANGES_PAGE_MAX = 50
+SEQ_MAX = 2 ** 53 - 1
+_CHANGE_FIELDS = frozenset(('seq', 'at', 'round', 'host', 'address', 'before', 'after', 'block', 'cell'))
 for _kind in ('demob_page', 'demob_page_result', 'config_search_page', 'config_search_page_result'):
     FIELDS[_kind] |= _PAGE_OPTIONS
 FIELDS['demob_page_result'] |= {'columns', 'overall_total'}
 FIELDS['config_search_page_result'] |= {'overall_total', 'device_counts'}
-COMMANDS = frozenset(('delete_report', 'initialize', 'reload_config', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_live_map', 'monitor_live_host', 'monitor_history', 'monitor_coverage_export', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
+COMMANDS = frozenset(('delete_report', 'initialize', 'reload_config', 'credentials_reply', 'lookup', 'cancel', 'snapshot_report', 'shutdown', 'forget_credentials', 'monitor_live_page', 'monitor_live_map', 'monitor_live_host', 'monitor_live_changes', 'monitor_history', 'monitor_coverage_export', 'monitor_delete', 'config_search_page', 'demob_lookup', 'demob_confirm', 'demob_decline', 'demob_page'))
 
 
 def _short_text(value, limit):
@@ -141,6 +153,46 @@ def _valid_live_host(answer):
 def _valid_moment(value):
     """``round_at`` and ``next_at`` of a Monitor update: a finite number from 0 (none) to ``MOMENT_MAX``."""
     return type(value) in (int, float) and 0 <= value <= MOMENT_MAX  # a NaN fails both comparisons
+
+
+def _seq(value, low=0):
+    return type(value) is int and low <= value <= SEQ_MAX
+
+
+def valid_change(entry, after, last_seq):
+    """One entry of the change feed: a host whose seen state a complete round changed, from ``before`` to ``after``
+    (``ping_grid``'s characters), at its place in the Map (``block`` and ``cell``, or neither)."""
+    return (isinstance(entry, dict) and set(entry) == _CHANGE_FIELDS and _seq(entry['seq'], after + 1) and
+            entry['seq'] <= last_seq and _valid_moment(entry['at']) and _seq(entry['round'], 1) and
+            _short_text(entry['host'], 255) and bool(entry['host']) and _short_text(entry['address'], 255) and
+            all(isinstance(entry[key], str) and len(entry[key]) == 1 and entry[key] in MAP_CHARS
+                for key in ('before', 'after')) and
+            ((entry['block'] is None and entry['cell'] is None) or
+             all(type(entry[key]) is int and 0 <= entry[key] < MAP_CELLS_MAX for key in ('block', 'cell'))))
+
+
+def _validate_changes(kind, message, payload):
+    if message['job_id'] is not None or set(payload) != FIELDS[kind]:
+        raise ValueError('Invalid change feed envelope')
+    if any(not isinstance(payload[k], str) or not payload[k] or len(payload[k]) > 128 or
+               not payload[k].isascii() or not payload[k].isprintable() for k in ('job_id', 'run_id', 'query_id')):
+        raise ValueError('Invalid change feed identifier')
+    if not _seq(payload['after']):
+        raise ValueError('Invalid change feed position')
+    if kind == 'monitor_live_changes':
+        if type(payload['limit']) is not int or not 1 <= payload['limit'] <= CHANGES_PAGE_MAX:
+            raise ValueError('Invalid change feed limit')
+        return
+    entries, last_seq = payload['entries'], payload['last_seq']
+    if (payload['status'] not in ('ready', 'unavailable') or not _seq(last_seq) or not isinstance(entries, list) or
+            len(entries) > CHANGES_PAGE_MAX or
+            (payload['status'] == 'unavailable' and (entries or last_seq))):
+        raise ValueError('Invalid change feed result')
+    previous = payload['after']
+    for entry in entries:
+        if not valid_change(entry, previous, last_seq):
+            raise ValueError('Invalid change feed entry')
+        previous = entry['seq']  # oldest first, each once
 
 
 def envelope(session_id, job_id, kind, payload):
@@ -255,6 +307,9 @@ def valid_monitor_history_item(kind, item):
                 text(item['note']))
     return False
 
+# ``state`` of a `report_state` event is free text to the protocol; the words the worker uses: off, idle, pending,
+# saving, saved, failed, deleted, and `waiting` (R3-04): the job's report is due but another job holds the report gate;
+# `saving` follows once it has the gate. A free gate never produces a `waiting`.
 def _valid_report_state(report):
     fields = {'state', 'status', 'filename', 'message', 'available', 'saved_for_attempt'}
     return (isinstance(report, dict) and set(report) == fields
@@ -516,6 +571,9 @@ def validate(message):
                                            else _valid_live_host(answer)):
                 raise ValueError('Invalid live map answer')
         return message
+    if kind in {'monitor_live_changes', 'monitor_live_changes_result'}:
+        _validate_changes(kind, message, payload)
+        return message
     if kind in {'monitor_live_page', 'monitor_live_page_result'}:
         optional = {'sort', 'descending', 'group', 'filter_field', 'filter_text'} if kind == 'monitor_live_page' else {'total', 'counts'}
         base = FIELDS[kind] - optional - {'filter_exact'}
@@ -580,7 +638,8 @@ def validate(message):
     if kind == 'monitor_update':
         # 'hosts': how many hosts the run probes, 0 until it knows; it stays between two rounds, when 'total' is 0.
         counts = ('revision', 'completed', 'total', 'current_rounds', 'earlier_rounds', 'skipped_slots', 'hosts')
-        if (payload.get('lookup_type') != 'monitor' or not isinstance(payload.get('run_id'), str)
+        # 'changes_seq': the newest sequence number of the run's change feed, 0 before its first change.
+        if (payload.get('lookup_type') != 'monitor' or not _seq(payload.get('changes_seq')) or not isinstance(payload.get('run_id'), str)
                 or not payload['run_id'] or len(payload['run_id']) > 128 or not payload['run_id'].isascii()
                 or not payload['run_id'].isprintable() or any(type(payload.get(k)) is not int or payload[k] < 0 for k in counts)
                 or payload['completed'] > payload['total']
@@ -604,7 +663,7 @@ def validate(message):
                 type(completed) is not int or type(total) is not int or
                 not len(rows) <= completed <= total <= PING_ROWS_MAX):
             raise ValueError('Invalid partial result')
-        if len(json.dumps(rows, ensure_ascii=False, allow_nan=False).encode('utf-8')) > 512 * 1024:
+        if len(json.dumps(rows, ensure_ascii=False, allow_nan=False).encode('utf-8')) > PARTIAL_BYTES_MAX:
             raise ValueError('Partial result exceeds limit')
     if kind == 'error':
         required -= {'sign_in_again'}  # only a job whose typed password Infoblox refused says it
@@ -641,7 +700,7 @@ def validate(message):
             if type(value) is not int or not 10 <= value <= 2**53 - 1:
                 raise ValueError('Invalid Monitor timing')
         elif key in {'completed', 'total', 'revision', 'current_rounds', 'earlier_rounds', 'skipped_slots',
-                     'round_at', 'next_at', 'hosts', 'tries_left'}:
+                     'round_at', 'next_at', 'hosts', 'changes_seq', 'tries_left'}:
             continue
         elif key == 'inputs':
             if not isinstance(value, list) or not all(isinstance(i, str) for i in value):

@@ -33,6 +33,10 @@ AUTH_ENV_DEFAULTS: Dict[str, str] = {
 
 # Days of ping history kept when [ping] history_days is not set: a monitor that runs for months keeps its evidence.
 DEFAULT_PING_HISTORY_DAYS = 180
+# [ping] parallel_probes: the most hosts Ping and the Ping Monitor ping, and TCP-probe, at the same time. The default is
+# the batch every release before it used; the protocol's partial result takes a batch of the maximum.
+DEFAULT_PING_PARALLEL_PROBES = 100
+MAX_PING_PARALLEL_PROBES = 1024
 
 BASE_CONFIG_SCHEMA = {
     "api_endpoint":          {"section": "api", "ini_key": "endpoint", "type": "str", "fallback": "API_URL"},
@@ -78,6 +82,10 @@ BASE_CONFIG_SCHEMA = {
     "cache_sqlite_mmap_size":  {"section": "cache", "ini_key": "sqlite_mmap_size", "type": "str", "fallback": "32M"},
     "ping_history_file":     {"section": "ping", "ini_key": "history_file", "type": "path", "fallback": "~/.cn-ping-history.db"},
     "ping_history_days":     {"section": "ping", "ini_key": "history_days", "type": "int", "fallback": DEFAULT_PING_HISTORY_DAYS},
+    # An int with limits ("min", "max"): read with configured_int, which reports a value outside them; the Settings
+    # page refuses one (config_editor.validate_value).
+    "ping_parallel_probes":  {"section": "ping", "ini_key": "parallel_probes", "type": "int",
+                              "fallback": DEFAULT_PING_PARALLEL_PROBES, "min": 1, "max": MAX_PING_PARALLEL_PROBES},
     "theme_name":            {"section": "theme", "ini_key": "theme", "type": "str", "fallback": "default"},
     # Config Analyzer (external TUI) settings
     "config_repo_history_dir":     {"section": "config_repo", "ini_key": "history_dir", "type": "str", "fallback": "history"},
@@ -202,10 +210,41 @@ def coerce_config_value(raw: str, spec: Dict[str, Any], logger: logging.Logger =
         try:
             return int(clean)
         except (ValueError, TypeError):
+            if "max" in spec:
+                return clean  # an int with limits keeps its text: configured_int reports it where it is read
             if logger:
                 logger.warning("CONFIG: Could not convert '%s' to int for key. Using fallback.", clean)
             return spec.get("fallback")
     return clean
+
+
+def whole_number_rule(spec: Mapping[str, Any]) -> str:
+    """"a whole number from 1 to 1024": what an int with limits (``min`` and ``max`` on its schema entry) must be."""
+    return f"a whole number from {spec['min']} to {spec['max']}"
+
+
+def configured_int(cfg: Mapping[str, Any], key: str) -> Tuple[int, str]:
+    """
+    The value of an int with limits (``BASE_CONFIG_SCHEMA[key]`` has ``min`` and ``max``) and ``""``, or its default
+    and the problem to report: ``[ping] parallel_probes must be a whole number from 1 to 1024; using 100``.
+
+    A value that is missing (no file sets it, or a context built without reading one) is the default with no problem.
+    Anything but a whole number within the limits is a problem: text that is not one (``read_config`` keeps it as
+    text), a bool, a float, zero, a negative number, a number over the maximum. The text names the key, never the value.
+    """
+    spec = BASE_CONFIG_SCHEMA[key]
+    fallback = spec["fallback"]
+    value = cfg.get(key)
+    if value is None:
+        return fallback, ""
+    if isinstance(value, str):
+        try:
+            value = int(value.strip())
+        except ValueError:
+            pass
+    if type(value) is int and spec["min"] <= value <= spec["max"]:
+        return value, ""
+    return fallback, f"[{spec['section']}] {spec['ini_key']} must be {whole_number_rule(spec)}; using {fallback}"
 
 
 def _apply_types(cfg: Dict[str, Any], schema: Dict[str, Any], logger: logging.Logger) -> Dict[str, Any]:

@@ -63,6 +63,12 @@ version = 6
 # replied (cn monitor --available, Show Available in the browser) rests on the rounds kept, so set this to
 # cover the period you want to judge.
 # history_days = 180
+# The most hosts Ping and the Ping Monitor ping, and TCP-probe, at the same time (menu 6 and m, cn ping,
+# cn monitor, the browser's Ping and Monitor). A whole number from 1 to 1024. It is an upper bound: on Linux and
+# macOS every ping keeps a file open and every TCP probe another, so the system's open-file limit can lower it. cn
+# then runs fewer at once and says so when the run starts (in the browser only in the log file). Process limits can
+# also refuse a probe, which then reads as an error. A Monitor run reads it when it starts.
+# parallel_probes = 100
 
 [theme]
 # theme = default

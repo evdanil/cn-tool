@@ -9,6 +9,7 @@ workbook is (`report_menu_line`, `REPORT_DOWNLOAD_HELP`), and a page says only w
 """
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -158,27 +159,33 @@ def _since(started, now) -> str:
     return f"since {day + ' ' if day != today else ''}{utc_time(started)[:5]} UTC"
 
 
+# Two jobs can run (R3-03): a lookup makes the other lookups wait, and the Monitor is not one of the tools it holds back.
+WAIT_FINISHES = 'Other lookups wait until it finishes'
+
+
 def job_notice(state, *, page: str, hosts: int | None = None, now: float | None = None) -> JobNotice | None:
-    """The banner of page ``page`` for a job it does not own, or None. ``hosts`` is the size the caller remembers
+    """The banner of page ``page`` for a one-shot job it does not own, or None (a Monitor never has one: it makes
+    nobody wait, and the indicator names it). ``hosts`` is the size the caller remembers
     (`job_size`) for the moments the snapshot does not carry it; ``now`` only decides whether the start needs a date."""
     if state is not None and state.phase not in _ENDING and state.report_delete_pending:
         return JobNotice('The report is being deleted. Tools wait until it finishes.', '', '')
     tool = _job(state)
-    if tool is None or tool == page or state.phase not in {'running', 'stopping', 'saving'}:
+    # A Monitor makes no tool wait (R3-03, plan 5.7): its place is the header's indicator, never a banner.
+    if tool is None or tool == 'monitor' or tool == page or state.phase not in {'running', 'stopping', 'saving'}:
         return None
     name, (route, label) = TOOL_NAMES[tool], TOOL_PAGES[tool]
     if state.phase == 'saving':
-        text = sentence(f'The report of {_THE_JOB[tool]} is being saved', 'Other tools wait until it finishes')
+        text = sentence(f'The report of {_THE_JOB[tool]} is being saved', WAIT_FINISHES)
     elif state.phase == 'stopping':
-        text = sentence(f'{name} is stopping', 'Other tools wait until it has stopped')
+        text = sentence(f'{name} is stopping', 'Other lookups wait until it has stopped')
     else:
         # The banner is a live region (role=status): it names the job's size and start, which stand still. What
         # moves (a Ping's hosts probed, a Monitor's round) is in the header's pill, which announces nothing.
-        size = (job_size(state) or hosts) if tool in ('ping', 'monitor') else None
+        size = (job_size(state) or hosts) if tool == 'ping' else None
         since = _since(state.active_started_at, now)
         running = (f"{name} is running: {', '.join([plural(size, 'host')] + ([since] if since else []))}" if size
                    else f'{name} is running {since}'.rstrip())
-        text = sentence(running, 'Other tools wait until it ' + ('stops' if tool == 'monitor' else 'finishes'))
+        text = sentence(running, WAIT_FINISHES)
     return JobNotice(text, route, f'Open {label}')
 
 
@@ -188,7 +195,9 @@ def job_indicator(state) -> JobNotice | None:
     if tool is None or state.phase not in {'running', 'stopping', 'saving'}:
         return None
     name, (route, label) = TOOL_NAMES[tool], TOOL_PAGES[tool]
-    if state.phase != 'running':
+    if state.phase == 'saving' and state.save_waiting:
+        detail = 'waiting to save'  # another job holds the report gate (plan 5.9)
+    elif state.phase != 'running':
         detail = state.phase
     elif tool == 'monitor':
         detail = f'round {_round(state)}'
@@ -197,6 +206,43 @@ def job_indicator(state) -> JobNotice | None:
     else:
         detail = ''
     return JobNotice(f'{name} · {detail}' if detail else name, route, label)
+
+
+INDICATOR_STOP = 'Stop…'  # the indicator's button: it asks before it stops (``stop_warning``), hence the dots
+_SHORT_STOP = {'subnet': 'lookup', 'ip': 'lookup', 'ping': 'Ping', 'monitor': 'Monitor', 'config_search': 'search',
+               'demob': 'site check'}
+
+
+def indicator_stop_label(tool: str) -> str:
+    """The name of the indicator's Stop button for a screen reader: it says which job, as the dots cannot."""
+    return f'Stop {TOOL_NAMES[tool]}…'
+
+
+def stop_warning(state, *, hosts: int | None = None) -> QuitWarning | None:
+    """The question the indicator's Stop… asks about the job in ``state`` (one slot's view), or None when that job
+    cannot be stopped now (it is not running). A stop outside the page that owns the job asks first (B2)."""
+    from .job_slots import stoppable
+
+    tool = _job(state)
+    if tool is None or not stoppable(state):
+        return None
+    if state.phase == 'saving':  # a one-shot job that waits for the report gate
+        lines = (f'{_A_JOB[tool]} is waiting to save its report.', 'Stop ends it. It is not saved.')
+    elif tool == 'monitor':
+        size, rounds = job_size(state) or hosts, (state.monitor_update or {}).get('current_rounds') or 0
+        counts = ', '.join(([plural(size, 'host')] if size else []) + ([plural(rounds, 'round')] if rounds else []))
+        lines = (sentence('The Monitor is running' + (f': {counts}' if counts else '')),
+                 'Stop ends it once the probes in flight have finished, and saves what it has.')
+    elif tool in ('config_search', 'demob'):
+        lines = (f'{_A_JOB[tool]} is running.', 'Stop ends it. Its results are not saved.')
+    else:
+        lines = (f'{_A_JOB[tool]} is running.', 'Stop ends it. A stopped lookup is not saved to the report.')
+    return QuitWarning(f'Stop {_THE_JOB[tool]}?', lines, f'Stop {_SHORT_STOP[tool]}', (f'stop:{tool}:{state.active_job_id}',))
+
+
+def stop_too_late(tool: str) -> str:
+    """What the indicator's Stop… says when the job ended while the question was open ("The Monitor had already ended.")."""
+    return sentence(f'{_THE_JOB[tool][0].upper()}{_THE_JOB[tool][1:]} had already ended')
 
 
 def job_ended_notice(tool: str, *, hosts: int | None = None, stopped: bool = False) -> str:
@@ -234,7 +280,7 @@ def own_status(state, *, page: str) -> str:
             return 'Waiting: a report is being saved'
         return f"Waiting: {TOOL_NAMES[tool]} is {'stopping' if state.phase == 'stopping' else 'running'}"
     if state.phase == 'saving':
-        return 'Saving the report…'
+        return 'Waiting to save the report…' if state.save_waiting else 'Saving the report…'
     if state.phase == 'stopping':
         return 'Stopping… waiting for probes to finish' if tool in ('ping', 'monitor') else 'Stopping…'
     stage, completed, total = _progress(state, tool)
@@ -252,23 +298,27 @@ def quit_warning(state, *, unsaved: bool = False, hosts: int | None = None) -> Q
 
     ``unsaved`` is the Settings page's own fact; ``hosts`` is the Monitor's size as the caller remembers it. A job's
     fact names the job itself, not only its tool: an answer given for one run is not an answer for the next."""
+    from .job_slots import running_views
+
     lines, facts = [], []
-    tool = _job(state)
-    if tool is not None and state.phase == 'saving':
+    # Each slot's job (the one-shot job, then the Monitor: R3-03); a job that saves is said once, as "a report".
+    jobs = [(view, _job(view)) for view in running_views(state) if _job(view) is not None]
+    if any(view.phase == 'saving' for view, _ in jobs):
         lines.append('A report is being saved. Quit waits for it.')
         facts.append('saving')
-    elif tool == 'monitor':
-        size, rounds = job_size(state) or hosts, (state.monitor_update or {}).get('current_rounds') or 0
-        counts = ', '.join(([plural(size, 'host')] if size else []) + ([plural(rounds, 'round')] if rounds else []))
-        lines.append(sentence('A monitor is running' + (f': {counts}' if counts else ''),
-                              'Quit stops it and saves what it has'))
-        facts.append(f'job:monitor:{state.active_job_id}')
-    elif tool in ('config_search', 'demob'):
-        lines.append(f'{_A_JOB[tool]} is running. Quit stops it; its results are not saved.')
-        facts.append(f'job:{tool}:{state.active_job_id}')
-    elif tool is not None:
-        lines.append(f'{_A_JOB[tool]} is running. Quit waits for it to finish and saves it.')
-        facts.append(f'job:{tool}:{state.active_job_id}')
+    for view, tool in jobs:
+        if view.phase == 'saving':
+            continue
+        if tool == 'monitor':
+            size, rounds = job_size(view) or hosts, (view.monitor_update or {}).get('current_rounds') or 0
+            counts = ', '.join(([plural(size, 'host')] if size else []) + ([plural(rounds, 'round')] if rounds else []))
+            lines.append(sentence('A monitor is running' + (f': {counts}' if counts else ''),
+                                  'Quit stops it and saves what it has'))
+        elif tool in ('config_search', 'demob'):
+            lines.append(f'{_A_JOB[tool]} is running. Quit stops it; its results are not saved.')
+        else:
+            lines.append(f'{_A_JOB[tool]} is running. Quit waits for it to finish and saves it.')
+        facts.append(f'job:{tool}:{view.active_job_id}')
     if state is not None and state.phase not in _ENDING:
         if state.report_snapshot_pending:
             lines.append('A report download is being prepared. Quit cancels it.')
@@ -284,8 +334,63 @@ def quit_warning(state, *, unsaved: bool = False, hosts: int | None = None) -> Q
     return QuitWarning('Quit cn-tool?', (*lines, EXIT_ACTIONS), 'Quit', tuple(facts))
 
 
+_DOING = {'running': 'is running', 'stopping': 'is stopping', 'saving': 'is saving its report'}
+
+
+def busy_reason(state) -> str:
+    """Why nothing that needs a quiet session can start now, in words that name the jobs ("Ping is running and Monitor
+    is stopping."), or '' when nothing says it. The Report menu's Delete report and Settings' Use the new settings now
+    give it as their visible reason, and the controller's refusals begin with it."""
+    from .job_slots import running_views
+
+    if state is None or state.phase in _ENDING:
+        return ''
+    parts = [f"{TOOL_NAMES[tool]} {'is waiting to save its report' if view.save_waiting and view.phase == 'saving' else _DOING[view.phase]}"
+             for view in running_views(state) if (tool := _job(view)) is not None and view.phase in _DOING]
+    text = sentence(' and '.join(parts)) if parts else ''
+    if state.report_snapshot_pending:
+        text = sentence(text, 'A report download is being prepared')
+    if state.report_delete_pending:
+        text = sentence(text, 'The report is being deleted')
+    return text
+
+
+_JOBS_IN_THE_WAY = re.compile(r' is (running|stopping|saving|waiting)')
+
+
+def _unavailable(state, what, jobs, download) -> str:
+    """``what`` waits: the jobs that are in the way, or a download in preparation; nothing while a deletion runs (the
+    status line already says "Deleting report…")."""
+    if state is None or state.report_delete_pending:
+        return ''
+    reason = busy_reason(state)
+    if not reason:
+        return ''
+    return sentence(reason, f'{what} is available once {jobs if _JOBS_IN_THE_WAY.search(reason) else download}')
+
+
+def delete_unavailable(state) -> str:
+    """The visible reason beside Delete report… while it is off because work runs; '' when work is not the reason."""
+    return _unavailable(state, 'Delete report', 'nothing is running or saving', 'the download is ready')
+
+
+def reload_unavailable(state) -> str:
+    """The visible reason beside Settings' Use the new settings now while work runs; '' when it is not the reason."""
+    return _unavailable(state, 'Use the new settings now', 'nothing is running', 'the download is ready')
+
+
+def reload_refusal(state) -> str:
+    """The controller's refusal of a reload while work runs: the reason, then the rule."""
+    return sentence(busy_reason(state), 'The settings can be reloaded when no work is running',
+                    'Try again when it finishes')
+
+
 REPORT_DOWNLOAD_HELP = 'Download copies the report as it is once pending saves have finished.'
-_SAVING = {'pending', 'saving'}
+
+
+def _saving(state) -> bool:
+    # A stopped Monitor always saves its rounds and stays `stopping` until it ends; a stopped one-shot job is not saved.
+    return state.phase == 'saving' or state.monitor_phase in {'stopping', 'saving'}
 
 
 def report_menu_line(state) -> str:
@@ -295,13 +400,18 @@ def report_menu_line(state) -> str:
         return 'The report is not known yet'
     report = state.report_state or {}
     kind, name, available = report.get('state'), report.get('filename') or '', report.get('available') is True
-    saving = ' · a save is in progress' if kind in _SAVING else ''
+    # The workbook's state is the latest event's of either slot, so it cannot say that a save is on: the slots' own
+    # phases do (a Monitor's end can overwrite the state while a lookup still saves).
+    busy = _saving(state)
+    saving = ' · a save is in progress' if busy else ''
+    if not busy and kind != 'off' and state.monitor_phase == 'running':
+        saving = ' · the Monitor is saved when it stops'  # a Monitor writes its rounds at its end, not round by round
     if available:
         if kind == 'off':
             return f'Reporting is off · {name} contains earlier data' if name else 'Reporting is off · the report contains earlier data'
         if not name:
             return 'The report contains earlier data' + saving
-        latest = kind == 'saved' and report.get('saved_for_attempt')
+        latest = kind == 'saved' and report.get('saved_for_attempt') and not busy
         return f"{name} · {'includes the latest run' if latest else 'contains earlier data'}{saving}"
     if kind == 'off':
         return 'Reporting is off'
@@ -354,3 +464,92 @@ def sign_in_again(outcome) -> bool:
     """Whether an attempt's ``outcome`` offers "Sign in again": the worker said so (``sign_in_again``), and no later
     sign-in of the session has succeeded since (the controller then drops the mark)."""
     return isinstance(outcome, dict) and outcome.get('sign_in_again') is True
+
+
+# --- The Monitor's change feed (plan 7.4, R3-08) --------------------------------------------------------------------
+# Words come from the Map's own table (`monitor_map.STATE_WORDS`), cut at their bracket: a list line is short, the Map's
+# popup gives the long form. "Went to no answer" is "the state after the change is not one of `ANSWERS`".
+TITLE_COUNT = '({count}↓) {title}'  # the page script formats the same template (it is given this text)
+TITLE_COUNT_MAX = 99
+
+
+def state_word(char: str) -> str:
+    from .monitor_map import STATE_WORDS
+    return STATE_WORDS.get(char, 'unknown').split(' (')[0]
+
+
+def change_words(before: str, after: str) -> str:
+    return f'{state_word(before)} → {state_word(after)}'
+
+
+def change_host(entry) -> str:
+    host, address = entry['host'], entry['address']
+    return f'{host} ({address})' if address and address != host else host
+
+
+def change_line(entry) -> str:
+    return ' · '.join((utc_time(entry['at']), change_host(entry), change_words(entry['before'], entry['after'])))
+
+
+LOST = 'x.U'    # a host that answered and now does not: gone, silent or unreachable
+UNPROBED = 'E?'  # the probe failed, or the name did not resolve: no evidence about the host
+
+
+def went_silent(entry) -> bool:
+    """The title's down count: a real loss of answer. A probe error or an unresolved name is not an outage."""
+    return entry['after'] in LOST
+
+
+def gap_line(count: int) -> str:
+    from .protocol import CHANGES_KEPT
+    return f"{plural(count, 'change is', 'changes are')} not available: the list keeps the last {CHANGES_KEPT}."
+
+
+def round_changes(count: int, exact: bool = True) -> str:
+    if not count:
+        return ''
+    return f"{'' if exact else 'At least '}{plural(count, 'change')} in the latest round."
+
+
+def changes_count(count: int) -> str:
+    """The closed section's line: how many changes the run has had (those the list holds and those it let go)."""
+    return plural(count, 'change') if count else ''
+
+
+def notification_text(entries, total: int | None = None) -> str:
+    """One round's notification: counts only, no host names. ``total``: how many hosts changed (the feed's number,
+    which includes changes it let go of); ``entries`` are the ones it still has and give the breakdown."""
+    from .monitor_map import ANSWERS
+    total = len(entries) if total is None else max(total, len(entries))
+    stopped = sum(1 for e in entries if e['after'] in LOST and e['before'] in ANSWERS)
+    unprobed = sum(1 for e in entries if e['after'] in UNPROBED)
+    again = sum(1 for e in entries if e['before'] not in ANSWERS and e['after'] in ANSWERS)
+    unlisted = total - len(entries)
+    other = len(entries) - stopped - unprobed - again
+    parts = [part for part in (
+        f'{fmt_count(stopped)} stopped answering' if stopped else '',
+        f"{fmt_count(again)} {'answers' if again == 1 else 'answer'} again" if again else '',
+        f"{fmt_count(unprobed)} could not be probed" if unprobed else '',
+        plural(other, 'other change') if other else '',
+        f'{fmt_count(unlisted)} not itemised' if unlisted else '') if part]
+    head = f"{plural(total, 'host')} changed"
+    return f"{head}: {', '.join(parts)}" if parts else head
+
+
+def title_with_count(title: str, count: int) -> str:
+    if count <= 0:
+        return title
+    return TITLE_COUNT.format(count=f'{TITLE_COUNT_MAX}+' if count > TITLE_COUNT_MAX else count, title=title)
+
+
+NOTIFY_LABEL = 'Notify me about changes'
+NOTIFY_HELP = {
+    'off': 'Off. Turn on to get one desktop notification per round that changed hosts, while this tab is in the '
+           'background. It says how many hosts changed, never which. The choice lasts until cn-tool is restarted.',
+    'on': 'On: one notification per round that changed hosts, while this tab is in the background. It says how many '
+          'hosts changed, never which. Turn off here at any time; the choice lasts until cn-tool is restarted.',
+    'blocked': 'Notifications are blocked for this site. Allow them in the browser\'s site settings, then turn this on.',
+    'declined': 'The browser did not allow notifications, so none will be sent.',
+    'unsupported': 'This browser cannot show desktop notifications. The tab title still counts hosts that stopped '
+                   'answering while the tab is in the background.',
+}

@@ -17,7 +17,13 @@ an IPv4 address or, only when the name has none, to an IPv6 address, and ICMP an
 address; a name that does not resolve is listed in `not_found` as `no such host`. A link-local
 IPv6 address needs its interface (`cn ping fe80::1%eth0`), and an IPv4-mapped one is refused with
 the IPv4 address to use. `--tcp PORTS` also connects to up to 5 TCP ports (1-65535) and allows at
-most 1,024 hosts (a /22, or an IPv6 /118). Every probe gives up after 3 seconds. ICMP runs the
+most 1,024 hosts (a /22, or an IPv6 /118). Every probe gives up after 3 seconds. Hosts are probed 100 at a time;
+`[ping] parallel_probes` (1 to 1024, see [Configuration](configuration.md)) changes how many for `cn ping`, the menu, the
+Ping Monitor and the browser. It is an upper bound: on Linux and macOS every ping keeps a file open and every TCP probe
+another, so when the system's open-file limit is too low even after `cn` has raised its own, fewer run at once and a
+line on stderr says how many (`cn: ping: this system's open-file limit (256) allows 104 probes at once, ...`); the
+default, 100, is never lowered. A high value can also meet process and thread limits: a ping that cannot start for want
+of a file or a process is that host's `ERROR`, and a TCP probe that gets no thread is an `error` cell. ICMP runs the
 system's `ping`: on Linux `ping -n -w3 -c2` for both families, so `ping` must take IPv6 literals
 (current iputils does); on macOS `ping -n -c 2 -t 3`, and `ping6 -n -c 2` for IPv6 (it has no
 deadline flag, so `cn` stops a ping still running after 7 seconds); on Windows `ping -n 2 -w 1500`. On

@@ -12,7 +12,7 @@ from cn_tool.utils.auth import (
     infoblox_credentials_known, infoblox_source,
 )
 from cn_tool.utils.config import (
-    BASE_CONFIG_SCHEMA, coerce_bool, coerce_config_value, env_name, env_name_problem, no_config_file_found,
+    BASE_CONFIG_SCHEMA, coerce_bool, coerce_config_value, configured_int, env_name, env_name_problem, no_config_file_found,
     unset_env_note, user_config_path, write_config_value,
 )
 from cn_tool.utils.file_io import check_dir_accessibility
@@ -74,6 +74,9 @@ def _network_view_setting(ctx: ScriptContext) -> HealthCheck:
     return HealthCheck(_NETWORK_VIEW_CHECK, "info", "every view", f"{_NETWORK_VIEW_KEY} not set")
 
 
+_PING_PROBES_CHECK = "Ping probes"
+
+
 def health_checks(ctx: ScriptContext, live: Sequence[HealthCheck] = ()) -> List[HealthCheck]:
     """
     The status rows of the menu and of ``cn doctor``, in their fixed order.
@@ -103,6 +106,9 @@ def health_checks(ctx: ScriptContext, live: Sequence[HealthCheck] = ()) -> List[
     else:
         active_dir = _enabled("Active Dir", cfg.get("ad_enabled"), ad_uri)
 
+    # [ping] parallel_probes has a row only when it is wrong: every other run shows the rows it always showed.
+    _, probes_problem = configured_int(cfg, "ping_parallel_probes")
+    probes = [HealthCheck(_PING_PROBES_CHECK, "error", probes_problem)] if probes_problem else []
     return [
         *first,
         infoblox,
@@ -111,6 +117,7 @@ def health_checks(ctx: ScriptContext, live: Sequence[HealthCheck] = ()) -> List[
         _config_repo_check(ctx),
         active_dir,
         _enabled("Cache", cfg.get("cache_enabled"), cfg.get("cache_directory", "")),
+        *probes,
         HealthCheck("Theme", "info", str(cfg.get("theme_name", "default"))),
     ]
 
@@ -389,7 +396,7 @@ class SetupModule(BaseModule):
         ctx.logger.info("Request Type - Application Setup (doctor, command line)")
         live, invalid, failed = _live_checks(ctx, args) if ctx.cfg.get("infoblox_enabled") else ([], False, False)
         checks = health_checks(ctx, live)
-        invalid = invalid or any(row.check == "Config Repo" and row.status == "error" for row in checks)
+        invalid = invalid or any(row.check in ("Config Repo", _PING_PROBES_CHECK) and row.status == "error" for row in checks)
         rows = [{"check": row.check, "status": row.status, "detail": row.text} for row in checks]
         return CliResult(cli_exit_code(found=True, invalid=invalid, failed=failed), {"checks": rows})
 

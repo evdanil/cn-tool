@@ -21,11 +21,18 @@ from cn_tool.utils.cli_input import read_objects
 from cn_tool.utils.user_input import press_any_key, read_user_input
 from cn_tool.utils.display import console, get_global_color_scheme, print_table_data, table_columns
 from cn_tool.utils import oscompat
+from cn_tool.utils.config import DEFAULT_PING_PARALLEL_PROBES, configured_int
 from cn_tool.utils.file_io import queue_save
 from cn_tool.utils.validation import ipv6_form_problem, is_fqdn, parse_tcp_ports
 
 
-BATCH_SIZE = 100  # hosts pinged and probed at once
+# Names looked up at once (one wave of DNS lookups), and the hosts pinged and probed at once when the context holds no
+# [ping] parallel_probes (one built without reading a configuration file): probe_count reads the setting.
+BATCH_SIZE = DEFAULT_PING_PARALLEL_PROBES
+# Files a run keeps open besides its probes' pipes and sockets: the standard streams, the log, the history and the
+# report, the web worker's connections, and the few a child holds for a moment while it starts. 100 pings and 100
+# sockets fit in 256, the soft limit macOS starts a shell with, so a run with the default is never lowered there.
+OPEN_FILES_MARGIN = 48
 TCP_TIMEOUT = 3.0  # seconds a TCP connection attempt may take
 MAX_PING_HOSTS = 65534  # a /16; an IPv6 /112 expands to 65,535 hosts and is allowed as well
 MAX_TCP_HOSTS = 1024  # per run, a /22 or an IPv6 /118
@@ -42,6 +49,11 @@ _NO_SUCH_HOST = "no such host"
 _TCP_PROMPT = "TCP ports to test as well, e.g. 22,443 (Enter for ping only): "
 _TCP_SKIPPED = f"TCP test needs at most {MAX_TCP_HOSTS:,} hosts (a /22); pinging only."
 _PING_MISSING = "cn: ping: the 'ping' command is not installed"
+
+# A ping that cannot start for want of a file (this process's limit, or the system's) or of a process (EAGAIN: a
+# per-user or container process limit; ENOMEM) is that host's ERROR row; any other failure to start one ends the
+# batch, as before.
+_NO_FILE_LEFT = (errno.EMFILE, errno.ENFILE, errno.EAGAIN, errno.ENOMEM)
 
 PING_COUNT = 2  # echo requests per host, on every platform
 _WINDOWS_TIMEOUT_MS = 1500  # per echo request: two of them take the 3 seconds Linux's -w3 allows
@@ -102,6 +114,41 @@ def tcp_probe(address: str, port: int, timeout: float = TCP_TIMEOUT) -> str:
 
 def _tcp_column(port: int) -> str:
     return f"TCP {port}"
+
+
+def probe_count(ctx: ScriptContext, *, tcp: bool) -> Tuple[int, List[str]]:
+    """
+    How many hosts a run pings, and TCP-probes, at once, and what to tell the user about it (each note is logged here;
+    the command line and the menu also print it, the web UI only logs it).
+
+    The number is ``[ping] parallel_probes`` (``BATCH_SIZE`` when the context has no such key); a value that is not a
+    whole number from 1 to 1024 is 100 and a note. On Linux and macOS each running ping holds a pipe and each TCP probe
+    a socket, so the run needs ``n`` files (``2n`` with ``tcp``) plus ``OPEN_FILES_MARGIN``: the soft open-file limit
+    is raised that far when the hard limit allows (``oscompat.open_files_allowed``), and when it still falls short the
+    run takes the most that fit (at least one) and says so; the default, 100, is never lowered. Windows has no such
+    limit.
+    """
+    notes: List[str] = []
+    if ctx.cfg.get("ping_parallel_probes") is None:
+        wanted = BATCH_SIZE
+    else:
+        wanted, problem = configured_int(ctx.cfg, "ping_parallel_probes")
+        if problem:
+            notes.append(problem)
+    per_probe = 2 if tcp else 1
+    # A raise asks for BATCH_SIZE more: the Monitor's DNS lookups left behind by a stop hold files of their own.
+    allowed = oscompat.open_files_allowed(wanted * per_probe + OPEN_FILES_MARGIN, headroom=BATCH_SIZE)
+    count = wanted
+    # The default is never lowered and never noted: it is what every run did before the setting existed, and the margin
+    # is generous; a ping that then cannot start is that host's ERROR row.
+    if (allowed is not None and wanted != DEFAULT_PING_PARALLEL_PROBES
+            and allowed < wanted * per_probe + OPEN_FILES_MARGIN):
+        count = max(1, (allowed - OPEN_FILES_MARGIN) // per_probe)
+        notes.append(f"this system's open-file limit ({allowed:,}) allows {count} probes at once, not the {wanted} of "
+                     f"[ping] parallel_probes; running {count} at once")
+    for note in notes:
+        ctx.logger.warning("Bulk PING - %s", note)
+    return count, notes
 
 
 def _row(host: str, address: str, result: str, tcp_ports: Sequence[int], outcomes: Optional[Mapping[Tuple[str, int], str]] = None) -> Row:
@@ -617,8 +664,11 @@ class BulkPingModule(BaseModule):
         """
         colors = get_global_color_scheme(ctx.cfg)
         results: List[Row] = []
-        total_batches = -(-len(targets) // BATCH_SIZE)
-        sweep = self._sweep(targets, ctx.logger, tcp_ports, icmp)
+        probes, notes = probe_count(ctx, tcp=bool(tcp_ports))
+        for note in notes:
+            console.print(f"cn: ping: {note}", markup=False, soft_wrap=True)
+        total_batches = -(-len(targets) // probes)
+        sweep = self._sweep(targets, ctx.logger, tcp_ports, icmp, probes=probes)
         for number in range(1, total_batches + 1):
             ending = f" batch {number} out of {total_batches}" if total_batches > 1 else "..."
 
@@ -630,10 +680,11 @@ class BulkPingModule(BaseModule):
 
     def _sweep(
         self, targets: List[Target], logger: Logger, tcp_ports: Sequence[int], icmp: bool = True,
-        *, control: Optional[OperationControl] = None, on_attempt: Optional[Callable[[str], None]] = None
+        *, control: Optional[OperationControl] = None, on_attempt: Optional[Callable[[str], None]] = None,
+        probes: Optional[int] = None,
     ) -> Iterator[Tuple[List[Target], List[Row]]]:
         """
-        Test the targets a batch of ``BATCH_SIZE`` at a time, yielding each batch with its rows in the order given; a
+        Test the targets a batch of ``probes`` (``probe_count``; ``BATCH_SIZE`` when not given) at a time, yielding each batch with its rows in the order given; a
         target the batch did not report on is an ``ERROR (No Result)`` row without control. With control,
         only completed target/row pairs are yielded; ``control.stop`` signals cancellation separately.
         A missing ping executable raises ``PingUnavailableError`` after started children are reaped.
@@ -642,17 +693,19 @@ class BulkPingModule(BaseModule):
 
         No spinner and no hook: ``_ping_all`` adds both, and the Ping Monitor drives the batches under its own live view.
         """
-        for start in range(0, len(targets), BATCH_SIZE):
+        size = probes or BATCH_SIZE
+        for start in range(0, len(targets), size):
             if control is not None and control.stop.is_set():
                 break
-            batch = targets[start:start + BATCH_SIZE]
+            batch = targets[start:start + size]
             if control is None:
-                rows = self._ping_batch(batch, logger, tcp_ports, icmp)
+                rows = self._ping_batch(batch, logger, tcp_ports, icmp, probes=size)
             else:
                 if on_attempt is None:
-                    rows = self._ping_batch(batch, logger, tcp_ports, icmp, control=control)
+                    rows = self._ping_batch(batch, logger, tcp_ports, icmp, control=control, probes=size)
                 else:
-                    rows = self._ping_batch(batch, logger, tcp_ports, icmp, control=control, on_attempt=on_attempt)
+                    rows = self._ping_batch(batch, logger, tcp_ports, icmp, control=control, on_attempt=on_attempt,
+                                            probes=size)
             batch_rows = {row["Host"]: row for row in rows}
             if control is not None:
                 completed = [(host, address) for host, address in batch if host in batch_rows]
@@ -666,12 +719,15 @@ class BulkPingModule(BaseModule):
 
     def _ping_batch(
         self, batch: List[Target], logger: Logger, tcp_ports: Sequence[int] = (), icmp: bool = True,
-        *, control: Optional[OperationControl] = None, on_attempt: Optional[Callable[[str], None]] = None
+        *, control: Optional[OperationControl] = None, on_attempt: Optional[Callable[[str], None]] = None,
+        probes: Optional[int] = None,
     ) -> List[Row]:
         """
         Pings a batch of hosts in parallel and, for each of ``tcp_ports``, connects to every
-        host's address while the pings run. Returns one row per host (see ``_row``), or nothing
-        when ``ping`` cannot be started.
+        host's address while the pings run, on a pool of at most ``probes`` workers (``BATCH_SIZE`` when not given).
+        Returns one row per host (see ``_row``), or nothing when ``ping`` is not installed. A ping that cannot be
+        started for want of a file or a process (``_NO_FILE_LEFT``) is that host's ``ERROR``, and a TCP probe that gets
+        no thread (``RuntimeError`` from the pool) is an ``error`` cell; neither ends the batch.
 
         A ping still running ``PING_DEADLINE`` seconds after the last one was started is interrupted and, failing
         that, killed (``_collect_pings``); its row is ``NO RESPONSE`` unless a reply had been counted
@@ -679,6 +735,8 @@ class BulkPingModule(BaseModule):
         """
         processes: Dict[str, Popen] = {}
         outstanding: Dict[int, Popen] = {}
+        not_started: Dict[str, str] = {}
+        workers = probes or BATCH_SIZE
         try:
             if icmp:
                 for host, address in batch:
@@ -696,6 +754,12 @@ class BulkPingModule(BaseModule):
                         if control is not None:
                             raise PingUnavailableError("'ping' command not found") from exc
                         return []
+                    except OSError as exc:
+                        if exc.errno not in _NO_FILE_LEFT:
+                            raise
+                        logger.error("Bulk PING - the ping of %s could not start: %s", host, exc)
+                        not_started[host] = "ERROR"
+                        continue
                     processes[host] = proc
                     outstanding[id(proc)] = proc
             deadline_at = monotonic() + PING_DEADLINE
@@ -703,23 +767,36 @@ class BulkPingModule(BaseModule):
             outcomes: Dict[Tuple[str, int], str] = {}
             if tcp_ports:
                 if control is None:
-                    with ThreadPoolExecutor(max_workers=min(BATCH_SIZE, len(batch) * len(tcp_ports))) as pool:
-                        probes = {(host, port): pool.submit(tcp_probe, address, port)
-                                  for host, address in batch for port in tcp_ports}
-                        outcomes = {key: probe.result() for key, probe in probes.items()}
+                    with ThreadPoolExecutor(max_workers=min(workers, len(batch) * len(tcp_ports))) as pool:
+                        submitted = {}
+                        try:
+                            for host, address in batch:
+                                for port in tcp_ports:
+                                    submitted[(host, port)] = pool.submit(tcp_probe, address, port)
+                        except RuntimeError as exc:  # no thread could start: the probes not submitted could not run
+                            logger.error("Bulk PING - a TCP probe could not start: %s", exc)
+                        outcomes = {key: probe.result() for key, probe in submitted.items()}
+                        outcomes.update({(host, port): "error" for host, _ in batch for port in tcp_ports
+                                         if (host, port) not in outcomes})
                 else:
                     tasks = [(host, address, port) for host, address in batch for port in tcp_ports]
                     def probe(task):
                         if on_attempt is not None:
                             on_attempt(task[0])
                         return tcp_probe(task[1], task[2])
-                    for (host, _, port), result in controlled_map(
-                        probe, tasks, control, min(BATCH_SIZE, len(tasks))
-                    ):
-                        outcomes[(host, port)] = result
+                    try:
+                        for (host, _, port), result in controlled_map(
+                            probe, tasks, control, min(workers, len(tasks))
+                        ):
+                            outcomes[(host, port)] = result
+                    except RuntimeError as exc:  # no thread could start: what ran is kept, the rest could not run
+                        logger.error("Bulk PING - a TCP probe could not start: %s", exc)
+                        if not control.stop.is_set():
+                            outcomes.update({(host, port): "error" for host, _, port in tasks
+                                             if (host, port) not in outcomes})
 
             address_of = dict(batch)
-            statuses: Dict[str, str] = {}
+            statuses: Dict[str, str] = dict(not_started)
             outputs, stopped = _collect_pings(processes, deadline_at, control=control)
             for host in outputs:
                 outstanding.pop(id(processes[host]), None)

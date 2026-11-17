@@ -27,6 +27,8 @@ CSS = '''
 .cn-report-menu .cn-report-state { font-weight:600; overflow-wrap:anywhere; }
 .cn-report-menu .cn-report-status:empty { display:none; }
 .cn-report-menu .cn-report-status { overflow-wrap:anywhere; }
+.cn-report-menu .cn-report-reason:empty { display:none; }
+.cn-report-menu .cn-report-reason { overflow-wrap:anywhere; }
 .cn-report-menu .cn-report-actions { gap:8px; }
 '''
 
@@ -54,6 +56,7 @@ class ReportDeleteAction:
         self.text = ''  # what the status line says about the deletion: "Deleting report…", a refusal or a failure
         self.failed = False
         self.button = None
+        self.reason = None  # the line that says why the button is off (draw_reason)
         with ui.dialog().props('no-refocus') as self.dialog:
             with ui.card().classes('w-full').style('max-width: 540px; overflow-wrap: anywhere') as self.card:
                 title = ui.label('Delete accumulated report?').classes('text-h6')
@@ -93,12 +96,31 @@ if (trigger) delete trigger.cnDeleteOwnedFocus;
         self.button.disable()
         return self.button
 
+    def draw_reason(self):
+        """The line under the buttons that says why Delete report… is off while work runs (R3-04, plan 5.7: it names
+        the Monitor); the button is described by it while it shows."""
+        from nicegui import ui
+
+        self.reason = ui.label('').classes('cn-report-reason cn-muted').props('data-report-delete-reason')
+        return self.reason
+
+    def _show_reason(self, state):
+        from . import texts
+
+        text = texts.delete_unavailable(state) if (state.report_state or {}).get('available') else ''
+        if self.reason is None or self.reason.text == text:
+            return
+        self.reason.set_text(text)
+        if self.button is not None:
+            if text:
+                self.button._props['aria-describedby'] = self.reason.html_id
+            else:
+                self.button._props.pop('aria-describedby', None)
+            self.button.update()
+
     def _available(self):
         state = self.state
-        return bool(state and state.phase == 'ready' and not state.active_job_id
-                    and (state.report_state or {}).get('available')
-                    and not state.report_delete_pending and not state.report_snapshot_pending
-                    and not self.request_id)
+        return bool(state and state.quiet and (state.report_state or {}).get('available') and not self.request_id)
 
     def _show(self):
         pending = bool(self.state and self.state.report_delete_pending) or bool(self.request_id)
@@ -163,7 +185,7 @@ if (trigger) delete trigger.cnDeleteOwnedFocus;
             # Messages expire with their cause. A refusal says why a click did nothing, so it stays while that cause
             # lasts (the other work) and goes once deletion is offered again. Any other message (a failure, a dropped
             # request) is about an earlier moment: new work or a report download in progress makes it stale.
-            busy = bool(state.active_job_id or state.report_snapshot_pending)
+            busy = bool(state.active_job_id or state.monitor_job_id or state.report_snapshot_pending)  # either slot
             if (self.refused and self._available()) or (busy and not self.refused):
                 self.message, self.refused = '', False
         if self.request_id:
@@ -188,6 +210,7 @@ if (trigger) delete trigger.cnDeleteOwnedFocus;
             self.message, self.refused = '', False  # The workbook is gone, so advice about retrying no longer applies.
         if self.button is not None:
             self.button.set_enabled(self._available())
+        self._show_reason(state)
         self._show()
 
     def close(self) -> None:
@@ -236,6 +259,7 @@ class ReportMenu:
                 # Off until the first poll reports: nothing is known about the workbook before it.
                 self.download.disable()
                 self.delete.draw_button()
+            self.delete.draw_reason()
         trigger = json.dumps(self.trigger.html_id)
         # Say whether the menu is open, and when it closes with focus nowhere (Escape, a click on the page's own
         # background) give it back to the button: what the menu's own refocus would do, without taking focus from the

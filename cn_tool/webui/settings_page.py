@@ -202,6 +202,17 @@ def render_settings(controller, scope):
     shell.quit_button.mark('settings-quit')
     shell.set_help(HELP)
 
+    def show_reason(state):
+        text = texts.reload_unavailable(state) if use_now.visible else ''
+        if reason.text != text:
+            reason.set_text(text)
+            if text:
+                use_now._props['aria-describedby'] = reason.html_id
+            else:
+                use_now._props.pop('aria-describedby', None)
+            use_now.update()
+    shell.watch(show_reason)
+
     with ui.column().classes('cn-panel cn-settings'):
         with ui.row().classes('items-baseline gap-2'):
             ui.label('Configuration file:').classes('text-weight-bold')
@@ -234,6 +245,8 @@ def render_settings(controller, scope):
         quit_now = ui.button('Quit now', on_click=shell.request_quit).props('outline').mark('settings-quit-now')
         quit_now.set_visibility(False)
     with ui.row().classes('items-center gap-3 cn-settings'):
+        # Why Use the new settings now waits while work runs: it names the job (a Monitor included), as the Report menu does.
+        reason = ui.label('').classes('cn-muted cn-settings-empty').mark('settings-use-now-reason')
         problem = ui.label('').props('role=alert').classes('text-negative cn-settings-empty').mark('settings-problem')
         keep = ui.button('Reload and keep my edits', on_click=lambda: reload(keep_edits=True)).props('outline').mark('settings-keep')
         keep.set_visibility(False)

@@ -1,17 +1,20 @@
 """Persistent cn runtime; its sole reader stays responsive during blocking work."""
+from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 from queue import Empty, Full, Queue
-from threading import Condition, Event, Lock, Thread
+from threading import Condition, Event, Lock, RLock, Thread
 from uuid import uuid4
 
 from cn_tool.core.interaction import AuthenticationFailed, AuthenticationRequired, CredentialReply
-from cn_tool.core.operation import OperationCancelled, OperationControl
+from cn_tool.core.operation import OperationCancelled
 from cn_tool.core.runtime import RuntimeSession, SetupRequired, abort_initialization
 from . import ping_partial
 from .config_pages import config_search_page
 from .interrupts import ignore_console_interrupts as _ignore_parent_interrupts
 from .lookup_scope import _remember_refusal, ensure_lookup_scope, infoblox_configured
+from .report_gate import GatedControl, ReportGate, report_turn
+from .worker_slots import BUSY_MESSAGES, MONITOR, ONE_SHOT, Slot, SlotGate, slot_name
 from .protocol import COMMANDS, SIGN_IN_TRIES, decode, encode, envelope, valid_monitor_history_item
 
 _ignore_parent_interrupts()
@@ -461,10 +464,11 @@ def perform_ip_lookup(runtime, module, scope, inputs, control):
         if not lookup.stopped:
             if runtime.ctx.cfg.get('report_auto_save'):
                 control.progress('saving report')
-            if control.stop.is_set():
-                lookup.stopped = result['stopped'] = True
-                return result, report
-            report = finish_ip_lookup_report(runtime.ctx, module, lookup)
+            with report_turn(control) as turn:  # one saver at a time: the counters of the report are global
+                if not turn or control.stop.is_set():
+                    lookup.stopped = result['stopped'] = True
+                    return result, report
+                report = finish_ip_lookup_report(runtime.ctx, module, lookup)
             if prepared.ip_addresses:
                 _publish_stats(runtime.ctx, len(prepared.keys), prepared.ip_addresses,
                                lookup.processed_data_by_ip, lookup.rows)
@@ -516,10 +520,11 @@ def perform_lookup(runtime, module, scope, inputs, control):
         if not lookup.stopped:
             if runtime.ctx.cfg.get('report_auto_save'):
                 control.progress('saving report')
-            if control.stop.is_set():
-                lookup.stopped = result['stopped'] = True
-                return result, report
-            report = finish_lookup_report(runtime.ctx, module, lookup)
+            with report_turn(control) as turn:  # one saver at a time: the counters of the report are global
+                if not turn or control.stop.is_set():
+                    lookup.stopped = result['stopped'] = True
+                    return result, report
+                report = finish_lookup_report(runtime.ctx, module, lookup)
             module._publish_stats(runtime.ctx, len(inputs), lookup.query_targets, list(lookup.grouped), lookup.subnet_data)
         return result, report
     finally:
@@ -611,7 +616,9 @@ def perform_ping_lookup(runtime, module, inputs, tcp_ports, control, partial=Non
                 if not control.stop.is_set():
                     if targets:
                         control.stage('probing')
-                    for finished, batch in module._sweep(targets, ctx.logger, tcp_ports, icmp, control=control, on_attempt=on_attempt):
+                    probes, _ = bulk_ping.probe_count(ctx, tcp=bool(tcp_ports))  # a note is logged only
+                    for finished, batch in module._sweep(targets, ctx.logger, tcp_ports, icmp, control=control,
+                                                         on_attempt=on_attempt, probes=probes):
                         completed.update(host for host, _ in finished)
                         rows.extend(batch)
                         control.counted_stage('probing', len(rows), len(targets))
@@ -637,12 +644,13 @@ def perform_ping_lookup(runtime, module, inputs, tcp_ports, control, partial=Non
         if not result['stopped'] and not report.get('probe_failed') and not report.get('probe_errors'):
             if rows and ctx.cfg.get('report_auto_save'):
                 control.progress('saving report')
-            if control.stop.is_set():
-                result['stopped'] = True
-            else:
-                details = {key: report[key] for key in ('unattempted', 'attempted_incomplete')}
-                report = finish_ping_report(ctx, module, rows)
-                report.update(details)
+            with report_turn(control) as turn:
+                if not turn or control.stop.is_set():
+                    result['stopped'] = True
+                else:
+                    details = {key: report[key] for key in ('unattempted', 'attempted_incomplete')}
+                    report = finish_ping_report(ctx, module, rows)
+                    report.update(details)
         return result, report
     finally:
         try:
@@ -676,7 +684,9 @@ def _moment(value):
 class MonitorLiveCache:
     """Latest complete round copied on the run thread and paged without SQLite."""
     def __init__(self, job_id, emit, logger=None):
+        from .monitor_changes import ChangeFeed
         self.job_id, self.emit = job_id, emit
+        self.feed = ChangeFeed()  # the job's change feed (plan 7.4), recorded in on_round under the lock
         self.logger, self.last_history_error = logger, None
         self.lock = Lock()
         self.run_id = None
@@ -690,7 +700,7 @@ class MonitorLiveCache:
         # complete round. 'total' is 0 between two rounds, so a page opened then reads the size here.
         self.update = dict(lookup_type='monitor', run_id='', revision=0, stage='starting', completed=0, total=0,
                            current_rounds=0, earlier_rounds=0, skipped_slots=0, history_error='',
-                           round_at=0, next_at=0, hosts=0)
+                           round_at=0, next_at=0, hosts=0, changes_seq=0)
 
     def on_started(self, run_id):
         with self.lock:
@@ -745,11 +755,13 @@ class MonitorLiveCache:
             if run_id != self.run_id or revision <= self.update['revision']:
                 return
             self.rows = rows
-            self.map_snapshot = snapshot
             self.rows_by_host = {row[0]: row for row in rows} if snapshot is not None else {}
+            if snapshot is not None:
+                self.feed.record(revision, round_at, self.map_snapshot, snapshot, self.rows_by_host)
+            self.map_snapshot = snapshot
             self.update.update(revision=revision, current_rounds=outcome.rounds, earlier_rounds=outcome.earlier,
                                skipped_slots=outcome.late, history_error=monitor_history_error(outcome.store_error),
-                               round_at=round_at, next_at=0, hosts=len(rows))
+                               round_at=round_at, next_at=0, hosts=len(rows), changes_seq=self.feed.last_seq)
             update = dict(self.update)
         self.emit(update)
 
@@ -772,6 +784,16 @@ class MonitorLiveCache:
             result[name] = answer(snapshot, rows) if snapshot is not None else None
             result['status'] = 'ready' if result[name] is not None else 'unavailable'
         return result
+
+    def changes(self, query):
+        """``monitor_live_changes``: the run's entries after ``after``; not tied to a round, so it is never expired."""
+        from .monitor_changes import unavailable
+        answer = unavailable(query)
+        with self.lock:
+            if query['job_id'] == self.job_id and query['run_id'] == self.run_id:
+                answer.update(entries=self.feed.since(query['after'], query['limit']), last_seq=self.feed.last_seq,
+                              status='ready')
+        return answer
 
     def map(self, query):
         from . import monitor_map
@@ -940,7 +962,9 @@ def run_monitor_lookup(runtime, module, payload, control, observer):
                 observer.on_ended()  # before the report is saved: a stopped run counts down to nothing
             if runtime.ctx.cfg.get('report_auto_save'):
                 control.progress('saving report')
-            report = asdict(finish_monitor_report(runtime.ctx, module, outcome))
+            with report_turn(control, honour_stop=False) as turn:  # a stopped Monitor still saves its rounds
+                report = (asdict(finish_monitor_report(runtime.ctx, module, outcome)) if turn else
+                          dict(state='idle', filename='', message='The Monitor was not saved: the session ended.'))
             report['status'] = report['state']
             return outcome, report
         finally:
@@ -955,7 +979,8 @@ def run_monitor_lookup(runtime, module, payload, control, observer):
         outcome, report = pair
         return ('failed' if outcome.probe_failed or outcome.store_error or report['status'] == 'failed' or report.get('hook_error')
                 else 'interrupted' if outcome.stop_reason else 'completed')
-    return _run_tracked(runtime.ctx, module, run, outcome=status)
+    # Its own statistics handle: a Monitor will run beside a one-shot lookup (plan 5.8) and must not interrupt it.
+    return _run_tracked(runtime.ctx, module, run, outcome=status, concurrent=True)
 
 
 def mark_monitor_history_ownership(page, kind, active_job, cache_job, run_id):
@@ -987,44 +1012,57 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
     from .config_demob import DemobPreviewVault
     demob_vault = DemobPreviewVault()
     write_lock = Lock()
-    operation_lock = Lock()
-    operation_stop = Event()
+    operation_lock = RLock()  # re-entrant: update_report takes it, also from code that holds it
+    report_gate = ReportGate()
+    # Plan 5.4: a Monitor and one one-shot job, each with its own thread, job, stop and saving flag (worker_slots).
+    slots = {ONE_SHOT: Slot(ONE_SHOT), MONITOR: Slot(MONITOR)}
+    oneshot, monitor = slots[ONE_SHOT], slots[MONITOR]
+    abandon = Event()  # the session is given up: a Monitor *waiting* for the report gate leaves without saving
     snapshot_stop = Event()
     report_delete_stop = Event()
-    state = {'session': None, 'job': None, 'runtime': None, 'scope': None,
+    state = {'session': None, 'runtime': None, 'scope': None,
              'closing': False, 'initializing': False, 'initialization_failed': False, 'interrupted': False,
              'started': False,  # once a runtime has started, a later start failure is Setup required, never fatal
              'rebind': False,  # a reload asked for saved logins to follow the new settings; kept until a start succeeds
-             'orphaned': False, 'thread': None, 'ready': False, 'saving': False,
-             'report': None, 'job_type': None, 'monitor_cache': None,
+             'orphaned': False, 'ready': False, 'report': None,
              # Each slot is one independently bounded (10,000 rows / 8 MiB) completed search.
              'config_cache': {'config_search': None, 'demob': None},
-             'waiting_snapshot': False, 'demob_preview_job': None, 'report_deleting': None, 'snapshot_active': False}
+             'demob_preview_job': None, 'report_deleting': None, 'snapshot_active': False}
+    def stop_jobs():
+        """The session is given up (a closed pipe, an interrupt): both jobs stop, and nothing waits to save."""
+        abandon.set()
+        for slot in slots.values():
+            slot.stop.set()
+    def working():
+        """A job in either slot, or one inside the report gate: report deletion and reload wait for both."""
+        return any(slot.job is not None or slot.saving for slot in slots.values())
     def emit(kind, payload, job_id=None):
         try:
             with write_lock:
                 connection.send_bytes(encode(envelope(state['session'], job_id, kind, payload)))
         except (OSError, EOFError):
             state['orphaned'] = True
-            operation_stop.set()
+            stop_jobs()
             snapshot_stop.set()
             report_delete_stop.set()
-    interaction = WorkerInteraction(lambda kind, payload: emit(kind, payload, state['job']), operation_stop)
+    # Credential prompts belong to the one-shot job: a Monitor asks for none.
+    interaction = WorkerInteraction(lambda kind, payload: emit(kind, payload, oneshot.job), oneshot.stop)
     if interrupt is not None:
         def watch_for_interrupt():
             interrupt.wait()
             state['interrupted'] = True
             state['orphaned'] = True
-            operation_stop.set()
+            stop_jobs()
             snapshot_stop.set()
             report_delete_stop.set()
             interaction.close()
         Thread(target=watch_for_interrupt, daemon=True).start()
 
     def update_report(report):
-        current = state['report'] or {}
-        if current.get('state') != 'deleted' or report['available']:
-            state['report'] = report
+        with operation_lock:
+            current = state['report'] or {}
+            if current.get('state') != 'deleted' or report['available']:
+                state['report'] = report
 
     def report_delete_result(request, status, message):
         """Emit the one terminal reply of an accepted request; reading the workbook's metadata never prevents it."""
@@ -1114,8 +1152,9 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 interaction.rebind(endpoint)
             state['rebind'] = False
             cfg = getattr(runtime.ctx, 'cfg', {})
-            state['report'] = report_state_for_context(runtime.ctx, {
-                'state': 'idle' if cfg.get('report_auto_save') else 'off'})
+            report = report_state_for_context(runtime.ctx, {'state': 'idle' if cfg.get('report_auto_save') else 'off'})
+            with operation_lock:
+                state['report'] = report
             refresh_history_context()
             # Ready only now: a failure above leaves the worker not ready, so Retry setup is admitted.
             state['ready'] = True
@@ -1152,9 +1191,11 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             state['initialization_failed'] = True
             emit('error', {'message': 'Runtime initialization failed. Check the configured connection.'})
 
-    def lookup(payload, job, snapshot_thread=None):
+    def lookup(payload, job, slot, snapshot_thread=None):
         scope = None
         refused = Event()
+        # A pending "remember me" belongs to the one-shot job: a Monitor's end must not drop it.
+        discard = interaction.discard if slot is oneshot else (lambda: None)
         def rollback():
             if scope is not None:
                 from cn_tool.utils import api
@@ -1200,14 +1241,14 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 'state': 'idle', 'status': 'idle', 'message': 'Stopped lookup was not saved.'})
             update_report(report)
             emit('report_state', {'state': report, 'lookup_type': lookup_type}, job)
-            state['job'] = None
+            slot.job = None
             emit('result', {'result': result, 'outcome': outcome, 'lookup_type': lookup_type}, job)
         try:
             while snapshot_thread is not None and snapshot_thread.is_alive():
-                if operation_stop.wait(.05):
+                if slot.stop.wait(.05):
                     raise OperationCancelled()
-            state['waiting_snapshot'] = False
-            if operation_stop.is_set():
+            slot.waiting_snapshot = False
+            if slot.stop.is_set():
                 raise OperationCancelled()
             runtime = state['runtime']
             lookup_type = payload['lookup_type']
@@ -1217,16 +1258,24 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             else:
                 module = next(m for m in runtime.modules.values() if m.cli_name == lookup_type)
             def progress(stage):
-                if stage == 'saving report':
+                if stage == 'saving report':  # announced before the gate; slot.saving is set inside it (SlotGate)
                     with operation_lock:
-                        state['saving'] = True
-                    report = dict(state['report'], state='saving', status='saving', message='Saving report.', saved_for_attempt=False)
+                        report = dict(state['report'], state='saving', status='saving', message='Saving report.',
+                                      saved_for_attempt=False)
                     emit('report_state', {'state': report, 'lookup_type': payload['lookup_type']}, job)
                 emit('progress', {'stage': stage, 'lookup_type': payload['lookup_type']}, job)
             def counted(stage, completed, total):
                 emit('progress', {'stage': stage, 'lookup_type': lookup_type,
                                   'completed': completed, 'total': total}, job)
-            control = OperationControl(operation_stop, progress, counted if lookup_type == 'ping' else None)
+            def gate_said(kind, message):
+                with operation_lock:  # taken for a moment, never while the job waits for the gate
+                    report = dict(state['report'], state=kind, status=kind, message=message, saved_for_attempt=False)
+                emit('report_state', {'state': report, 'lookup_type': lookup_type}, job)
+            gate = SlotGate(report_gate, slot, operation_lock,
+                            on_wait=lambda: gate_said('waiting', 'Waiting to save the report.'),
+                            on_enter=lambda: gate_said('saving', 'Saving report.'))
+            control = GatedControl(slot.stop, progress, counted if lookup_type == 'ping' else None,
+                                   report_gate=gate, abandon=abandon)
             if lookup_type == 'config_search' or (lookup_type == 'demob' and 'demob_scope' in payload):
                 from .config_search import SearchOutcome, perform_config_search, perform_demob_search
                 from cn_tool.utils.process_data import remove_duplicate_rows_sorted_by_col
@@ -1234,21 +1283,27 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 search = (perform_demob_search(runtime, module, demob_scope, control, config_search_connection)
                           if demob_scope else perform_config_search(runtime, module, payload['inputs'], control, config_search_connection))
                 from .reports import finish_config_search_report
+                turn = ExitStack()  # the job's turn at the report gate lasts until the workbook is written
                 def before_write():
+                    if not turn.enter_context(report_turn(control)):  # outside operation_lock (report_gate)
+                        return False
                     with operation_lock:
-                        if operation_stop.is_set():
+                        if slot.stop.is_set():  # Quit or a closed pipe since the gate was taken: not saving after all
+                            slot.saving = False
                             return False
-                        state['saving'] = True
                         current = dict(state['report'], state='saving', status='saving', message='Saving report.',
                                        saved_for_attempt=False)
                         emit('report_state', {'state': current, 'lookup_type': lookup_type}, job)
                         emit('progress', {'stage': 'saving report', 'lookup_type': lookup_type}, job)
                         return True
-                report = asdict(finish_config_search_report(runtime.ctx, module, search, before_write=before_write,
-                                                           site_search=bool(demob_scope), demob_scope=demob_scope)
-                                if demob_scope else finish_config_search_report(runtime.ctx, module, search, before_write=before_write))
+                try:
+                    report = asdict(finish_config_search_report(runtime.ctx, module, search, before_write=before_write,
+                                                               site_search=bool(demob_scope), demob_scope=demob_scope)
+                                    if demob_scope else finish_config_search_report(runtime.ctx, module, search, before_write=before_write))
+                finally:
+                    turn.close()
                 with operation_lock:
-                    if operation_stop.is_set() and not state['saving'] and search.status == 'complete':
+                    if slot.stop.is_set() and not slot.saving and search.status == 'complete':
                         search = SearchOutcome('stopped', 'Search stopped.', errors=search.errors)
                     rows = remove_duplicate_rows_sorted_by_col(search.rows, 2) if search.status == 'complete' else []
                     rows = [[str(row[0]), row[1], row[2], row[3], row[4]] for row in rows]
@@ -1280,34 +1335,34 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                     report = report_state_for_context(runtime.ctx, report)
                     update_report(report)
                     emit('report_state', {'state': report, 'lookup_type': lookup_type}, job)
-                    state['job'] = None
+                    slot.job = None
                     emit('result', {'result': result, 'outcome': outcome, 'lookup_type': lookup_type}, job)
                     return
             if lookup_type == 'monitor':
                 from cn_tool.modules.bulk_ping import PingCleanupError
                 from cn_tool.utils.ping_store import AlreadyRunning, StoreError
                 try:
-                    outcome, report = run_monitor_lookup(runtime, module, payload, control, state['monitor_cache'])
+                    outcome, report = run_monitor_lookup(runtime, module, payload, control, slot.cache)
                 except PingCleanupError:
-                    state['job'] = None
+                    slot.job = None
                     emit('error', {'lookup_type': 'monitor',
                                    'message': 'A Monitor probe could not be cleaned up. Check the application logs.'}, job)
                     return
                 except AlreadyRunning:
-                    state['job'] = None
+                    slot.job = None
                     emit('error', {'lookup_type': 'monitor', 'message': 'These targets are already being monitored. View their history to follow the run.'}, job)
                     return
                 except StoreError:
-                    state['job'] = None
+                    slot.job = None
                     emit('error', {'lookup_type': 'monitor', 'message': 'Could not open or update Ping history. Check its availability and permissions.'}, job)
                     return
                 except MonitorInputError as exc:
-                    state['job'] = None
+                    slot.job = None
                     emit('error', {'lookup_type': 'monitor', 'message': str(exc)}, job)
                     return
-                if outcome.store_error and outcome.store_error != state['monitor_cache'].last_history_error:
+                if outcome.store_error and outcome.store_error != slot.cache.last_history_error:
                     runtime.ctx.logger.error('Ping Monitor history: %s', outcome.store_error)
-                result = dict(run_id=state['monitor_cache'].run_id or '', current_rounds=outcome.rounds,
+                result = dict(run_id=slot.cache.run_id or '', current_rounds=outcome.rounds,
                               earlier_rounds=outcome.earlier, skipped_slots=outcome.late,
                               history_error=monitor_history_error(outcome.store_error), probe_failed=outcome.probe_failed)
                 stopped = bool(outcome.stop_reason)
@@ -1321,7 +1376,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 report = report_state_for_context(runtime.ctx, report)
                 update_report(report)
                 emit('report_state', {'state': report, 'lookup_type': lookup_type}, job)
-                state['job'] = None
+                slot.job = None
                 emit('result', {'result': result, 'outcome': summary, 'lookup_type': lookup_type}, job)
                 return
             if lookup_type == 'ping':
@@ -1331,7 +1386,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 report = report_state_for_context(runtime.ctx, report)
                 update_report(report)
                 emit('report_state', {'state': report, 'lookup_type': lookup_type}, job)
-                state['job'] = None
+                slot.job = None
                 emit('result', {'result': result, 'outcome': outcome, 'lookup_type': lookup_type}, job)
                 return
             budget = demob_vault.new_budget(control) if lookup_type == 'demob' else None
@@ -1368,7 +1423,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 control.checkpoint()
                 authenticated = verified.is_set() and not refused.is_set() and preview.status in {'ok', 'partial_error'}
                 if not authenticated:
-                    interaction.discard()
+                    discard()
                     rollback()
                     demob_vault.invalidate()
                     preview.token = None
@@ -1384,7 +1439,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                     encode(envelope(state['session'], job, 'demob_preview', public))
                 except (ValueError, UnicodeError):
                     demob_vault.invalidate()
-                    interaction.discard()
+                    discard()
                     rollback()
                     authenticated = False
                     public = dict(site='', status='limit', message='Subnet lookup exceeds the preview limit.',
@@ -1392,15 +1447,15 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 if authenticated and not scope._webui_verified:
                     publish_context()
                 with operation_lock:
-                    if operation_stop.is_set():
+                    if slot.stop.is_set():
                         demob_vault.invalidate()
                         raise OperationCancelled()
                     if authenticated and public['status'] in {'ok', 'partial_error'}:
                         interaction.commit()
                     else:
-                        interaction.discard()
+                        discard()
                     state['demob_preview_job'] = job if public['token'] else None
-                    state['job'] = None
+                    slot.job = None
                     emit('demob_preview', public, job)
                 return
             runner = run_ip_lookup if lookup_type == 'ip' else run_lookup
@@ -1412,44 +1467,42 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             if (verified.is_set() and not refused.is_set() and outcome['kind'] in {'matched', 'partial', 'no_match'}
                     and report.get('status', report.get('state')) != 'failed'):
                 with operation_lock:
-                    if not operation_stop.is_set():
+                    if not slot.stop.is_set():
                         interaction.commit()
                     else:
-                        interaction.discard()
+                        discard()
                         rollback()
             else:
-                interaction.discard()
+                discard()
                 rollback()
             report = report_state_for_context(runtime.ctx, report)
             update_report(report)
             emit('report_state', {'state': report, 'lookup_type': payload['lookup_type']}, job)
-            state['job'] = None
+            slot.job = None
             emit('result', {'result': result, 'outcome': outcome, 'lookup_type': lookup_type}, job)
         except OperationCancelled:
-            interaction.discard()
+            discard()
             rollback()
             stopped()
         except (SetupRequired, AuthenticationRequired) as exc:
-            interaction.discard()
+            discard()
             rollback()
-            if operation_stop.is_set() or (isinstance(exc, AuthenticationRequired) and not isinstance(exc, AuthenticationFailed)):
+            if slot.stop.is_set() or (isinstance(exc, AuthenticationRequired) and not isinstance(exc, AuthenticationFailed)):
                 stopped()
             else:
-                state['job'] = None
+                slot.job = None
                 emit('error', {'message': exc.message, 'lookup_type': payload['lookup_type'], 'sign_in_again': getattr(exc, 'sign_in_again', False)}, job)
         except Exception:
-            interaction.discard()
+            discard()
             rollback()
-            state['job'] = None
+            slot.job = None
             label = {'ip': 'IP', 'subnet': 'Subnet', 'ping': 'Ping', 'monitor': 'Monitor', 'config_search': 'Configuration', 'demob': 'Demobilization'}[payload['lookup_type']]
             emit('error', {'message': f'{label} lookup failed. Check the configured connection.', 'lookup_type': payload['lookup_type']}, job)
         finally:
-            if state['runtime'] is not None and hasattr(state['runtime'].ctx, '_webui_request_observer'):
-                del state['runtime'].ctx._webui_request_observer
-            state['job'] = None
-            state['saving'] = False
-            state['job_type'] = None
-            state['waiting_snapshot'] = False
+            runtime = state['runtime']
+            if slot is oneshot and runtime is not None and hasattr(runtime.ctx, '_webui_request_observer'):
+                del runtime.ctx._webui_request_observer
+            slot.ended()
 
     def report_snapshot(payload):
         try:
@@ -1510,7 +1563,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 connection.send_bytes(encode(envelope(state['session'], None, 'report_snapshot', event)))
             except (OSError, EOFError):
                 state['orphaned'] = True
-                operation_stop.set()
+                stop_jobs()
     def read_history(history_ctx, session_id, source, extra=None):
         from cn_tool.utils.ping_history import read_monitor_history
         while True:
@@ -1525,8 +1578,8 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 page = read_monitor_history(history_ctx, query, **(extra or {}))
                 if history_stopped.is_set():
                     return
-                cache = state['monitor_cache']
-                page = mark_monitor_history_ownership(page, query['kind'], state['job'],
+                cache = monitor.cache
+                page = mark_monitor_history_ownership(page, query['kind'], monitor.job,
                                                       cache.job_id if cache else None, cache.run_id if cache else None)
                 page = classify_monitor_history_runs(page, query['kind'])
                 if (not isinstance(page.get('items'), list) or len(page['items']) > query['limit'] or
@@ -1548,7 +1601,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                     connection.send_bytes(data)
                 except (OSError, EOFError):
                     state['orphaned'] = True
-                    operation_stop.set()
+                    stop_jobs()
                     return
 
     report_delete_thread = None
@@ -1563,8 +1616,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 break
             if not connection.poll(.05):
                 if pending_snapshots and not state['report_deleting'] and (snapshot_thread is None or not snapshot_thread.is_alive()):
-                    if (state['job_type'] == 'monitor' or state['thread'] is None or
-                            not state['thread'].is_alive()):
+                    if not oneshot.busy():  # a Monitor does not hold a download back (plan 5.4)
                         payload = pending_snapshots.pop(0)
                         state['snapshot_active'] = True
                         snapshot_thread = Thread(target=report_snapshot, args=(payload,))
@@ -1583,7 +1635,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             if message['session_id'] != state['session']:
                 continue
             kind, payload, job = message['kind'], message['payload'], message['job_id']
-            busy = state['thread'] is not None and state['thread'].is_alive()
+            busy = any(slot.busy() for slot in slots.values())
             with operation_lock:
                 deleting_report = state['report_deleting']
             if kind == 'shutdown':
@@ -1592,10 +1644,13 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 snapshot_stop.set()
                 report_delete_stop.set()
                 state['interrupted'] = state['interrupted'] or bool(payload.get('interrupted'))
-                # Quit finishes an existing lookup, but releases blocked credentials.
-                if (state['interrupted'] or not state['ready'] or state['job_type'] in ('monitor', 'config_search', 'demob')
-                        or state['waiting_snapshot']):
-                    operation_stop.set()
+                if state['interrupted']:
+                    abandon.set()
+                # Quit stops the Monitor and finishes an existing lookup, but releases blocked credentials.
+                monitor.stop.set()
+                if (state['interrupted'] or not state['ready'] or oneshot.job_type in ('config_search', 'demob')
+                        or oneshot.waiting_snapshot):
+                    oneshot.stop.set()
                 interaction.close()
             elif kind == 'delete_report':
                 from cn_tool.utils.file_io import saves_in_progress
@@ -1610,9 +1665,8 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 else:
                     # An ID that got any answer is spent: replaying a refused one later must not delete a fresh workbook.
                     report_delete_ids.add(request_id)
-                    if (not state['ready'] or state['initializing'] or busy or state['job'] is not None or
-                            state['saving'] or saves_in_progress() or pending_snapshots or deleting_report or
-                            state['snapshot_active']):
+                    if (not state['ready'] or state['initializing'] or busy or working() or
+                            saves_in_progress() or pending_snapshots or deleting_report or state['snapshot_active']):
                         report_delete_result(payload, 'busy', 'The report is busy. Try again when the current operation finishes.')
                     else:
                         if snapshot_thread is not None:
@@ -1632,12 +1686,15 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                                              error='Report deletion is in progress. Try again when it finishes.'))
             elif kind == 'cancel':
                 with operation_lock:
-                    if job == state['job']:
-                        demob_vault.invalidate()
-                        if not state['saving']:
-                            operation_stop.set()
-                            interaction.discard()
-                            interaction.cancel()
+                    slot = next((slot for slot in slots.values() if slot.job is not None and slot.job == job), None)
+                    if slot is not None:  # only that slot stops (plan 5.4)
+                        if slot is oneshot:
+                            demob_vault.invalidate()
+                        if not slot.saving:
+                            slot.stop.set()
+                            if slot is oneshot:
+                                interaction.discard()
+                                interaction.cancel()
                     elif job == state['demob_preview_job']:
                         demob_vault.invalidate()
                         state['demob_preview_job'] = None
@@ -1704,15 +1761,19 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                               if item is not None and item[0] == payload['job_id']), None)
                 emit('config_search_page_result', config_search_page(cache[1] if cache else None, payload))
             elif kind == 'monitor_live_page':
-                cache = state['monitor_cache']
+                cache = monitor.cache
                 if cache is None:
                     page = {key: payload[key] for key in ('job_id', 'run_id', 'revision', 'offset', 'query_id')}
                     page.update(rows=[], next_offset=None, status='unavailable', current_revision=0)
                 else:
                     page = cache.page(payload)
                 emit('monitor_live_page_result', page)
+            elif kind == 'monitor_live_changes':
+                from .monitor_changes import unavailable
+                cache = monitor.cache
+                emit('monitor_live_changes_result', cache.changes(payload) if cache is not None else unavailable(payload))
             elif kind in ('monitor_live_map', 'monitor_live_host'):
-                cache = state['monitor_cache']
+                cache = monitor.cache
                 name = kind.rsplit('_', 1)[1]
                 if cache is None:
                     answer = dict(payload, status='unavailable', current_revision=0)
@@ -1722,7 +1783,7 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                 emit(kind + '_result', answer)
             elif kind == 'forget_credentials':
                 interaction.forget()
-            elif kind == 'credentials_reply' and job is not None and job == state['job']:
+            elif kind == 'credentials_reply' and job is not None and job == oneshot.job:
                 interaction.answer(payload['request_id'], payload['reply'], payload.get('remember', False))
             elif kind == 'snapshot_report' and state['runtime'] is not None:
                 if len(pending_snapshots) < 8:
@@ -1732,33 +1793,41 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                                              'error': 'Report downloads are busy. Try again.'})
             elif kind == 'reload_config':
                 from cn_tool.utils.file_io import saves_in_progress
-                if busy and state['ready'] and not state['initializing'] and state['job'] is None:
-                    # The last operation has sent its answer and is only returning: wait for it, as 'initialize'
-                    # does, instead of refusing a reload sent the moment that answer arrived.
-                    state['thread'].join(5)
-                    busy = state['thread'].is_alive()
-                if (not state['ready'] or state['initializing'] or busy or state['job'] is not None or
-                        state['saving'] or saves_in_progress() or pending_snapshots or deleting_report or
-                        state['snapshot_active'] or (delete_thread is not None and delete_thread.is_alive())):
+                for slot in slots.values():
+                    if slot.busy() and state['ready'] and not state['initializing'] and slot.job is None:
+                        # The last operation has sent its answer and is only returning: wait for it, as
+                        # 'initialize' does, instead of refusing a reload sent the moment that answer arrived.
+                        slot.thread.join(5)
+                busy = any(slot.busy() for slot in slots.values())
+                if (not state['ready'] or state['initializing'] or busy or working() or saves_in_progress() or
+                        pending_snapshots or deleting_report or state['snapshot_active'] or
+                        (delete_thread is not None and delete_thread.is_alive())):
                     if state['ready']:
                         emit_ready()  # refused: the session stays as it was (an error without a job would end it)
                     emit('reload_result', {'status': 'refused', 'message': 'The settings can be reloaded when no work '
                                            'is running. Try again when it finishes.'})
                 else:
                     demob_vault.invalidate()
-                    operation_stop.clear()
+                    oneshot.stop.clear()
                     state['ready'] = False
                     state['initializing'] = True
-                    state['thread'] = Thread(target=reload_config, args=(payload,))
-                    state['thread'].start()
+                    oneshot.thread = Thread(target=reload_config, args=(payload,))  # the runtime's own work
+                    oneshot.thread.start()
             elif kind == 'initialize' and not state['initializing'] and not state['ready']:
-                if busy:
-                    state['thread'].join()
-                operation_stop.clear()
+                for slot in slots.values():
+                    if slot.busy():
+                        slot.thread.join()
+                oneshot.stop.clear()
                 state['initializing'] = True
-                state['thread'] = Thread(target=initialize, args=(payload,))
-                state['thread'].start()
-            elif kind in {'lookup', 'demob_lookup', 'demob_confirm'} and state['ready'] and state['job'] is None:
+                oneshot.thread = Thread(target=initialize, args=(payload,))
+                oneshot.thread.start()
+            elif kind in {'lookup', 'demob_lookup', 'demob_confirm'} and state['ready']:
+                slot = slots[slot_name(kind, payload)]
+                if slot.job is not None:
+                    # The controller refuses first; a command that still arrives (two tabs) gets its answer (5.5).
+                    emit('error', {'lookup_type': payload['lookup_type'] if kind == 'lookup' else 'demob',
+                                   'message': BUSY_MESSAGES[slot.name]}, job)
+                    continue
                 if kind == 'demob_confirm':
                     demob_scope = demob_vault.consume(payload['token'])
                     if demob_scope is None:
@@ -1770,20 +1839,20 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
                     state['demob_preview_job'] = None
                     demob_vault.invalidate()
                     payload = dict(lookup_type='demob', site=payload['site'])
-                else:
+                elif slot is not monitor:  # a Monitor leaves a Site Demobilization preview alone (5.6; it expires)
                     state['demob_preview_job'] = None
                     demob_vault.invalidate()
-                if busy:
-                    state['thread'].join()
-                state['job'] = job
-                state['job_type'] = payload['lookup_type']
-                if state['job_type'] == 'monitor':
-                    state['monitor_cache'] = MonitorLiveCache(job, lambda update, job_id=job: emit('monitor_update', update, job_id),
-                                                               state['runtime'].ctx.logger)
-                operation_stop.clear()
-                state['waiting_snapshot'] = snapshot_thread is not None and snapshot_thread.is_alive()
-                state['thread'] = Thread(target=lookup, args=(payload, job, snapshot_thread))
-                state['thread'].start()
+                if slot.busy():
+                    slot.thread.join()
+                slot.job = job
+                slot.job_type = payload['lookup_type']
+                if slot is monitor:
+                    slot.cache = MonitorLiveCache(job, lambda update, job_id=job: emit('monitor_update', update, job_id),
+                                                  state['runtime'].ctx.logger)
+                slot.stop.clear()
+                slot.waiting_snapshot = snapshot_thread is not None and snapshot_thread.is_alive()
+                slot.thread = Thread(target=lookup, args=(payload, job, slot, snapshot_thread))
+                slot.thread.start()
     except KeyboardInterrupt:
         state['interrupted'] = True
         state['orphaned'] = True
@@ -1800,12 +1869,13 @@ def worker_main(connection, stop, interrupt=None, config_search_connection=None,
             state['interrupted'] = True
             state['orphaned'] = True
         if state['orphaned']:
-            operation_stop.set()
+            stop_jobs()
         with write_lock:
             history_stopped.set()
         interaction.close()
-        if state['thread'] is not None:
-            state['thread'].join()
+        for slot in slots.values():  # both jobs end, and save, before the runtime closes (exit actions run once)
+            if slot.thread is not None:
+                slot.thread.join()
         state['config_cache'].clear()
         if config_search_connection is not None:
             try:

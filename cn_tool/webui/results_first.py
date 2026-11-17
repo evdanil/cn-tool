@@ -5,6 +5,7 @@ screen. `form_summary` is that line (pure); `form_field` draws a field in the on
 outlined, dense box). The top level imports the standard library and `texts` only: NiceGUI is imported inside the
 functions that draw.
 """
+import functools
 import json
 
 from . import texts
@@ -28,18 +29,45 @@ def _seconds(value) -> str:
     return texts.fmt_duration(int(value)) if value.isdigit() else value
 
 
-def form_summary(targets: str, *, ports: str = '', interval=None, duration=None) -> str:
+@functools.lru_cache(maxsize=8)
+def _read(targets: str, tool: str):
+    """``(count, named, not_understood)`` of a Targets box as the tokenizer reads it (``target_text``), cached: the
+    pages ask on every poll. A text over 64 KiB, which the live line does not read, is counted by its lines."""
+    from cn_tool.utils.target_text import parse
+
+    if len(targets.encode('utf-8', 'surrogatepass')) > 64 * 1024:
+        lines = [line.strip() for line in targets.splitlines() if line.strip()]
+        return len(lines), tuple(lines[:SHOWN + 1]), 0
+    tokens = parse(targets, tool, expand=False).tokens
+    understood = list({token.text: token for token in tokens if token.kind not in ('unknown', 'ignored')}.values())
+    return (len(understood), tuple(token.text for token in understood[:SHOWN + 1]),
+            sum(1 for token in tokens if token.kind == 'unknown'))
+
+
+def form_summary(targets: str, *, ports: str = '', interval=None, duration=None, tool: str = '') -> str:
     """The folded form's line: "320 targets: 10.20.30.0/24, 10.20.31.0/24, … · TCP 22 · every 10 s · until stopped".
 
-    A non-blank line is one target, as the tools count them. ``ports`` are shown as typed. ``interval`` given (even
+    With ``tool`` ('subnet', 'ip', 'ping' or 'monitor') the targets are counted as the tokenizer reads the box, the
+    same as the live line under it (comments, commas and ranges included; an item that is not understood adds "· N not
+    understood"). Without it a non-blank line is one target. ``ports`` are shown as typed. ``interval`` given (even
     blank) means a Monitor's form: its interval, then its duration ("for 1 h", or "until stopped" when blank). A value
     that is not a number is shown as typed."""
-    lines = [line.strip() for line in str(targets or '').splitlines() if line.strip()]
-    if lines:
-        named = ', '.join(_short(line) for line in lines[:SHOWN]) + (', …' if len(lines) > SHOWN else '')
-        parts = [f"{texts.plural(len(lines), 'target')}: {named}"]
+    if tool:
+        count, names, refused = _read(str(targets or ''), tool)
+        if count == 0 and refused == 0:
+            parts = ['No targets']
+        else:
+            named = ', '.join(_short(name) for name in names[:SHOWN]) + (', …' if count > SHOWN else '')
+            parts = [f"{texts.plural(count, 'target')}: {named}" if count else 'No targets']
+            if refused:
+                parts[0] += f' · {refused:,} not understood'
     else:
-        parts = ['No targets']
+        lines = [line.strip() for line in str(targets or '').splitlines() if line.strip()]
+        if lines:
+            named = ', '.join(_short(line) for line in lines[:SHOWN]) + (', …' if len(lines) > SHOWN else '')
+            parts = [f"{texts.plural(len(lines), 'target')}: {named}"]
+        else:
+            parts = ['No targets']
     if str(ports or '').strip():
         parts.append('TCP ' + str(ports).strip())
     if interval is not None:
