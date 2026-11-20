@@ -385,6 +385,14 @@ def reload_refusal(state) -> str:
                     'Try again when it finishes')
 
 
+# Clear results (every one-shot page, and the Monitor once it has stopped): the page forgets its result and outcome.
+CLEAR_RESULTS = 'Clear results'
+CLEAR_HELP = 'Clears this page. The report keeps what was saved.'
+RESULTS_CLEARED = 'Results cleared.'
+NOT_CLEARED = 'Not cleared: the results changed.'
+CLEARED_ELSEWHERE = 'Results were cleared in another tab.'
+
+
 REPORT_DOWNLOAD_HELP = 'Download copies the report as it is once pending saves have finished.'
 
 

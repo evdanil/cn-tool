@@ -8,7 +8,7 @@ from . import config_table, dialogs, search_text, texts, view_state
 from . import outcome as outcome_banner
 from .dialogs import confirm_dialog
 from .setup_card import needs_endpoint, render_setup
-from .results_first import form_field
+from .results_first import focus_field, form_field
 from .shell import render_shell
 from .sign_in import SignInFlow
 from .tables import DEFAULT_SIZE, TableState, apply_table_assets, cn_table
@@ -48,7 +48,7 @@ def render_demob(controller, scope):
 ''')
     apply_table_assets()
     scope.head_once('config-matches', css=config_table.MATCH_CSS, script=config_table.COPY_SCRIPT)
-    latest = dict(preview=None, preview_page=None, preview_query=None, preview_table=TableState(),
+    latest = dict(attempt_job=None, preview=None, preview_page=None, preview_query=None, preview_table=TableState(),
                   result_job=None, result_table=TableState(),
                   result_revision=None, attempt_revision=None, outcome=None, attempt_result=None,
                   note='', discovery=None, previous_results=False, result_site=None, result_heading=None)
@@ -112,6 +112,9 @@ def render_demob(controller, scope):
             sign_in.started(job)
             error.set_text('')
             latest['note'] = ''
+            latest.pop('notice', None)  # a new lookup ends a refused Clear's line
+            if preview_message.text in (texts.RESULTS_CLEARED, texts.NOT_CLEARED):
+                preview_message.set_text('')  # a new check: the line that said the last one was cleared goes
             await poll()
         def lookup_from_keyboard():
             if run.enabled:
@@ -127,6 +130,11 @@ def render_demob(controller, scope):
     discovery_announcement = ui.label('').props('role=status aria-live=polite aria-atomic=true').classes('text-warning cn-demob-empty')
     discovery_announcement._props['data-demob-announcement'] = 'true'
     preview_message = ui.label('').props('role=status').classes('cn-muted cn-demob-empty')
+
+    def say(text):
+        """The line under the form: a refused Clear results (``latest['notice']``) comes before anything else this page
+        writes there, until the next lookup or a successful clear."""
+        preview_message.set_text(latest.get('notice') or text)
     preview_area = ui.column().classes('w-full cn-demob')
     preview_area.set_visibility(False)
 
@@ -142,9 +150,9 @@ def render_demob(controller, scope):
             return
         try:
             latest['preview_query'] = controller.request_demob_page(preview['token'], 0, FIRST_PAGE)
-            preview_message.set_text('Loading site networks…')
+            say('Loading site networks…')
         except (ValueError, RuntimeError, OSError, EOFError):
-            preview_message.set_text('Preview expired or is unavailable. Look up the site again.')
+            say('Preview expired or is unavailable. Look up the site again.')
 
     async def confirm(token):
         if not scope.alive:
@@ -287,7 +295,30 @@ def render_demob(controller, scope):
             site.set_value(request['site'])
         await lookup()
 
-    handlers = dict(sign_in_again=repeat, retry=repeat, open_settings=outcome_banner.open_settings)
+    async def clear_results():
+        """Clear results: the controller forgets the last check, the page is as on a first visit (the site code stays), the
+        focus goes to it and the polite line says so. A preview that waits for consent is not a result: it stays.
+        Nothing is stopped and the report is not touched."""
+        if not scope.alive:
+            return
+        try:
+            # What the page drew, not what the controller holds now: another tab may have checked since.
+            controller.clear_results('demob', attempt_job_id=latest['attempt_job'], result_job_id=latest['result_job'])
+        except RuntimeError:  # the results changed, or a check started (another tab): nothing is cleared
+            latest['notice'] = texts.NOT_CLEARED  # kept: no later write of this line replaces it (say)
+            say('')
+            await poll()
+            return
+        latest.pop('notice', None)
+        if not latest['preview']:  # a waiting preview keeps its own line; the focus move tells the rest
+            latest['note'] = texts.RESULTS_CLEARED
+            say(texts.RESULTS_CLEARED)
+        await poll()
+        if scope.alive:
+            focus_field(client, site)
+
+    handlers = dict(sign_in_again=repeat, retry=repeat, open_settings=outcome_banner.open_settings,
+                    clear_results=clear_results)
 
     async def poll():
         # A poll that a click awaits is no timer tick: nothing cancels it when the tool is left (PageScope), so it asks
@@ -301,6 +332,7 @@ def render_demob(controller, scope):
             deleting = state.report_delete_pending
             latest['delete_pending'] = deleting
             phase = state.phase
+            latest['attempt_job'] = page_state.attempt_job_id
             active = bool(state.active_job_id and state.active_lookup_type == 'demob')
             # The status line, Stop, the banner of another tool's job and the end of the session. While the setup card
             # or the Setup required block shows, it carries the reason and the status line only names the state.
@@ -339,14 +371,14 @@ def render_demob(controller, scope):
                     latest['note'] = ''
                     await request_preview_page()
                 else:
-                    preview_message.set_text(latest['note'])
+                    say(latest['note'])
                 if not scope.alive:
                     return
                 await draw_preview.refresh()
                 if not scope.alive:
                     return
             elif latest['note'] and not preview:
-                preview_message.set_text(latest['note'])
+                say(latest['note'])
             if latest['preview_query']:
                 page = controller.demob_page(latest['preview_query'])
                 if page is not None:
@@ -354,9 +386,9 @@ def render_demob(controller, scope):
                     latest['preview_query'] = None
                     latest['preview_page'] = page
                     if page['status'] != 'ready':
-                        preview_message.set_text('Preview expired or is unavailable. Look up the site again.')
+                        say('Preview expired or is unavailable. Look up the site again.')
                     else:
-                        preview_message.set_text('' if page['total'] else 'No site networks to show.')
+                        say('' if page['total'] else 'No site networks to show.')
                     await draw_preview.refresh()
                     if not scope.alive:
                         return
@@ -400,7 +432,9 @@ def render_demob(controller, scope):
             # A typed login that Infoblox refused was dropped: Sign in again starts the same lookup, which asks again.
             banner.set(outcome_banner.tone_for(latest['outcome']) if latest['outcome'] else outcome_banner.INFORMATION, title,
                        actions=outcome_banner.actions_for('demob', latest['outcome'], handlers,
-                                                          can_repeat=bool(controller.last_request('demob'))))
+                                                          can_repeat=bool(controller.last_request('demob')),
+                                                          can_clear=not active and bool(
+                                                              latest['outcome'] or discovery or page_state.result_job_id)))
             note = texts.attempt_report_note(page_state.attempt_report_state, state.report_state)
             if report.text != note:
                 report.set_text(note)

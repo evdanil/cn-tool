@@ -36,6 +36,14 @@ class ReportDeletionInProgress(RuntimeError):
         super().__init__('Report deletion is in progress. Try again when it finishes.')
 
 
+class ResultsChanged(RuntimeError):
+    """Clear results was asked for results that are no longer the ones the page drew; the text is for the user."""
+
+    def __init__(self):
+        from . import texts
+        super().__init__(texts.NOT_CLEARED)
+
+
 @dataclass
 class SessionSnapshot:
     session_id: str
@@ -431,6 +439,52 @@ class SessionController:
         when the session closes."""
         with self._lock:
             return deepcopy(self._last_requests.get(lookup_type))
+
+    def clear_results(self, lookup_type, *, attempt_job_id, result_job_id):
+        """Forget what the tool's page shows: its last result and its last attempt (the outcome, the diagnostics and the
+        attempt's report note), and for a Monitor the stopped run's rounds, so that a page opened or reloaded after
+        this one finds nothing to show, as on a first visit. Raises ``RuntimeError`` while a job of the tool runs,
+        saves or waits (nothing is stopped or cancelled here) and ``ValueError`` for a tool that is not one of ours.
+
+        Not touched: the report workbook (what was saved stays saved), the Monitor's history files, the request the
+        tool was last asked (``last_request``: it is the form's, and a new tab's prefill) and a Site Demobilization
+        preview that waits for consent. The page's revisions move, so every tab that polls the tool sees it empty.
+
+        ``attempt_job_id`` and ``result_job_id`` are the ids of the attempt and of the result the page drew (None for
+        none): what the tool holds now must be those, or ``ResultsChanged`` is raised and nothing is forgotten (another
+        tab ran the tool since: the page would clear results it never showed)."""
+        with self._lock:
+            if lookup_type not in self._result_revisions:
+                raise ValueError(f'Unknown tool: {lookup_type!r}')
+            state = self._state
+            running = (state.monitor_job_id is not None if lookup_type == 'monitor'
+                       else state.active_job_id is not None and state.active_lookup_type == lookup_type)
+            if running:
+                raise RuntimeError('This tool is running. Clear its results when it has finished.')
+            held = (state.results_by_type.get(lookup_type), state.attempts_by_type.get(lookup_type))
+            if ((held[1] or {}).get('job_id'), (held[0] or {}).get('job_id')) != (attempt_job_id, result_job_id):
+                raise ResultsChanged()
+            jobs = {entry.get('job_id') for entry in held if entry and entry.get('job_id')}
+            state.results_by_type[lookup_type] = None
+            state.attempts_by_type[lookup_type] = None
+            self._result_revisions[lookup_type] += 1
+            self._attempt_revisions[lookup_type] += 1
+            if state.latest_attempt_id in jobs:
+                state.latest_attempt_id = state.latest_outcome = None
+            if lookup_type == 'subnet':
+                state.result = state.result_job_id = None
+            elif lookup_type in ('config_search', 'demob'):
+                for queries in (self._config_requests, self._config_pages):
+                    for query, entry in list(queries.items()):
+                        if entry['job_id'] in jobs:
+                            queries.pop(query, None)
+                if lookup_type == 'demob':
+                    state.demob_discovery = None
+            elif lookup_type == 'monitor':
+                state.monitor_update = None
+                for queries in (self._monitor_requests, self._monitor_pages, self._map_requests, self._map_answers,
+                                self._changes_requests, self._changes_answers):
+                    queries.clear()
 
     def _clear_demob(self):
         self._state.demob_preview = None

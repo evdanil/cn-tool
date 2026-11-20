@@ -27,6 +27,7 @@ and setup](infoblox.md#access-and-setup) requirements before using them.
 | 0.12.3 | The same tools; the Monitor **Map** view of the latest round, an icon for the Windows shortcut, and the version on every page |
 | 0.13.0 | The same tools in one browser page: results first with **Run again**, one table style with a quick filter, Ping progress, view links, single-key shortcuts, a dark theme that follows the system, a sign-in that stays open, and a clearer **Stop** and **Quit** |
 | 0.14.0 | The same tools; a Monitor beside one other tool with both jobs in the header and **Stop…** for each, smart paste on every Targets box, the Monitor's **Changes** list, tab-title count and opt-in desktop notification, the unused addresses of several networks in a table on the Subnets summary, and `[ping] parallel_probes` |
+| 0.14.1 | The same tools; **Clear results** on Subnets, IP, Ping, Configuration Search, Site Demobilization and a stopped Monitor, and Targets and Search terms boxes you can resize on a desktop |
 
 The browser tools beyond Subnets are available in 0.9.0 and are not part of 0.8.4.
 The menu and CLI have their own established workflows.
@@ -264,6 +265,21 @@ and a message about a job that ended stay where they are, the focus moves to the
   that shows the question can still sign in (this tab does not ask again meanwhile), and when
   none does, the next page that needs the password asks for it again; **Stop** ends the lookup.
 
+### Resizing the text boxes
+
+On a desktop (a mouse or trackpad, and a window at least 600 pixels wide) every box you type a list
+into (the Targets boxes of Subnets, IP, Ping and the Monitor, and Configuration Search's Search
+terms) has a handle at its bottom-right corner. Drag it down to make the box taller, up to 70% of
+the window's height, or up to make it shorter, down to three lines. While you type, the box still
+grows by itself up to ten lines; once you have dragged it, it keeps the size you gave it whatever
+you type, paste or restore into it (the text scrolls inside when it is longer), until the page is
+loaded again. The fold and **Edit** keep the size too. On a phone, or in a window under 600
+pixels, the box is as before, with no handle; that now includes Configuration Search's Search
+terms, which had a handle in any width before. The Monitor's Targets box grew without limit as
+you typed; on a desktop it now stops growing at ten lines like the others (it scrolls inside), and
+you can drag it taller. There are no other multi-line boxes: Site
+Demobilization's Site code and Settings use one-line fields.
+
 ### After you run: the form folds
 
 On Subnets, IP, Ping and the Monitor, **Look up**, **Run Ping** and **Run monitor** fold the
@@ -314,8 +330,23 @@ errors, warnings or probe errors) and **Error** (the run failed). The buttons:
 - **Show the N lines not understood** (Subnets, IP and Ping): opens the list of the input
   lines that were not understood and moves the focus to it.
 
-Monitor shows its probe-error line and the notice of a run that has ended in the same form,
-without buttons.
+- **Clear results** (Subnets, IP, Ping, Configuration Search, Site Demobilization, and the
+  Monitor once it has stopped): removes the result from the page, as on a first visit. The
+  tables, the summary and the outcome line go, the form opens with what you typed (Subnets, IP,
+  Ping and Monitor unfold it) and the focus goes to its first field, and the page says "Results
+  cleared." The report keeps what was saved (the line beside the button says so), the Monitor's
+  history files are not touched, and nothing is stopped. It is not offered while a job of that
+  page runs, saves or waits (for the Monitor, until the run has stopped and saved). A reload, or
+  Back to the page, finds it cleared, because the session has forgotten the page's last result:
+  another tab of the same session sees the page empty too. Clear results clears
+  what the page showed: if another tab ran the tool since, nothing is cleared and the page says
+  "Not cleared: the results changed." The Monitor offers it also after a run that failed before
+  its first round. A new run shows its result as usual.
+  **Retry**, the form's typed text and the last request are kept; **Run again** is offered again
+  with the next result.
+
+The Monitor shows its probe-error line and the notice of a run that has ended in the same form;
+that notice has **Clear results** only.
 
 ### Subnets and IP
 

@@ -186,11 +186,23 @@ def form_field(kind: str, label: str, *, value: str = '', props: str = '', class
     caption.tag = 'label'  # a text element (found by its text, as a label of NiceGUI is) drawn as a <label>
     make = ui.textarea if kind == 'textarea' else ui.input
     field = make(value=value).props(f'outlined dense {props}'.strip()).classes(classes)
+    if kind == 'textarea':
+        from .box_resize import mark
+        mark(field)  # a desktop can drag it taller (box_resize)
     # Quasar gives the box's own input the id named by ``for``: the field's id, so the pages' scripts find the input
     # by it as before.
     field.props(f'for={field.html_id}')
     caption._props['for'] = field.html_id
     return caption, field
+
+
+def focus_field(client, field) -> None:
+    """Put the focus on a form field (its box, whatever the element ``field`` wraps): the first field of a form that has
+    no fold to open (Clear results on Configuration Search and Site Demobilization)."""
+    if client.is_deleted or not client.has_socket_connection:
+        return
+    client.run_javascript(f'(() => {{ const root = document.getElementById({json.dumps(field.html_id)}); '
+                          '(root?.matches("input,textarea") ? root : root?.querySelector("input,textarea"))?.focus(); })()')
 
 
 class FormFold:

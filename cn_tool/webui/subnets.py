@@ -156,6 +156,17 @@ class Presentation:
     def select(self, identity):
         self.selection = identity
 
+    def forget(self):
+        """The result on screen was cleared: no table arrangement, details or scroll of it is kept (the next result, and
+        the URL, start from the defaults). The rows per page of Ping stays, as for a new result; so does Show Available."""
+        ping = self.tables.get('ping')
+        self.tables.clear()
+        if ping is not None:
+            self.tables['ping'] = TableState(size=ping.size)
+        self.available_cache.clear()
+        self.summary_scroll = (0, 0, 0)
+        self.selection = self.result_identity = None
+
     def groups(self, result):
         return [group for group in result.get('detail_groups', [])
                 if self.selection == 'all' or group['id'] == self.selection]
@@ -459,22 +470,55 @@ def render_subnets(controller, scope, lookup_type='subnet'):
         ui.run_javascript('if (document.activeElement?.closest("[data-outcome-action]")) document.activeElement.blur();')
         await refresh_now()
 
+    async def clear_results():
+        """Clear results: the controller forgets this tool's last result and attempt, the page is as on a first visit (the
+        form opens with what was typed and takes the focus), and the polite region says so. Never stops a job and never
+        touches the report."""
+        if not scope.alive:
+            return
+        shown = latest.get('displayed_snapshot')
+        try:
+            # What the page drew, not what the controller holds now: another tab may have run the tool since.
+            controller.clear_results(lookup_type, attempt_job_id=latest.get('drawn_attempt'),
+                                     result_job_id=shown.result_job_id if shown is not None else None)
+        except RuntimeError:  # the results changed, or a job of this tool started (another tab): nothing is cleared
+            latest['say'] = texts.NOT_CLEARED
+            announcement.set_content(texts.NOT_CLEARED)
+            await refresh_now()
+            return
+        view.forget()
+        latest['say'] = texts.RESULTS_CLEARED  # said by the polite region when the page has drawn the empty outcome
+        # Let go of the button first: the outcome is not redrawn under the focus, and the form may not take it (the
+        # setup card stands in its place), so the stale banner would stay.
+        try:
+            await ui.context.client.run_javascript(
+                'if (document.activeElement?.closest("[data-outcome-action]")) document.activeElement.blur();', timeout=2)
+        except (TimeoutError, RuntimeError):
+            pass
+        if not scope.alive:
+            return
+        fold.edit()  # the form unfolds, and its first box takes the focus
+        await refresh_now()
+
     def draw_headline(title, snapshot, *, escaped, lines=0):
         """The outcome banner: its title is the page's one polite region; its actions are what the outcome offers."""
         outcome_value = snapshot.latest_outcome
         handlers = dict(sign_in_again=sign_in_again, retry=retry_last, open_settings=outcome_banner.open_settings,
-                        show_lines=outcome_banner.show_lines)
+                        show_lines=outcome_banner.show_lines, clear_results=clear_results)
+        own_job = bool(snapshot.active_job_id) and snapshot.active_lookup_type == lookup_type  # Clear results: not while this runs
         actions = outcome_banner.actions_for(lookup_type, outcome_value, handlers, lines=lines,
-                                             can_repeat=bool(controller.last_request(lookup_type)))
+                                             can_repeat=bool(controller.last_request(lookup_type)), can_clear=not own_job)
         # One banner for the page, drawn once above the panel's redrawn part: a redraw updates the text of the same
         # live region (a region that is new at each redraw is often not announced).
         banner.set(outcome_banner.tone_for(outcome_value), title, actions=actions)
         latest['outcome_heading'] = banner.title.html_id
+        latest['drawn_attempt'] = snapshot.latest_attempt_id
         latest['headline_drawn'] = True
 
     @ui.refreshable
     def draw_outcome():
         latest['headline_drawn'] = False
+        latest['drawn_attempt'] = None  # the attempt the banner shows (draw_headline), for Clear results
         try:
             draw_outcome_parts()
         finally:
@@ -924,12 +968,14 @@ return !!(active?.closest(interactive) && document.getElementById({json.dumps(co
                 return False
 
         outcome_fingerprint = page.attempt_revision
+        latest['outcome_deferred'] = False  # set below while the banner waits for the focus to leave it
         if outcome_fingerprint != latest.get('outcome_fingerprint'):
             focused = latest.get('outcome_fingerprint') is not None and await focused_inside(outcome_area)
             if not scope.alive:
                 return
             if focused:
-                if outcome_fingerprint != latest.get('announced_outcome'):
+                latest['outcome_deferred'] = True  # the table waits with it: one answer, never two
+                if outcome_fingerprint != latest.get('announced_outcome') and not latest.get('say'):  # a refusal is said first
                     if lookup_type == 'ping':
                         from .ping import ping_outcome_display
                         display_outcome = ping_outcome_display(snapshot, attempt, format_entries=False)
@@ -943,7 +989,7 @@ return !!(active?.closest(interactive) && document.getElementById({json.dumps(co
                     latest['announced_outcome'] = outcome_fingerprint
             else:
                 latest['outcome_fingerprint'] = outcome_fingerprint
-                announcement.set_content('')
+                announcement.set_content(latest.pop('say', ''))
                 if lookup_type == 'ping':
                     latest['displayed_outcome_snapshot'] = snapshot
                     latest['displayed_outcome_result'] = latest.get('received_attempt_result')
@@ -977,11 +1023,13 @@ if (!active?.closest(interactive) || active.matches('[data-form-edit]:not([data-
             # The hosts probed so far replace the earlier result at once, whatever has the focus (owner decision):
             # both on screen would show two answers; the focus that was in the removed table moves to the progress.
             arriving = partial_active and not latest.get('partial_active')
-            focused = latest.get('results_fingerprint') is not None and not arriving and await focused_inside(results)
+            focused = (latest.get('results_fingerprint') is not None and not arriving
+                       and (latest['outcome_deferred'] or await focused_inside(results)))
             if not scope.alive:
                 return
             if focused:
-                pending_results.set_text('New results are available. Move focus away from the current results to update them.')
+                pending_results.set_text(texts.CLEARED_ELSEWHERE if snapshot.result is None else
+                                         'New results are available. Move focus away from the current results to update them.')
             else:
                 if arriving:
                     await partial.take_focus()

@@ -6,7 +6,7 @@ from cn_tool.utils import oscompat
 from . import config_table
 from . import outcome as outcome_banner
 from . import search_text, texts, view_state
-from .results_first import form_field
+from .results_first import focus_field, form_field
 from .shell import render_shell
 from .tables import TableState, apply_table_assets, cn_table
 from .theme import apply_theme
@@ -25,7 +25,7 @@ def render_config_search(controller, scope):
 .cn-config .q-field, .cn-config .q-btn { max-width:100%; min-width:0; }
 .cn-config-form { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; gap:12px; }
 .cn-config-input { width:100%; min-width:0; gap:6px; }
-.cn-config textarea { resize:vertical; max-height:calc(10 * 1.5em + 16px); }
+.cn-config textarea { max-height:calc(10 * 1.5em + 16px); }  /* the handle is box_resize's, on a desktop only */
 .cn-config-panel { display:flex; flex-direction:column; gap:8px; }
 .cn-config details { min-width:0; }
 .cn-config summary { color:var(--cn-link); cursor:pointer; width:fit-content; }
@@ -39,7 +39,7 @@ def render_config_search(controller, scope):
 ''')
     apply_table_assets()
     scope.head_once('config-matches', css=config_table.MATCH_CSS, script=config_table.COPY_SCRIPT)
-    latest = dict(job=None, result=None, attempt=None, outcome=None, result_revision=None, attempt_revision=None,
+    latest = dict(job=None, attempt_job=None, result=None, attempt=None, outcome=None, result_revision=None, attempt_revision=None,
                   attempt_result=None, table=TableState())
     lock = asyncio.Lock()
     shell = render_shell(controller, 'config_search')
@@ -84,6 +84,7 @@ def render_config_search(controller, scope):
                 show_error(str(exc) or 'Search could not start. Try again.')
                 return
             show_error('')
+            latest.pop('notice', None)
             await poll()
         async def retry():
             if not scope.alive:
@@ -95,8 +96,27 @@ def render_config_search(controller, scope):
                 return
             terms.set_value('\n'.join(request['inputs']))  # what is repeated is shown
             show_error('')
+            latest.pop('notice', None)
             await poll()
-        handlers = dict(retry=retry, open_settings=outcome_banner.open_settings, show_lines=outcome_banner.show_lines)
+        async def clear_results():
+            """Clear results: the controller forgets the last search, the page is as on a first visit (the terms stay) and
+            the focus goes to the terms box. Nothing is stopped and the report is not touched."""
+            if not scope.alive:
+                return
+            try:
+                # What the page drew, not what the controller holds now: another tab may have searched since.
+                controller.clear_results('config_search', attempt_job_id=latest['attempt_job'], result_job_id=latest['job'])
+            except RuntimeError:  # the results changed, or a search started (another tab): nothing is cleared
+                latest['notice'] = texts.NOT_CLEARED
+                await poll()
+                return
+            latest.pop('notice', None)
+            latest['cleared'] = True  # said by the banner's polite region until the next search
+            await poll()
+            if scope.alive:
+                focus_field(client, terms)
+        handlers = dict(retry=retry, open_settings=outcome_banner.open_settings, show_lines=outcome_banner.show_lines,
+                        clear_results=clear_results)
         def submit_from_keyboard():
             if run.enabled:
                 return submit()
@@ -205,6 +225,7 @@ def render_config_search(controller, scope):
                 latest['attempt_revision'] = page_state.attempt_revision
                 latest['outcome'] = page_state.outcome
                 latest['attempt_result'] = page_state.attempt_result
+            latest['attempt_job'] = page_state.attempt_job_id
             phase = state.phase
             active = bool(state.active_job_id and state.active_lookup_type == 'config_search')
             shell.update(state)  # the status line, Stop, the banner of another tool's job and the end of the session
@@ -214,13 +235,17 @@ def render_config_search(controller, scope):
             run.set_enabled(not deleting and not oscompat.is_macos() and phase == 'ready' and not state.active_job_id)
             attempt_value = latest['outcome'] or {}
             previous = bool(page_state.result_job_id and page_state.attempt_job_id != page_state.result_job_id)
-            title = search_text.headline(attempt_value) or ('Search in progress.' if active else 'No search yet.')
+            if active or attempt_value:
+                latest['cleared'] = False
+            title = search_text.headline(attempt_value) or ('Search in progress.' if active else
+                                                             texts.RESULTS_CLEARED if latest.get('cleared') else 'No search yet.')
             if previous:
                 title = texts.sentence(title, 'Showing results from an earlier completed search')
             lines = len((latest['attempt_result'] or {}).get('errors', []))
             banner.set(outcome_banner.tone_for(attempt_value) if attempt_value else outcome_banner.INFORMATION, title,
                        actions=outcome_banner.actions_for('config_search', attempt_value, handlers, lines=lines,
-                                                          can_repeat=bool(controller.last_request('config_search'))))
+                                                          can_repeat=bool(controller.last_request('config_search')),
+                                                          can_clear=not active and bool(attempt_value or page_state.result_job_id)))
             diagnostic_result = latest['attempt_result'] or {}
             diagnostic_key = (page_state.attempt_job_id, latest['attempt_revision'])
             if latest['attempt'] != diagnostic_key:
@@ -228,7 +253,7 @@ def render_config_search(controller, scope):
                 await render_diagnostics(diagnostic_result)
                 if not scope.alive:
                     return
-            note = texts.attempt_report_note(page_state.attempt_report_state, state.report_state)
+            note = latest.get('notice') or texts.attempt_report_note(page_state.attempt_report_state, state.report_state)  # a refusal first
             if report.text != note:
                 report.set_text(note)
             job = page_state.result_job_id

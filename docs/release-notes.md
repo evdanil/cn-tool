@@ -18,6 +18,25 @@ files and fragments before publishing, and check their public URLs after publica
 
 ## Unreleased
 
+## 0.14.1
+
+The browser tools get **Clear results** and text boxes you can resize. The command line and the menu are unchanged.
+
+**Clear results.** On Subnets, IP, Ping, Configuration Search and Site Demobilization, **Clear results** among the
+outcome's buttons removes the result from the page once nothing of it runs: the tables, the summary and the outcome line
+go, the form opens with what you typed and takes the focus, and the page says "Results cleared." The report keeps what
+was saved and nothing is stopped; a reload or Back finds the page cleared, and a new run shows its result as usual. If
+another tab ran the tool since, nothing is cleared and the page says "Not cleared: the results changed." The Monitor
+offers it once the run has stopped or has failed before its first round; its history files stay.
+
+**Text boxes you can resize.** On a desktop, the Targets boxes (Subnets, IP, Ping and Monitor) and Configuration
+Search's Search terms have a handle to drag them up to 70% of the window and down to three lines; a size you dragged is
+kept while you type. Phones and windows under 600 pixels have no handle (Configuration Search's box had one at any width
+before). The Monitor's Targets box used to grow without limit while typing; on a desktop it now stops at ten lines like
+the others. See [Resizing the text boxes](webui.md#resizing-the-text-boxes) in the web interface guide.
+
+No configuration change or migration is needed, and no dependency changed.
+
 ## 0.14.0
 
 A Monitor can now run beside one other tool in the browser, every Targets box reads pasted lists the same way, and the

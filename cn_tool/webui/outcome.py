@@ -22,6 +22,7 @@ INFORMATION, ATTENTION, ERROR = 'information', 'attention', 'error'
 TONE_WORDS = {INFORMATION: 'Information', ATTENTION: 'Attention', ERROR: 'Error'}
 
 RETRY, OPEN_SETTINGS, SIGN_IN_AGAIN = 'Retry', 'Open Settings', 'Sign in again'
+CLEAR_RESULTS = 'clear_results'  # the key of the Clear results action (texts.CLEAR_RESULTS is its label)
 NO_REQUEST = 'The request to repeat is no longer known. Enter it again.'
 # The tools whose errors can come from their settings (the Infoblox endpoint, the configuration repository).
 SETTINGS_TOOLS = ('subnet', 'ip', 'demob', 'config_search')
@@ -32,7 +33,7 @@ _KINDS_NEEDING_ATTENTION = ('partial', 'stopped', 'invalid')
 _COUNTS_NEEDING_ATTENTION = ('invalid_count', 'resolution_error_count', 'warning_count')
 
 # Key order is the order of the buttons.
-ACTION_KEYS = ('sign_in_again', 'retry', 'open_settings', 'show_lines')
+ACTION_KEYS = ('sign_in_again', 'retry', 'open_settings', 'show_lines', CLEAR_RESULTS)
 
 CSS = '''
 /* One line where it fits (results first): the tone's mark, the title, then the actions at the end of the line. What
@@ -73,6 +74,7 @@ class Action:
     label: str
     on_click: Callable = field(compare=False, default=lambda: None)
     primary: bool = False
+    help: str = ''  # what the button does to the page: visible text beside it, and its aria-describedby
 
 
 # --- the pure part ---------------------------------------------------------------------------------------------------
@@ -97,7 +99,7 @@ def lines_label(count) -> str:
     return 'Show the line not understood' if count == 1 else f'Show the {texts.fmt_count(count)} lines not understood'
 
 
-def action_keys(tool, outcome, *, lines=0, can_repeat=True) -> list:
+def action_keys(tool, outcome, *, lines=0, can_repeat=True, can_clear=False) -> list:
     """The actions an outcome of ``tool`` offers, in button order.
 
     - **Sign in again** when the worker said the typed password was refused (`texts.sign_in_again`), and then no Retry:
@@ -105,6 +107,7 @@ def action_keys(tool, outcome, *, lines=0, can_repeat=True) -> list:
     - **Retry** and **Open Settings** for an error (the error tone) of a tool that can be repeated / whose errors can
       come from its settings; Retry only while the request is still known (``can_repeat``).
     - **Show the N lines not understood** when the page lists some (``lines`` of them).
+    - **Clear results** when the page may (``can_clear``: it has something to show and nothing of its own runs).
     """
     from . import texts
     keys = []
@@ -117,16 +120,21 @@ def action_keys(tool, outcome, *, lines=0, can_repeat=True) -> list:
             keys.append('open_settings')
     if lines:
         keys.append('show_lines')
+    if can_clear:
+        keys.append(CLEAR_RESULTS)
     return keys
 
 
-def actions_for(tool, outcome, handlers, *, lines=0, can_repeat=True) -> list:
+def actions_for(tool, outcome, handlers, *, lines=0, can_repeat=True, can_clear=False) -> list:
     """`action_keys` as `Action` objects. ``handlers`` maps a key to what the button does; a key with no handler on
     this page is left out."""
+    from . import texts
     labels = {'sign_in_again': SIGN_IN_AGAIN, 'retry': RETRY, 'open_settings': OPEN_SETTINGS,
-              'show_lines': lines_label(lines)}
-    return [Action(key, labels[key], handlers[key], primary=key == 'sign_in_again')
-            for key in action_keys(tool, outcome, lines=lines, can_repeat=can_repeat) if key in handlers]
+              'show_lines': lines_label(lines), CLEAR_RESULTS: texts.CLEAR_RESULTS}
+    helps = {CLEAR_RESULTS: texts.CLEAR_HELP}
+    return [Action(key, labels[key], handlers[key], primary=key == 'sign_in_again', help=helps.get(key, ''))
+            for key in action_keys(tool, outcome, lines=lines, can_repeat=can_repeat, can_clear=can_clear)
+            if key in handlers]
 
 
 def repeat(controller, tool):
@@ -218,9 +226,14 @@ def _draw_actions(container, actions):
     from nicegui import ui
     with container:
         for action in actions:
-            ui.button(action.label, on_click=action.on_click).props(
+            button = ui.button(action.label, on_click=action.on_click).props(
                 f'{"color=primary" if action.primary else "outline"} data-outcome-action={action.key}'
                 + (' data-sign-in-again' if action.key == 'sign_in_again' else ''))
+            if action.help:
+                # What the button does to the page is a consequence: visible text beside it (a tooltip is for names),
+                # which is also the button's description for a screen reader.
+                described = ui.label(action.help).classes('cn-muted text-sm cn-outcome-help')
+                button._props['aria-describedby'] = described.html_id
 
 
 @dataclass

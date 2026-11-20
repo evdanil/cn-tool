@@ -5,6 +5,7 @@ import json
 from . import job_slots, lookup_inputs, monitor_map, monitor_style, monitor_tables, tab_aria, target_preview, texts, view_state
 from . import outcome as outcome_banner
 from .dialogs import confirm_dialog
+from .monitor_clear import MonitorClear
 from .monitor_feed import ChangesPanel
 from .monitor_link import MonitorLink
 from .monitor_live_map import NOT_RUNNING, WAITING, LiveMap, set_changed  # noqa: F401 (WAITING: re-exported)
@@ -21,7 +22,7 @@ from .monitor_text import (  # noqa: F401
     live_row, round_host_row, coverage_row, COVERAGE_TONES, coverage_defaults, coverage_download_note, coverage_time,
     coverage_answered, coverage_summary_line, coverage_notices, history_run_summary, history_template_error,
     history_template_form, history_value, RUN_DETAILS, history_run_details, delete_run_reason, monitor_warnings, moment,
-    monitor_header, stopped_notice, request_form, live_page_label, monitor_summary, request_summary,
+    monitor_header, stopped_notice, request_form, live_page_label, monitor_summary, request_summary, outcome_lines,
     EXPORT_TABLE_CHANGED, LIVE_CHANGED, LIVE_UNAVAILABLE, ROUND_CHANGED, ROUND_TOO_LARGE, COVERAGE_CHANGED,
 )
 
@@ -851,6 +852,7 @@ if (!requested && fallback) {{
         if focus and alive():
             focus_history(focus)
 
+    clear = MonitorClear(controller, alive=alive, edit_form=lambda: fold.edit(), poll=lambda: poll())
     async def poll():
         # Also awaited by a click, which is not cancelled with the scope: it asks scope.alive (alive()) at its start and
         # after every await, so a page that was left neither reads nor asks anything more. Its job is never stopped.
@@ -895,15 +897,10 @@ if (!requested && fallback) {{
             else:  # a run before its first round, or one that ended without one; nothing at all says nothing here
                 summary_text = ('No complete round yet. An unfinished round does not indicate an outage.'
                                 if active or outcome else '')
+            summary_text = clear.say(summary_text, page, active=active, outcome=outcome)
             rounds = data.get('current_rounds', 0)
-            # The run has ended and left something to say: a result, or rounds the session still holds.
-            ended = not active and bool(outcome) and (latest.get('attempt_result') is not None or bool(rounds))
+            ended, message, failed, failed_title = outcome_lines(outcome, latest.get('attempt_result'), active=active, rounds=rounds)
             probe_failed = bool(data.get('probe_failed'))
-            message = str(outcome.get('message') or '') if outcome.get('kind') in {'invalid', 'lookup_error', 'partial', 'stopped'} else ''
-            # Said once: a stop by the notice of the ended run, a probe error by its one line in the attention tone.
-            if (outcome.get('kind') == 'stopped' and ended) or (
-                    outcome.get('kind') == 'lookup_error' and (latest.get('attempt_result') or {}).get('probe_failed')):
-                message = ''
             set_changed(outcome_status, message)
             probe_notice.set(outcome_banner.ATTENTION, PROBE_ERRORS) if probe_failed else probe_notice.hide()
             set_changed(warning_status, ' '.join(monitor_warnings(data, outcome)))
@@ -969,7 +966,7 @@ if (!requested && fallback) {{
             header.set_visibility(active or bool(rounds))
             notice = stopped_notice(outcome, page.attempt_meta, rounds, probe_failed=probe_failed,
                                     showing=same_run and (update.get('revision') or 0) > 0) if ended else ''
-            ended_notice.set(outcome_banner.INFORMATION, notice) if notice else ended_notice.hide()
+            clear.show(ended_notice, outcome, notice, failed, failed_title)
             live_map.enable()  # every line above the view switch has its place now
             if latest['template_query']:
                 template_page = controller.monitor_history_page(latest['template_query'])

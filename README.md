@@ -160,6 +160,7 @@ sign-in open after a refused password, and says what **Stop** and **Quit** will 
 Release 0.14.0 lets a Monitor run beside one other tool, reads a pasted list the same way in every Targets box (with a size
 limit), lists what changed in the Monitor, can send an opt-in desktop notification, shows the unused addresses of several
 networks in a table on the Subnets summary, and adds the `[ping] parallel_probes` setting.
+Release 0.14.1 adds **Clear results** to the browser tools and lets a desktop drag the Targets and Search terms boxes taller.
 See the [WebUI guide](https://github.com/evdanil/cn-tool/blob/main/docs/webui.md) for details.
 Closing a tab keeps the application running; **Quit application** ends it and runs
 configured exit actions, including email when enabled.

@@ -386,3 +386,20 @@ def request_summary(item):
     return [preview('Targets', item.get('targets_preview') or [], item.get('target_count')),
             preview('TCP ports', item.get('ports_preview') or [], item.get('port_count')),
             f"Hosts: {hosts if hosts is not None else 'unavailable'}"]
+
+
+def outcome_lines(outcome, attempt_result, *, active, rounds):
+    """``(ended, message, failed, title)`` for the Monitor's attempt, not running: ``ended`` (it left something to say: a
+    result, or rounds the session still holds), the red ``message`` (said once: a stop by the notice of the ended run,
+    a probe error by its one line in the attention tone) and, for a run that ended with nothing to show (it failed before
+    a round), ``failed`` with its message as the banner's ``title``, so that Clear results has a place and the message
+    is not said again in red."""
+    ended = not active and bool(outcome) and (attempt_result is not None or bool(rounds))
+    message = str(outcome.get('message') or '') if outcome.get('kind') in {'invalid', 'lookup_error', 'partial', 'stopped'} else ''
+    if (outcome.get('kind') == 'stopped' and ended) or (
+            outcome.get('kind') == 'lookup_error' and (attempt_result or {}).get('probe_failed')):
+        message = ''
+    failed = not active and bool(outcome) and not ended
+    if failed:
+        return ended, '', True, str(outcome.get('message') or 'The last run ended without a result.')
+    return ended, message, False, ''
